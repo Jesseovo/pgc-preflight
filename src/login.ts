@@ -13,7 +13,7 @@ document.querySelector('#app')!.innerHTML = `
   <main class="auth-main">
     <section class="auth-sheet" aria-labelledby="welcome-title">
       <div class="sheet-label"><span class="pixel-mark"></span>CREATOR'S LITTLE CORNER<span class="sheet-tag">MEMBERS ONLY</span></div>
-      <div class="auth-welcome"><div class="welcome-heading"><h1 id="welcome-title">Hi there, creator<span>.</span></h1>${catWalk}</div><p>好游戏，准备出发。登录后开始你的游戏基础体检。</p></div>
+      <div class="auth-welcome"><div class="welcome-heading"><h1 id="welcome-title">Hi there, creator<span>.</span></h1>${catWalk}</div><p>好游戏，准备出发。登录后开始你的游戏基础体检。</p><div class="auth-bottom"><span>Making good games. Keeping it playful.</span>${quietCorner}</div></div>
       <section class="login-card member-login-card" aria-labelledby="login-title">
         <div class="login-card-heading"><div class="login-symbol">${icon('gamepad-2')}</div><div><h2 id="login-title">欢迎回来</h2><p>登录你的团队账号</p></div></div>
         <form id="member-login" class="auth-form">
@@ -24,7 +24,6 @@ document.querySelector('#app')!.innerHTML = `
         </form>
         <div class="login-foot">${icon('user-round-check')}没有账号？联系管理员开通。</div>
       </section>
-      <div class="auth-bottom"><span>Making good games. Keeping it playful.</span>${quietCorner}</div>
     </section>
     <footer><span>PGC Preflight <span class="footer-separator">/</span> For your next good game</span><span>模型检查，人工终审</span></footer>
   </main>`;
