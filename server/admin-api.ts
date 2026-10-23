@@ -40,7 +40,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       if(!apiKey)return json({error:'请先填写 API Key。'},400);
       const transport=modelTransport({...fields,apiKey});
       const started=Date.now();
-      const text=await transport([{role:'user',content:[{type:'text',text:'这是模型接口与图片输入测试。请只回复 READY。'},{type:'image_url',image_url:{url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9hUAAAAASUVORK5CYII='}}]}]);
+      const text=await transport([{role:'user',content:[{type:'text',text:'这是模型接口与图片输入测试。请只回复 READY。'},{type:'image_url',image_url:{url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfPXCY1iiH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBVNChh70khwUAAAAASUVORK5CYII='}}]}]);
       return json({ok:true,durationMs:Date.now()-started,message:text.slice(0,150)});
     }
     return json({error:'接口不存在。'},404);

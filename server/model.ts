@@ -20,8 +20,9 @@ export function modelTransport(config: ModelRuntime): ModelTransport {
     const response = await fetch(`${config.baseUrl}/chat/completions`, {
       method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${config.apiKey}`},
       body:JSON.stringify({model:config.model,messages,max_tokens:2200,stream:false}),
-      signal:AbortSignal.timeout(35000), redirect:'error',
+      signal:AbortSignal.timeout(35000), redirect:'manual',
     });
+    if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
     if (!response.ok) throw new Error(`模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`);
     const data = await response.json() as {choices?:{message?:{content?:string}}[]};
     const content = data.choices?.[0]?.message?.content;
