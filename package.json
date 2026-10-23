@@ -1,0 +1,30 @@
+{
+  "name": "pgc-preflight",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "test:runtime": "tsx scripts/verify-runtime.ts",
+    "deploy": "npm run build && wrangler deploy",
+    "check:deploy": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
+    "lucide": "^0.468.0"
+  },
+  "overrides": {
+    "@cloudflare/puppeteer": { "@puppeteer/browsers": "^3.2.6" }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "puppeteer-core": "^25.16.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.12",
+    "vitest": "^5.0.5",
+    "wrangler": "^4.151.3"
+  }
+}
