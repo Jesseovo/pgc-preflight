@@ -9,6 +9,7 @@ import {configStore,memberStore} from './storage';
 import type {Database} from './storage';
 import {authApi} from './auth-api';
 import {identity} from './members';
+import {guardCheckPage} from './page-access';
 
 interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
@@ -53,6 +54,8 @@ export default {
       } finally { await browser?.close().catch(() => {}); }
     }
     if (url.pathname.startsWith('/api/')) return json({ error: '接口不存在。' }, 404);
+    const redirect = await guardCheckPage(request, members, env);
+    if (redirect) return redirect;
     return env.ASSETS.fetch(request);
   },
 };

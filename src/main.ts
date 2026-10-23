@@ -1,5 +1,6 @@
 import { createIcons, icons } from 'lucide';
 import './style.css';
+import {catWalk} from './artwork';
 import type { CheckReport, Status } from './types';
 import { MAX_BATCH, MAX_FILE_BYTES, makeReportText } from '../server/policy';
 
@@ -23,12 +24,12 @@ app.innerHTML = `
     <div class="header-right"><span class="service" id="service"><span class="service-dot"></span>正在连接检查服务</span><span id="user-menu"></span><button class="icon-button" id="scope-button" title="检查范围" aria-label="查看检查范围">${icon('circle-help')}</button></div>
   </div></header>
   <main>
-    <section class="intro"><div><div class="eyebrow"><span></span> GAME CHECK, BEFORE YOU SHIP</div><h1>上传前，先过一遍<span>。</span></h1><p>把基础问题留在提交前，把时间留给好游戏。</p></div><div class="intro-note">${icon('scan-line')}<span>基础体检<br><b>人工终审</b></span></div></section>
+    <section class="intro"><div><div class="eyebrow"><span></span> GAME CHECK, BEFORE YOU SHIP</div><h1>上传前，先过一遍<span>。</span></h1><p>把基础问题留在提交前，把时间留给好游戏。</p></div>${catWalk}</section>
     <section class="workspace" aria-label="游戏检查工作台">
       <div class="upload-panel">
         <div class="section-label"><span><b>01</b> 添加游戏</span><span class="muted">支持批量检查</span></div>
         <div class="dropzone" id="dropzone">
-          <div class="file-illustration" aria-hidden="true"><div class="mini-file back-file">${icon('code-xml')}</div><div class="mini-file front-file">${icon('gamepad-2')}<span>HTML</span><div class="file-check">${icon('check')}</div></div></div>
+          <img class="file-illustration pixel-art" src="/artwork/pixel-console.svg" width="112" height="88" alt="" aria-hidden="true"/>
           <h2>把游戏拖到这里</h2><p>一次放入多个 HTML，剩下的交给我们</p>
           <button class="primary-button" id="choose-files">${icon('plus')} 选择游戏文件</button>
           <div class="upload-meta">.html / .htm <span>·</span> 单个 ≤ 8 MB <span>·</span> 每批最多 20 个</div>
@@ -47,7 +48,7 @@ app.innerHTML = `
       <div class="results-heading"><div><h2>检查队列 <span id="queue-count">00</span></h2><p id="queue-caption">添加文件后，检查会自动开始</p></div><div class="queue-actions"><button class="subtle-button" id="pause-button" hidden>${icon('pause')}暂停队列</button><button class="subtle-button" id="export-button" hidden>${icon('download')}导出报告</button><button class="icon-button" id="clear-button" title="清空已完成项目" aria-label="清空已完成项目" hidden>${icon('list-x')}</button></div></div>
       <div id="queue-content"><div class="empty-state"><div class="empty-line"></div><div class="empty-icon">${icon('list-checks')}</div><p>好游戏，从少一个小问题开始。</p><span>你的检查结果会出现在这里</span><div class="empty-line"></div></div></div>
     </section>
-    <footer><span>PGC Preflight <span class="footer-separator">/</span> 给创作者的一次轻量检查</span><span>模型检查，人工终审 <a href="/admin" class="admin-link" aria-label="模型管理">${icon('settings-2')}</a></span></footer>
+    <footer><span>PGC Preflight <span class="footer-separator">/</span> 给创作者的一次轻量检查</span><span>模型检查，人工终审</span></footer>
   </main>
   <div id="toast" role="status" aria-live="polite"></div>
   <dialog id="scope-dialog"><div class="dialog-heading"><h2>检查到哪里？</h2><button class="icon-button" id="close-scope" aria-label="关闭">${icon('x')}</button></div><p>大模型查看实际游戏画面和运行记录，自主决定基本操作，再给出审核结论。程序负责浏览器取证，不用固定规则给游戏打分。</p><ul><li>模型检查加载、脚本异常、缺失资源和明显的文字或按钮显示问题。</li><li>模型识别开始与重试入口；无法确认操作是否生效时，交给人工。</li><li>只覆盖本次实际到达的页面，不强制通关。</li><li>需要在管理页配置支持图片输入的模型；未配置时不会生成审核结论。</li><li>检查环境仅放行常用公共 CDN；其他外部依赖需结合环境限制判断。</li></ul><div class="dialog-note">基础检查通过 ≠ 最终审核通过。<br>不评价操作手感、美术、趣味性或难度。</div></dialog>
@@ -167,7 +168,7 @@ function findingMarkup(item: CheckReport['findings'][number]) { return `<div cla
 let toastTimer: ReturnType<typeof setTimeout>;
 function toast(message: string) { $('#toast').textContent = message; $('#toast').classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('#toast').classList.remove('visible'), 5000); }
 function download(text: string, filename: string, type: string) { const url = URL.createObjectURL(new Blob([text], { type: `${type};charset=utf-8` })); const link = document.createElement('a'); link.href = url; link.download = filename; link.click(); setTimeout(()=>URL.revokeObjectURL(url), 1000); }
-async function healthCheck() { try { const response = await fetch('/api/health'); if (!response.ok) throw new Error();const data=await response.json(); $('#service').innerHTML = data.configured?'<span class="service-dot online"></span>审核模型已就绪':'<span class="service-dot offline"></span><a href="/admin">待配置审核模型</a>'; } catch { $('#service').innerHTML = '<span class="service-dot offline"></span>服务暂不可用，可稍后重试'; } }
+async function healthCheck() { try { const response = await fetch('/api/health'); if (!response.ok) throw new Error();const data=await response.json(); $('#service').innerHTML = data.configured?'<span class="service-dot online"></span>审核模型已就绪':'<span class="service-dot offline"></span>等待管理员配置模型'; } catch { $('#service').innerHTML = '<span class="service-dot offline"></span>服务暂不可用，可稍后重试'; } }
 void healthCheck();
 void loadIdentity();
 
@@ -184,8 +185,7 @@ async function loadIdentity(){
     else banner.hidden=true;
   }catch{
     currentUser=null;
-    $('#user-menu').innerHTML='<a class="login-link" href="/login">成员登录</a>';
-    banner.hidden=false;banner.innerHTML=`${icon('users')}<span>检查需要团队账号。<a href="/login">成员登录</a><span class="banner-divider">/</span><a href="/admin">管理员登录</a></span>`;
+    location.replace('/login');
   }
   refreshIcons();
 }

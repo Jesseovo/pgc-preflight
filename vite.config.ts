@@ -11,6 +11,7 @@ import type { AppSecrets, ConfigStore, ModelConfig } from './server/settings';
 import type {Member,MemberStore} from './server/members';
 import {identity} from './server/members';
 import {authApi} from './server/auth-api';
+import {guardCheckPage} from './server/page-access';
 
 function localCheckApi(): Plugin {
   return {
@@ -20,6 +21,15 @@ function localCheckApi(): Plugin {
       const readMembers=async():Promise<Member[]>=>{try{return JSON.parse(await readFile('.local-members.json','utf8'));}catch{return[];}};
       const members:MemberStore={list:readMembers,byUsername:async username=>(await readMembers()).find(m=>m.username.toLowerCase()===username.toLowerCase())||null,byId:async id=>(await readMembers()).find(m=>m.id===id)||null,save:async member=>{const all=await readMembers();const index=all.findIndex(m=>m.id===member.id);if(index>=0)all[index]=member;else all.push(member);await writeFile('.local-members.json',JSON.stringify(all,null,2));}};
       const secrets=async()=>{const text=await readFile('.dev.vars','utf8').catch(()=>'');return Object.fromEntries(text.split(/\r?\n/).filter(line=>line.includes('=')).map(line=>{const i=line.indexOf('=');return[line.slice(0,i),line.slice(i+1)];}))as unknown as AppSecrets;};
+      server.middlewares.use(async (request, response, next) => {
+        const path = new URL(request.url || '/', 'http://localhost').pathname;
+        if (!['/', '/index.html'].includes(path)) { next(); return; }
+        try {
+          const result = await guardCheckPage(new Request(`http://${request.headers.host}${request.url}`, { method: request.method, headers: request.headers as Record<string, string> }), members, await secrets());
+          if (result) { response.writeHead(result.status, Object.fromEntries(result.headers)); response.end(); return; }
+          next();
+        } catch { response.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' }); response.end('登录服务暂不可用，请刷新重试。'); }
+      });
       server.middlewares.use('/api', async (request, response, next) => {
         const send = (value: unknown, status = 200) => { response.statusCode = status; response.setHeader('Content-Type', 'application/json; charset=utf-8'); response.setHeader('Cache-Control', 'no-store'); response.end(JSON.stringify(value)); };
         if(request.url?.startsWith('/admin/')||request.url?.startsWith('/auth/')){

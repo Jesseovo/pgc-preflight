@@ -1,6 +1,7 @@
 import {createIcons,icons} from 'lucide';
 import './style.css';
 import './admin.css';
+import {catWalk} from './artwork';
 
 const icon=(name:string)=>`<i data-lucide="${name}" aria-hidden="true"></i>`;
 const escape=(value:string)=>value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
@@ -9,7 +10,7 @@ type PublicConfig={baseUrl:string;model:string;enabled:boolean;hasKey:boolean;up
 let saved:PublicConfig={baseUrl:'',model:'',enabled:true,hasKey:false,updatedAt:''};
 const $=<T extends Element=HTMLElement>(selector:string)=>document.querySelector<T>(selector)!;
 const iconsReady=()=>createIcons({icons,attrs:{'stroke-width':1.7}});
-app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><a href="/" class="back-link">${icon('arrow-left')}返回检查台</a></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">MODEL CONTROL ROOM</div><h1>让合适的模型，来检查<span>。</span></h1><p>配置视觉模型，管理你的游戏基础预审。</p></div></section><div id="admin-content"><div class="admin-loading">正在读取管理配置…</div></div><footer><span>PGC Preflight / Model-driven review</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
+app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><a href="/" class="back-link">${icon('arrow-left')}返回检查台</a></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">MODEL CONTROL ROOM</div><h1>让合适的模型，来检查<span>。</span></h1><p>配置视觉模型，管理你的游戏基础预审。</p></div>${catWalk}</section><div id="admin-content"><div class="admin-loading">正在读取管理配置…</div></div><footer><span>PGC Preflight / Model-driven review</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
 iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){
@@ -23,7 +24,7 @@ async function init(){try{saved=await api('config');renderSettings();}catch(erro
 void init();
 
 function renderLogin(initialMessage=''){
-  $('#admin-content').innerHTML=`<section class="login-card"><div class="login-symbol">${icon('key-round')}</div><h2>管理员登录</h2><p>使用部署时设置的管理密码进入。</p><form id="login-form"><label for="admin-password">管理密码</label><input id="admin-password" type="password" autocomplete="current-password" placeholder="输入管理密码" required maxlength="500"/><button class="primary-button" type="submit">${icon('arrow-right')}进入管理页</button><p id="login-message" class="form-message" role="status">${escape(initialMessage)}</p></form><div class="login-foot">${icon('shield-check')}登录状态保留 8 小时</div></section>`;
+  $('#admin-content').innerHTML=`<section class="login-card"><div class="login-card-heading"><div class="login-symbol">${icon('key-round')}</div><div><h2>管理员登录</h2><p>管理模型与团队账号</p></div></div><form id="login-form" class="auth-form"><div class="auth-field"><label for="admin-password">管理密码</label><input id="admin-password" type="password" autocomplete="current-password" placeholder="输入管理密码" required maxlength="500"/></div><button class="primary-button" type="submit"><span>进入管理页</span>${icon('arrow-right')}</button><p id="login-message" class="form-message" role="status">${escape(initialMessage)}</p></form><div class="login-foot">${icon('shield-check')}登录状态保留 8 小时</div></section>`;
   iconsReady();
   $('#login-form').addEventListener('submit',async event=>{
     event.preventDefault();const button=$<HTMLButtonElement>('#login-form button');button.disabled=true;

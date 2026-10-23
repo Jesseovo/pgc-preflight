@@ -11,6 +11,8 @@
 - Uploaded HTML is untrusted. Keep it in a separate browser context, restrict navigation and outbound resources, close browsers in finally, and never run it in the app origin.
 - `/admin` manages the OpenAI-compatible Chat Completions endpoint, model ID, enabled state and encrypted API key. Never echo keys in responses or logs. Model must support images.
 - `/admin` also creates member accounts, resets passwords, enables/disables accounts and grants/revokes `canReview`. `/login` is for members. `/api/check` must validate session and current review permission on the server. Role changes, account disablement and password resets revoke old sessions.
+- Opening `/` or `/index.html` without a valid session redirects to `/login` before the workspace renders. Keep public and member views free of links to `/admin`; the administrator can visit that path directly.
+- Visual direction follows Jesseovo's GitHub profile: white surfaces, fine borders, muted sage accents, compact layouts and the original pixel cat. Avoid garden backgrounds and oversized decorative cards. Profile artwork is copied into `public/artwork/`.
 - Keep uploads, screenshots and reports ephemeral. Never commit real team game files or internal research data.
 
 ## Development
