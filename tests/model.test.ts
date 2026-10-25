@@ -2,7 +2,7 @@ import {afterEach,describe,expect,it,vi} from 'vitest';
 import {modelTransport} from '../server/model';
 import {parseJson} from '../server/forge-llm';
 
-afterEach(()=>vi.unstubAllGlobals());
+afterEach(()=>{vi.unstubAllGlobals();vi.useRealTimers();});
 
 describe('模型传输',()=>{
   const config={baseUrl:'https://provider.example',model:'vision-model',apiKey:'test-only-api-key'};
@@ -61,6 +61,20 @@ describe('模型传输',()=>{
     await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'})([
       {role:'user',content:'test'},
     ])).rejects.toThrow('Anthropic Messages');
+  });
+
+  it('持续返回思考片段也不能突破任务总时限',async()=>{
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init?:RequestInit)=>new Response(new ReadableStream({
+      start(controller){
+        const timer=setInterval(()=>controller.enqueue(new TextEncoder().encode('data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"…"}}\n\n')),20_000);
+        init?.signal?.addEventListener('abort',()=>{clearInterval(timer);controller.error(new DOMException('aborted','AbortError'));});
+      },
+    }),{headers:{'content-type':'text/event-stream'}})));
+    const response=modelTransport({...config,protocol:'anthropic'},{timeoutMs:30_000,totalTimeoutMs:45_000})([]);
+    const check=expect(response).rejects.toThrow('模型响应超时');
+    await vi.advanceTimersByTimeAsync(45_000);
+    await check;
   });
 
   it('读取 Anthropic 流式文本，并带上幂等键',async()=>{

@@ -345,7 +345,7 @@ async function listTopics(env, params) {
   const limit = Math.min(Number(params.get("limit")) || 100, 500);
   const marks = statuses.map(() => "?").join(",");
   const rows = await all(env, `SELECT id, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
-      preview_svg IS NOT NULL AS has_preview, brief_md IS NOT NULL AS has_brief
+      preview_svg IS NOT NULL AS has_preview, brief_md IS NOT NULL AS has_brief, brief_status, brief_error
     FROM topics WHERE status IN (${marks}) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses, limit);
   return rows.map(hydrate);
 }

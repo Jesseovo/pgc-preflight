@@ -36,12 +36,13 @@ function anthropicText(data: any) {
   return (data?.content || []).filter((part: any) => part?.type === 'text').map((part: any) => String(part.text || '')).join('\n');
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; idempotencyKey?: string } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string } = {}): ModelTransport {
   return async messages => {
     const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), 24000);
     const anthropic = config.protocol === 'anthropic';
     const controller = new AbortController();
     let timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
+    const totalTimeout = options.totalTimeoutMs ? setTimeout(() => controller.abort(), options.totalTimeoutMs) : undefined;
     const touch = () => {
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
@@ -61,6 +62,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       });
     } catch (error) {
       clearTimeout(timeout);
+      clearTimeout(totalTimeout);
       if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new Error('模型响应超时，请重试或切换到 DeepSeek。');
       throw error;
     }
@@ -109,8 +111,12 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
       if (!content) throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。');
       return content;
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('模型响应超时，请重试或切换到 DeepSeek。');
+      throw error;
     } finally {
       clearTimeout(timeout);
+      clearTimeout(totalTimeout);
     }
   };
 }

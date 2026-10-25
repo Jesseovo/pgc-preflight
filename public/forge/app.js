@@ -153,7 +153,7 @@ function topicCard(t, mode) {
     acts.push(`<button class="ghost bad" data-act="reject">移出候选</button>`);
   }
   acts.push(`<button class="ghost" data-act="preview">${t.has_preview ? "看样板图" : "生成样板图"}</button>`);
-  acts.push(`<button class="${mode === "picks" ? "primary" : "ghost"}" data-act="brief">${t.has_brief ? "看简报" : "生成简报"}</button>`);
+  acts.push(`<button class="${mode === "picks" ? "primary" : "ghost"}" data-act="brief">${t.brief_status === 'running' ? "查看生成进度" : t.has_brief ? "看简报" : "生成简报"}</button>`);
   return `<article class="card state-${t.status}" data-id="${t.id}">
     <div class="art" style="${artStyle(d)}"><div class="title">${esc(d.title)}</div><div class="score" title="预估 美学/易玩性/可玩性">${esc(sc)}</div></div>
     <div class="body">
@@ -206,9 +206,9 @@ function bindCards(root, list, rerender) {
         showPreview(t, svg);
       } else if (act === "brief") {
         let md;
-        if (t.has_brief) md = (await api("GET", `topics/${id}`)).brief_md;
+        if (t.has_brief && t.brief_status !== 'running') md = (await api("GET", `topics/${id}`)).brief_md;
         else {
-          toast("正在写简报，Opus 可能需要 1–3 分钟…", 180000);
+          toast("简报已交给后台生成，可以离开页面。Opus 长简报可能需要数分钟…", 180000);
           md = await requestBrief(id);
           t.has_brief = 1;
           if (t.status !== "made") t.status = "liked";
@@ -241,7 +241,7 @@ async function requestBrief(id, regenerate = false) {
     if (!/超时|timeout|409|5\d\d|网络|failed to fetch|fetch failed|network/i.test(String(error?.message || error))) throw error;
   }
   let reclaimed = false;
-  for (let attempt = 0; attempt < 70; attempt++) {
+  for (let attempt = 0; attempt < 210; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
     try {
       const saved = await api("GET", `topics/${id}`);

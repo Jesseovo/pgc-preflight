@@ -54,7 +54,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     const deadline = Date.now() + 12 * 60 * 1000;
     for (let attempt = 0; attempt < attempts; attempt++) {
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
-      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: Math.min(req.timeoutMs || 90000, Math.max(1, deadline - Date.now())), idempotencyKey: attemptKey });
+      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey });
       try {
         const text = await transport(messages);
         if (!req.schema) return text;
