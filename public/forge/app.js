@@ -40,7 +40,11 @@ async function api(method, path, data) {
     location.replace('/login');
     throw new Error((out && out.error) || "未授权");
   }
-  if (!res.ok) throw new Error((out && out.error) || `请求失败 ${res.status}`);
+  if (!res.ok) {
+    const error = new Error((out && out.error) || `请求失败 ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
   return out;
 }
 
@@ -370,27 +374,33 @@ async function expandIds(ids) {
   prog();
   for (const id of ids) { const t = state.drawn.find((x) => x.id === id); if (t) { t._inflight = true; delete t._error; } }
   paintDrawn();
-  const recover = async (chunk) => {
+  const recover = async (chunk, maxWaitMs = 10000) => {
     // A proxy can drop the browser response after the Worker has finished
-    // writing D1. Read the topic before retrying so we do not spend another
-    // model call for an already completed expansion.
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    const recovered = [];
-    for (const id of chunk) {
-      try {
-        const topic = await api("GET", `topics/${id}`);
-        if (topic?.data?.title) recovered.push(topic);
-      } catch {}
+    // writing D1. A 409 from the relay means the same idempotent request is
+    // still running; keep reading D1 instead of starting a duplicate call.
+    const deadline = Date.now() + maxWaitMs;
+    let first = true;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, first ? 1200 : 3500));
+      first = false;
+      const recovered = [];
+      for (const id of chunk) {
+        try {
+          const topic = await api("GET", `topics/${id}`);
+          if (topic?.data?.title) recovered.push(topic);
+        } catch {}
+      }
+      if (recovered.length === chunk.length) return recovered;
     }
-    return recovered.length === chunk.length ? recovered : null;
+    return null;
   };
   const expandChunk = async (chunk) => {
     for (let attempt = 0; attempt < 2; attempt++) {
       try { return await api("POST", "expand", { ids: chunk }); }
       catch (e) {
         const message = String(e?.message || e);
-        if (!/超时|timeout|429|5\d\d|网络|failed to fetch|fetch failed|network/i.test(message)) throw e;
-        const recovered = await recover(chunk);
+        if (!/超时|timeout|409|429|5\d\d|网络|failed to fetch|fetch failed|network/i.test(message)) throw e;
+        const recovered = await recover(chunk, /409|正在处理/i.test(message) ? 90000 : 10000);
         if (recovered) return recovered;
         if (attempt) throw e;
         await new Promise((resolve) => setTimeout(resolve, 1500));
