@@ -33,10 +33,25 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   try { apiKey = await decryptKey(active.profile.encryptedKey, env.SETTINGS_KEY); }
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }
   try {
-    const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, idempotencyKey: req.idempotencyKey });
-    const text = await transport(toMessages(req.system, req.user, req.schema) as any);
-    if (!req.schema) return text;
-    return parseJson(text);
+    const messages = toMessages(req.system, req.user, req.schema) as any;
+    let lastError: unknown;
+    // Riffle uses 409 while the same API key is already processing another
+    // idempotent request. Retry only requests with a stable key; unkeyed
+    // calls must never be repeated behind the caller's back.
+    const attempts = req.idempotencyKey ? 5 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, idempotencyKey: req.idempotencyKey });
+      try {
+        const text = await transport(messages);
+        if (!req.schema) return text;
+        return parseJson(text);
+      } catch (error) {
+        lastError = error;
+        if (attempt + 1 >= attempts || !/返回 409|\b409\b/.test(String(error instanceof Error ? error.message : error))) throw error;
+        await new Promise(resolve => setTimeout(resolve, 5000 * (attempt + 1)));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('模型调用失败。');
   } catch (error) {
     if (error instanceof LLMError) throw error;
     throw new LLMError(error instanceof Error ? error.message : '模型调用失败。');

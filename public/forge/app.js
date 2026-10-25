@@ -11,6 +11,8 @@ const EXPORT_SNIPPET = `(async()=>{const get=u=>fetch(u).then(r=>r.json());const
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const memberOnly = document.body.dataset.memberOnly === "true" || location.pathname === "/review";
+const tabOwner = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const EXPAND_LEASE_KEY = "pgc-forge-expand-lease";
 const state = { tab: memberOnly ? "review" : "draw", vocab: null, settings: null, info: null, drawn: [], busy: false, showDup: false };
 
 // ---------- helpers ----------
@@ -378,6 +380,11 @@ async function expandIds(ids) {
   // run two combos per call; Opus is deliberately one combo per call and
   // serialized to avoid a burst of gateway timeouts and rate-limit responses.
   const slowModel = /opus|claude/i.test(String(state.info?.model || ""));
+  if (slowModel && !claimExpandLease(ids)) {
+    const p = $("#progress");
+    if (p) p.textContent = "已有另一个工作台标签页在使用 Opus，当前页会自动读取完成结果…";
+    return;
+  }
   const size = slowModel ? 1 : Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
   const chunks = [];
   for (let i = 0; i < ids.length; i += size) chunks.push(ids.slice(i, i + size));
@@ -445,9 +452,30 @@ async function expandIds(ids) {
     }
   };
   const total = chunks.length;
-  await Promise.all(Array.from({ length: slowModel ? 1 : Math.min(2, total) }, worker));
-  done = total;
-  prog();
+  try {
+    await Promise.all(Array.from({ length: slowModel ? 1 : Math.min(2, total) }, worker));
+    done = total;
+    prog();
+  } finally {
+    if (slowModel) releaseExpandLease();
+  }
+}
+
+function claimExpandLease(ids) {
+  try {
+    const now = Date.now();
+    const current = JSON.parse(localStorage.getItem(EXPAND_LEASE_KEY) || "null");
+    if (current && current.owner !== tabOwner && Number(current.expiresAt) > now) return false;
+    localStorage.setItem(EXPAND_LEASE_KEY, JSON.stringify({ owner: tabOwner, ids, expiresAt: now + 30 * 60 * 1000 }));
+    return true;
+  } catch { return true; }
+}
+
+function releaseExpandLease() {
+  try {
+    const current = JSON.parse(localStorage.getItem(EXPAND_LEASE_KEY) || "null");
+    if (current?.owner === tabOwner) localStorage.removeItem(EXPAND_LEASE_KEY);
+  } catch {}
 }
 
 // ---------- 候选 ----------

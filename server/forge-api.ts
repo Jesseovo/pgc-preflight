@@ -450,7 +450,7 @@ async function preview(env, id) {
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   const cfg = await getSettings(env);
-  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 12000 });
+  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 12000, idempotencyKey: `pgc-preview-${id}` });
   const svg = sanitizeSvg(text);
   await run(env, "UPDATE topics SET preview_svg = ?, updated_at = ? WHERE id = ?", svg, now(), id);
   return { id, svg };
