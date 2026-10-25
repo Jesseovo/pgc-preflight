@@ -252,7 +252,7 @@ async function requestBrief(id) {
       // A waitUntil task can be cut off by the edge while the model gateway is
       // still working. Re-submit once after the lease expires so the server
       // can reclaim the stale job instead of polling forever.
-      if (!reclaimed && attempt >= 22 && saved?.brief_status === 'running') {
+      if (!reclaimed && attempt >= 28 && saved?.brief_status === 'running') {
         reclaimed = true;
         await api("POST", `topics/${id}/brief`);
       }
@@ -459,9 +459,9 @@ async function expandIds(ids) {
         const result = await api("POST", "expand", { ids: chunk });
         if (Array.isArray(result)) return result;
         if (result?.pending) {
-          const recovered = await recover(chunk, 240000);
+          const recovered = await recover(chunk, 85000);
           if (recovered) return recovered;
-          throw new Error("扩写任务仍在进行，请稍后刷新工作台查看结果。");
+          throw new Error("扩写任务超时，请重试。");
         }
         throw new Error("扩写接口返回格式不正确。");
       }
