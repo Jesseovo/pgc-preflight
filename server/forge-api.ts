@@ -99,6 +99,17 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
     case "GET topics/:id": return getTopic(env, id);
+    case "GET topics/:id/brief": {
+      const topic = await getTopic(env, id);
+      if (!topic.brief_md?.trim()) throw new HttpError(409, "简报尚未生成，请稍后再下载。");
+      const filename = `${String(topic.data.title || 'pgc').replace(/[^\p{L}\p{N}._-]+/gu, '-')}-brief.md`;
+      return new Response(topic.brief_md, { headers: {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Disposition': `attachment; filename="pgc-brief.md"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+        'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+      } });
+    }
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
     case "POST topics/:id/preview": return preview(env, id);
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');

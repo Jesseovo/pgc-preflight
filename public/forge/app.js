@@ -277,10 +277,9 @@ function showPreview(t, svg) {
 function showBrief(t, md) {
   openModal(`${t.data.title} · 制作简报`, `<p class="muted small">整段复制给 Claude Code（或任何能写代码的模型）即可开工。</p>
     <div class="row" style="margin-bottom:8px"><button class="primary" id="cpBrief">复制简报</button>
-    <button class="ghost" id="dlBrief">下载 .md</button><button class="ghost" id="regenBrief">重新生成</button></div>
+    <a class="btn" id="dlBrief" href="/api/forge/topics/${t.id}/brief" download style="text-decoration:none">下载 .md</a><button class="ghost" id="regenBrief">重新生成</button></div>
     <pre class="md">${esc(md)}</pre>`);
   $("#cpBrief").onclick = () => copyText(md);
-  $("#dlBrief").onclick = () => download(`${t.data.title}-brief.md`, md);
   $("#regenBrief").onclick = (e) => guard(e.target, async () => {
     toast("重新生成中…", 120000);
     const md = await requestBrief(t.id, true);
