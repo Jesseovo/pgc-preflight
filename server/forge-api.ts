@@ -452,7 +452,7 @@ async function expandBatch(env, ids) {
         // budget makes the relay spend too long on reasoning and lets the
         // browser give up before the Worker can return the result.
         maxTokens: 2800 + 1200 * pending.length,
-        idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}`,
+      idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}-${Date.now()}`,
       }));
   } catch (error) {
     // Riffle returns 409 when another tab is already processing the same
@@ -610,7 +610,7 @@ async function briefJob(env, id, t) {
         // longer idle window accommodates Opus's streamed reasoning.
         maxTokens: 8000,
         timeoutMs: 180000,
-        idempotencyKey: `pgc-brief-${id}`,
+        idempotencyKey: `pgc-brief-${id}-${Date.now()}`,
       }));
     const body = String(md).trim();
     if (!body) throw new LLMError("模型没有返回简报内容", 502);
