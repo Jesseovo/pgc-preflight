@@ -22,14 +22,14 @@ const SETTING_KEYS = new Set([...Object.keys(FORGE_DEFAULTS), ...Object.keys(TEX
 const TOPIC_STATUSES = new Set(["new", "dup", "liked", "rejected", "made"]);
 const GAME_FIELDS = ["title", "descr", "status", "score", "aes", "ease", "play", "revisions", "feedback", "source", ...DIMS];
 
-export async function forgeApi(request: Request, env: ForgeEnv, route: string[], members: MemberStore) {
+export async function forgeApi(request: Request, env: ForgeEnv, route: string[], members: MemberStore, ctx?: { waitUntil(promise: Promise<unknown>): void }) {
   try {
     const user = await identity(request.headers.get('Cookie'), members, env);
     if (!user) return json({ error: '请先登录。' }, 401);
     const reviewOnly = route[0] === 'review' || route[0] === 'reviews';
     if (user.role !== 'admin' && !reviewOnly) return json({ error: '成员账号只开放 AI 模拟审核。' }, 403);
     if (user.role !== 'admin' && !user.canReview) return json({ error: '当前账号未开通 AI 模拟审核权限，请联系管理员。' }, 403);
-    const res = await dispatch(request.method, route, request, env, user.id);
+    const res = await dispatch(request.method, route, request, env, user.id, ctx);
     return res instanceof Response ? res : json(res);
   } catch (err) {
     const status = err instanceof HttpError || err instanceof LLMError ? err.status : 500;
@@ -75,7 +75,7 @@ async function runBatch(env, statements) {
   for (let i = 0; i < statements.length; i += 50) await env.DB.batch(statements.slice(i, i + 50));
 }
 
-async function dispatch(method, route, request, env, ownerId) {
+async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
   const id = b != null ? Number(b) : null;
   switch (`${method} ${a}${c ? "/:id/" + c : b != null ? "/:id" : ""}`) {
@@ -93,12 +93,12 @@ async function dispatch(method, route, request, env, ownerId) {
     case "POST import": return importWorks(env, await body(request));
     case "POST tag": return tagGames(env);
     case "POST draw": return draw(env, await body(request));
-    case "POST expand": return expand(env, await body(request));
+    case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
     case "GET topics/:id": return getTopic(env, id);
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
     case "POST topics/:id/preview": return preview(env, id);
-    case "POST topics/:id/brief": return brief(env, id);
+    case "POST topics/:id/brief": return brief(env, id, ctx);
     case "POST review": return review(env, await body(request), ownerId);
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
@@ -380,7 +380,7 @@ async function draw(env, { n, locks = {} } = {}) {
   return (await all(env, "SELECT * FROM topics WHERE batch = ? ORDER BY id", batch)).map(hydrate);
 }
 
-async function expand(env, { ids }) {
+async function expand(env, { ids }, ctx) {
   if (!Array.isArray(ids) || !ids.length) throw new HttpError(400, "缺少 ids");
   const marks = ids.map(() => "?").join(",");
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
@@ -388,6 +388,28 @@ async function expand(env, { ids }) {
   // A browser/proxy may lose the response after the model has already
   // completed and persisted the topic. Make retries idempotent: return the
   // saved result instead of generating it a second time.
+  const pending = topics.filter((topic) => !topic.data?.title);
+  if (!pending.length) return topics;
+  if (ctx?.waitUntil) {
+    const claimed = [];
+    for (const topic of pending) {
+      const result = await run(env, "UPDATE topics SET expand_status = 'running', expand_error = '', updated_at = ? WHERE id = ? AND (expand_status = '' OR expand_status = 'error') AND json_extract(data, '$.title') IS NULL", now(), topic.id);
+      if (result.meta?.changes) claimed.push(topic.id);
+    }
+    if (claimed.length) {
+      ctx.waitUntil(expandBatch(env, claimed).catch(async error => {
+        await run(env, `UPDATE topics SET expand_status = 'error', expand_error = ?, updated_at = ? WHERE id IN (${claimed.map(() => "?").join(",")})`, String(error?.message || error).slice(0, 500), now(), ...claimed).catch(() => {});
+      }));
+    }
+    const current = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
+    return { pending: true, topics: current };
+  }
+  return expandBatch(env, ids);
+}
+
+async function expandBatch(env, ids) {
+  const marks = ids.map(() => "?").join(",");
+  const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
   const [cfg, games, prior] = await Promise.all([
@@ -428,7 +450,7 @@ async function expand(env, { ids }) {
     if (!t) continue;
     const score = [item.aes, item.ease, item.play].map((x) => Math.max(1, Math.min(3, Number(x) || 1))).reduce((s, x) => s + x, 0);
     const status = item.dup_of && item.dup_of.trim() ? "dup" : "new";
-    stmts.push(env.DB.prepare("UPDATE topics SET data = ?, score = ?, status = ?, updated_at = ? WHERE id = ?")
+    stmts.push(env.DB.prepare("UPDATE topics SET data = ?, score = ?, status = ?, expand_status = '', expand_error = '', updated_at = ? WHERE id = ?")
       .bind(JSON.stringify(item), score, status, now(), t.id));
   }
   await runBatch(env, stmts);
@@ -522,26 +544,44 @@ async function getReview(env, id, ownerId = 'admin') {
   return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots) };
 }
 
-async function brief(env, id) {
+async function brief(env, id, ctx) {
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   // A previous request may have completed after the browser lost its
   // connection. Return the persisted brief instead of generating it again.
   if (typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
+  if (t.brief_status === 'running') return { id, status: 'pending' };
+  if (ctx?.waitUntil) {
+    const claim = await run(env, "UPDATE topics SET brief_status = 'running', brief_error = '', updated_at = ? WHERE id = ? AND (brief_status = '' OR brief_status = 'error')", now(), id);
+    if (!claim.meta?.changes) return { id, status: 'pending' };
+    ctx.waitUntil(briefJob(env, id, t).catch(async error => {
+      await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ?", String(error?.message || error).slice(0, 500), now(), id).catch(() => {});
+    }));
+    return { id, status: 'pending' };
+  }
+  return briefJob(env, id, t);
+}
+
+async function briefJob(env, id, t) {
   const cfg = await getSettings(env);
-  const md = await complete(env, cfg, {
-    system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
-    user: briefUser(t),
-    // The F template is intentionally structured and normally fits below
-    // 6k output tokens. A smaller cap keeps the relay responsive while the
-    // longer idle window accommodates Opus's streamed reasoning.
-    maxTokens: 8000,
-    timeoutMs: 180000,
-    idempotencyKey: `pgc-brief-${id}`,
-  });
-  const body = String(md).trim();
-  if (!body) throw new LLMError("模型没有返回简报内容", 502);
-  const full = cfg.template + body + "\n";
-  await run(env, "UPDATE topics SET brief_md = ?, status = CASE WHEN status = 'made' THEN status ELSE 'liked' END, updated_at = ? WHERE id = ?", full, now(), id);
-  return { id, brief: full };
+  try {
+    const md = await complete(env, cfg, {
+      system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
+      user: briefUser(t),
+      // The F template is intentionally structured and normally fits below
+      // 6k output tokens. A smaller cap keeps the relay responsive while the
+      // longer idle window accommodates Opus's streamed reasoning.
+      maxTokens: 8000,
+      timeoutMs: 180000,
+      idempotencyKey: `pgc-brief-${id}`,
+    });
+    const body = String(md).trim();
+    if (!body) throw new LLMError("模型没有返回简报内容", 502);
+    const full = cfg.template + body + "\n";
+    await run(env, "UPDATE topics SET brief_md = ?, brief_status = '', brief_error = '', status = CASE WHEN status = 'made' THEN status ELSE 'liked' END, updated_at = ? WHERE id = ?", full, now(), id);
+    return { id, brief: full };
+  } catch (error) {
+    await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ?", String(error?.message || error).slice(0, 500), now(), id).catch(() => {});
+    throw error;
+  }
 }

@@ -234,20 +234,25 @@ function bindCards(root, list, rerender) {
 
 async function requestBrief(id) {
   try {
-    return (await api("POST", `topics/${id}/brief`)).brief;
+    const started = await api("POST", `topics/${id}/brief`);
+    if (started?.brief) return started.brief;
   } catch (error) {
     // The Worker writes the brief before sending its response. If the relay
     // or browser timed out, recover the saved result before asking the model
     // to run again.
-    for (let attempt = 0; attempt < 30; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
-      try {
-        const saved = await api("GET", `topics/${id}`);
-        if (saved?.brief_md) return saved.brief_md;
-      } catch {}
-    }
-    throw error;
+    if (!/超时|timeout|409|5\d\d|网络|failed to fetch|fetch failed|network/i.test(String(error?.message || error))) throw error;
   }
+  for (let attempt = 0; attempt < 70; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
+    try {
+      const saved = await api("GET", `topics/${id}`);
+      if (saved?.brief_md) return saved.brief_md;
+      if (saved?.brief_status === 'error') throw new Error(saved.brief_error || "简报生成失败，请重试或切换模型。");
+    } catch (error) {
+      if (error instanceof Error && /简报生成失败/.test(error.message)) throw error;
+    }
+  }
+  throw new Error("简报仍在生成中，请稍后刷新候选列表查看结果。");
 }
 
 function showPreview(t, svg) {
@@ -383,6 +388,26 @@ async function expandIds(ids) {
   if (slowModel && !claimExpandLease(ids)) {
     const p = $("#progress");
     if (p) p.textContent = "已有另一个工作台标签页在使用 Opus，当前页会自动读取完成结果…";
+    const deadline = Date.now() + 240000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 3500));
+      const recovered = [];
+      for (const id of ids) {
+        try {
+          const topic = await api("GET", `topics/${id}`);
+          if (topic?.data?.title) recovered.push(topic);
+        } catch {}
+      }
+      if (recovered.length === ids.length) {
+        for (const topic of recovered) {
+          const index = state.drawn.findIndex((item) => item.id === topic.id);
+          if (index >= 0) state.drawn[index] = topic;
+        }
+        paintDrawn();
+        if (p) p.textContent = "";
+        return;
+      }
+    }
     return;
   }
   const size = slowModel ? 1 : Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
@@ -422,11 +447,20 @@ async function expandIds(ids) {
   };
   const expandChunk = async (chunk) => {
     for (let attempt = 0; attempt < 2; attempt++) {
-      try { return await api("POST", "expand", { ids: chunk }); }
+      try {
+        const result = await api("POST", "expand", { ids: chunk });
+        if (Array.isArray(result)) return result;
+        if (result?.pending) {
+          const recovered = await recover(chunk, 240000);
+          if (recovered) return recovered;
+          throw new Error("扩写任务仍在进行，请稍后刷新工作台查看结果。");
+        }
+        throw new Error("扩写接口返回格式不正确。");
+      }
       catch (e) {
         const message = String(e?.message || e);
         if (!/超时|timeout|409|429|5\d\d|网络|failed to fetch|fetch failed|network/i.test(message)) throw e;
-        const recovered = await recover(chunk, /409|正在处理/i.test(message) ? 90000 : 10000);
+        const recovered = await recover(chunk, /409|正在处理/i.test(message) ? 240000 : 10000);
         if (recovered) return recovered;
         if (attempt) throw e;
         await new Promise((resolve) => setTimeout(resolve, 1500));
