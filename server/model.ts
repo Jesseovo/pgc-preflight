@@ -29,37 +29,77 @@ function anthropicContent(content: unknown) {
 function anthropicRequest(messages: ChatMessage[], maxTokens: number) {
   const system = messages.filter(message => message.role === 'system').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n\n');
   const converted = messages.filter(message => message.role !== 'system').map(message => ({ role: message.role === 'assistant' ? 'assistant' : 'user', content: anthropicContent(message.content) }));
-  return { ...(system ? { system } : {}), messages: converted, max_tokens: maxTokens, stream: false };
+  return { ...(system ? { system } : {}), messages: converted, max_tokens: maxTokens, stream: true };
 }
 
 function anthropicText(data: any) {
   return (data?.content || []).filter((part: any) => part?.type === 'text').map((part: any) => String(part.text || '')).join('\n');
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; idempotencyKey?: string } = {}): ModelTransport {
   return async messages => {
     const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), 24000);
     const anthropic = config.protocol === 'anthropic';
+    const controller = new AbortController();
+    let timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
+    const touch = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
+    };
+    const idempotency = options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {};
     let response: Response;
     try {
+      const headers: Record<string, string> = anthropic
+        ? {'Content-Type':'application/json','Accept':'text/event-stream','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
+        : {'Content-Type':'application/json',Authorization:`Bearer ${config.apiKey}`};
+      Object.assign(headers, idempotency);
       response = await fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST',
-        headers: anthropic
-          ? {'Content-Type':'application/json','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
-          : {'Content-Type':'application/json',Authorization:`Bearer ${config.apiKey}`},
+        headers,
         body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens) } : {model:config.model,messages,max_tokens:maxTokens,stream:false}),
-        signal:AbortSignal.timeout(options.timeoutMs || 90000), redirect:'manual',
+        signal:controller.signal, redirect:'manual',
       });
     } catch (error) {
+      clearTimeout(timeout);
       if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new Error('模型响应超时，请重试或切换到 DeepSeek。');
       throw error;
     }
-    if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
-    if (!response.ok) throw new Error(`模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`);
-    const data = await response.json() as {choices?:{message?:{content?:string}}[];content?:{type?:string;text?:string}[]};
-    const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
-    if (!content) throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。');
-    return content;
+    try {
+      if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
+      if (!response.ok) throw new Error(`模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`);
+      const contentType = response.headers.get('content-type') || '';
+      if (anthropic && contentType.includes('text/event-stream') && response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let content = '';
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          touch();
+          buffer += decoder.decode(part.value, { stream: true });
+          let newline;
+          while ((newline = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newline).replace(/\r$/, '');
+            buffer = buffer.slice(newline + 1);
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === '[DONE]') continue;
+            try {
+              const event = JSON.parse(payload);
+              if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') content += String(event.delta.text || '');
+            } catch {}
+          }
+        }
+        if (content) return content;
+      }
+      const data = await response.json() as {choices?:{message?:{content?:string}}[];content?:{type?:string;text?:string}[]};
+      const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
+      if (!content) throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。');
+      return content;
+    } finally {
+      clearTimeout(timeout);
+    }
   };
 }
 export function parseDecision(raw: string): ModelDecision {

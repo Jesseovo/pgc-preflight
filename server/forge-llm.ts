@@ -25,7 +25,7 @@ function toMessages(system: string, user: unknown, schema: unknown) {
   return [{ role: 'system', content: system }, { role: 'user', content }];
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; idempotencyKey?: string }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured);
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError('管理员尚未配置并启用审核模型。', 503);
@@ -33,7 +33,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   try { apiKey = await decryptKey(active.profile.encryptedKey, env.SETTINGS_KEY); }
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }
   try {
-    const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: active.profile.protocol === 'anthropic' ? 90000 : 90000 });
+    const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: 90000, idempotencyKey: req.idempotencyKey });
     const text = await transport(toMessages(req.system, req.user, req.schema) as any);
     if (!req.schema) return text;
     return parseJson(text);

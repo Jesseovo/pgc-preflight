@@ -408,6 +408,7 @@ async function expand(env, { ids }) {
     // makes the relay spend too long on reasoning and lets the browser give
     // up before the Worker can return the result.
     maxTokens: 2800 + 1200 * pending.length,
+    idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}`,
   });
   const stmts = [];
   for (const item of out.items || []) {
