@@ -12,7 +12,7 @@ import {identity} from './members';
 import {guardCheckPage,guardForgePage,guardReviewPage} from './page-access';
 import {forgeApi} from './forge-api';
 
-interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
+interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 
@@ -29,7 +29,7 @@ export default {
       return(await authApi(request,members,env))!;
     }
     if(url.pathname.startsWith('/api/forge/')){
-      if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
+      if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
       return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store},route,members,ctx);
     }
