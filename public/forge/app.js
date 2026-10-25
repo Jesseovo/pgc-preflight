@@ -242,12 +242,20 @@ async function requestBrief(id) {
     // to run again.
     if (!/超时|timeout|409|5\d\d|网络|failed to fetch|fetch failed|network/i.test(String(error?.message || error))) throw error;
   }
+  let reclaimed = false;
   for (let attempt = 0; attempt < 70; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
     try {
       const saved = await api("GET", `topics/${id}`);
       if (saved?.brief_md) return saved.brief_md;
       if (saved?.brief_status === 'error') throw new Error(saved.brief_error || "简报生成失败，请重试或切换模型。");
+      // A waitUntil task can be cut off by the edge while the model gateway is
+      // still working. Re-submit once after the lease expires so the server
+      // can reclaim the stale job instead of polling forever.
+      if (!reclaimed && attempt >= 22 && saved?.brief_status === 'running') {
+        reclaimed = true;
+        await api("POST", `topics/${id}/brief`);
+      }
     } catch (error) {
       if (error instanceof Error && /简报生成失败/.test(error.message)) throw error;
     }

@@ -353,6 +353,21 @@ async function getTopic(env, id) {
   return t;
 }
 
+// Cloudflare may end a long waitUntil task while the upstream model is still
+// working. Keep a short lease on async jobs so a later browser poll can take
+// over a task that was left in `running` forever.
+const JOB_LEASE_MS = 75_000;
+function staleJobBefore() {
+  return new Date(Date.now() - JOB_LEASE_MS).toISOString();
+}
+async function withTopicLease<T>(env, ids: number[], statusColumn: 'expand_status' | 'brief_status', work: () => Promise<T>): Promise<T> {
+  const marks = ids.map(() => "?").join(",");
+  const touch = () => run(env, `UPDATE topics SET updated_at = ? WHERE id IN (${marks}) AND ${statusColumn} = 'running'`, now(), ...ids).catch(() => {});
+  const timer = setInterval(() => { void touch(); }, 20_000);
+  try { return await work(); }
+  finally { clearInterval(timer); }
+}
+
 async function patchTopic(env, id, data) {
   const t = await getTopic(env, id);
   const status = data.status ?? t.status;
@@ -392,8 +407,9 @@ async function expand(env, { ids }, ctx) {
   if (!pending.length) return topics;
   if (ctx?.waitUntil) {
     const claimed = [];
+    const staleBefore = staleJobBefore();
     for (const topic of pending) {
-      const result = await run(env, "UPDATE topics SET expand_status = 'running', expand_error = '', updated_at = ? WHERE id = ? AND (expand_status = '' OR expand_status = 'error') AND json_extract(data, '$.title') IS NULL", now(), topic.id);
+      const result = await run(env, "UPDATE topics SET expand_status = 'running', expand_error = '', updated_at = ? WHERE id = ? AND json_extract(data, '$.title') IS NULL AND (expand_status = '' OR expand_status = 'error' OR (expand_status = 'running' AND updated_at < ?))", now(), topic.id, staleBefore);
       if (result.meta?.changes) claimed.push(topic.id);
     }
     if (claimed.length) {
@@ -423,17 +439,17 @@ async function expandBatch(env, ids) {
     .slice(-260);
   let out;
   try {
-    out = await complete(env, cfg, {
-      system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
-      user: expandUser({ existing, combos: pending }),
-      schema: EXPAND_SCHEMA,
-      // Keep Opus responses bounded. The schema has many fields, but a single
-      // topic normally fits comfortably below 4k output tokens; a larger
-      // budget makes the relay spend too long on reasoning and lets the
-      // browser give up before the Worker can return the result.
-      maxTokens: 2800 + 1200 * pending.length,
-      idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}`,
-    });
+    out = await withTopicLease(env, pending.map((topic) => topic.id), 'expand_status', () => complete(env, cfg, {
+        system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
+        user: expandUser({ existing, combos: pending }),
+        schema: EXPAND_SCHEMA,
+        // Keep Opus responses bounded. The schema has many fields, but a single
+        // topic normally fits comfortably below 4k output tokens; a larger
+        // budget makes the relay spend too long on reasoning and lets the
+        // browser give up before the Worker can return the result.
+        maxTokens: 2800 + 1200 * pending.length,
+        idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}`,
+      }));
   } catch (error) {
     // Riffle returns 409 when another tab is already processing the same
     // idempotent request. Wait for that request to persist its result instead
@@ -550,9 +566,10 @@ async function brief(env, id, ctx) {
   // A previous request may have completed after the browser lost its
   // connection. Return the persisted brief instead of generating it again.
   if (typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
-  if (t.brief_status === 'running') return { id, status: 'pending' };
+  const staleBefore = staleJobBefore();
+  if (t.brief_status === 'running' && !(String(t.updated_at || '') < staleBefore)) return { id, status: 'pending' };
   if (ctx?.waitUntil) {
-    const claim = await run(env, "UPDATE topics SET brief_status = 'running', brief_error = '', updated_at = ? WHERE id = ? AND (brief_status = '' OR brief_status = 'error')", now(), id);
+    const claim = await run(env, "UPDATE topics SET brief_status = 'running', brief_error = '', updated_at = ? WHERE id = ? AND (brief_status = '' OR brief_status = 'error' OR (brief_status = 'running' AND updated_at < ?))", now(), id, staleBefore);
     if (!claim.meta?.changes) return { id, status: 'pending' };
     ctx.waitUntil(briefJob(env, id, t).catch(async error => {
       await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ?", String(error?.message || error).slice(0, 500), now(), id).catch(() => {});
@@ -565,16 +582,16 @@ async function brief(env, id, ctx) {
 async function briefJob(env, id, t) {
   const cfg = await getSettings(env);
   try {
-    const md = await complete(env, cfg, {
-      system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
-      user: briefUser(t),
-      // The F template is intentionally structured and normally fits below
-      // 6k output tokens. A smaller cap keeps the relay responsive while the
-      // longer idle window accommodates Opus's streamed reasoning.
-      maxTokens: 8000,
-      timeoutMs: 180000,
-      idempotencyKey: `pgc-brief-${id}`,
-    });
+    const md = await withTopicLease(env, [id], 'brief_status', () => complete(env, cfg, {
+        system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
+        user: briefUser(t),
+        // The F template is intentionally structured and normally fits below
+        // 6k output tokens. A smaller cap keeps the relay responsive while the
+        // longer idle window accommodates Opus's streamed reasoning.
+        maxTokens: 8000,
+        timeoutMs: 180000,
+        idempotencyKey: `pgc-brief-${id}`,
+      }));
     const body = String(md).trim();
     if (!body) throw new LLMError("模型没有返回简报内容", 502);
     const full = cfg.template + body + "\n";
