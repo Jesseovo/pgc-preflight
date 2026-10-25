@@ -451,7 +451,12 @@ async function expandBatch(env, ids) {
         // topic normally fits comfortably below 4k output tokens; a larger
         // budget makes the relay spend too long on reasoning and lets the
         // browser give up before the Worker can return the result.
-        maxTokens: 2800 + 1200 * pending.length,
+        // Extended-thinking Opus responses can spend part of the output
+        // budget on reasoning. Give each Opus item enough room to finish the
+        // requested JSON instead of cutting it off mid-object.
+        maxTokens: /opus|claude/i.test(String(cfg.openai_model || cfg.anthropic_model || ''))
+          ? Math.min(24000, 7000 * pending.length)
+          : 2800 + 1200 * pending.length,
         // Opus can spend more than 90 seconds reasoning before its first
         // useful chunk. Queue jobs are allowed to run longer than an HTTP
         // request, so keep the relay open long enough for the model stream to
