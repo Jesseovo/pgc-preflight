@@ -368,7 +368,7 @@ async function expandIds(ids) {
     if (!p) return;
     if (done >= chunks.length) { p.textContent = ""; return; }
     p.textContent = slowModel
-      ? `Opus 扩写中 ${done}/${chunks.length} 批（每批约 40–90 秒）…`
+      ? `Opus 扩写中 ${done}/${chunks.length} 批（每批约 1–3 分钟）…`
       : `AI 扩写中 ${done}/${chunks.length} 批…`;
   };
   prog();
