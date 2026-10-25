@@ -100,6 +100,10 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           if (progressed) touch();
         }
         if (content) return content;
+        // The stream body has already been consumed. Do not fall through to
+        // response.json(), which would mask the real empty-stream error with
+        // “Body has already been used”.
+        throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Anthropic Messages。');
       }
       const data = await response.json() as {choices?:{message?:{content?:string}}[];content?:{type?:string;text?:string}[]};
       const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;

@@ -49,6 +49,13 @@ describe('模型传输',()=>{
     expect(value.items[0].title).toBe('A {B}');
   });
 
+  it('空的 Anthropic 流不会再次读取已消费的响应体',async()=>{
+    vi.stubGlobal('fetch',vi.fn(async()=>new Response('data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}})));
+    await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'})([
+      {role:'user',content:'test'},
+    ])).rejects.toThrow('Anthropic Messages');
+  });
+
   it('读取 Anthropic 流式文本，并带上幂等键',async()=>{
     const fetchMock=vi.fn(async(_input:unknown,_init?:RequestInit)=>new Response([
       'event: message_start\n',
