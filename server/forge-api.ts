@@ -101,7 +101,7 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "GET topics/:id": return getTopic(env, id);
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
     case "POST topics/:id/preview": return preview(env, id);
-    case "POST topics/:id/brief": return brief(env, id, ctx);
+    case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
     case "POST review": return review(env, await body(request), ownerId);
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
@@ -574,14 +574,14 @@ async function getReview(env, id, ownerId = 'admin') {
   return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots) };
 }
 
-async function brief(env, id, ctx) {
+async function brief(env, id, ctx, regenerate = false) {
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   // A previous request may have completed after the browser lost its
   // connection. Return the persisted brief instead of generating it again.
-  if (typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
   const staleBefore = staleJobBefore();
   if (t.brief_status === 'running' && !(String(t.updated_at || '') < staleBefore)) return { id, status: 'pending' };
+  if (!regenerate && typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
   if (env.FORGE_QUEUE || ctx?.waitUntil) {
     const claim = await run(env, "UPDATE topics SET brief_status = 'running', brief_error = '', updated_at = ? WHERE id = ? AND (brief_status = '' OR brief_status = 'error' OR (brief_status = 'running' AND updated_at < ?))", now(), id, staleBefore);
     if (!claim.meta?.changes) return { id, status: 'pending' };

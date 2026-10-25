@@ -14,7 +14,7 @@
   ],
   "queues": {
     "producers": [{ "binding": "FORGE_QUEUE", "queue": "pgc-forge-jobs" }],
-    "consumers": [{ "queue": "pgc-forge-jobs", "max_batch_size": 1, "max_batch_timeout": 5, "max_retries": 3 }]
+    "consumers": [{ "queue": "pgc-forge-jobs", "max_batch_size": 1, "max_batch_timeout": 5, "max_retries": 3, "max_concurrency": 1 }]
   },
   "routes": [{ "pattern": "pgc.ovoxin.top", "custom_domain": true }],
   "observability": { "enabled": true }

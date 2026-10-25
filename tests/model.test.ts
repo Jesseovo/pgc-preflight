@@ -49,6 +49,13 @@ describe('模型传输',()=>{
     expect(value.items[0].title).toBe('A {B}');
   });
 
+  it('修复尾随逗号时保留字符串里的逗号、括号和转义引号',()=>{
+    const copy = 'Use ,} or ,] and "quoted" text';
+    const response = `结果：{"items":[{"title":${JSON.stringify(copy)},},]} 完成。`;
+    expect(parseJson(response)).toEqual({items:[{title:copy}]});
+    expect(()=>parseJson('{"items": [')).toThrow('不是合法 JSON');
+  });
+
   it('空的 Anthropic 流不会再次读取已消费的响应体',async()=>{
     vi.stubGlobal('fetch',vi.fn(async()=>new Response('data: [DONE]\n\n',{headers:{'content-type':'text/event-stream'}})));
     await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'})([

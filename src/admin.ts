@@ -11,9 +11,10 @@ type ProfileView={baseUrl:string;model:string;protocol:'openai'|'anthropic';enab
 type PublicConfig={baseUrl:string;model:string;protocol:'openai'|'anthropic';enabled:boolean;hasKey:boolean;updatedAt:string;activeProfile:ProfileId;profiles:Record<ProfileId,ProfileView>};
 let saved:PublicConfig={baseUrl:'',model:'',protocol:'openai',enabled:true,hasKey:false,updatedAt:'',activeProfile:'deepseek',profiles:{deepseek:{baseUrl:'',model:'deepseek-chat',protocol:'openai',enabled:true,hasKey:false,updatedAt:''},opus:{baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',protocol:'anthropic',enabled:true,hasKey:false,updatedAt:''}}};
 let selectedProfile:ProfileId='deepseek';
+let adminTab:'model'|'members'|'forge'='forge';
 const $=<T extends Element=HTMLElement>(selector:string)=>document.querySelector<T>(selector)!;
 const iconsReady=()=>createIcons({icons,attrs:{'stroke-width':1.7}});
-app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><div class="header-actions"><a href="/" class="back-link">${icon('arrow-left')}返回检查台</a></div></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">MODEL CONTROL ROOM</div><h1>让合适的模型，来检查<span>。</span></h1><p>配置视觉模型，管理你的游戏基础预审。</p></div>${catWalk}</section><div id="admin-content"><div class="admin-loading">正在读取管理配置…</div></div><footer><span>PGC Preflight / Model-driven review</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
+app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><div class="header-actions"><span class="back-link">${icon('panels-top-left')}团队工作空间</span></div></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">CREATOR WORKSPACE</div><h1>从灵感，到下一款游戏<span>。</span></h1><p>选题、制作简报与基础预审，在一个工作台里完成。</p></div>${catWalk}</section><div id="admin-content"><div class="admin-loading">正在读取管理配置…</div></div><footer><span>PGC Preflight / Model-driven review</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
 iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){
@@ -23,7 +24,7 @@ async function api(path:string,method='GET',body?:unknown){
   if(!response.ok)throw new Error(data.error||'请求未完成，请稍后重试。');
   return data;
 }
-async function init(){try{saved=await api('config');renderSettings();}catch(error){if(!document.querySelector('#login-form'))renderLogin(error instanceof Error?error.message:'管理服务暂不可用。');}}
+async function init(){try{saved=await api('config');selectedProfile=saved.activeProfile;renderSettings();}catch(error){if(!document.querySelector('#login-form'))renderLogin(error instanceof Error?error.message:'管理服务暂不可用。');}}
 void init();
 
 function renderLogin(initialMessage=''){
@@ -31,7 +32,7 @@ function renderLogin(initialMessage=''){
   iconsReady();
   $('#login-form').addEventListener('submit',async event=>{
     event.preventDefault();const button=$<HTMLButtonElement>('#login-form button');button.disabled=true;
-    try{await api('login','POST',{password:$<HTMLInputElement>('#admin-password').value});saved=await api('config');renderSettings();}
+    try{await api('login','POST',{password:$<HTMLInputElement>('#admin-password').value});saved=await api('config');selectedProfile=saved.activeProfile;renderSettings();}
     catch(error){$('#login-message').textContent=error instanceof Error?error.message:'登录失败。';}
     finally{button.disabled=false;}
   });
@@ -41,21 +42,23 @@ function renderSettings(){
   const isActive=selectedProfile===saved.activeProfile;
   const label=selectedProfile==='opus'?'Claude Opus 5.5':'DeepSeek';
   const protocolHint=selectedProfile==='opus'?'Anthropic Messages（Riffle 直连）':'OpenAI Chat Completions';
-  $('#admin-content').innerHTML=`<nav class="admin-tabs" aria-label="管理功能"><button id="tab-model" class="active">${icon('brain-circuit')}模型配置</button><button id="tab-members">${icon('users')}成员管理</button><button id="tab-forge">${icon('sparkles')}选题工作台</button></nav><div class="admin-grid" id="model-panel"><section class="settings-card"><div class="settings-heading"><div><span class="eyebrow">MODEL SWITCHBOARD</span><h2>审核模型</h2></div><span class="config-status ${saved.hasKey&&saved.enabled?'connected':''}"><span class="status-dot"></span>${saved.hasKey&&saved.enabled?'已启用':'待配置'}</span></div>
+  $('#admin-content').innerHTML=`<nav class="admin-tabs" aria-label="管理功能"><button id="tab-forge">${icon('sparkles')}创作工作台</button><button id="tab-model">${icon('brain-circuit')}模型配置</button><button id="tab-members">${icon('users')}成员管理</button></nav><div class="admin-grid" id="model-panel"><section class="settings-card"><div class="settings-heading"><div><span class="eyebrow">MODEL SWITCHBOARD</span><h2>审核模型</h2></div><span class="config-status ${saved.hasKey&&saved.enabled?'connected':''}"><span class="status-dot"></span>${saved.hasKey&&saved.enabled?'已启用':'待配置'}</span></div>
     <div class="profile-switch" role="group" aria-label="选择模型配置"><button type="button" class="profile-tab ${selectedProfile==='deepseek'?'active':''}" data-profile="deepseek"><b>DeepSeek</b><small>${saved.profiles?.deepseek?.hasKey?'已配置':'未配置'}</small></button><button type="button" class="profile-tab ${selectedProfile==='opus'?'active':''}" data-profile="opus"><b>Claude Opus 5.5</b><small>${saved.profiles?.opus?.hasKey?'已配置':'未配置'}</small></button></div>
     <div class="active-model-note">${isActive?`当前所有审核、选题扩写和简报都使用 <b>${escape(label)}</b>。`:`当前正在编辑 <b>${escape(label)}</b>，保存后可切换为全局模型。`}</div>
     <form id="model-form">
-    <div class="field"><label for="base-url">接口地址 <span>${protocolHint}</span></label><input id="base-url" type="url" placeholder="${selectedProfile==='opus'?'https://riffle-api.pages.dev':'https://api.deepseek.com/v1'}" autocomplete="off" value="${escape(profile.baseUrl)}" required/><p>${selectedProfile==='opus'?'Riffle 支持 Anthropic /v1/messages，当前请求实测可直连，但单次响应可能需要约 40 秒。':'填写兼容 Chat Completions 的 HTTPS 接口前缀。'}</p></div>
+    <div class="field"><label for="base-url">接口地址 <span>${protocolHint}</span></label><input id="base-url" type="url" placeholder="${selectedProfile==='opus'?'https://riffle-api.pages.dev':'https://api.deepseek.com/v1'}" autocomplete="off" value="${escape(profile.baseUrl)}" required/><p>${selectedProfile==='opus'?'Riffle 支持 Anthropic /v1/messages，请求由服务端直连；扩写和简报在后台排队，完成后自动更新。':'填写兼容 Chat Completions 的 HTTPS 接口前缀。'}</p></div>
     <div class="field"><label for="model-name">模型名称 <span>Model</span></label><input id="model-name" placeholder="${selectedProfile==='opus'?'claude-opus-5-5':'deepseek-chat'}" value="${escape(profile.model)}" autocomplete="off" required/></div>
     <div class="field"><label for="api-key">API Key <span>${profile.hasKey?'已保存，留空保留原密钥':'首次配置必填'}</span></label><div class="key-field"><input id="api-key" type="password" autocomplete="new-password" placeholder="${profile.hasKey?'密钥已加密保存，不会回显':'输入模型服务商的 API Key'}" ${profile.hasKey?'':'required'}/><button type="button" class="icon-button" id="toggle-key" aria-label="切换密钥显示">${icon('eye')}</button></div><p>密钥加密保存在服务端，不会发送给上传游戏的用户。</p></div>
     <label class="enable-toggle"><input id="model-enabled" type="checkbox" ${profile.enabled?'checked':''}/><span><b>启用此模型</b><small>关闭后不能切换到它，但不会删除已保存配置。</small></span></label>
     <div class="form-actions"><button type="button" class="subtle-button" id="test-model">${icon('plug-zap')}测试连接与图片输入</button><div class="model-action-group"><button type="submit" class="primary-button" id="save-model">${icon('check')}保存配置</button><button type="button" class="subtle-button" id="activate-model" ${isActive||!profile.hasKey?'disabled':''}>${icon('arrow-left-right')}${isActive?'当前使用中':'切换到此模型'}</button></div></div><div id="config-message" class="form-message" role="status" aria-live="polite"></div>
   </form></section><aside class="admin-aside"><div class="model-flow"><span class="eyebrow">HOW IT WORKS</span><h2>模型判断，浏览器取证。</h2><div class="flow-step"><span>1</span><div><h3>打开游戏</h3><p>独立浏览器运行 HTML，收集真实画面与运行记录。</p></div></div><div class="flow-step"><span>2</span><div><h3>模型操作</h3><p>模型结合截图决定点击、长按或滑动，再查看结果。</p></div></div><div class="flow-step"><span>3</span><div><h3>模型出报告</h3><p>只检查基础故障，附截图依据，无法验证就明确说明。</p></div></div><div class="admin-boundary">不评价手感、美感、趣味性。<br>最终审核始终交给人。</div></div><div class="config-meta"><span>当前生效</span><b>${escape(saved.model||'未配置')}</b><span>上次保存</span><b>${saved.updatedAt?new Date(saved.updatedAt).toLocaleString('zh-CN'):'尚未配置'}</b><button class="text-button" id="logout">${icon('log-out')}退出管理</button></div></aside></div>`;
-  $('#admin-content').insertAdjacentHTML('beforeend','<section id="members-panel" hidden></section><section id="forge-panel" hidden><div class="forge-embed-heading"><div><span class="eyebrow">PGC FORGE</span><h2>选题与作品工作台</h2><p>模型配置、选题扩写、简报和作品库都从这里统一使用。</p></div><a class="subtle-button" href="/forge" target="_blank" rel="noreferrer">新窗口打开 ↗</a></div><iframe id="forge-embed" title="PGC Forge 管理工作台" src="/forge/?embedded=1"></iframe></section>');
-  const selectTab=(name:'model'|'members'|'forge')=>{ $('#model-panel').hidden=name!=='model';$('#members-panel').hidden=name!=='members';$('#forge-panel').hidden=name!=='forge';for(const [id,active] of [['tab-model',name==='model'],['tab-members',name==='members'],['tab-forge',name==='forge']] as const)$( `#${id}`).classList.toggle('active',active); };
+  $('#admin-content').insertAdjacentHTML('beforeend','<section id="members-panel" hidden></section><section id="forge-panel" hidden><div class="forge-embed-heading"><div><span class="eyebrow">PGC FORGE</span><h2>选题与作品工作台</h2><p>从选题到简报，沿用同一份全局模型配置。</p></div><a class="subtle-button" href="/admin" target="_blank" rel="noreferrer">新窗口打开 ↗</a></div><iframe id="forge-embed" title="PGC Forge 管理工作台" src="/forge/?embedded=1"></iframe></section>');
+  const selectTab=(name:'model'|'members'|'forge')=>{ adminTab=name; $('#model-panel').hidden=name!=='model';$('#members-panel').hidden=name!=='members';$('#forge-panel').hidden=name!=='forge';for(const [id,active] of [['tab-model',name==='model'],['tab-members',name==='members'],['tab-forge',name==='forge']] as const)$( `#${id}`).classList.toggle('active',active); };
   $('#tab-model').addEventListener('click',()=>selectTab('model'));
   $('#tab-members').addEventListener('click',()=>{selectTab('members');if(!$('#members-panel').children.length)void renderMembers();});
   $('#tab-forge').addEventListener('click',()=>selectTab('forge'));
+  selectTab(adminTab);
+  if(adminTab==='members')void renderMembers();
   document.querySelectorAll<HTMLButtonElement>('[data-profile]').forEach(button=>button.addEventListener('click',()=>{selectedProfile=button.dataset.profile as ProfileId;renderSettings();}));
   iconsReady();
   $('#toggle-key').addEventListener('click',()=>{const key=$<HTMLInputElement>('#api-key');key.type=key.type==='password'?'text':'password';});

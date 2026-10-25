@@ -13,7 +13,7 @@ export function providerStatus(_env: unknown, cfg: Record<string, string>) {
 export function activeModel(cfg: Record<string, string>) { return cfg.openai_model || cfg.anthropic_model || '（未配置）'; }
 
 function jsonTail(schema: unknown) {
-  return schema ? '\n\n只输出一个 JSON 对象，不要任何解释或代码块标记。它必须符合这个 JSON Schema：\n' + JSON.stringify(schema) : '';
+  return schema ? '\n\n只输出一个 JSON 对象，不要任何解释或代码块标记。不要尾随逗号；字符串内换行写成 \\n。它必须符合这个 JSON Schema：\n' + JSON.stringify(schema) : '';
 }
 
 function toMessages(system: string, user: unknown, schema: unknown) {
@@ -48,10 +48,13 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     // Riffle uses 409 while the same API key is already processing another
     // idempotent request. Parse failures get a fresh idempotency key so a
     // truncated or non-JSON model response is regenerated instead of replayed.
-    const attempts = req.idempotencyKey ? 5 : 1;
+    const attempts = req.idempotencyKey ? 3 : 1;
+    // A Queue consumer has a finite wall-clock lifetime. Leave time to persist
+    // an actionable error rather than being killed during the final retry.
+    const deadline = Date.now() + 12 * 60 * 1000;
     for (let attempt = 0; attempt < attempts; attempt++) {
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
-      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, idempotencyKey: attemptKey });
+      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: Math.min(req.timeoutMs || 90000, Math.max(1, deadline - Date.now())), idempotencyKey: attemptKey });
       try {
         const text = await transport(messages);
         if (!req.schema) return text;
@@ -62,8 +65,8 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         const parseFailure = /模型返回的不是合法 JSON/.test(message);
         const emptyResponse = /模型没有返回可读的审核内容/.test(message);
         const busy = /返回 409|\b409\b/.test(message);
-        if (attempt + 1 >= attempts || (!parseFailure && !emptyResponse && !busy)) throw error;
-        freshRequest = parseFailure || emptyResponse;
+        if (attempt + 1 >= attempts || Date.now() >= deadline || (!parseFailure && !emptyResponse && !busy)) throw error;
+        if (parseFailure || emptyResponse) freshRequest = true;
         await new Promise(resolve => setTimeout(resolve, parseFailure || emptyResponse ? 1200 : 5000 * (attempt + 1)));
       }
     }
@@ -76,32 +79,54 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
 
 export function parseJson(text: string): any {
   const cleaned = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-  try { return JSON.parse(cleaned); }
-  catch {
-    // Models sometimes add a short preamble, a trailing sentence, or a
-    // second example object around the requested JSON. Find balanced objects
-    // while respecting quoted braces instead of slicing from the first `{` to
-    // the last `}`, which can make an otherwise valid response unparsable.
-    for (let start = 0; start < cleaned.length; start++) {
-      if (cleaned[start] !== '{') continue;
-      let depth = 0;
+  const tryParse = (candidate: string) => {
+    try { return JSON.parse(candidate); }
+    catch {
+      // Claude occasionally leaves a trailing comma in otherwise valid JSON.
+      // Scan outside strings so punctuation in game copy remains untouched.
+      let repaired = '';
       let quoted = false;
       let escaped = false;
-      for (let end = start; end < cleaned.length; end++) {
-        const char = cleaned[end];
+      for (let i = 0; i < candidate.length; i++) {
+        const char = candidate[i];
         if (quoted) {
           if (escaped) escaped = false;
           else if (char === '\\') escaped = true;
           else if (char === '"') quoted = false;
-          continue;
-        }
-        if (char === '"') { quoted = true; continue; }
-        if (char === '{') depth++;
-        else if (char === '}' && --depth === 0) {
-          try { return JSON.parse(cleaned.slice(start, end + 1)); } catch { break; }
-        }
+        } else if (char === '"') quoted = true;
+        else if (char === ',' && /^\s*[}\]]/.test(candidate.slice(i + 1))) continue;
+        repaired += char;
+      }
+      try { return JSON.parse(repaired); } catch { return undefined; }
+    }
+  };
+  const direct = tryParse(cleaned);
+  if (direct !== undefined) return direct;
+  // Models sometimes add a short preamble, a trailing sentence, or a
+  // second example object around the requested JSON. Find balanced objects
+  // while respecting quoted braces instead of slicing from the first `{` to
+  // the last `}`, which can make an otherwise valid response unparsable.
+  for (let start = 0; start < cleaned.length; start++) {
+    if (cleaned[start] !== '{') continue;
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let end = start; end < cleaned.length; end++) {
+      const char = cleaned[end];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === '"') quoted = false;
+        continue;
+      }
+      if (char === '"') { quoted = true; continue; }
+      if (char === '{') depth++;
+      else if (char === '}' && --depth === 0) {
+        const parsed = tryParse(cleaned.slice(start, end + 1));
+        if (parsed !== undefined) return parsed;
+        break;
       }
     }
-    throw new LLMError('模型返回的不是合法 JSON。', 502);
   }
+  throw new LLMError('模型返回的不是合法 JSON。', 502);
 }

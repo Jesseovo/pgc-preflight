@@ -230,9 +230,9 @@ function bindCards(root, list, rerender) {
   });
 }
 
-async function requestBrief(id) {
+async function requestBrief(id, regenerate = false) {
   try {
-    const started = await api("POST", `topics/${id}/brief`);
+    const started = await api("POST", `topics/${id}/brief${regenerate ? '?regenerate=1' : ''}`);
     if (started?.brief) return started.brief;
   } catch (error) {
     // The Worker writes the brief before sending its response. If the relay
@@ -245,8 +245,8 @@ async function requestBrief(id) {
     await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
     try {
       const saved = await api("GET", `topics/${id}`);
-      if (saved?.brief_md) return saved.brief_md;
-      if (saved?.brief_status === 'error') throw new Error(saved.brief_error || "简报生成失败，请重试或切换模型。");
+      if (saved?.brief_status === 'error') throw new Error(`简报生成失败：${saved.brief_error || "请重试或切换模型。"}`);
+      if (saved?.brief_md && saved.brief_status !== 'running') return saved.brief_md;
       // A waitUntil task can be cut off by the edge while the model gateway is
       // still working. Re-submit once after the lease expires so the server
       // can reclaim the stale job instead of polling forever.
@@ -283,7 +283,7 @@ function showBrief(t, md) {
   $("#dlBrief").onclick = () => download(`${t.data.title}-brief.md`, md);
   $("#regenBrief").onclick = (e) => guard(e.target, async () => {
     toast("重新生成中…", 120000);
-    const md = await requestBrief(t.id);
+    const md = await requestBrief(t.id, true);
     t.has_brief = 1;
     showBrief(t, md);
   });
