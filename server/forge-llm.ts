@@ -71,10 +71,29 @@ export function parseJson(text: string): any {
   const cleaned = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   try { return JSON.parse(cleaned); }
   catch {
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      try { return JSON.parse(cleaned.slice(start, end + 1)); } catch {}
+    // Models sometimes add a short preamble, a trailing sentence, or a
+    // second example object around the requested JSON. Find balanced objects
+    // while respecting quoted braces instead of slicing from the first `{` to
+    // the last `}`, which can make an otherwise valid response unparsable.
+    for (let start = 0; start < cleaned.length; start++) {
+      if (cleaned[start] !== '{') continue;
+      let depth = 0;
+      let quoted = false;
+      let escaped = false;
+      for (let end = start; end < cleaned.length; end++) {
+        const char = cleaned[end];
+        if (quoted) {
+          if (escaped) escaped = false;
+          else if (char === '\\') escaped = true;
+          else if (char === '"') quoted = false;
+          continue;
+        }
+        if (char === '"') { quoted = true; continue; }
+        if (char === '{') depth++;
+        else if (char === '}' && --depth === 0) {
+          try { return JSON.parse(cleaned.slice(start, end + 1)); } catch { break; }
+        }
+      }
     }
     throw new LLMError('模型返回的不是合法 JSON。', 502);
   }

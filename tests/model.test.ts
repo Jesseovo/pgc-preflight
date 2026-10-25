@@ -1,5 +1,6 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {modelTransport} from '../server/model';
+import {parseJson} from '../server/forge-llm';
 
 afterEach(()=>vi.unstubAllGlobals());
 
@@ -41,6 +42,11 @@ describe('模型传输',()=>{
       'https://riffle.example/v1/messages',
       expect.objectContaining({redirect:'manual'}),
     ]);
+  });
+
+  it('从模型前后说明文字中提取唯一的平衡 JSON',()=>{
+    const value = parseJson('说明：先看这个例子 {example}。\n结果：{\"items\":[{\"title\":\"A {B}\"}]}\n完成。');
+    expect(value.items[0].title).toBe('A {B}');
   });
 
   it('读取 Anthropic 流式文本，并带上幂等键',async()=>{
