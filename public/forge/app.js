@@ -802,41 +802,17 @@ async function renderGames(alive) {
 async function renderSettings(alive) {
   const s = (state.settings = await api("GET", "settings"));
   if (!alive()) return;
-  const p = state.info?.providers || {};
   view.innerHTML = `<form id="setForm">
-    <div class="box section"><h2>模型</h2>
+    <div class="box section forge-model-notice"><div class="section-label"><span>审核模型</span><span class="small-tag">ADMIN ONLY</span></div>
+      <h2>${esc(state.info?.model || "未配置")}</h2>
+      <p class="muted small">选题扩写、简报、标签和模拟审核统一使用管理员在 <a href="/admin">/admin</a> 配置的模型。Forge 不再重复保存模型地址或密钥。</p>
+      <p class="small ${state.info?.providers?.[state.info?.provider] ? "good" : "bad"}">${state.info?.providers?.[state.info?.provider] ? "模型已启用" : "尚未配置可用模型，请先到 /admin 保存并启用"}</p>
+    </div>
+    <div class="box section"><h2>选题工作流</h2>
       <div class="locks">
-        <label class="field">当前使用<select name="provider">
-          <option value="anthropic">Claude 官方 API${p.anthropic ? "" : " · 未配置 key"}</option>
-          <option value="anthropic_compat">Anthropic 协议（第三方/中转）${p.anthropic_compat ? "" : " · 未配置"}</option>
-          <option value="openai">OpenAI 兼容接口${p.openai ? "" : " · 未配置 key"}</option></select></label>
         <label class="field">每次抽几个<input type="number" name="draw_size" min="1" max="40"></label>
         <label class="field">每次 AI 调用扩写几个<input type="number" name="expand_batch" min="1" max="8"></label>
       </div>
-      <h3 style="margin-top:12px">Claude 官方 API</h3>
-      <div class="locks">
-        <label class="field">模型<input type="text" name="anthropic_model" list="claudeModels"></label>
-        <label class="field">思考强度<select name="anthropic_effort">${["low", "medium", "high", "xhigh", "max"].map((x) => `<option>${x}</option>`).join("")}</select></label>
-      </div>
-      <p class="muted small">密钥：ANTHROPIC_API_KEY。会用到结构化输出、提示词缓存和拒答兜底。</p>
-      <h3 style="margin-top:12px">Anthropic 协议（第三方模型或中转服务）</h3>
-      <div class="locks">
-        <label class="field">Base URL<input type="text" name="compat_base_url" placeholder="https://…/anthropic"></label>
-        <label class="field">模型名<input type="text" name="compat_model" placeholder="以服务商文档为准"></label>
-        <label class="field">鉴权方式<select name="compat_auth"><option value="x-api-key">x-api-key（官方写法）</option><option value="bearer">Authorization: Bearer</option></select></label>
-        <label class="field">单次最多输出 token<input type="number" name="compat_max_tokens" min="1024" step="1024"></label>
-        <label class="field">结构化输出<select name="compat_structured"><option value="0">不用（让模型按提示输出 JSON）</option><option value="1">用 output_config.format</option></select></label>
-        <label class="field">能看图片<select name="anthropic_compat_vision"><option value="1">能</option><option value="0">不能（审核时不发截图）</option></select></label>
-      </div>
-      <p class="muted small">密钥：ANTHROPIC_COMPAT_API_KEY。Base URL 填到 /v1 之前，程序会自己拼上 /v1/messages。例如 DeepSeek 是 https://api.deepseek.com/anthropic，Kimi 是 https://api.moonshot.cn/anthropic，智谱是 https://open.bigmodel.cn/api/anthropic，具体以各家文档为准；接 Claude 中转就填中转地址。默认只发最基本的字段（不发 effort、缓存、beta 和兜底），兼容性最好。如果输出上限较小，把"每次 AI 调用扩写几个"调到 2，避免输出被截断。</p>
-      <h3 style="margin-top:12px">OpenAI 兼容接口</h3>
-      <div class="locks">
-        <label class="field">模型名<input type="text" name="openai_model" placeholder="如 deepseek-chat"></label>
-        <label class="field">能看图片<select name="openai_vision"><option value="1">能</option><option value="0">不能（审核时不发截图）</option></select></label>
-      </div>
-      <p class="muted small">密钥：OPENAI_API_KEY 和 OPENAI_BASE_URL。</p>
-      <datalist id="claudeModels"><option value="claude-opus-5-5"><option value="claude-sonnet-5-5"><option value="claude-haiku-5-5"></datalist>
-      <p class="muted small">所有密钥都在 Cloudflare 后台的环境变量里配置，不经过浏览器。</p>
     </div>
     <div class="box section"><h2>选题规律与雷区</h2>
       <p class="muted small">扩写和简报都会读这段。收到新的审核意见后，把新规律补进来。</p>

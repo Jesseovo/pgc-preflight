@@ -17,7 +17,7 @@
 
 ## PGC Forge integration
 
-- `/forge` and `/review` are the migrated PGC Forge workflow. Their backend behavior, prompts, weighting, topic library, work library, brief generation and AI simulation review follow `C:\Users\Administrator\Desktop\05 Riffle\pgc-forge`.
+- `/forge` and `/review` are the migrated PGC Forge workflow. Their backend behavior, prompts, weighting, topic library, work library, brief generation and AI simulation review follow `C:\Users\Administrator\Desktop\05 Riffle\pgc-forge`. All Forge model calls use the encrypted model configured once in `/admin`; Forge settings must not expose a second model or API key configuration.
 - The legacy root PGC Preflight API remains available only for compatibility. Members only receive the Forge AI simulation review surface; administrators receive the complete Forge workbench.
 - The Forge surface uses the existing PGC Preflight visual language: white surfaces, fine borders, muted sage accents, compact layouts and the pixel cat artwork.
 

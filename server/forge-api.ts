@@ -14,7 +14,11 @@ import {
 } from "./forge/prompts.js";
 
 const TEXT_DEFAULTS = { redlines: DEFAULT_REDLINES, template: DEFAULT_TEMPLATE, template_f: DEFAULT_TEMPLATE_F };
-const SETTING_KEYS = new Set([...Object.keys(DEFAULT_SETTINGS), ...Object.keys(TEXT_DEFAULTS)]);
+// Model credentials and model selection belong to /admin. Forge only stores
+// its own workflow settings; keeping the old provider fields out of this
+// surface prevents a second, misleading configuration source.
+const FORGE_DEFAULTS = { draw_size: DEFAULT_SETTINGS.draw_size, expand_batch: DEFAULT_SETTINGS.expand_batch };
+const SETTING_KEYS = new Set([...Object.keys(FORGE_DEFAULTS), ...Object.keys(TEXT_DEFAULTS)]);
 const TOPIC_STATUSES = new Set(["new", "dup", "liked", "rejected", "made"]);
 const GAME_FIELDS = ["title", "descr", "status", "score", "aes", "ease", "play", "revisions", "feedback", "source", ...DIMS];
 
@@ -110,17 +114,8 @@ async function dispatch(method, route, request, env, ownerId) {
 
 async function getSettings(env) {
   const rows = await all(env, "SELECT id AS key, value FROM settings WHERE id != 'model'");
-  const s = { ...DEFAULT_SETTINGS, ...TEXT_DEFAULTS };
+  const s = { ...FORGE_DEFAULTS, ...TEXT_DEFAULTS };
   for (const r of rows) if (SETTING_KEYS.has(r.key)) s[r.key] = r.value;
-  // The platform keeps the active provider key encrypted in /admin. Mirror
-  // that effective model into Forge's original settings shape so the Forge
-  // UI and its status line describe the model that its calls actually use.
-  const configured = await env.modelStore?.get?.();
-  if (configured) {
-    s.provider = 'openai';
-    s.openai_model = configured.model || s.openai_model;
-    s.openai_vision = '1';
-  }
   return s;
 }
 
