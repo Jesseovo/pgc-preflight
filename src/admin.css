@@ -113,6 +113,10 @@
 .reset-password input { max-width: 300px; }
 .members-list .empty-state { padding: 36px 15px; border: 0; border-radius: 0; }
 .members-list .empty-state > svg { color: #9bb0a5; margin-bottom: 12px; }
+.forge-embed-heading { display:flex; align-items:flex-end; justify-content:space-between; gap:18px; margin:8px 0 16px; }
+.forge-embed-heading h2 { margin:10px 0 6px; font-size:22px; font-weight:550; }
+.forge-embed-heading p { margin:0; color:#656d76; font-size:12px; line-height:1.8; }
+#forge-embed { display:block; width:100%; min-height:980px; border:1px solid var(--line); border-radius:10px; background:#fff; box-shadow:0 6px 18px rgba(31,72,51,.04); }
 @media (hover: hover) and (pointer: fine) { .admin-tabs button:hover { background: #f6f8f3; } .back-link:hover { color: #36463e; } }
 @media (max-width: 850px) {
   .auth-sheet { grid-template-columns: minmax(0, 1fr) 330px; }
@@ -158,6 +162,8 @@
   .create-bottom { align-items: flex-start; flex-direction: column; }
   .create-bottom > div { align-self: flex-end; }
   .admin-tabs button { font-size: 12px; }
+  .forge-embed-heading { align-items:flex-start; flex-direction:column; }
+  #forge-embed { min-height:1200px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .auth-welcome .pixel-companion img { height: 64px; }

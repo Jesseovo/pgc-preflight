@@ -399,17 +399,29 @@ async function expand(env, { ids }) {
   const existing = games.map((g) => `- ${g.title}｜${g.descr}｜${g.gesture}`)
     .concat(prior.map((p) => JSON.parse(p.data || "{}")).filter((d) => d.title).map((d) => `- ${d.title}｜${d.logline}（已抽过的选题）`))
     .slice(-260);
-  const out = await complete(env, cfg, {
-    system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
-    user: expandUser({ existing, combos: pending }),
-    schema: EXPAND_SCHEMA,
-    // Keep Opus responses bounded. The schema has many fields, but a single
-    // topic normally fits comfortably below 4k output tokens; a larger budget
-    // makes the relay spend too long on reasoning and lets the browser give
-    // up before the Worker can return the result.
-    maxTokens: 2800 + 1200 * pending.length,
-    idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}`,
-  });
+  let out;
+  try {
+    out = await complete(env, cfg, {
+      system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
+      user: expandUser({ existing, combos: pending }),
+      schema: EXPAND_SCHEMA,
+      // Keep Opus responses bounded. The schema has many fields, but a single
+      // topic normally fits comfortably below 4k output tokens; a larger
+      // budget makes the relay spend too long on reasoning and lets the
+      // browser give up before the Worker can return the result.
+      maxTokens: 2800 + 1200 * pending.length,
+      idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}`,
+    });
+  } catch (error) {
+    // Riffle returns 409 when another tab is already processing the same
+    // idempotent request. Wait for that request to persist its result instead
+    // of surfacing a false failure or starting a duplicate model call.
+    if (/返回 409|409/.test(String(error?.message || error))) {
+      const recovered = await waitForExpanded(env, ids, 130000);
+      if (recovered) return recovered;
+    }
+    throw error;
+  }
   const stmts = [];
   for (const item of out.items || []) {
     const t = pending[item.idx];
@@ -421,6 +433,17 @@ async function expand(env, { ids }) {
   }
   await runBatch(env, stmts);
   return (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
+}
+
+async function waitForExpanded(env, ids, maxWaitMs) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const marks = ids.map(() => "?").join(",");
+    const rows = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
+    if (rows.length === ids.length && rows.every((topic) => topic.data?.title)) return rows;
+    await new Promise((resolve) => setTimeout(resolve, 3500));
+  }
+  return null;
 }
 
 async function preview(env, id) {
@@ -502,13 +525,23 @@ async function getReview(env, id, ownerId = 'admin') {
 async function brief(env, id) {
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
+  // A previous request may have completed after the browser lost its
+  // connection. Return the persisted brief instead of generating it again.
+  if (typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
   const cfg = await getSettings(env);
   const md = await complete(env, cfg, {
     system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
     user: briefUser(t),
-    maxTokens: 16000,
+    // The F template is intentionally structured and normally fits below
+    // 6k output tokens. A smaller cap keeps the relay responsive while the
+    // longer idle window accommodates Opus's streamed reasoning.
+    maxTokens: 8000,
+    timeoutMs: 180000,
+    idempotencyKey: `pgc-brief-${id}`,
   });
-  const full = cfg.template + String(md).trim() + "\n";
+  const body = String(md).trim();
+  if (!body) throw new LLMError("模型没有返回简报内容", 502);
+  const full = cfg.template + body + "\n";
   await run(env, "UPDATE topics SET brief_md = ?, status = CASE WHEN status = 'made' THEN status ELSE 'liked' END, updated_at = ? WHERE id = ?", full, now(), id);
   return { id, brief: full };
 }

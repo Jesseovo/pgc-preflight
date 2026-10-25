@@ -64,6 +64,10 @@ export default {
     if (redirect) return redirect;
     if (url.pathname === '/forge') return env.ASSETS.fetch(new Request(new URL('/forge/index.html', url), request));
     if (url.pathname === '/review') return env.ASSETS.fetch(new Request(new URL('/review.html', url), request));
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      const user = await identity(request.headers.get('Cookie'), members, env);
+      if (user?.role === 'member') return env.ASSETS.fetch(new Request(new URL('/review.html', url), request));
+    }
     return env.ASSETS.fetch(request);
   },
 };

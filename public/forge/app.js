@@ -208,8 +208,8 @@ function bindCards(root, list, rerender) {
         let md;
         if (t.has_brief) md = (await api("GET", `topics/${id}`)).brief_md;
         else {
-          toast("正在写简报，约 1–2 分钟…", 120000);
-          md = (await api("POST", `topics/${id}/brief`)).brief;
+          toast("正在写简报，Opus 可能需要 1–3 分钟…", 180000);
+          md = await requestBrief(id);
           t.has_brief = 1;
           if (t.status !== "made") t.status = "liked";
           toast("简报好了");
@@ -228,6 +228,24 @@ function bindCards(root, list, rerender) {
       toast("补充要求已保存；已生成的简报需要重新生成才会包含它");
     });
   });
+}
+
+async function requestBrief(id) {
+  try {
+    return (await api("POST", `topics/${id}/brief`)).brief;
+  } catch (error) {
+    // The Worker writes the brief before sending its response. If the relay
+    // or browser timed out, recover the saved result before asking the model
+    // to run again.
+    for (let attempt = 0; attempt < 30; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
+      try {
+        const saved = await api("GET", `topics/${id}`);
+        if (saved?.brief_md) return saved.brief_md;
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 function showPreview(t, svg) {
@@ -252,8 +270,9 @@ function showBrief(t, md) {
   $("#dlBrief").onclick = () => download(`${t.data.title}-brief.md`, md);
   $("#regenBrief").onclick = (e) => guard(e.target, async () => {
     toast("重新生成中…", 120000);
-    const r = await api("POST", `topics/${t.id}/brief`);
-    showBrief(t, r.brief);
+    const md = await requestBrief(t.id);
+    t.has_brief = 1;
+    showBrief(t, md);
   });
 }
 

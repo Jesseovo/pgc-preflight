@@ -30,9 +30,9 @@ describe('检查台的登录前置', () => {
     const store = memoryStore();
     const member = await createMember({ username: 'creator01', password: 'test-only-password' }, store);
     const token = await memberLogin('creator01', 'test-only-password', store, secrets.SETTINGS_KEY);
-    expect((await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets))?.headers.get('Location')).toBe('/review');
+    expect(await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets)).toBe(null);
     const admin = await login(secrets.ADMIN_PASSWORD, secrets);
-    expect((await guardCheckPage(page('/', `pgc_admin=${admin}`), store, secrets))?.headers.get('Location')).toBe('/forge');
+    expect((await guardCheckPage(page('/', `pgc_admin=${admin}`), store, secrets))?.headers.get('Location')).toBe('/admin');
     await updateMember(member.id, { enabled: false }, store);
     expect((await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets))?.status).toBe(302);
   });
@@ -47,8 +47,8 @@ describe('检查台的登录前置', () => {
     const memberToken = await memberLogin('creator02', 'test-only-password', store, secrets.SETTINGS_KEY);
     const adminToken = await login(secrets.ADMIN_PASSWORD, secrets);
     expect(await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets)).toMatchObject({ status: 302 });
-    expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/review');
+    expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
     expect(await guardForgePage(page('/forge', `pgc_admin=${adminToken}`), store, secrets)).toBe(null);
-    expect(await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets)).toBe(null);
+    expect((await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
   });
 });
