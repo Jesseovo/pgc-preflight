@@ -12,6 +12,10 @@
     { "name": "CHECK_RATE_LIMIT", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
     { "name": "FORGE_RATE_LIMIT", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } }
   ],
+  "queues": {
+    "producers": [{ "binding": "FORGE_QUEUE", "queue": "pgc-forge-jobs" }],
+    "consumers": [{ "queue": "pgc-forge-jobs", "max_batch_size": 1, "max_batch_timeout": 5, "max_retries": 3 }]
+  },
   "routes": [{ "pattern": "pgc.ovoxin.top", "custom_domain": true }],
   "observability": { "enabled": true }
 }

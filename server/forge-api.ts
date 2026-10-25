@@ -42,7 +42,10 @@ export interface ForgeEnv {
   ADMIN_PASSWORD: string;
   SETTINGS_KEY: string;
   modelStore: ConfigStore;
+  FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
 }
+
+export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number };
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -405,7 +408,7 @@ async function expand(env, { ids }, ctx) {
   // saved result instead of generating it a second time.
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
-  if (ctx?.waitUntil) {
+  if (env.FORGE_QUEUE || ctx?.waitUntil) {
     const claimed = [];
     const staleBefore = staleJobBefore();
     for (const topic of pending) {
@@ -413,7 +416,8 @@ async function expand(env, { ids }, ctx) {
       if (result.meta?.changes) claimed.push(topic.id);
     }
     if (claimed.length) {
-      ctx.waitUntil(expandBatch(env, claimed).catch(async error => {
+      if (env.FORGE_QUEUE) await env.FORGE_QUEUE.send({ type: 'expand', ids: claimed });
+      else ctx.waitUntil(expandBatch(env, claimed).catch(async error => {
         await run(env, `UPDATE topics SET expand_status = 'error', expand_error = ?, updated_at = ? WHERE id IN (${claimed.map(() => "?").join(",")})`, String(error?.message || error).slice(0, 500), now(), ...claimed).catch(() => {});
       }));
     }
@@ -568,15 +572,31 @@ async function brief(env, id, ctx) {
   if (typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
   const staleBefore = staleJobBefore();
   if (t.brief_status === 'running' && !(String(t.updated_at || '') < staleBefore)) return { id, status: 'pending' };
-  if (ctx?.waitUntil) {
+  if (env.FORGE_QUEUE || ctx?.waitUntil) {
     const claim = await run(env, "UPDATE topics SET brief_status = 'running', brief_error = '', updated_at = ? WHERE id = ? AND (brief_status = '' OR brief_status = 'error' OR (brief_status = 'running' AND updated_at < ?))", now(), id, staleBefore);
     if (!claim.meta?.changes) return { id, status: 'pending' };
-    ctx.waitUntil(briefJob(env, id, t).catch(async error => {
+    if (env.FORGE_QUEUE) await env.FORGE_QUEUE.send({ type: 'brief', id });
+    else ctx.waitUntil(briefJob(env, id, t).catch(async error => {
       await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ?", String(error?.message || error).slice(0, 500), now(), id).catch(() => {});
     }));
     return { id, status: 'pending' };
   }
   return briefJob(env, id, t);
+}
+
+export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
+  if (job.type === 'expand') {
+    try { return await expandBatch(env, job.ids); }
+    catch (error) {
+      await run(env, `UPDATE topics SET expand_status = 'error', expand_error = ?, updated_at = ? WHERE id IN (${job.ids.map(() => "?").join(",")}) AND expand_status = 'running'`, String(error?.message || error).slice(0, 500), now(), ...job.ids).catch(() => {});
+      throw error;
+    }
+  }
+  try { return await briefJob(env, job.id, await getTopic(env, job.id)); }
+  catch (error) {
+    await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ? AND brief_status = 'running'", String(error?.message || error).slice(0, 500), now(), job.id).catch(() => {});
+    throw error;
+  }
 }
 
 async function briefJob(env, id, t) {
