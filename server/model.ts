@@ -76,8 +76,8 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         while (true) {
           const part = await reader.read();
           if (part.done) break;
-          touch();
           buffer += decoder.decode(part.value, { stream: true });
+          let progressed = false;
           let newline;
           while ((newline = buffer.indexOf('\n')) >= 0) {
             const line = buffer.slice(0, newline).replace(/\r$/, '');
@@ -87,9 +87,17 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
             if (!payload || payload === '[DONE]') continue;
             try {
               const event = JSON.parse(payload);
-              if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') content += String(event.delta.text || '');
+              if (event.type === 'content_block_delta') {
+                const deltaType = event.delta?.type;
+                if (deltaType === 'text_delta') content += String(event.delta.text || '');
+                if (deltaType === 'text_delta' || deltaType === 'thinking_delta' || deltaType === 'signature_delta') progressed = true;
+              }
             } catch {}
           }
+          // Riffle may send ping events while a request is queued. They keep
+          // the TCP connection open but are not model progress and must not
+          // postpone the idle timeout.
+          if (progressed) touch();
         }
         if (content) return content;
       }
