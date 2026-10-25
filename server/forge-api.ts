@@ -452,6 +452,11 @@ async function expandBatch(env, ids) {
         // budget makes the relay spend too long on reasoning and lets the
         // browser give up before the Worker can return the result.
         maxTokens: 2800 + 1200 * pending.length,
+        // Opus can spend more than 90 seconds reasoning before its first
+        // useful chunk. Queue jobs are allowed to run longer than an HTTP
+        // request, so keep the relay open long enough for the model stream to
+        // make progress instead of recording a false timeout.
+        timeoutMs: /opus|claude/i.test(String(cfg.openai_model || cfg.anthropic_model || '')) ? 300000 : 150000,
       idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}-${Date.now()}`,
       }));
   } catch (error) {
@@ -609,7 +614,7 @@ async function briefJob(env, id, t) {
         // 6k output tokens. A smaller cap keeps the relay responsive while the
         // longer idle window accommodates Opus's streamed reasoning.
         maxTokens: 8000,
-        timeoutMs: 180000,
+        timeoutMs: /opus|claude/i.test(String(cfg.openai_model || cfg.anthropic_model || '')) ? 300000 : 180000,
         idempotencyKey: `pgc-brief-${id}-${Date.now()}`,
       }));
     const body = String(md).trim();

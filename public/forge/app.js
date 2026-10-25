@@ -11,8 +11,6 @@ const EXPORT_SNIPPET = `(async()=>{const get=u=>fetch(u).then(r=>r.json());const
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const memberOnly = document.body.dataset.memberOnly === "true" || location.pathname === "/review";
-const tabOwner = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-const EXPAND_LEASE_KEY = "pgc-forge-expand-lease";
 const state = { tab: memberOnly ? "review" : "draw", vocab: null, settings: null, info: null, drawn: [], busy: false, showDup: false };
 
 // ---------- helpers ----------
@@ -388,136 +386,102 @@ async function doDraw() {
   await expandIds(fresh.map((t) => t.id));
 }
 
+const activeExpandPolls = new Set();
+const pendingExpandIds = new Set();
+
 async function expandIds(ids) {
-  // Keep model calls small enough for the slower Opus gateway. DeepSeek can
-  // run two combos per call; Opus is deliberately one combo per call and
-  // serialized to avoid a burst of gateway timeouts and rate-limit responses.
+  const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!unique.length) return;
+  // Queue consumers serialize the actual model calls. Submit every batch up
+  // front so a 12-topic draw is queued as 12 small jobs instead of waiting for
+  // one browser request to finish before the next one can even start.
   const slowModel = /opus|claude/i.test(String(state.info?.model || ""));
-  if (slowModel && !claimExpandLease(ids)) {
-    const p = $("#progress");
-    if (p) p.textContent = "已有另一个工作台标签页在使用 Opus，当前页会自动读取完成结果…";
-    const deadline = Date.now() + 240000;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 3500));
-      const recovered = [];
-      for (const id of ids) {
-        try {
-          const topic = await api("GET", `topics/${id}`);
-          if (topic?.data?.title) recovered.push(topic);
-        } catch {}
-      }
-      if (recovered.length === ids.length) {
-        for (const topic of recovered) {
-          const index = state.drawn.findIndex((item) => item.id === topic.id);
-          if (index >= 0) state.drawn[index] = topic;
-        }
-        paintDrawn();
-        if (p) p.textContent = "";
-        return;
-      }
-    }
-    return;
-  }
   const size = slowModel ? 1 : Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
   const chunks = [];
-  for (let i = 0; i < ids.length; i += size) chunks.push(ids.slice(i, i + size));
-  let done = 0;
-  const prog = () => {
+  for (let i = 0; i < unique.length; i += size) chunks.push(unique.slice(i, i + size));
+  const updateTopic = (topic) => {
+    if (!topic || !Number.isFinite(Number(topic.id))) return;
+    const local = state.drawn.find((item) => item.id === Number(topic.id));
+    if (!local) return;
+    Object.assign(local, topic);
+    if (topic.data?.title) {
+      local._inflight = false;
+      local._error = "";
+      pendingExpandIds.delete(Number(topic.id));
+    }
+  };
+  const paintProgress = () => {
     const p = $("#progress");
     if (!p) return;
-    if (done >= chunks.length) { p.textContent = ""; return; }
+    const waiting = [...pendingExpandIds].filter((id) => !state.drawn.find((item) => item.id === id)?.data?.title).length;
+    if (!waiting) { p.textContent = ""; return; }
+    const done = unique.length - waiting;
     p.textContent = slowModel
-      ? `Opus 扩写中 ${done}/${chunks.length} 批（每批约 1–3 分钟）…`
-      : `AI 扩写中 ${done}/${chunks.length} 批…`;
+      ? `Opus 扩写队列中 · 已完成 ${done}/${unique.length} 个，后台会继续处理…`
+      : `AI 扩写队列中 · 已完成 ${done}/${unique.length} 个…`;
   };
-  prog();
-  for (const id of ids) { const t = state.drawn.find((x) => x.id === id); if (t) { t._inflight = true; delete t._error; } }
-  paintDrawn();
-  const recover = async (chunk, maxWaitMs = 10000) => {
-    // A proxy can drop the browser response after the Worker has finished
-    // writing D1. A 409 from the relay means the same idempotent request is
-    // still running; keep reading D1 instead of starting a duplicate call.
-    const deadline = Date.now() + maxWaitMs;
-    let first = true;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, first ? 1200 : 3500));
-      first = false;
-      const recovered = [];
-      for (const id of chunk) {
-        try {
-          const topic = await api("GET", `topics/${id}`);
-          if (topic?.data?.title) recovered.push(topic);
-        } catch {}
-      }
-      if (recovered.length === chunk.length) return recovered;
-    }
-    return null;
-  };
-  const expandChunk = async (chunk) => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const result = await api("POST", "expand", { ids: chunk });
-        if (Array.isArray(result)) return result;
-        if (result?.pending) {
-          const recovered = await recover(chunk, 85000);
-          if (recovered) return recovered;
-          throw new Error("扩写任务超时，请重试。");
-        }
-        throw new Error("扩写接口返回格式不正确。");
-      }
-      catch (e) {
-        const message = String(e?.message || e);
-        if (!/超时|timeout|409|429|5\d\d|网络|failed to fetch|fetch failed|network/i.test(message)) throw e;
-        const recovered = await recover(chunk, /409|正在处理/i.test(message) ? 240000 : 10000);
-        if (recovered) return recovered;
-        if (attempt) throw e;
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    }
-    throw new Error("扩写未完成");
-  };
-  const worker = async () => {
-    while (chunks.length) {
-      const chunk = chunks.shift();
-      try {
-        const updated = await expandChunk(chunk);
-        for (const u of updated) {
-          const i = state.drawn.findIndex((x) => x.id === u.id);
-          if (i >= 0) state.drawn[i] = u;
-        }
-      } catch (e) {
-        for (const id of chunk) { const t = state.drawn.find((x) => x.id === id); if (t) { t._error = e.message; t._inflight = false; } }
-      }
-      done++;
-      prog();
-      paintDrawn();
-    }
-  };
-  const total = chunks.length;
-  try {
-    await Promise.all(Array.from({ length: slowModel ? 1 : Math.min(2, total) }, worker));
-    done = total;
-    prog();
-  } finally {
-    if (slowModel) releaseExpandLease();
+  for (const id of unique) {
+    const t = state.drawn.find((item) => item.id === id);
+    if (t && !t.data?.title) { t._inflight = true; t._error = ""; pendingExpandIds.add(id); }
   }
-}
+  paintDrawn();
+  paintProgress();
 
-function claimExpandLease(ids) {
-  try {
-    const now = Date.now();
-    const current = JSON.parse(localStorage.getItem(EXPAND_LEASE_KEY) || "null");
-    if (current && current.owner !== tabOwner && Number(current.expiresAt) > now) return false;
-    localStorage.setItem(EXPAND_LEASE_KEY, JSON.stringify({ owner: tabOwner, ids, expiresAt: now + 30 * 60 * 1000 }));
-    return true;
-  } catch { return true; }
-}
+  const submit = async (chunk) => {
+    try {
+      const result = await api("POST", "expand", { ids: chunk });
+      if (Array.isArray(result)) result.forEach(updateTopic);
+      else if (Array.isArray(result?.topics)) result.topics.forEach(updateTopic);
+    } catch (error) {
+      const message = String(error?.message || error);
+      if (!/409|429|5\d\d|超时|timeout|网络|failed to fetch|fetch failed|network/i.test(message)) {
+        for (const id of chunk) {
+          const t = state.drawn.find((item) => item.id === id);
+          if (t) { t._error = message; t._inflight = false; }
+          pendingExpandIds.delete(id);
+        }
+      }
+    }
+  };
+  // Keep the HTTP enqueue burst small; the queue, rather than the browser,
+  // controls model concurrency.
+  const waitingChunks = chunks.slice();
+  const submitWorker = async () => { while (waitingChunks.length) await submit(waitingChunks.shift()); };
+  await Promise.all(Array.from({ length: Math.min(4, waitingChunks.length) }, submitWorker));
+  paintDrawn();
+  paintProgress();
 
-function releaseExpandLease() {
-  try {
-    const current = JSON.parse(localStorage.getItem(EXPAND_LEASE_KEY) || "null");
-    if (current?.owner === tabOwner) localStorage.removeItem(EXPAND_LEASE_KEY);
-  } catch {}
+  const poll = async (id) => {
+    const deadline = Date.now() + (slowModel ? 30 * 60 * 1000 : 10 * 60 * 1000);
+    while (Date.now() < deadline && pendingExpandIds.has(id)) {
+      await new Promise((resolve) => setTimeout(resolve, 3500));
+      try {
+        const topic = await api("GET", `topics/${id}`);
+        updateTopic(topic);
+        const local = state.drawn.find((item) => item.id === id);
+        if (topic?.expand_status === "error" && !topic.data?.title) {
+          if (local) { local._error = topic.expand_error || "扩写失败，请点击重试。"; local._inflight = false; }
+          pendingExpandIds.delete(id);
+        }
+        paintDrawn();
+        paintProgress();
+      } catch {}
+    }
+    if (pendingExpandIds.has(id)) {
+      const local = state.drawn.find((item) => item.id === id);
+      if (local) { local._error = "任务仍在队列中，点击重试可继续等待。"; local._inflight = false; }
+      pendingExpandIds.delete(id);
+      paintDrawn();
+      paintProgress();
+    }
+  };
+  for (const id of unique) {
+    const t = state.drawn.find((item) => item.id === id);
+    if (!t?.data?.title && pendingExpandIds.has(id) && !activeExpandPolls.has(id)) {
+      activeExpandPolls.add(id);
+      void poll(id).finally(() => activeExpandPolls.delete(id));
+    }
+  }
 }
 
 // ---------- 候选 ----------
