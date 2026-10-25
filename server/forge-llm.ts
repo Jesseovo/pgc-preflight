@@ -33,7 +33,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   try { apiKey = await decryptKey(active.profile.encryptedKey, env.SETTINGS_KEY); }
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }
   try {
-    const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: active.profile.protocol === 'anthropic' ? 120000 : 90000 });
+    const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: active.profile.protocol === 'anthropic' ? 90000 : 90000 });
     const text = await transport(toMessages(req.system, req.user, req.schema) as any);
     if (!req.schema) return text;
     return parseJson(text);

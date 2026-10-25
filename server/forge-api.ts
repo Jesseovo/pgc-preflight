@@ -403,7 +403,11 @@ async function expand(env, { ids }) {
     system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
     user: expandUser({ existing, combos: pending }),
     schema: EXPAND_SCHEMA,
-    maxTokens: 4000 + 2200 * pending.length,
+    // Keep Opus responses bounded. The schema has many fields, but a single
+    // topic normally fits comfortably below 4k output tokens; a larger budget
+    // makes the relay spend too long on reasoning and lets the browser give
+    // up before the Worker can return the result.
+    maxTokens: 2800 + 1200 * pending.length,
   });
   const stmts = [];
   for (const item of out.items || []) {
