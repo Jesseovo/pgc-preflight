@@ -170,7 +170,9 @@ button, input, select, textarea { font: inherit; }
 button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid #8fbda6; outline-offset: 3px; }
 .top { position: sticky; top: 0; z-index: 5; min-height: 72px; max-width: none; padding: 0 max(24px, calc((100vw - 1168px) / 2)); background: rgba(255,255,255,.96); border-bottom: 1px solid var(--line); backdrop-filter: blur(10px); }
 .embedded { min-width: 0; }
-.embedded .top { display: none; }
+.embedded .top { display: flex; min-height: 54px; padding: 0 24px; }
+.embedded .top .brand { display: none; }
+.embedded .top .status { margin-left: auto; }
 .embedded main { max-width: none; padding: 22px 24px 34px; }
 .embedded .box, .embedded .card, .embedded .tablewrap { box-shadow: none; }
 .brand { color: var(--ink); display: inline-flex; align-items: center; gap: 9px; letter-spacing: -.4px; font-size: 18px; font-weight: 750; padding: 4px 0; }
