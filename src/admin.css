@@ -9,6 +9,16 @@
 .settings-heading h2 { font-size: 20px; margin: 8px 0 0; font-weight: 600; }
 .config-status { display: inline-flex; align-items: center; gap: 6px; color: #8e754c; background: #f8f3e7; font-size: 11px; white-space: nowrap; padding: 6px 9px; border-radius: 4px; }
 .config-status.connected { color: #536f5c; background: #edf3e9; }
+.profile-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: -4px 0 18px; padding: 4px; border: 1px solid #e1e8df; border-radius: 6px; background: #f7faf6; }
+.profile-tab { display: flex; align-items: center; justify-content: space-between; gap: 9px; min-height: 48px; padding: 9px 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #65766a; text-align: left; cursor: pointer; }
+.profile-tab b { font-size: 12px; font-weight: 600; }
+.profile-tab small { color: #8b988e; font-size: 10px; }
+.profile-tab.active { border-color: #d5e3d2; background: #fff; color: #496654; box-shadow: 0 2px 8px rgba(31,72,51,.06); }
+.profile-tab.active small { color: #5d8864; }
+.active-model-note { padding: 10px 12px; margin-bottom: 20px; border-left: 2px solid #a9c5a2; background: #f5f9f3; color: #708076; font-size: 11px; line-height: 1.75; }
+.active-model-note b { color: #4f7156; font-weight: 650; }
+.model-action-group { display: flex; align-items: center; gap: 9px; }
+.model-action-group .subtle-button { min-height: 42px; font-size: 11px; }
 .field { margin-bottom: 24px; }
 .field label, .auth-field label { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; font-size: 13px; font-weight: 500; color: #36463e; }
 .field label > span { color: #7a887f; font-weight: 400; font-size: 11px; }
@@ -117,6 +127,8 @@
   .field label > span { font-size: 10px; }
   .form-actions { flex-wrap: wrap; }
   .form-actions > button { flex: 1; }
+  .model-action-group { width: 100%; }
+  .model-action-group > button { flex: 1; }
   .model-flow { padding: 22px; }
   .login-card { padding: 25px 22px; }
   .auth-main { justify-content: flex-start; padding-top: 24px; }

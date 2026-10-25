@@ -25,4 +25,21 @@ describe('模型传输',()=>{
       expect.objectContaining({redirect:'manual'}),
     ]);
   });
+
+  it('把 Anthropic 配置转换为 /v1/messages 请求并读取文本块',async()=>{
+    const fetchMock=vi.fn(async(_input:unknown,init?:RequestInit)=>{
+      const body=JSON.parse(String(init?.body));
+      expect(body.system).toBe('system prompt');
+      expect(body.messages[0].content[0]).toEqual({type:'text',text:'user prompt'});
+      return Response.json({content:[{type:'text',text:'READY'}]});
+    });
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'})([
+      {role:'system',content:'system prompt'}, {role:'user',content:'user prompt'},
+    ])).resolves.toBe('READY');
+    expect(fetchMock.mock.calls[0]).toEqual([
+      'https://riffle.example/v1/messages',
+      expect.objectContaining({redirect:'manual'}),
+    ]);
+  });
 });

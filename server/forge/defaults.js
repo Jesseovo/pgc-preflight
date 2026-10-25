@@ -15,7 +15,7 @@ export const DEFAULT_SETTINGS = {
   openai_model: "deepseek-chat",
   openai_vision: "1",
   draw_size: "12",                // combos per draw
-  expand_batch: "4",              // combos per LLM call
+  expand_batch: "2",              // combos per LLM call; keeps slower vision gateways reliable
 };
 
 // Platform rules, copied from the PGC home page.

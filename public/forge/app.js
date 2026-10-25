@@ -351,19 +351,58 @@ async function doDraw() {
 }
 
 async function expandIds(ids) {
-  const size = Math.max(1, Number(state.settings?.expand_batch) || 4);
+  // Keep model calls small enough for the slower Opus gateway. DeepSeek can
+  // run two combos per call; Opus is deliberately one combo per call and
+  // serialized to avoid a burst of gateway timeouts and rate-limit responses.
+  const slowModel = /opus|claude/i.test(String(state.info?.model || ""));
+  const size = slowModel ? 1 : Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
   const chunks = [];
   for (let i = 0; i < ids.length; i += size) chunks.push(ids.slice(i, i + size));
   let done = 0;
-  const prog = () => { const p = $("#progress"); if (p) p.textContent = done < chunks.length ? `AI 扩写中 ${done}/${chunks.length} 批…` : ""; };
+  const prog = () => {
+    const p = $("#progress");
+    if (!p) return;
+    if (done >= chunks.length) { p.textContent = ""; return; }
+    p.textContent = slowModel
+      ? `Opus 扩写中 ${done}/${chunks.length} 批（每批约 40–90 秒）…`
+      : `AI 扩写中 ${done}/${chunks.length} 批…`;
+  };
   prog();
   for (const id of ids) { const t = state.drawn.find((x) => x.id === id); if (t) { t._inflight = true; delete t._error; } }
   paintDrawn();
+  const recover = async (chunk) => {
+    // A proxy can drop the browser response after the Worker has finished
+    // writing D1. Read the topic before retrying so we do not spend another
+    // model call for an already completed expansion.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const recovered = [];
+    for (const id of chunk) {
+      try {
+        const topic = await api("GET", `topics/${id}`);
+        if (topic?.data?.title) recovered.push(topic);
+      } catch {}
+    }
+    return recovered.length === chunk.length ? recovered : null;
+  };
+  const expandChunk = async (chunk) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { return await api("POST", "expand", { ids: chunk }); }
+      catch (e) {
+        const message = String(e?.message || e);
+        if (!/超时|timeout|429|5\d\d|网络|failed to fetch|fetch failed|network/i.test(message)) throw e;
+        const recovered = await recover(chunk);
+        if (recovered) return recovered;
+        if (attempt) throw e;
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    }
+    throw new Error("扩写未完成");
+  };
   const worker = async () => {
     while (chunks.length) {
       const chunk = chunks.shift();
       try {
-        const updated = await api("POST", "expand", { ids: chunk });
+        const updated = await expandChunk(chunk);
         for (const u of updated) {
           const i = state.drawn.findIndex((x) => x.id === u.id);
           if (i >= 0) state.drawn[i] = u;
@@ -377,7 +416,7 @@ async function expandIds(ids) {
     }
   };
   const total = chunks.length;
-  await Promise.all(Array.from({ length: Math.min(3, total) }, worker));
+  await Promise.all(Array.from({ length: slowModel ? 1 : Math.min(2, total) }, worker));
   done = total;
   prog();
 }
@@ -811,7 +850,7 @@ async function renderSettings(alive) {
     <div class="box section"><h2>选题工作流</h2>
       <div class="locks">
         <label class="field">每次抽几个<input type="number" name="draw_size" min="1" max="40"></label>
-        <label class="field">每次 AI 调用扩写几个<input type="number" name="expand_batch" min="1" max="8"></label>
+        <label class="field">每次 AI 调用扩写几个<input type="number" name="expand_batch" min="1" max="2"></label>
       </div>
     </div>
     <div class="box section"><h2>选题规律与雷区</h2>

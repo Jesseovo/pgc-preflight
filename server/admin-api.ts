@@ -1,4 +1,4 @@
-import { authorized, login, publicConfig, saveConfig, validateModelFields, decryptKey } from './settings';
+import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, validateModelFields, decryptKey } from './settings';
 import type { AppSecrets, ConfigStore } from './settings';
 import { modelTransport } from './model';
 import {createMember,updateMember,publicMember} from './members';
@@ -32,11 +32,18 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       if(request.method==='GET')return json(publicConfig(await store.get()));
       if(request.method==='PUT')return json(publicConfig(await saveConfig(await smallJson(request),store,secrets.SETTINGS_KEY)));
     }
+    if(url.pathname==='/api/admin/config/active'&&request.method==='POST'){
+      const body=await smallJson(request) as {profile?:unknown};
+      return json(publicConfig(await activateProfile(body.profile,store)));
+    }
     if(url.pathname==='/api/admin/test'&&request.method==='POST'){
-      const fields=validateModelFields(await smallJson(request));
+      const raw=await smallJson(request) as Record<string, unknown>;
+      const fields=validateModelFields(raw);
       const previous=await store.get();
-      if(!fields.apiKey&&previous&&fields.baseUrl!==previous.baseUrl)return json({error:'更换接口地址时，请重新填写 API Key。'},400);
-      const apiKey=fields.apiKey||(previous?.encryptedKey?await decryptKey(previous.encryptedKey,secrets.SETTINGS_KEY):'');
+      const profileId=raw.profile==='opus'?'opus':'deepseek';
+      const savedProfile=modelProfiles(previous)[profileId];
+      if(!fields.apiKey&&savedProfile&&(fields.baseUrl!==savedProfile.baseUrl||fields.protocol!==(savedProfile.protocol||'openai')))return json({error:'更换接口地址或协议时，请重新填写 API Key。'},400);
+      const apiKey=fields.apiKey||(savedProfile?.encryptedKey?await decryptKey(savedProfile.encryptedKey,secrets.SETTINGS_KEY):'');
       if(!apiKey)return json({error:'请先填写 API Key。'},400);
       const transport=modelTransport({...fields,apiKey});
       const started=Date.now();

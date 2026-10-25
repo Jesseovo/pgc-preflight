@@ -1,5 +1,5 @@
 import {describe,expect,it} from 'vitest';
-import {authorized,login,encryptKey,decryptKey,saveConfig,publicConfig,validateModelFields} from '../server/settings';
+import {activateProfile,authorized,login,encryptKey,decryptKey,resolveModel,saveConfig,publicConfig,validateModelFields} from '../server/settings';
 import type {ModelConfig,ConfigStore} from '../server/settings';
 import {parseDecision} from '../server/model';
 
@@ -27,6 +27,17 @@ describe('管理与密钥',()=>{
     expect(JSON.stringify(publicConfig(config))).not.toContain('test-only-api-key');
     expect(publicConfig(config).hasKey).toBe(true);
     await expect(saveConfig({baseUrl:'https://other.example/v1',model:'vision-model',apiKey:''},store,secrets.SETTINGS_KEY)).rejects.toThrow('重新填写');
+  });
+  it('保留 DeepSeek 与 Opus 两套密钥，并可切换当前模型',async()=>{
+    let current:ModelConfig|null=null;
+    const store:ConfigStore={get:async()=>current,set:async config=>{current=config;}};
+    await saveConfig({profile:'deepseek',baseUrl:'https://deepseek.example/v1',model:'deepseek-chat',apiKey:'deepseek-key'},store,secrets.SETTINGS_KEY);
+    await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',apiKey:'opus-key'},store,secrets.SETTINGS_KEY);
+    expect(publicConfig(current).activeProfile).toBe('deepseek');
+    expect(publicConfig(current).profiles.opus.hasKey).toBe(true);
+    expect(JSON.stringify(publicConfig(current))).not.toContain('opus-key');
+    await activateProfile('opus',store);
+    await expect(resolveModel(current,secrets.SETTINGS_KEY)).resolves.toMatchObject({protocol:'anthropic',model:'claude-opus-5-5',apiKey:'opus-key'});
   });
   it('拒绝带凭据、内网或非 HTTPS 的模型地址',()=>{
     for(const baseUrl of ['http://provider.example','https://user:pass@provider.example','https://127.0.0.1/v1','https://192.168.0.1/v1'])expect(()=>validateModelFields({baseUrl,model:'test'})).toThrow();

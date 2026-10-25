@@ -385,6 +385,11 @@ async function expand(env, { ids }) {
   const marks = ids.map(() => "?").join(",");
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   if (!topics.length) throw new HttpError(404, "选题不存在");
+  // A browser/proxy may lose the response after the model has already
+  // completed and persisted the topic. Make retries idempotent: return the
+  // saved result instead of generating it a second time.
+  const pending = topics.filter((topic) => !topic.data?.title);
+  if (!pending.length) return topics;
   const [cfg, games, prior] = await Promise.all([
     getSettings(env),
     all(env, "SELECT * FROM games ORDER BY id"),
@@ -396,13 +401,13 @@ async function expand(env, { ids }) {
     .slice(-260);
   const out = await complete(env, cfg, {
     system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
-    user: expandUser({ existing, combos: topics }),
+    user: expandUser({ existing, combos: pending }),
     schema: EXPAND_SCHEMA,
-    maxTokens: 4000 + 2200 * topics.length,
+    maxTokens: 4000 + 2200 * pending.length,
   });
   const stmts = [];
   for (const item of out.items || []) {
-    const t = topics[item.idx];
+    const t = pending[item.idx];
     if (!t) continue;
     const score = [item.aes, item.ease, item.play].map((x) => Math.max(1, Math.min(3, Number(x) || 1))).reduce((s, x) => s + x, 0);
     const status = item.dup_of && item.dup_of.trim() ? "dup" : "new";
