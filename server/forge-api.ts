@@ -529,8 +529,6 @@ async function brief(env, id) {
   // connection. Return the persisted brief instead of generating it again.
   if (typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
   const cfg = await getSettings(env);
-  const started = Date.now();
-  console.log('forge brief start', id);
   const md = await complete(env, cfg, {
     system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
     user: briefUser(t),
@@ -545,6 +543,5 @@ async function brief(env, id) {
   if (!body) throw new LLMError("模型没有返回简报内容", 502);
   const full = cfg.template + body + "\n";
   await run(env, "UPDATE topics SET brief_md = ?, status = CASE WHEN status = 'made' THEN status ELSE 'liked' END, updated_at = ? WHERE id = ?", full, now(), id);
-  console.log('forge brief saved', id, full.length, Date.now() - started);
   return { id, brief: full };
 }

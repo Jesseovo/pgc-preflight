@@ -25,6 +25,14 @@ function toMessages(system: string, user: unknown, schema: unknown) {
   return [{ role: 'system', content: system }, { role: 'user', content }];
 }
 
+async function keyedRequestId(base: string | undefined, messages: unknown) {
+  if (!base) return undefined;
+  const bytes = new TextEncoder().encode(JSON.stringify(messages));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const suffix = Array.from(digest.slice(0, 12), byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${base}-${suffix}`;
+}
+
 export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured);
@@ -34,13 +42,14 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }
   try {
     const messages = toMessages(req.system, req.user, req.schema) as any;
+    const idempotencyKey = await keyedRequestId(req.idempotencyKey, messages);
     let lastError: unknown;
     // Riffle uses 409 while the same API key is already processing another
     // idempotent request. Retry only requests with a stable key; unkeyed
     // calls must never be repeated behind the caller's back.
     const attempts = req.idempotencyKey ? 5 : 1;
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, idempotencyKey: req.idempotencyKey });
+      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, idempotencyKey });
       try {
         const text = await transport(messages);
         if (!req.schema) return text;

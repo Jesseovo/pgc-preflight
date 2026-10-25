@@ -66,12 +66,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
     }
     try {
       if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
-      if (!response.ok) {
-        let detail = '';
-        try { detail = (await response.clone().text()).replace(/\s+/g, ' ').slice(0, 300); } catch {}
-        console.error('model upstream error', response.status, detail);
-        throw new Error(`模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`);
-      }
+      if (!response.ok) throw new Error(`模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`);
       const contentType = response.headers.get('content-type') || '';
       if (anthropic && contentType.includes('text/event-stream') && response.body) {
         const reader = response.body.getReader();
