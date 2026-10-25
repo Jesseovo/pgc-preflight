@@ -60,10 +60,11 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         lastError = error;
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = /模型返回的不是合法 JSON/.test(message);
+        const emptyResponse = /模型没有返回可读的审核内容/.test(message);
         const busy = /返回 409|\b409\b/.test(message);
-        if (attempt + 1 >= attempts || (!parseFailure && !busy)) throw error;
-        freshRequest = parseFailure;
-        await new Promise(resolve => setTimeout(resolve, parseFailure ? 1200 : 5000 * (attempt + 1)));
+        if (attempt + 1 >= attempts || (!parseFailure && !emptyResponse && !busy)) throw error;
+        freshRequest = parseFailure || emptyResponse;
+        await new Promise(resolve => setTimeout(resolve, parseFailure || emptyResponse ? 1200 : 5000 * (attempt + 1)));
       }
     }
     throw lastError instanceof Error ? lastError : new Error('模型调用失败。');
