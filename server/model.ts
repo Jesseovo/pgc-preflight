@@ -15,11 +15,11 @@ export type ModelDecision = { action: ModelAction; reason: string } | { report: 
 export type ChatMessage = { role: string; content: unknown };
 export type ModelTransport = (messages: ChatMessage[]) => Promise<string>;
 
-export function modelTransport(config: ModelRuntime): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number } = {}): ModelTransport {
   return async messages => {
     const response = await fetch(`${config.baseUrl}/chat/completions`, {
       method:'POST', headers:{'Content-Type':'application/json',Authorization:`Bearer ${config.apiKey}`},
-      body:JSON.stringify({model:config.model,messages,max_tokens:2200,stream:false}),
+      body:JSON.stringify({model:config.model,messages,max_tokens:Math.min(Math.max(options.maxTokens || 2200, 256), 24000),stream:false}),
       signal:AbortSignal.timeout(35000), redirect:'manual',
     });
     if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');

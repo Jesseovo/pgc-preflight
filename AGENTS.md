@@ -15,6 +15,12 @@
 - Visual direction follows Jesseovo's GitHub profile: white surfaces, fine borders, muted sage accents, compact layouts and the original pixel cat. Avoid garden backgrounds and oversized decorative cards. Profile artwork is copied into `public/artwork/`.
 - Keep uploads, screenshots and reports ephemeral. Never commit real team game files or internal research data.
 
+## PGC Forge integration
+
+- `/forge` and `/review` are the migrated PGC Forge workflow. Their backend behavior, prompts, weighting, topic library, work library, brief generation and AI simulation review follow `C:\Users\Administrator\Desktop\05 Riffle\pgc-forge`.
+- The root PGC Preflight workspace keeps its basic preflight contract. Members only receive the Forge AI simulation review surface; administrators receive the complete Forge workbench.
+- The Forge surface uses the existing PGC Preflight visual language: white surfaces, fine borders, muted sage accents, compact layouts and the pixel cat artwork.
+
 ## Development
 
 - `npm run dev`: website plus local browser-check API. Requires local Chrome or Edge; set `PGC_CHROME_PATH` if needed.

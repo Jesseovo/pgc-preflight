@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { guardCheckPage } from '../server/page-access';
+import { guardCheckPage, guardForgePage, guardReviewPage } from '../server/page-access';
 import { createMember, memberLogin, updateMember } from '../server/members';
 import type { Member, MemberStore } from '../server/members';
 import { login } from '../server/settings';
@@ -30,7 +30,7 @@ describe('检查台的登录前置', () => {
     const store = memoryStore();
     const member = await createMember({ username: 'creator01', password: 'test-only-password' }, store);
     const token = await memberLogin('creator01', 'test-only-password', store, secrets.SETTINGS_KEY);
-    expect(await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets)).toBe(null);
+    expect((await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets))?.headers.get('Location')).toBe('/review');
     const admin = await login(secrets.ADMIN_PASSWORD, secrets);
     expect(await guardCheckPage(page('/', `pgc_admin=${admin}`), store, secrets)).toBe(null);
     await updateMember(member.id, { enabled: false }, store);
@@ -40,5 +40,15 @@ describe('检查台的登录前置', () => {
     for (const path of ['/login', '/admin', '/artwork/pixel-cat-walk.gif', '/api/auth/me']) {
       expect(await guardCheckPage(page(path), memoryStore(), secrets)).toBe(null);
     }
+  });
+  it('管理员可以进入 Forge 全功能台，成员只进入模拟审核台', async () => {
+    const store = memoryStore();
+    const member = await createMember({ username: 'creator02', password: 'test-only-password' }, store);
+    const memberToken = await memberLogin('creator02', 'test-only-password', store, secrets.SETTINGS_KEY);
+    const adminToken = await login(secrets.ADMIN_PASSWORD, secrets);
+    expect(await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets)).toMatchObject({ status: 302 });
+    expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/review');
+    expect(await guardForgePage(page('/forge', `pgc_admin=${adminToken}`), store, secrets)).toBe(null);
+    expect(await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets)).toBe(null);
   });
 });

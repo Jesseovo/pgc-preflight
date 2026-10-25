@@ -39,8 +39,8 @@ document.querySelector('#member-login')!.addEventListener('submit', async event 
     const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.querySelector<HTMLInputElement>('#username')!.value.trim(), password: document.querySelector<HTMLInputElement>('#password')!.value }) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '登录失败。');
-    location.replace('/');
+    location.replace('/review');
   } catch (error) { message.textContent = error instanceof Error ? error.message : '登录失败，请重试。'; }
   finally { button.disabled = false; }
 });
-void fetch('/api/auth/me', { cache: 'no-store' }).then(response => { if (response.ok) location.replace('/'); }).catch(() => {});
+void fetch('/api/auth/me', { cache: 'no-store' }).then(async response => { if (response.ok) { const user=await response.json(); location.replace(user.role==='admin'?'/admin':'/review'); } }).catch(() => {});

@@ -1,0 +1,56 @@
+CREATE TABLE IF NOT EXISTS vocab (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  dim TEXT NOT NULL,
+  word TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  base REAL NOT NULL DEFAULT 1,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (dim, word)
+);
+CREATE TABLE IF NOT EXISTS games (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ext_id TEXT UNIQUE,
+  title TEXT NOT NULL,
+  descr TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'local',
+  score INTEGER,
+  aes INTEGER, ease INTEGER, play INTEGER,
+  revisions INTEGER NOT NULL DEFAULT 1,
+  feedback TEXT NOT NULL DEFAULT '',
+  subject TEXT NOT NULL DEFAULT '',
+  medium TEXT NOT NULL DEFAULT '',
+  gesture TEXT NOT NULL DEFAULT '',
+  structure TEXT NOT NULL DEFAULT '',
+  mood TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'mine',
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS topics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  medium TEXT NOT NULL,
+  gesture TEXT NOT NULL,
+  structure TEXT NOT NULL,
+  mood TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'drawn',
+  data TEXT NOT NULL DEFAULT '{}',
+  score REAL,
+  preview_svg TEXT,
+  brief_md TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS topics_status ON topics (status);
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_id TEXT NOT NULL DEFAULT 'admin',
+  title TEXT NOT NULL,
+  topic_id INTEGER,
+  score INTEGER,
+  result TEXT NOT NULL,
+  probe TEXT NOT NULL,
+  shots TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);

@@ -9,7 +9,8 @@ import {configStore,memberStore} from './storage';
 import type {Database} from './storage';
 import {authApi} from './auth-api';
 import {identity} from './members';
-import {guardCheckPage} from './page-access';
+import {guardCheckPage,guardForgePage,guardReviewPage} from './page-access';
+import {forgeApi} from './forge-api';
 
 interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
@@ -25,6 +26,11 @@ export default {
     if(url.pathname.startsWith('/api/auth/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`auth:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'登录操作较频繁，请稍后重试。'},429);}
       return(await authApi(request,members,env))!;
+    }
+    if(url.pathname.startsWith('/api/forge/')){
+      if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
+      const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
+      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store},route,members);
     }
     if (url.pathname === '/api/health') {const config=await store.get();return json({ ok:true,configured:!!config?.enabled&&!!config?.encryptedKey,engine:'vision-model',version:'0.2.0',maxFileMB:8,maxBatch:20 });}
     if (url.pathname === '/api/check') {
@@ -54,8 +60,10 @@ export default {
       } finally { await browser?.close().catch(() => {}); }
     }
     if (url.pathname.startsWith('/api/')) return json({ error: '接口不存在。' }, 404);
-    const redirect = await guardCheckPage(request, members, env);
+    const redirect = await guardForgePage(request, members, env) || await guardReviewPage(request, members, env) || await guardCheckPage(request, members, env);
     if (redirect) return redirect;
+    if (url.pathname === '/forge') return env.ASSETS.fetch(new Request(new URL('/forge/index.html', url), request));
+    if (url.pathname === '/review') return env.ASSETS.fetch(new Request(new URL('/review.html', url), request));
     return env.ASSETS.fetch(request);
   },
 };
