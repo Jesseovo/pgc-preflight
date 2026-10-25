@@ -26,13 +26,13 @@ describe('检查台的登录前置', () => {
       expect(response?.headers.get('Vary')).toBe('Cookie');
     }
   });
-  it('成员和管理员登录后能进入检查台，撤销的成员会话重新登录', async () => {
+  it('成员和管理员登录后进入各自工作台，撤销的成员会话重新登录', async () => {
     const store = memoryStore();
     const member = await createMember({ username: 'creator01', password: 'test-only-password' }, store);
     const token = await memberLogin('creator01', 'test-only-password', store, secrets.SETTINGS_KEY);
     expect((await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets))?.headers.get('Location')).toBe('/review');
     const admin = await login(secrets.ADMIN_PASSWORD, secrets);
-    expect(await guardCheckPage(page('/', `pgc_admin=${admin}`), store, secrets)).toBe(null);
+    expect((await guardCheckPage(page('/', `pgc_admin=${admin}`), store, secrets))?.headers.get('Location')).toBe('/forge');
     await updateMember(member.id, { enabled: false }, store);
     expect((await guardCheckPage(page('/', `pgc_member=${token}`), store, secrets))?.status).toBe(302);
   });

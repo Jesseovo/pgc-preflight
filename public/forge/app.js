@@ -576,31 +576,50 @@ async function renderReview(alive) {
     ? [await api("GET", "reviews"), []]
     : await Promise.all([api("GET", "reviews"), api("GET", "topics?status=liked,made&limit=200")]);
   if (!alive()) return;
-  view.innerHTML = `<div class="box section"><h2>模拟审核</h2>
-      <p class="muted small">提交 PGC 之前先过一遍。游戏会在三个手机比例的沙箱里自动运行 15 秒左右（看得到画面），检查报错、黑边、BGM、开始页、偷懒打法，然后连同截图和源码交给 AI，按真实审核意见的标准打分。</p>
-      <div class="locks">
-        <label class="field">游戏文件（.html）<input type="file" id="rvFile" accept=".html,.htm,text/html"></label>
-        <label class="field">游戏名<input type="text" id="rvTitle"></label>
-        <label class="field">对应的选题（可选）<select id="rvTopic"><option value="">不关联</option>${topics.map((t) => `<option value="${t.id}">${esc(t.data.title)}</option>`).join("")}</select></label>
-        <label class="field">&nbsp;<button class="primary" id="rvGo" disabled>开始审核</button></label>
+  view.innerHTML = `<section class="review-intro"><div><div class="eyebrow"><span></span>GAME CHECK, BEFORE YOU SHIP</div><h1>上传前，先过一遍<span>。</span></h1><p>把基础问题留在提交前，把时间留给好游戏。</p></div><div class="review-cat-note" aria-hidden="true">✦<br><b>AI<br>PREVIEW</b></div></section>
+    <section class="review-workspace">
+      <div class="review-upload-panel">
+        <div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>支持单个 HTML</b></div>
+        <div class="review-dropzone" id="rvDropzone">
+          <div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div>
+          <h2>把游戏拖到这里</h2>
+          <p>一次放入一个 HTML，接下来交给我们</p>
+          <button type="button" class="primary-button" id="rvChoose"><span class="review-plus">＋</span>选择游戏文件</button>
+          <input type="file" id="rvFile" accept=".html,.htm,text/html" hidden>
+          <div class="upload-meta"><span>.html / .htm</span><span>单个 ≤ 8 MB</span><span>AI 模拟审核</span></div>
+          <div class="review-file-name" id="rvFileName">还未选择文件</div>
+        </div>
+        <div class="review-fields">
+          <label class="field">游戏名<input type="text" id="rvTitle" placeholder="自动读取 HTML title"></label>
+          <label class="field">对应的选题（可选）<select id="rvTopic"><option value="">不关联</option>${topics.map((t) => `<option value="${t.id}">${esc(t.data.title)}</option>`).join("")}</select></label>
+        </div>
+        <div class="review-action-row"><span class="progress" id="rvLog"></span><button type="button" class="primary-button" id="rvGo" disabled>开始审核</button></div>
       </div>
-      <div class="progress" id="rvLog"></div>
-      <div class="phones" id="rvPhones"></div>
-      <div id="rvChecks"></div>
-    </div>
+      <aside class="review-scope-panel"><div class="section-label"><span><i class="step-number">02</i>我们会检查</span><span class="small-tag">BASIC</span></div>
+        <div class="scope-items"><div class="scope-item"><div class="scope-icon">▣</div><div><h3>打开与加载</h3><p>白屏、缺失资源、加载异常</p></div></div><div class="scope-item"><div class="scope-icon">⌁</div><div><h3>开始与操作</h3><p>能否进入，输入是否有响应</p></div></div><div class="scope-item"><div class="scope-icon">▯</div><div><h3>手机显示</h3><p>关键文字、按钮是否明显出界</p></div></div><div class="scope-item"><div class="scope-icon">↻</div><div><h3>基础流程</h3><p>是否能到达结算与重试</p></div></div></div>
+        <div class="human-note"><span class="review-human-icon">♧</span><p><b>手感、美感、好不好玩</b><br>留给人工审核判断</p></div>
+      </aside>
+    </section>
+    <section class="review-live" id="rvLive"><div class="progress" id="rvLiveHint">上传 HTML 后，体检结果会显示在这里。</div><div class="phones" id="rvPhones"></div><div id="rvChecks"></div></section>
     <div id="rvResult"></div>
-    <div class="box section"><h3>审核记录</h3>
+    <section class="review-history"><div class="results-heading"><div><h2>审核记录 <span>${history.length}</span></h2><p>点击一条记录查看完整报告</p></div></div>
       ${history.length ? `<table><tbody>${history.map((h) => `<tr data-rid="${h.id}" style="cursor:pointer"><td><b>${esc(h.title)}</b></td><td>${esc(h.score)}/9</td><td><span class="pill ${h.score >= 7 ? "approved" : "rejected"}">${esc(h.verdict)}</span></td><td class="small muted">${esc(String(h.created_at).slice(0, 16).replace("T", " "))}</td></tr>`).join("")}</tbody></table>` : `<p class="muted small">还没有记录。</p>`}
-    </div>`;
+    </section>`;
   let html = "";
-  $("#rvFile").onchange = async (e) => {
-    const file = e.target.files[0];
+  const acceptFile = async (file) => {
     if (!file) return;
     html = await file.text();
     const t = /<title>([^<]*)<\/title>/i.exec(html);
     $("#rvTitle").value = (t && t[1].trim()) || file.name.replace(/\.html?$/i, "");
+    $("#rvFileName").textContent = file.name;
+    $("#rvDropzone").classList.add("has-file");
     $("#rvGo").disabled = false;
   };
+  $("#rvChoose").onclick = () => $("#rvFile").click();
+  $("#rvFile").onchange = async (e) => acceptFile(e.target.files[0]);
+  $("#rvDropzone").ondragover = (e) => { e.preventDefault(); $("#rvDropzone").classList.add("drag-over"); };
+  $("#rvDropzone").ondragleave = () => $("#rvDropzone").classList.remove("drag-over");
+  $("#rvDropzone").ondrop = async (e) => { e.preventDefault(); $("#rvDropzone").classList.remove("drag-over"); await acceptFile(e.dataTransfer.files[0]); };
   const showResult = (r) => {
     $("#rvResult").innerHTML = reviewHtml(r);
     $("#rvResult [data-copy-fix]").onclick = () => copyText(r.result.fix_prompt);

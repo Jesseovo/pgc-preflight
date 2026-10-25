@@ -11,14 +11,14 @@
 - Uploaded HTML is untrusted. Keep it in a separate browser context, restrict navigation and outbound resources, close browsers in finally, and never run it in the app origin.
 - `/admin` manages the OpenAI-compatible Chat Completions endpoint, model ID, enabled state and encrypted API key. Never echo keys in responses or logs. Model must support images.
 - `/admin` also creates member accounts, resets passwords, enables/disables accounts and grants/revokes `canReview`. `/login` is for members. `/api/check` must validate session and current review permission on the server. Role changes, account disablement and password resets revoke old sessions.
-- Opening `/` or `/index.html` without a valid session redirects to `/login` before the workspace renders. Keep public and member views free of links to `/admin`; the administrator can visit that path directly.
+- Opening `/` or `/index.html` without a valid session redirects to `/login` before any workspace renders. An administrator is routed to `/forge`, and a member is routed to `/review`; the old root upload view is no longer a user-facing entry. Keep public and member views free of links to `/admin`; the administrator can visit that path directly.
 - Visual direction follows Jesseovo's GitHub profile: white surfaces, fine borders, muted sage accents, compact layouts and the original pixel cat. Avoid garden backgrounds and oversized decorative cards. Profile artwork is copied into `public/artwork/`.
 - Keep uploads, screenshots and reports ephemeral. Never commit real team game files or internal research data.
 
 ## PGC Forge integration
 
 - `/forge` and `/review` are the migrated PGC Forge workflow. Their backend behavior, prompts, weighting, topic library, work library, brief generation and AI simulation review follow `C:\Users\Administrator\Desktop\05 Riffle\pgc-forge`.
-- The root PGC Preflight workspace keeps its basic preflight contract. Members only receive the Forge AI simulation review surface; administrators receive the complete Forge workbench.
+- The legacy root PGC Preflight API remains available only for compatibility. Members only receive the Forge AI simulation review surface; administrators receive the complete Forge workbench.
 - The Forge surface uses the existing PGC Preflight visual language: white surfaces, fine borders, muted sage accents, compact layouts and the pixel cat artwork.
 
 ## Development

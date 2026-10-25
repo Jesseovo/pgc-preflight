@@ -8,7 +8,7 @@ export async function guardCheckPage(request: Request, members: MemberStore, sec
   if (!['/', '/index.html'].includes(pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
   const user = await identity(request.headers.get('Cookie'), members, secrets);
   if (user?.role === 'member') return new Response(null, { status: 302, headers: { Location: '/review', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
-  if (user) return null;
+  if (user?.role === 'admin') return new Response(null, { status: 302, headers: { Location: '/forge', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
   return new Response(null, { status: 302, headers: { Location: '/login', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
 }
 
