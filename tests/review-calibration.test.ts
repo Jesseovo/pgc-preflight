@@ -34,6 +34,14 @@ describe('审核提示词',()=>{
   it('列出刚好通过的样本',()=>{
     expect(text).toMatch(/【校准样本：刚好通过（7 分）】\n- Line/);
   });
+  it('区分画面证据、源码推断和未完成的测试，不把音频计数当成听感',()=>{
+    expect(text).toContain('captureMethod=browser-viewport-v1');
+    expect(text).toContain('不得仅凭这些数字断言缺 BGM');
+    expect(text).toContain('不能把未测到本身当成扣分理由');
+    expect(text).toContain('没有 GAME 接口不算游戏缺陷');
+    expect(text).toContain('不得为了贴合分布而调分');
+    expect(text).not.toContain('机器人存活到上限时间，说明');
+  });
 });
 
 describe('结论与总分一致',()=>{

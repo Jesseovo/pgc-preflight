@@ -6,6 +6,7 @@ import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "
 import { complete, providerStatus, activeModel, routedModel, LLMError } from "./forge-llm";
 import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob } from './review-jobs';
+import { reviewReportErrors } from './review-report';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
 import {
@@ -45,6 +46,7 @@ export interface ForgeEnv {
   modelStore: ConfigStore;
   FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
   REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
+  captureReview?: (html: string) => Promise<unknown>;
 }
 
 export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'review'; id: string };
@@ -101,6 +103,11 @@ function attachment(content, type, topic, suffix) {
 
 async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
+  if (a === 'review' && b === 'probe' && !c && method === 'POST') {
+    const input = await readReviewBody(request);
+    if (!env.captureReview) throw new HttpError(503, '浏览器采集服务尚未启用。');
+    return env.captureReview(input.html);
+  }
   if (a === 'review' && b === 'jobs') {
     if (method === 'GET' && !c) return listReviewJobs(env, ownerId);
     if (method === 'GET' && c) return getReviewJob(env, c, ownerId);
@@ -616,24 +623,23 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   }
   const parts = [];
   for (const s of images) parts.push({ type: "text", text: `截图：${s.label}` }, { type: "image", data: s.data });
-  // DeepSeek's context and output limits are smaller than Claude's.
+  // Keep the source bounded; thinking and report tokens share an output budget.
   const smallModel = /deepseek/i.test(routedModel(await env.modelStore.get(), 'review'));
-  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【自动体检报告】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
+  const captureNote = probe?.captureMethod === 'browser-viewport-v1'
+    ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
+    : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
+  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
   const result = await complete(env, cfg, {
     system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives }),
     user: parts,
     schema: REVIEW_SCHEMA,
+    validate: reviewReportErrors,
     purpose: 'review',
-    maxTokens: smallModel ? 8192 : 16000,
+    maxTokens: smallModel ? 24000 : 16000,
     timeoutMs: 300000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
     onWait: jobId ? message => run(env, "UPDATE review_jobs SET error = ? WHERE id = ? AND status = 'running'", message, jobId) : undefined,
   });
-  if (!result || !['aes', 'ease', 'play'].every(k => Number.isInteger(result[k]) && result[k] >= 1 && result[k] <= 3)
-    || !Array.isArray(result.issues) || typeof result.reviewer_comment !== 'string' || typeof result.fix_prompt !== 'string') {
-    throw new LLMError('模型没有返回完整评分与报告，请重试。', 502);
-  }
-  for (const k of ["aes", "ease", "play"]) result[k] = Math.max(1, Math.min(3, Number(result[k]) || 1));
   const score = result.aes + result.ease + result.play;
   result.verdict = consistentVerdict(result.verdict, score);
   const r = await run(env, "INSERT OR IGNORE INTO reviews (owner_id, title, topic_id, score, result, probe, shots, created_at, job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

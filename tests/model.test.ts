@@ -91,4 +91,34 @@ describe('模型传输',()=>{
     ])).resolves.toBe('READY');
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({'Idempotency-Key':'expand-42','Accept':'text/event-stream'});
   });
+
+  it('DeepSeek流式读取思考与正文，只有报告正文返回给调用方',async()=>{
+    const fetchMock=vi.fn(async(_input:unknown,init?:RequestInit)=>{
+      expect(JSON.parse(String(init?.body))).toMatchObject({stream:true,max_tokens:24000,reasoning_effort:'low',response_format:{type:'json_object'}});
+      return new Response([
+        ': keep-alive\n\n',
+        'data: {"choices":[{"delta":{"reasoning_content":"private reasoning"}}]}\r\n\r\n',
+        'data: {"choices":[{"delta":{"content":"{\\"aes\\":3}"}}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),{headers:{'Content-Type':'text/event-stream'}});
+    });
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(modelTransport({...config,baseUrl:'https://api.deepseek.com',model:'deepseek-flash'},{maxTokens:24000,json:true,reasoningEffort:'low'})([])).resolves.toBe('{"aes":3}');
+  });
+
+  it('OpenAI长度截断不被误报为空内容，也不把思考过程当成报告',async()=>{
+    vi.stubGlobal('fetch',vi.fn(async()=>Response.json({choices:[{finish_reason:'length',message:{content:'',reasoning_content:'private reasoning'}}]})));
+    await expect(modelTransport(config)([])).rejects.toMatchObject({kind:'truncated'});
+    vi.stubGlobal('fetch',vi.fn(async()=>Response.json({choices:[{finish_reason:'stop',message:{content:null,reasoning_content:'private reasoning'}}]})));
+    await expect(modelTransport(config)([])).rejects.toThrow('没有生成报告正文');
+  });
+
+  it('OpenAI流即使包含可解析JSON，缺少正常结束标记也不能当成完整报告',async()=>{
+    const stream=(tail:string)=>new Response(`data: {"choices":[{"delta":{"content":"{}"}}]}\n\n${tail}`,{headers:{'Content-Type':'text/event-stream'}});
+    vi.stubGlobal('fetch',vi.fn(async()=>stream('')));
+    await expect(modelTransport(config)([])).rejects.toMatchObject({kind:'incomplete'});
+    vi.stubGlobal('fetch',vi.fn(async()=>stream('data: {"choices":[{"finish_reason":"length"}]}\n\ndata: [DONE]\n\n')));
+    await expect(modelTransport(config)([])).rejects.toMatchObject({kind:'truncated'});
+  });
 });

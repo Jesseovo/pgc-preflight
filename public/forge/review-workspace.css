@@ -118,6 +118,17 @@
 .rr-comment p { margin: 9px 0 0; font-size: 13px; line-height: 1.95; color: #5d6e54; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rr-comment small { display: block; color: #99a68e; margin-top: 9px; font-size: 10px; }
 .rr-strengths { padding: 0 27px 22px; }
+.rr-reasons, .rr-uncertainties { margin: 0 27px 22px; font-size: 12px; line-height: 1.85; overflow-wrap: anywhere; }
+.rr-reasons h3, .rr-uncertainties h3 { font-size: 13px; font-weight: 600; margin: 0 0 10px; color: #50624f; }
+.rr-reasons dl { margin: 0; }
+.rr-reasons dl > div { padding: 12px 0; border-bottom: 1px solid #edf0e9; }
+.rr-reasons dt { display: flex; justify-content: space-between; gap: 12px; color: #536b51; font-weight: 600; }
+.rr-reasons dt b { white-space: nowrap; font-size: 11px; font-weight: 500; }
+.rr-reasons dd { margin: 5px 0 0; color: #63705e; white-space: pre-wrap; }
+.rr-uncertainties { padding-top: 15px; border-top: 1px dashed #d8dfd0; color: #7c7054; }
+.rr-uncertainties ul { margin: 0; padding-left: 18px; }
+.rr-uncertainties li + li { margin-top: 7px; }
+.rr-legacy-note { margin: 0 27px 22px; font-size: 12px; line-height: 1.8; color: #7c7054; }
 .rr-strengths h3 { font-size: 11px; font-weight: 500; color: #809372; }
 .rr-strengths ul { display: flex; flex-wrap: wrap; gap: 7px 16px; padding: 0; margin: 9px 0 0; list-style: none; }
 .rr-strengths li { display: flex; gap: 5px; color: #7d8f6e; font-size: 11px; line-height: 1.7; }
@@ -187,7 +198,7 @@
 @media (max-width: 900px) {
   .rv-results-grid { grid-template-columns: 205px minmax(0, 1fr); gap: 14px; }
   .rr-header { padding: 22px 20px; }
-  .rr-scores, .rr-comment, .rr-issues, .rr-agent, .rr-diagnostics { margin-left: 20px; margin-right: 20px; }
+  .rr-scores, .rr-comment, .rr-issues, .rr-agent, .rr-diagnostics, .rr-reasons, .rr-uncertainties, .rr-legacy-note { margin-left: 20px; margin-right: 20px; }
   .rr-evidence, .rr-strengths { padding-left: 20px; padding-right: 20px; }
   .rv-job-info > b, .rv-job-info > small { max-width: 128px; }
   .rr-score-value { gap: 4px; }
@@ -230,7 +241,7 @@
   .rr-header h2 { font-size: 23px; }
   .rr-total strong { font-size: 45px; }
   .rr-header { padding: 20px 17px; gap: 14px; }
-  .rr-scores, .rr-comment, .rr-issues, .rr-agent, .rr-diagnostics { margin-left: 17px; margin-right: 17px; }
+  .rr-scores, .rr-comment, .rr-issues, .rr-agent, .rr-diagnostics, .rr-reasons, .rr-uncertainties, .rr-legacy-note { margin-left: 17px; margin-right: 17px; }
   .rr-strengths, .rr-evidence { padding-left: 17px; padding-right: 17px; }
   .rr-scores > section { padding: 0 11px; }
   .rr-score-label > i { display: none; }

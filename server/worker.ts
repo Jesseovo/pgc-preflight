@@ -12,6 +12,7 @@ import {identity} from './members';
 import {guardCheckPage,guardForgePage,guardReviewPage} from './page-access';
 import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
 import {purgeReviewInputs} from './review-jobs';
+import {captureReview} from './review-probe';
 
 interface QueueMessage<T> { body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
@@ -34,7 +35,16 @@ export default {
     if(url.pathname.startsWith('/api/forge/')){
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
-      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE,REVIEW_QUEUE:env.REVIEW_QUEUE},route,members,ctx);
+      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE,REVIEW_QUEUE:env.REVIEW_QUEUE,
+        captureReview: async html => {
+          let browser;
+          try { browser = await puppeteer.launch(env.BROWSER); return await captureReview(browser as unknown as Browser, html); }
+          catch (error) {
+            if (/429|quota|concurrent|too many/i.test(String(error))) throw Object.assign(new Error('浏览器采集服务繁忙，请稍后重试；本次没有评分。'), { status: 429 });
+            throw error;
+          } finally { await browser?.close().catch(() => {}); }
+        },
+      },route,members,ctx);
     }
     if (url.pathname === '/api/health') {const config=await store.get();return json({ ok:true,configured:!!config?.enabled&&!!config?.encryptedKey,engine:'vision-model',version:'0.2.0',maxFileMB:8,maxBatch:20 });}
     if (url.pathname === '/api/check') {

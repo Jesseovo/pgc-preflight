@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import type { Plugin } from 'vite';
 import { findChrome, launchLocalBrowser } from './server/local-browser';
 import { inspectGame } from './server/checker';
+import { captureReview } from './server/review-probe';
 import { MAX_REQUEST_BYTES, validateInput } from './server/policy';
 import { readFile, writeFile } from 'node:fs/promises';
 import { adminApi } from './server/admin-api';
@@ -43,7 +44,8 @@ function localCheckApi(): Plugin {
           }catch(error){send({error:error instanceof Error?error.message:'操作失败。'},400);return;}
         }
         if (request.url === '/health') { const config=await store.get();send({ok:!!findChrome(),configured:!!config?.enabled&&!!config?.encryptedKey,engine:'vision-model',version:'0.2.0'});return; }
-        if (request.url !== '/check') { next(); return; }
+        const isReviewProbe = request.url === '/forge/review/probe';
+        if (request.url !== '/check' && !isReviewProbe) { next(); return; }
         if (request.method !== 'POST') { send({ error: '请使用 POST 提交游戏。' }, 405); return; }
         const user=await identity(request.headers.cookie||null,members,await secrets());
         if(!user){send({error:'请先使用管理员开通的账号登录。'},401);return;}
@@ -52,10 +54,14 @@ function localCheckApi(): Plugin {
         try {
           const chunks: Buffer[] = []; let size = 0;
           for await (const chunk of request) { size += chunk.length; if (size > MAX_REQUEST_BYTES) throw new Error('请求内容过大。'); chunks.push(chunk); }
-          input = validateInput(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+          const data = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+          input = validateInput(isReviewProbe ? { ...data, filename: 'review-probe.html' } : data);
         } catch (error) { send({ error: error instanceof Error ? error.message : '文件格式错误。' }, 400); return; }
         let browser;
-        try { const model=await resolveModel(await store.get(),(await secrets()).SETTINGS_KEY);if(!model){send({error:'管理员尚未配置审核模型，请先前往 /admin 配置。'},503);return;} browser = await launchLocalBrowser(); send(await inspectGame(browser, input,modelTransport(model))); }
+        try {
+          if (isReviewProbe) { browser = await launchLocalBrowser(); send(await captureReview(browser, input.html)); return; }
+          const model=await resolveModel(await store.get(),(await secrets()).SETTINGS_KEY);if(!model){send({error:'管理员尚未配置审核模型，请先前往 /admin 配置。'},503);return;} browser = await launchLocalBrowser(); send(await inspectGame(browser, input,modelTransport(model)));
+        }
         catch (error) { send({ error: `本地检查环境不可用：${error instanceof Error ? error.message : error}` }, 503); }
         finally { await browser?.close().catch(() => {}); }
       });

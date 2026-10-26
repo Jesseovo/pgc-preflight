@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { launchLocalBrowser } from '../server/local-browser';
+import { captureReview } from '../server/review-probe';
 
 // UI transport tests use synthetic model reports. The real probe is checked
 // separately below; this does not claim to measure a model's review accuracy.
@@ -15,6 +16,10 @@ const server = createServer(async (request, response) => {
   const url = new URL(request.url!, 'http://localhost');
   const json = (data: unknown, status = 200) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(data)); };
   try {
+    if (url.pathname === '/api/forge/review/probe' && request.method === 'POST') {
+      let body = ''; for await (const chunk of request) body += chunk;
+      return json(await captureReview(browser, JSON.parse(body).html));
+    }
     if (url.pathname === '/api/forge/reviews') return json([...reports.values()]);
     if (/^\/api\/forge\/reviews\/\d+$/.test(url.pathname)) return json(reports.get(Number(url.pathname.split('/').at(-1))));
     if (url.pathname === '/api/forge/review/jobs' && request.method === 'GET') return json([...tasks.values()]);
@@ -27,7 +32,11 @@ const server = createServer(async (request, response) => {
       setTimeout(() => {
         active--;
         if (input.title === 'Retry me' && !failOnce.has(input.title)) { failOnce.add(input.title); job.status = 'error'; job.error = '合成模型超时，请重试'; }
-        else { const report = fixture(input.title); report.probe = input.probe; report.shots = input.shots; reports.set(report.id, report); job.status = 'done'; job.result_id = report.id as any; }
+        else {
+          const report = fixture(input.title);
+          Object.assign(report.result, { score_reasons: { aes: '截图中视觉层级清楚，但反馈区分不足。', ease: '从源码推断触摸规则清楚，实际手感待确认。', play: '源码中挑战重复，长期节奏需要人工试玩确认。' }, uncertainties: ['未实际听音频，请人工确认背景音乐与音效。', '未完成完整试玩，请人工确认手感与长期节奏。'] });
+          report.probe = input.probe; report.shots = input.shots; reports.set(report.id, report); job.status = 'done'; job.result_id = report.id as any;
+        }
       }, 1000);
       return json(job, 202);
     }
@@ -88,6 +97,8 @@ try {
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 4', { timeout: 12000 });
   assert.equal(await page.evaluate('window.probeCount'), 4, 'Retry reuses collected evidence');
   await page.click('[data-select]');
+  assert.match(await page.$eval('.rr-reasons', el => el.textContent!), /为什么是这个分数.*实际手感待确认/s);
+  assert.match(await page.$eval('.rr-uncertainties', el => el.textContent!), /未实际听音频/);
   await page.click('[data-copy-fix]');
   assert.match(String(await page.evaluate('window.copied[0]')), /每 15 秒/);
   await page.evaluate(() => scrollTo(0, 0));
@@ -155,5 +166,6 @@ try {
   await real.evaluate(() => scrollTo(0, 0));
   await real.screenshot({ path: 'artifacts/review-real-probe.png', fullPage: true });
   assert.deepEqual(runtimeErrors, []);
-  console.log('PASS 真实上传入口 + 三种比例沙盒运行 + 4 张实际截图 + 后台报告 + 采集结束释放游戏 iframe。');
+  assert.equal(latest.probe.captureMethod, 'browser-viewport-v1');
+  console.log('PASS 真实上传入口 + 三种比例独立浏览器页面 + 4 张完整视口截图 + 后台报告。');
 } finally { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve())); }

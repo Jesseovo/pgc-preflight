@@ -40,11 +40,17 @@ function anthropicText(data: any) {
 export class ModelHttpError extends Error {
   constructor(message: string, public upstreamStatus: number, public retryMs?: number, public code = '') { super(message); }
 }
+export class ModelOutputError extends Error {
+  constructor(message: string, public kind: 'empty' | 'truncated' | 'incomplete' | 'format') { super(message); }
+}
+function redact(message: string, apiKey: string) {
+  return message.replaceAll(apiKey, '[REDACTED]').replace(/sk-[\w-]+/g, '[REDACTED]').slice(0, 300);
+}
 async function upstreamError(response: Response, apiKey: string): Promise<ModelHttpError> {
   let detail: any = {};
   try { detail = await response.json(); } catch {}
   const code = String(detail?.error?.code || detail?.error?.type || '');
-  const raw = String(detail?.error?.message || '').replaceAll(apiKey, '[REDACTED]').replace(/sk-[\w-]+/g, '[REDACTED]').slice(0, 300);
+  const raw = redact(String(detail?.error?.message || ''), apiKey);
   const wait = retryAfterMs(response.headers.get('retry-after'));
   return new ModelHttpError(response.status === 429
     ? `模型接口限流（429）${raw ? `：${raw}` : '，请求过多，请等待后重试。'}`
@@ -53,11 +59,12 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
     : `模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`, response.status, wait, code);
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; json?: boolean; reasoningEffort?: 'low' } = {}): ModelTransport {
   const throttle = createModelThrottle(options.DB, config);
   return async messages => {
     const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), 24000);
     const anthropic = config.protocol === 'anthropic';
+    const deepseek = !anthropic && new URL(config.baseUrl).hostname === 'api.deepseek.com';
     const controller = new AbortController();
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const totalMs = options.totalTimeoutMs || Math.max(300000, (options.timeoutMs || 90000) * 2);
@@ -73,35 +80,53 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       touch();
       const headers: Record<string, string> = anthropic
         ? {'Content-Type':'application/json','Accept':'text/event-stream','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
-        : {'Content-Type':'application/json',Authorization:`Bearer ${config.apiKey}`};
+        : {'Content-Type':'application/json', ...(deepseek ? { Accept: 'text/event-stream' } : {}), Authorization:`Bearer ${config.apiKey}`};
       if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
       const response = await fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST', headers,
-        body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens) } : {model:config.model,messages,max_tokens:maxTokens,stream:false}),
+        body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens) } : {
+          model:config.model,messages,max_tokens:maxTokens,stream:deepseek,
+          ...(deepseek && options.json ? { response_format: { type: 'json_object' } } : {}),
+          ...(deepseek && options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
+        }),
         signal:controller.signal, redirect:'manual',
       });
       if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
       if (!response.ok) throw await upstreamError(response, config.apiKey);
       const contentType = response.headers.get('content-type') || '';
-      if (anthropic && contentType.includes('text/event-stream') && response.body) {
+      if (contentType.includes('text/event-stream') && response.body) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
         let content = '';
         let truncated = false;
+        let ended = false;
+        let thinking = false;
         const event = (line: string) => {
           if (!line.startsWith('data:')) return false;
           const payload = line.slice(5).trim();
-          if (!payload || payload === '[DONE]') return false;
+          if (payload === '[DONE]') { ended = true; return false; }
+          if (!payload) return false;
           let data: any;
           try { data = JSON.parse(payload); } catch { return false; }
-          if (data.type === 'error') {
-            const busy = /rate_limit|overloaded/.test(String(data.error?.type));
-            throw new ModelHttpError(busy ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。' : '模型流式生成被接口中断，请重试。', busy ? 429 : 502, undefined, String(data.error?.type || ''));
+          if (data.type === 'error' || data.error) {
+            const code = String(data.error?.code || data.error?.type || '');
+            const busy = /rate_limit|overloaded/i.test(code);
+            const detail = redact(String(data.error?.message || ''), config.apiKey);
+            throw new ModelHttpError((busy ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。' : '模型流式生成被接口中断，请重试。') + (detail ? ` ${detail}` : ''), busy ? 429 : 502, undefined, code);
           }
+          if (!anthropic) {
+            const choice = data.choices?.[0];
+            if (choice?.finish_reason === 'length') truncated = true;
+            if (typeof choice?.delta?.content === 'string') content += choice.delta.content;
+            if (choice?.delta?.reasoning_content) thinking = true;
+            return Boolean(choice?.delta?.content || choice?.delta?.reasoning_content);
+          }
+          if (data.type === 'message_stop') ended = true;
           if (data.type === 'message_delta' && data.delta?.stop_reason === 'max_tokens') truncated = true;
           if (data.type !== 'content_block_delta') return false;
           if (data.delta?.type === 'text_delta') content += String(data.delta.text || '');
+          if (data.delta?.type === 'thinking_delta') thinking = true;
           return ['text_delta','thinking_delta','signature_delta'].includes(data.delta?.type);
         };
         try {
@@ -118,13 +143,15 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           if (buffer.trim()) event(buffer);
         } catch (error) { await reader.cancel().catch(() => {}); throw error; }
         finally { reader.releaseLock(); }
-        if (truncated) throw new Error('模型输出达到长度上限，内容不完整，请减少单批选题数量后重试。');
-        if (content) return content;
-        throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Anthropic Messages。');
+        if (truncated) throw new ModelOutputError(`模型${thinking ? '思考与报告' : '输出'}达到长度上限，内容不完整。`, 'truncated');
+        if (!ended) throw new ModelOutputError('模型连接提前结束，报告尚未完整接收，请重试。', 'incomplete');
+        if (content.trim()) return content;
+        throw new ModelOutputError(thinking ? '模型只返回了思考过程，没有生成报告正文。' : `模型没有返回可读的审核内容，请确认接口兼容 ${anthropic ? 'Anthropic Messages' : 'Chat Completions'}。`, 'empty');
       }
-      const data = await response.json() as {choices?:{message?:{content?:string}}[];content?:{type?:string;text?:string}[]};
+      const data = await response.json() as {choices?:{finish_reason?:string;message?:{content?:string;reasoning_content?:string}}[];stop_reason?:string;content?:{type?:string;text?:string}[]};
+      if (data.stop_reason === 'max_tokens' || data.choices?.[0]?.finish_reason === 'length') throw new ModelOutputError('模型思考与报告达到长度上限，内容不完整。', 'truncated');
       const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
-      if (!content) throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。');
+      if (typeof content !== 'string' || !content.trim()) throw new ModelOutputError(data.choices?.[0]?.message?.reasoning_content ? '模型只返回了思考过程，没有生成报告正文。' : '模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。', 'empty');
       return content;
     };
     try {

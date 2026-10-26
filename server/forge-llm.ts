@@ -1,6 +1,6 @@
 import { activeModelProfile, decryptKey } from './settings';
 import type { ModelConfig, ModelPurpose } from './settings';
-import { modelTransport } from './model';
+import { modelTransport, ModelOutputError } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
 
 export class LLMError extends Error {
@@ -50,7 +50,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError(req.purpose === 'review' ? '管理员尚未配置并启用审核模型。' : '管理员尚未配置并启用创作模型。', 503);
@@ -60,37 +60,49 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }
   try {
     const messages = toMessages(req.system, req.user, req.schema) as any;
-    const idempotencyKey = await keyedRequestId(req.idempotencyKey, messages);
+    let retryHint = '';
+    let maxTokens = req.maxTokens;
     let lastError: unknown;
     let freshRequest = false;
     // Only explicitly pending idempotent requests are retried by transport.
-    // Other gateway conflicts must preserve their exact cause. Parse failures
-    // get a fresh key so a non-JSON response is regenerated instead of replayed.
+    // Other gateway conflicts must preserve their exact cause. Completed but
+    // unusable outputs get a fresh key and format feedback for regeneration.
     const attempts = req.idempotencyKey ? 3 : 1;
     // A Queue consumer has a finite wall-clock lifetime. Leave time to persist
     // an actionable error rather than being killed during the final retry.
     const deadline = Date.now() + 12 * 60 * 1000;
     for (let attempt = 0; attempt < attempts; attempt++) {
+      const attemptMessages = retryHint ? [...messages, { role: 'user', content: retryHint }] : messages;
+      const idempotencyKey = await keyedRequestId(req.idempotencyKey, attemptMessages);
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
       const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, {
-        DB: env.DB, maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
+        DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
+        json: Boolean(req.schema), reasoningEffort: req.purpose === 'review' ? 'low' : undefined,
         onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
       try {
-        const text = await transport(messages);
+        const text = await transport(attemptMessages);
         if (!req.schema) return text;
-        return parseJson(text);
+        const value = parseJson(text);
+        const errors = req.validate?.(value) || [];
+        if (errors.length) throw new ModelOutputError(`模型评分报告字段不完整或格式错误：${errors.join('、')}。`, 'format');
+        return value;
       } catch (error) {
         lastError = error;
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = /模型返回的不是合法 JSON/.test(message);
-        const emptyResponse = /模型没有返回可读的审核内容/.test(message);
+        const outputFailure = error instanceof ModelOutputError && error.kind !== 'incomplete';
         // HTTP 429 and explicitly pending 409 requests are retried by transport.
         // A second retry loop would multiply requests and hit the key again.
         const busy = /返回 503/.test(message);
-        if (attempt + 1 >= attempts || Date.now() >= deadline || (!parseFailure && !emptyResponse && !busy)) throw error;
-        if (parseFailure || emptyResponse) freshRequest = true;
-        await new Promise(resolve => setTimeout(resolve, parseFailure || emptyResponse ? 1200 : 5000 * (attempt + 1)));
+        if (attempt + 1 >= attempts || deadline - Date.now() < 30000 || (!parseFailure && !outputFailure && !busy)) throw error;
+        if (parseFailure || outputFailure) {
+          freshRequest = true;
+          retryHint = `上次生成未能交付完整报告：${message} 请根据原始材料重新生成完整 JSON 对象，严格使用给定字段和类型，内容简洁，保留所有必需字段；不要输出思考过程、Markdown 或解释。不得编造分数或证据。`;
+          if (error instanceof ModelOutputError && error.kind === 'truncated') maxTokens = Math.min(24000, (maxTokens || 2200) * 2);
+          await req.onWait?.(`模型报告未完整生成，正在重新生成（${attempt + 2}/${attempts}）。`);
+        } else await req.onWait?.('模型接口暂不可用，正在等待恢复。');
+        await new Promise(resolve => setTimeout(resolve, parseFailure || outputFailure ? 1200 : 5000 * (attempt + 1)));
       }
     }
     throw lastError instanceof Error ? lastError : new Error('模型调用失败。');
