@@ -3,8 +3,8 @@
 ## Product contract
 
 - A website for batch preflight checks of single-file HTML games; target domain `pgc.ovoxin.top`.
-- Only check basic loading, obvious runtime faults, input response, obvious mobile layout defects, and reachable restart flows.
-- Never score aesthetics, control feel, fun, balance, originality, or platform acceptance. Human reviewers own these judgments.
+- The legacy root preflight API checks basic loading, obvious runtime faults, input response, obvious mobile layout defects, and reachable restart flows.
+- The current Forge AI simulation review follows the migrated PGC Forge contract: the model scores aesthetics, ease of play and playability from 1–3 each, uses the platform calibration set, and writes evidence-backed fixes. This is a simulation score, not the final human decision.
 - All game-review findings and verdicts come from the configured vision model. Code only validates uploads, runs the browser, gathers evidence, executes bounded model actions and validates report format. Never add rule-based game judgments as a fallback.
 - A check that could not be verified is `review`, never an automatic pass or failure. If no model is configured, refuse to start review rather than generate a report.
 - Do not treat screenshot changes in an animated game as proof that input worked.

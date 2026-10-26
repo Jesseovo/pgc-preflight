@@ -677,7 +677,7 @@ async function renderReview(alive) {
     ? [await api("GET", "reviews"), []]
     : await Promise.all([api("GET", "reviews"), api("GET", "topics?status=liked,made&limit=200")]);
   if (!alive()) return;
-  view.innerHTML = `<section class="review-intro"><div><div class="eyebrow"><span></span>GAME CHECK, BEFORE YOU SHIP</div><h1>上传前，先过一遍<span>。</span></h1><p>把基础问题留在提交前，把时间留给好游戏。</p></div><div class="review-cat-note" aria-hidden="true">✦<br><b>AI<br>PREVIEW</b></div></section>
+  view.innerHTML = `<section class="review-intro"><div><div class="eyebrow"><span></span>PGC AI SIMULATION REVIEW</div><h1>上传前，先模拟一次<span>。</span></h1><p>AI 按真实审核标准体验游戏，给出美学、易玩性、可玩性评分和修改建议。</p></div><div class="review-cat-note" aria-hidden="true">✦<br><b>AI<br>SCORE</b></div></section>
     <section class="review-workspace">
       <div class="review-upload-panel">
         <div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>支持单个 HTML</b></div>
@@ -698,7 +698,7 @@ async function renderReview(alive) {
       </div>
       <aside class="review-scope-panel"><div class="section-label"><span><i class="step-number">02</i>我们会检查</span><span class="small-tag">BASIC</span></div>
         <div class="scope-items"><div class="scope-item"><div class="scope-icon">▣</div><div><h3>打开与加载</h3><p>白屏、缺失资源、加载异常</p></div></div><div class="scope-item"><div class="scope-icon">⌁</div><div><h3>开始与操作</h3><p>能否进入，输入是否有响应</p></div></div><div class="scope-item"><div class="scope-icon">▯</div><div><h3>手机显示</h3><p>关键文字、按钮是否明显出界</p></div></div><div class="scope-item"><div class="scope-icon">↻</div><div><h3>基础流程</h3><p>是否能到达结算与重试</p></div></div></div>
-        <div class="human-note"><span class="review-human-icon">♧</span><p><b>手感、美感、好不好玩</b><br>留给人工审核判断</p></div>
+        <div class="human-note"><span class="review-human-icon">♧</span><p><b>AI 模拟评分</b><br>美学 · 易玩性 · 可玩性，各 1–3 分；总分 ≥ 7 通过</p></div>
       </aside>
     </section>
     <section class="review-live" id="rvLive"><div class="progress" id="rvLiveHint">上传 HTML 后，体检结果会显示在这里。</div><div class="phones" id="rvPhones"></div><div id="rvChecks"></div></section>
