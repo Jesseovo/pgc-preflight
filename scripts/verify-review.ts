@@ -81,7 +81,10 @@ try {
   await page.click('#rvGo');
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 3 && document.querySelectorAll(".rv-job-status.error").length === 1', { timeout: 20000 });
   assert.equal(peak, 3, 'AI jobs must overlap, limited to 3');
-  await page.click('[data-retry]');
+  await page.waitForSelector('.pgc-task[data-task-state="error"]');
+  assert.match(await page.$eval('.pgc-task[data-task-state="error"]', el => el.textContent!), /审核未完成.*重试审核/s);
+  assert.equal(await page.$('.pgc-task[data-task-state="error"] [data-progress-since]'), null, 'Failed tasks must stop their elapsed clock');
+  await page.click('.pgc-task[data-task-state="error"] button');
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 4', { timeout: 12000 });
   assert.equal(await page.evaluate('window.probeCount'), 4, 'Retry reuses collected evidence');
   await page.click('[data-select]');
@@ -99,6 +102,26 @@ try {
   assert.deepEqual(errors, []);
   console.log('PASS 页面任意位置拖入多文件、无效格式提示、3 路并发、逐项失败重试、复用截图、复制修改指令、手机布局。');
 
+  const recoveryId = crypto.randomUUID();
+  tasks.set(recoveryId, { id: recoveryId, title: 'Recovered failure', status: 'error', error: '模型接口返回 409。请在管理页检查模型配置、额度和图片输入支持。', result_id: null, created_at: new Date(Date.now() - 900000).toISOString(), updated_at: new Date(Date.now() - 60000).toISOString() });
+  const recovery = await browser.newPage();
+  await recovery.setViewport({ width: 1440, height: 1000 });
+  await recovery.goto(`${origin}/test`); await recovery.waitForFunction('window.ready');
+  const recoveredTask = `.pgc-task[data-task-key="review-${recoveryId}"][data-task-state="error"]`;
+  await recovery.waitForSelector(recoveredTask);
+  assert.match(await recovery.$eval(recoveredTask, el => el.textContent!), /请求冲突（409）.*重新上传重试/s);
+  assert.doesNotMatch(await recovery.$eval(recoveredTask, el => el.textContent!), /AI 评分中|检查模型配置/);
+  const chooser = recovery.waitForFileChooser();
+  await recovery.click(`${recoveredTask} button`);
+  await (await chooser).cancel();
+  assert.match(await recovery.$eval('#rvFeedback', el => el.textContent!), /重新选择原始 HTML/);
+  await recovery.screenshot({ path: 'artifacts/review-retry.png', fullPage: true });
+  await recovery.click('.pgc-task-toggle[aria-expanded="true"]');
+  await recovery.click('#rvClear');
+  assert.equal(await recovery.$('.pgc-task[data-task-state="error"]'), null, 'Clearing failed jobs also clears stale tray entries');
+  await recovery.close(); tasks.delete(recoveryId);
+  console.log('PASS 失败任务面板直接重试、刷新后恢复失败记录、旧409提示纠正、重新上传选择器、清理残留任务。');
+
   const upload = await browser.newPage();
   await upload.goto(`${origin}/test`); await upload.waitForFunction('window.ready');
   await upload.evaluate(() => {
@@ -106,7 +129,7 @@ try {
     for (let i = 0; i < 22; i++) transfer.items.add(new File([`<title>Batch ${i}</title>`], `batch-${i}.html`, { type: 'text/html' }));
     const input = document.querySelector<HTMLInputElement>('#rvFile')!; input.files = transfer.files; input.dispatchEvent(new Event('change', { bubbles: true }));
   });
-  await upload.waitForFunction('document.querySelectorAll("[data-job]").length === 20');
+  await upload.waitForFunction('document.querySelectorAll(".rv-job-status.staged").length === 20');
   assert.match(await upload.$eval('#rvFeedback', el => el.textContent!), /最多 20/);
   assert.equal(await upload.$eval('#rvFile', el => (el as HTMLInputElement).multiple), true);
   await upload.evaluate(() => { document.querySelectorAll<HTMLButtonElement>('[data-remove]').forEach(button => button.click()); });

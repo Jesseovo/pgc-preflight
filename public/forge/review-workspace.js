@@ -11,7 +11,14 @@ let adding = Promise.resolve();
 let refresh = () => {};
 let dependencies;
 const polls = new Set();
-const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+const pollWaiters = new Set();
+const pause = ms => new Promise(resolve => {
+  const wake = () => { clearTimeout(timer); pollWaiters.delete(wake); resolve(); };
+  const timer = setTimeout(wake, ms); pollWaiters.add(wake);
+});
+const wakePolls = () => { for (const wake of pollWaiters) wake(); };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) wakePolls(); });
+addEventListener('online', wakePolls);
 const labels = { staged: '待开始', waiting: '等待采集', probing: '采集画面', submitting: '提交中', queued: '等待模型', running: 'AI 评分中', done: '已完成', error: '未完成' };
 const active = job => ['probing', 'submitting', 'queued', 'running'].includes(job.status);
 const pending = job => !['done', 'error'].includes(job.status);
@@ -19,6 +26,24 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;
 const size = bytes => bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 const date = value => { const time = new Date(value); return Number.isNaN(time.valueOf()) ? '' : time.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }); };
 const safeImage = data => typeof data === 'string' && /^data:image\/(png|jpeg|webp);base64,[a-z0-9+/=\s]+$/i.test(data) ? data : '';
+const reviewError = message => /模型接口返回 409/.test(message || '') ? '模型网关返回请求冲突（409），这次未生成报告。可以重试；刷新过页面后需要重新上传原始 HTML。' : /模型接口返回 429/.test(message || '') ? '这次审核因模型接口限流（429）未完成。可点击重试，系统会按限额排队。' : message || '审核未完成，请重试。';
+
+function retryJob(job) {
+  if (!job || !['error', 'done'].includes(job.status)) return;
+  if (!job.html) {
+    selected = job.id; refresh();
+    dependencies.feedback('临时文件已清理，请重新选择原始 HTML 文件后开始审核。', true);
+    dependencies.chooseFile?.(); return;
+  }
+  if (job.remoteFailed) { job.requestId = null; job.remoteFailed = false; }
+  job.progress?.dismiss(); job.progress = null; job.progressSignature = ''; job.captureProgress = null; job.startedAt = Date.now();
+  job.error = ''; job.status = 'waiting'; started = true; refresh(); void pump();
+}
+function failJobProgress(job) {
+  job.error = reviewError(job.error);
+  job.progress?.update({label:`审核未完成 · ${job.title}`,value:undefined,total:undefined,action:()=>retryJob(job),actionLabel:job.html ? '重试审核' : '重新上传重试'});
+  job.progress?.fail(job.error);
+}
 const arr = value => Array.isArray(value) ? value : [];
 const icon = name => ({ file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13l-2 2 2 2m8-4 2 2-2 2m-3-5-2 8"/>', upload: '<path d="M12 16V3m-5 5 5-5 5 5M4 16v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>', arrow: '<path d="M5 12h14m-6-6 6 6-6 6"/>', copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4"/>', check: '<path d="m5 12 4 4L19 6"/>', download: '<path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/>', retry: '<path d="M3 11a9 9 0 1 1 2 7M3 3v8h8"/>', sparkle: '<path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/>' }[name] || '');
 const svg = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icon(name)}</svg>`;
@@ -60,7 +85,7 @@ async function pollJob(job) {
           job.result = await dependencies.api('GET', `reviews/${remote.result_id}`);
         }
         job.status = remote.status;
-        job.error = remote.error;
+        job.error = remote.status === 'error' ? reviewError(remote.error) : remote.error;
         job.remoteFailed = remote.status === 'error';
         job.note = remote.status === 'running' ? remote.error || '模型正在结合画面、源码与校准样本评分' : '后台排队中，可继续添加游戏';
         if (remote.status === 'done') {
@@ -71,13 +96,13 @@ async function pollJob(job) {
           if (!jobs.find(item => item.id === selected)?.result) selected = job.id;
           void dependencies.updateHistory?.();
         }
-        if (job.status === 'done') job.progress?.done('审核报告已生成');
-        if (job.status === 'error') job.progress?.fail(job.error || '审核未完成，请重试。');
+        if (job.status === 'done') { job.progress?.update({label:`审核完成 · ${job.title}`}); job.progress?.done('审核报告已生成'); }
+        if (job.status === 'error') failJobProgress(job);
         refresh();
         if (['done', 'error'].includes(job.status)) break;
       } catch (error) {
         if (error.status === 404 && ++missing >= 3) {
-          job.status = 'error'; job.error = '后台没有找到这次任务，请重试提交。'; job.remoteFailed = true; job.progress?.fail(job.error);
+          job.status = 'error'; job.error = '后台没有找到这次任务，请重试提交。'; job.remoteFailed = true; failJobProgress(job);
           refresh(); break;
         }
         // A transient poll failure must never resubmit a model request.
@@ -113,7 +138,7 @@ async function submit(job) {
       else void pollJob(job);
     } catch { job.status = 'error'; job.error = error.message; }
   }
-  if (job.status === 'error') job.progress?.fail(job.error);
+  if (job.status === 'error') failJobProgress(job);
   refresh();
 }
 
@@ -125,7 +150,7 @@ async function pump() {
       const job = jobs.find(item => item.status === 'waiting');
       if (!job) break;
       job.startedAt ||= Date.now();
-      job.progress ||= startTask(`AI 审核 · ${job.title}`, {detail:'准备采集游戏画面…',startedAt:job.startedAt});
+      job.progress ||= startTask(`AI 审核 · ${job.title}`, {key:`review-${job.id}`,detail:'准备采集游戏画面…',startedAt:job.startedAt});
       try {
         if (!job.prepared) {
           job.status = 'probing';
@@ -142,7 +167,7 @@ async function pump() {
       } catch (error) {
         job.status = 'error';
         job.error = error.message;
-        job.progress?.fail(job.error);
+        failJobProgress(job);
         dependencies.setProbing(false);
         dependencies.clearCapture();
         refresh();
@@ -213,6 +238,7 @@ export async function mountReviewWorkspace(options) {
   let renderedId = '';
   let renderedResult;
   dependencies = { api, probeGame, setProbing, isActive: current,
+    chooseFile: () => { if (current()) $('#rvFile').click(); },
     topicId: () => Number($('#rvTopic')?.value) || null,
     highlight: yes => $('#rvDropzone')?.classList.toggle('drag-over', yes),
     feedback: (message, error) => { if (current()) { $('#rvFeedback').textContent = message; $('#rvFeedback').classList.toggle('is-error', error); } },
@@ -273,17 +299,9 @@ export async function mountReviewWorkspace(options) {
     const remove = event.target.closest('[data-remove]');
     if (remove) { const index = jobs.findIndex(job => job.id === remove.dataset.remove && job.status === 'staged'); if (index >= 0) jobs.splice(index, 1); refresh(); }
     const retry = event.target.closest('[data-retry]');
-    if (retry) {
-      const job = jobs.find(item => item.id === retry.dataset.retry);
-      if (!job?.html) { dependencies.feedback('请重新拖入原始 HTML 文件，再开始审核。', true); job.signature = ''; return; }
-      // Known model failures start a new attempt. An uncertain submit failure
-      // keeps the old ID, so recovery cannot call the model twice.
-      if (job.remoteFailed) { job.requestId = null; job.remoteFailed = false; }
-      job.progress?.dismiss(); job.progress = null; job.progressSignature = ''; job.captureProgress = null; job.startedAt = Date.now();
-      job.error = ''; job.status = 'waiting'; started = true; refresh(); void pump();
-    }
+    if (retry) retryJob(jobs.find(item => item.id === retry.dataset.retry));
   };
-  $('#rvClear').onclick = () => { for (let i = jobs.length - 1; i >= 0; i--) if (['done', 'error'].includes(jobs[i].status)) jobs.splice(i, 1); refresh(); };
+  $('#rvClear').onclick = () => { for (let i = jobs.length - 1; i >= 0; i--) if (['done', 'error'].includes(jobs[i].status)) { jobs[i].progress?.dismiss(); jobs.splice(i, 1); } refresh(); };
   const history = async () => {
     try {
       const list = await withProgress('读取审核记录', () => api('GET', 'reviews'));
@@ -311,11 +329,15 @@ export async function mountReviewWorkspace(options) {
   try {
     const remote = await withProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
     for (const item of remote) {
-      if (!['queued', 'running'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
-      const job = { id: item.id, requestId: item.id, title: item.title, status: item.status, note: '恢复后台审核任务' };
+      if (!['queued', 'running', 'error'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
+      const job = { id: item.id, requestId: item.id, title: item.title, status: item.status, error:reviewError(item.error),remoteFailed:item.status==='error',note: '恢复后台审核任务' };
       job.startedAt = Date.parse(item.created_at) || Date.now();
-      job.progress = startTask(`AI 审核 · ${job.title}`,{detail:job.note,startedAt:job.startedAt});
-      jobs.push(job); selected ||= job.id; started = true; void pollJob(job);
+      job.progress = startTask(`AI 审核 · ${job.title}`,{key:`review-${job.id}`,detail:job.note,startedAt:job.startedAt});
+      jobs.push(job); selected ||= job.id;
+      if (item.status === 'error') {
+        failJobProgress(job);
+        job.progress.update({finishedAt:Date.parse(item.updated_at) || Date.now()});
+      } else { started = true; void pollJob(job); }
     }
     refresh();
   } catch { /* Older history still renders if job recovery is temporarily unavailable. */ }

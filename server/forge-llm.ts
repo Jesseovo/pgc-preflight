@@ -46,9 +46,9 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     const idempotencyKey = await keyedRequestId(req.idempotencyKey, messages);
     let lastError: unknown;
     let freshRequest = false;
-    // Riffle uses 409 while the same API key is already processing another
-    // idempotent request. Parse failures get a fresh idempotency key so a
-    // truncated or non-JSON model response is regenerated instead of replayed.
+    // Only explicitly pending idempotent requests are retried by transport.
+    // Other gateway conflicts must preserve their exact cause. Parse failures
+    // get a fresh key so a non-JSON response is regenerated instead of replayed.
     const attempts = req.idempotencyKey ? 3 : 1;
     // A Queue consumer has a finite wall-clock lifetime. Leave time to persist
     // an actionable error rather than being killed during the final retry.
@@ -57,7 +57,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
       const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, {
         DB: env.DB, maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
-        onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
+        onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
       try {
         const text = await transport(messages);
@@ -68,9 +68,9 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = /模型返回的不是合法 JSON/.test(message);
         const emptyResponse = /模型没有返回可读的审核内容/.test(message);
-        // HTTP 429 is already retried with Retry-After by modelTransport.
+        // HTTP 429 and explicitly pending 409 requests are retried by transport.
         // A second retry loop would multiply requests and hit the key again.
-        const busy = /返回 (409|503)|\b409\b/.test(message);
+        const busy = /返回 503/.test(message);
         if (attempt + 1 >= attempts || Date.now() >= deadline || (!parseFailure && !emptyResponse && !busy)) throw error;
         if (parseFailure || emptyResponse) freshRequest = true;
         await new Promise(resolve => setTimeout(resolve, parseFailure || emptyResponse ? 1200 : 5000 * (attempt + 1)));

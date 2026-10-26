@@ -83,6 +83,28 @@ describe('模型限流与恢复', () => {
     expect(retryAfterMs('invalid', now)).toBeUndefined();
   });
 
+  it('409保留网关原因；额度预占冲突不能被当成重复请求反复重试', async () => {
+    const fetchMock = vi.fn(async () => Response.json({ error: { code: 'KEY_BUDGET_RESERVED', message: '可用额度被其他请求预占，请等待结算。' } }, { status: 409 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(modelTransport(config)([])).rejects.toThrow(/请求冲突（409）.*可用额度被其他请求预占.*KEY_BUDGET_RESERVED/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('明确的同一请求仍在处理会等待并使用原幂等键取回结果', async () => {
+    vi.useFakeTimers(); const waiting = vi.fn();
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      expect((init!.headers as any)['Idempotency-Key']).toBe('pending-request');
+      return fetchMock.mock.calls.length === 1
+        ? Response.json({ error: { code: 'IDEMPOTENCY_IN_PROGRESS', message: '请求仍在处理' } }, { status: 409, headers: { 'Retry-After': '12' } })
+        : Response.json({ content: [{ type: 'text', text: 'READY' }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = modelTransport(config, { idempotencyKey:'pending-request', onWait:waiting })([]);
+    await vi.advanceTimersByTimeAsync(11999); expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); await expect(result).resolves.toBe('READY');
+    expect(waiting).toHaveBeenCalledWith(12000, 'pending');
+  });
+
   it('流式错误和被截断的正文不能作为成功内容返回', async () => {
     const stream = (tail: string) => new Response(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\ndata: ${tail}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
     vi.stubGlobal('fetch', vi.fn(async () => stream('{"type":"error","error":{"type":"api_error"}}')));

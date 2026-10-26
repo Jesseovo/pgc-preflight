@@ -48,6 +48,8 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
   const wait = retryAfterMs(response.headers.get('retry-after'));
   return new ModelHttpError(response.status === 429
     ? `模型接口限流（429）${raw ? `：${raw}` : '，请求过多，请等待后重试。'}`
+    : response.status === 409
+      ? `模型网关请求冲突（409）${raw ? `：${raw}` : '，这次请求未完成，请稍后重试。'}${code ? ` [${code}]` : ''}`
     : `模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`, response.status, wait, code);
 }
 
@@ -130,11 +132,12 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         try { return await once(); }
         catch (error) {
           clearTimeout(timeout);
-          if (!(error instanceof ModelHttpError) || error.upstreamStatus !== 429 || /quota|balance|credit|billing/i.test(error.code)) throw error;
+          const pendingRequest = error instanceof ModelHttpError && error.upstreamStatus === 409 && /IDEMPOTENCY_(IN_PROGRESS|PENDING)|REQUEST_(IN_PROGRESS|PENDING)|INFLIGHT/i.test(error.code);
+          if (!(error instanceof ModelHttpError) || (!pendingRequest && error.upstreamStatus !== 429) || /quota|balance|credit|billing/i.test(error.code)) throw error;
           const wait = Math.max(1000, error.retryMs ?? 15000 * 2 ** attempt);
-          await throttle.cooldown(wait);
+          if (!pendingRequest) await throttle.cooldown(wait);
           if (attempt >= 3 || Date.now() + wait + 1000 >= deadline) throw error;
-          await options.onWait?.(wait, 'rate_limit');
+          await options.onWait?.(wait, pendingRequest ? 'pending' : 'rate_limit');
           await pauseModel(wait, controller.signal);
         }
       }
