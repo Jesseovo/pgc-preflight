@@ -50,9 +50,10 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
+  if (req.requiredProfile && (active?.id !== req.requiredProfile || active.profile.model !== 'claude-opus-5-5')) throw new LLMError('制作任务要求 Claude Opus 5.5；创作模型已切换，请重新配置后重试。', 409);
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError(req.purpose === 'review' ? '管理员尚未配置并启用审核模型。' : '管理员尚未配置并启用创作模型。', 503);
   if (active.profile.vision === false) req = { ...req, user: withoutImages(req.user) };
   let apiKey: string;
@@ -99,7 +100,10 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         if (attempt + 1 >= attempts || deadline - Date.now() < 30000 || (!parseFailure && !outputFailure && !busy)) throw error;
         if (parseFailure || outputFailure) {
           freshRequest = true;
-          retryHint = `上次生成未能交付完整报告：${message} 请根据原始材料重新生成完整 JSON 对象，严格使用给定字段和类型，内容简洁，保留所有必需字段；不要输出思考过程、Markdown 或解释。不得编造分数或证据。`;
+          retryHint = req.outputFormat === 'html'
+            ? `上次输出不完整：${message} 请重新输出完整自包含 HTML 游戏，缩减实现以适应输出预算，保留完整核心循环。只输出 HTML，不要 JSON、解释或 Markdown。`
+            : req.schema ? `上次生成未能交付完整报告：${message} 请根据原始材料重新生成完整 JSON 对象，严格使用给定字段和类型，内容简洁，保留所有必需字段；不要输出思考过程、Markdown 或解释。不得编造分数或证据。`
+              : `上次输出不完整：${message} 请按原始要求重新完整输出，内容简洁，不要改成 JSON。`;
           if (error instanceof ModelOutputError && error.kind === 'truncated') maxTokens = Math.min(24000, (maxTokens || 2200) * 2);
           await req.onWait?.(`模型报告未完整生成，正在重新生成（${attempt + 2}/${attempts}）。`);
         } else await req.onWait?.('模型接口暂不可用，正在等待恢复。');

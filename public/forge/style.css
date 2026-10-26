@@ -97,6 +97,7 @@ label.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; 
 details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .preview { width: 100%; aspect-ratio: 9 / 16; object-fit: cover; display: block; background: var(--chip); }
 .assets-frame { width: 100%; height: min(72vh, 900px); border: 1px solid var(--line); border-radius: 8px; background: #fff; display: block; }
+.product-frame { width: min(100%, 390px); height: min(68vh, 760px); min-height: 300px; margin: 16px auto 0; display: block; border: 1px solid var(--line); border-radius: 12px; background: #f8faf7; }
 .note { width: 100%; }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }

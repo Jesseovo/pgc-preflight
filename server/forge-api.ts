@@ -4,6 +4,7 @@ import { SEED_GAMES, SEED_VOCAB } from "./forge/seed.js";
 import { DEFAULT_SETTINGS, DEFAULT_REDLINES, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_F } from "./forge/defaults.js";
 import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "./forge/logic.js";
 import { complete, providerStatus, activeModel, routedModel, LLMError } from "./forge-llm";
+import { activeModelProfile } from './settings';
 import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob } from './review-jobs';
 import { generateReview } from './review-generation';
@@ -12,8 +13,9 @@ import type { AppSecrets, ConfigStore } from './settings';
 import {
   expandSystem, expandUser, EXPAND_SCHEMA, PREVIEW_SYSTEM, previewUser,
   briefSystem, briefUser, ASSETS_SYSTEM, assetsUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
-  reviewSystem,
+  reviewSystem, GAME_SYSTEM, gameUser,
 } from "./forge/prompts.js";
+import { cleanGameHtml } from './game-generation';
 
 const TEXT_DEFAULTS = { redlines: DEFAULT_REDLINES, template: DEFAULT_TEMPLATE, template_f: DEFAULT_TEMPLATE_F };
 // Model credentials and model selection belong to /admin. Forge only stores
@@ -49,7 +51,7 @@ export interface ForgeEnv {
   captureReview?: (html: string) => Promise<unknown>;
 }
 
-export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'review'; id: string };
+export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string } | { type: 'review'; id: string };
 
 // Per-topic background jobs share one claim/lease/recovery path.
 type TopicJobKind = 'brief' | 'assets';
@@ -136,6 +138,7 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "POST draw": return draw(env, await body(request));
     case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
+    case "GET products": return listProducts(env);
     case "GET topics/:id": {
       const topic = await getTopic(env, id);
       return { ...topic, brief_export: composeBrief(topic) };
@@ -150,10 +153,41 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
       if (!topic.assets_html?.trim()) throw new HttpError(409, "资产尚未生成，请稍后再下载。");
       return attachment(topic.assets_html, 'text/html; charset=utf-8', topic, 'assets.html');
     }
+    case "GET topics/:id/product": {
+      const topic = await getTopic(env, id);
+      if (!topic.product_html?.trim()) throw new HttpError(409, "成品尚未生成。");
+      return json({ id, html: topic.product_html });
+    }
+    case "GET topics/:id/game": {
+      let topic = await getTopic(env, id);
+      const interrupted = topic.product_status === 'running' && Date.now() - Date.parse(topic.updated_at) > 15 * 60 * 1000;
+      const expired = topic.product_status === 'queued' && Date.now() - Date.parse(topic.updated_at) > 24 * 60 * 60 * 1000;
+      if (interrupted || expired) {
+        await run(env, "UPDATE topics SET product_status = 'error', product_error = '制作任务已中断或过期，请重新制作。', updated_at = ? WHERE id = ? AND updated_at = ?", now(), id, topic.updated_at);
+        topic = await getTopic(env, id);
+      }
+      return { id, product_status: topic.product_status || '', product_error: topic.product_error || '', has_product: Boolean(topic.product_html?.trim()), updated_at: topic.updated_at };
+    }
+    case "GET topics/:id/product-preview": {
+      const topic = await getTopic(env, id);
+      if (!topic.product_html?.trim()) throw new HttpError(409, "成品尚未生成。");
+      return new Response(topic.product_html, { headers: {
+        'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'",
+        'Referrer-Policy': 'no-referrer',
+      } });
+    }
+    case "GET topics/:id/product-file": {
+      const topic = await getTopic(env, id);
+      if (!topic.product_html?.trim()) throw new HttpError(409, "成品尚未生成。");
+      return attachment(topic.product_html, 'text/html; charset=utf-8', topic, 'game.html');
+    }
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
     case "POST topics/:id/preview": return preview(env, id);
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
     case "POST topics/:id/assets": return startTopicJob(env, 'assets', id, ctx, new URL(request.url).searchParams.get('regenerate') === '1', assetsJob);
+    case "POST topics/:id/game": return startGameJob(env, id);
     case "POST review": return review(env, await body(request), ownerId);
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
@@ -409,8 +443,17 @@ async function listTopics(env, params) {
   const marks = statuses.map(() => "?").join(",");
   const rows = await all(env, `SELECT id, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
       preview_svg IS NOT NULL AS has_preview, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
-      assets_html IS NOT NULL AS has_assets, assets_status, assets_error
+      assets_html IS NOT NULL AS has_assets, assets_status, assets_error,
+      product_html IS NOT NULL AS has_product, product_status, product_error
     FROM topics WHERE status IN (${marks}) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses, limit);
+  return rows.map(hydrate);
+}
+
+async function listProducts(env) {
+  const rows = await all(env, `SELECT id, subject, medium, gesture, structure, mood, status, data, score, note, updated_at,
+      product_html IS NOT NULL AS has_product, product_status, product_error
+    FROM topics WHERE product_html IS NOT NULL OR product_status IN ('queued', 'running', 'error')
+    ORDER BY updated_at DESC, id DESC LIMIT 300`);
   return rows.map(hydrate);
 }
 
@@ -427,7 +470,7 @@ const JOB_LEASE_MS = 75_000;
 function staleJobBefore() {
   return new Date(Date.now() - JOB_LEASE_MS).toISOString();
 }
-async function withTopicLease<T>(env, ids: number[], statusColumn: 'expand_status' | 'brief_status' | 'assets_status', work: () => Promise<T>): Promise<T> {
+async function withTopicLease<T>(env, ids: number[], statusColumn: 'expand_status' | 'brief_status' | 'assets_status' | 'product_status', work: () => Promise<T>): Promise<T> {
   const marks = ids.map(() => "?").join(",");
   const touch = () => run(env, `UPDATE topics SET updated_at = ? WHERE id IN (${marks}) AND ${statusColumn} = 'running'`, now(), ...ids).catch(() => {});
   const timer = setInterval(() => { void touch(); }, 20_000);
@@ -686,6 +729,28 @@ function brief(env, id, ctx, regenerate = false) {
   return startTopicJob(env, 'brief', id, ctx, regenerate, briefJob);
 }
 
+async function startGameJob(env: ForgeEnv, id: number) {
+  const topic = await getTopic(env, id);
+  if (topic.product_html?.trim()) return { id, status: 'done', has_product: true };
+  if (!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
+  const model = activeModelProfile(await env.modelStore.get(), 'create');
+  if (model?.id !== 'opus' || !/^claude-opus-5-5$/i.test(model.profile.model) || !model.profile.enabled || !model.profile.encryptedKey) {
+    throw new HttpError(409, "创作模型当前没有路由到 Claude Opus 5.5。请先在管理员的模型配置中切换创作模型，再开始制作。");
+  }
+  if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
+  const requestId = crypto.randomUUID();
+  const claim = await run(env, "UPDATE topics SET product_status = 'queued', product_error = '等待后台制作队列…', product_request_id = ?, updated_at = ? WHERE id = ? AND product_status IN ('', 'error')", requestId, now(), id);
+  if (!claim.meta?.changes) return { id, status: 'pending' };
+  try {
+    if (!env.FORGE_QUEUE) throw new HttpError(503, "后台制作队列尚未就绪，请稍后重试。");
+    await env.FORGE_QUEUE.send({ type: 'game', id, requestId });
+  } catch (error) {
+    await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ?", String(error?.message || error).slice(0, 500), now(), id, requestId);
+    throw new HttpError(503, "制作任务未能进入后台队列，请重试。");
+  }
+  return { id, status: 'pending' };
+}
+
 async function startTopicJob(env, kind: TopicJobKind, id, ctx, regenerate, job: (env, id, t) => Promise<unknown>) {
   const k = TOPIC_JOBS[kind];
   const t = await getTopic(env, id);
@@ -714,6 +779,7 @@ function markTopicJobError(env, kind: TopicJobKind, id, error, onlyIfRunning = f
 
 export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
   if (job.type === 'review') return processReviewJob(env, job.id, (payload, ownerId, jobId) => review(env, payload, ownerId, jobId));
+  if (job.type === 'game') return produceGame(env, job.id, job.requestId);
   if (job.type === 'expand') {
     try { return await expandBatch(env, job.ids); }
     catch (error) {
@@ -792,6 +858,49 @@ async function assetsJob(env, id, t) {
     await markTopicJobError(env, 'assets', id, error);
     throw error;
   }
+}
+
+async function produceGame(env: ForgeEnv, id: number, requestId: string) {
+  const claim = await run(env, "UPDATE topics SET product_status = 'running', product_error = '正在准备制作材料…', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'queued'", now(), id, requestId);
+  if (!claim.meta?.changes) return { id, status: 'ignored' };
+  const deadline = Date.now() + 12 * 60 * 1000;
+  const stage = (message: string) => run(env, "UPDATE topics SET product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", message, now(), id, requestId);
+  return withTopicLease(env, [id], 'product_status', async () => {
+  try {
+    let topic = await getTopic(env, id);
+    if (topic.product_html?.trim()) return { id, status: 'done' };
+    const model = activeModelProfile(await env.modelStore.get(), 'create');
+    if (model?.id !== 'opus' || !/^claude-opus-5-5$/i.test(model.profile.model)) throw new HttpError(409, "创作模型已切换，任务已停止；请将创作模型切回 Claude Opus 5.5 后重试。");
+    const cfg = await getSettings(env);
+    if (!topic.brief_md?.trim()) {
+      await stage('Opus 正在生成制作简报…');
+      const md = await complete(env, cfg, {
+        system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }), user: briefUser(topic),
+        maxTokens: 8000, timeoutMs: 300000, deadline, idempotencyKey: `pgc-product-brief-${requestId}`, purpose: 'create', requiredProfile: 'opus',
+        onWait: message => stage(message || 'Opus 正在生成制作简报…'),
+      });
+      if (!String(md).trim()) throw new Error('模型没有返回制作简报。');
+      await run(env, "UPDATE topics SET brief_md = ?, brief_status = '', brief_error = '', updated_at = ? WHERE id = ? AND product_request_id = ?", cfg.template + String(md).trim() + '\n', now(), id, requestId);
+      topic = await getTopic(env, id);
+    }
+    await stage('Opus 正在编写完整 HTML 游戏…');
+    const text = await withTopicLease(env, [id], 'product_status', () => complete(env, cfg, {
+      system: GAME_SYSTEM,
+      user: gameUser(topic, composeBrief(topic), topic.assets_html),
+      maxTokens: 24000,
+      timeoutMs: 300000,
+      deadline, idempotencyKey: `pgc-game-${requestId}`, requiredProfile: 'opus', outputFormat: 'html',
+      purpose: 'create',
+      onWait: message => stage(message || 'Opus 正在编写完整 HTML 游戏…'),
+    }));
+    const html = cleanGameHtml(text);
+    await run(env, "UPDATE topics SET product_html = ?, product_status = '', product_error = '', status = 'made', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", html, now(), id, requestId);
+    return { id, status: 'done' };
+  } catch (error) {
+    await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", String(error?.message || error).slice(0, 500), now(), id, requestId).catch(() => {});
+    throw error;
+  }
+  });
 }
 
 async function briefJob(env, id, t) {

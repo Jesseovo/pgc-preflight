@@ -1,0 +1,4 @@
+ALTER TABLE topics ADD COLUMN product_html TEXT;
+ALTER TABLE topics ADD COLUMN product_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE topics ADD COLUMN product_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE topics ADD COLUMN product_request_id TEXT NOT NULL DEFAULT '';

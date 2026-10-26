@@ -89,6 +89,8 @@ export default {
   },
   async scheduled(_event: unknown, env: Env): Promise<void> {
     await purgeReviewInputs(env);
+    await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ?")
+      .bind(new Date().toISOString(), new Date(Date.now() - 15 * 60 * 1000).toISOString()).run();
   },
   async queue(batch: QueueBatch<ForgeJob>, env: Env): Promise<void> {
     const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB) };
