@@ -1,0 +1,3 @@
+ALTER TABLE topics ADD COLUMN assets_html TEXT;
+ALTER TABLE topics ADD COLUMN assets_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE topics ADD COLUMN assets_error TEXT NOT NULL DEFAULT '';

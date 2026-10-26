@@ -1,6 +1,13 @@
 import { DIRECTION } from "./defaults.js";
 import { DIMS, DIM_LABEL } from "./logic.js";
 
+// Multi-round review text can run to 1,200 characters; a few dozen calibration
+// examples must stay a bounded prompt.
+function clip(text, max = 240) {
+  const t = String(text || "");
+  return t.length > max ? t.slice(0, max) + "…" : t;
+}
+
 function gameLine(g) {
   const s = g.score != null ? `${g.score}/9 (${g.aes}/${g.ease}/${g.play})` : g.status;
   const rev = (g.revisions || 1) > 1 ? `，改了 ${g.revisions} 版` : "";
@@ -20,7 +27,7 @@ ${redlines}
 ${positives.map(gameLine).join("\n")}
 
 【反例与驳回意见（真实审核原话摘要）】
-${negatives.map((g) => gameLine(g) + `\n    驳回意见：${g.feedback}`).join("\n")}
+${negatives.map((g) => gameLine(g) + `\n    驳回意见：${clip(g.feedback)}`).join("\n")}
 
 【扩写要求】
 - 种子组合 = 题材 × 美术媒介 × 手势 × 挑战结构 × 情绪基调。题材和美术媒介必须保留；手势、结构、基调可以微调到更合适的近似项，但要在 twist 里说明为什么。
@@ -130,36 +137,112 @@ export function briefUser(topic) {
 ${topic.note ? "- 我的补充要求：" + topic.note : ""}`;
 }
 
-// Mock review of a finished game. The real review history is the calibration set.
-export function reviewSystem({ redlines, positives, negatives }) {
-  return `你是 PGC 游戏平台的审核员。你要像真实审核员一样体验并评分一款即将提交的竖屏小游戏，在它被真正打回之前找出问题。
+// Asset pack: one self-contained HTML file that is both the art review sheet
+// and the drawing code the game copies verbatim.
+export const ASSETS_SYSTEM = `你是游戏美术总监兼图形程序员。根据选题和设计文档，为一款竖屏手机小游戏制作完整的美术资产包，交付一个自包含的 HTML 文件。
 
 ${DIRECTION}
 
-评分维度（每项 1–3 分）：
-- 美学：画面与风格是否好看、协调，视觉反馈是否清楚。
-- 易玩性：规则易懂，操控顺手，新玩家能快速开始。
-- 可玩性：玩法有趣，有继续游玩或反复挑战的动力。
+【文件结构，必须严格遵守】
+1. 一个完整的 HTML 文档（以 <!doctype html> 开头）。不引用任何外部资源：没有 CDN、外链字体、图片文件或网络请求。所有图形用 Canvas 2D 程序化绘制。
+2. 文档里有且只有一个 <script id="game-assets">，内容是纯数据加绘制函数，不访问 DOM、不读写全局状态、不使用 Math.random（需要随机就用传入的 seed 做哈希），最后一行是 window.GAME_ASSETS = GAME_ASSETS;。这一段会被原样复制进游戏，所以它必须能独立运行。
+3. GAME_ASSETS 的形状：
+   const GAME_ASSETS = {
+     meta: { title, logicalWidth: 540, logicalHeight: 960, palette: { 名字: "#hex" }, style: "一句话风格规范：线条粗细、纹理、阴影、高光的规则" },
+     sprites: { 名字: { size: [宽, 高], states: ["idle", ...], frames: 帧数, draw(ctx, o) } },
+     backgrounds: { 名字: { parallax: 0 到 1, draw(ctx, o) } },
+     ui: { 名字: { size: [宽, 高], draw(ctx, o) } },
+     fx: { 名字: { duration: 秒, draw(ctx, o) } },
+   };
+   - sprites 和 ui 的 draw 以 (0, 0) 为中心绘制，单位是逻辑像素；o 里有 t（秒）、state、frame、scale、seed，ui 还可能有 value、label。
+   - backgrounds 的 draw 铺满 (0, 0, o.w, o.h)，用 o.t 和 o.scroll 做动画和视差。
+   - fx 的 draw 以 (o.x, o.y) 为中心，o.p 是 0 到 1 的进度。
+   - 每个 draw 都用 ctx.save() / ctx.restore() 包住，不泄漏画布状态。
+4. 页面其余部分是给人看的资产总览：
+   - 最上面是一个 9:16 的"游戏画面合成"：用背景、主角、两三个敌人或障碍、HUD 拼出一张像真实截图的画面，并持续播放动画。这就是概念图。
+   - 下面是网格，每个资产一张卡片：名字、尺寸、状态，卡片里循环播放它的每个状态和动画帧。
+   - 再下面是配色色板和风格规范说明。
+   - 总览页的文字用中文；游戏里会出现的文字（UI 上的字）用英文。
+   - 页面在手机和电脑上都能看，不出现横向滚动。
+
+【内容要求】
+- 覆盖设计文档里出现的所有视觉元素：主角、每一种敌人或障碍、拾取物、Boss、背景各层、HUD 元素（生命、分数、连击、暂停按钮、结算面板）、命中和击杀等特效。
+- 每个精灵至少有循环的待机动画；主角有受击状态；敌人有攻击前的预警状态；会出现的拾取物有闪光或呼吸。
+- 风格必须忠实于选题指定的美术媒介，像一张有设计感的海报，而不是程序员配色。主色不超过 6 个（另加中性色），元素和背景要有足够的明度差。
+- 造型精致：用路径、渐变和分层勾勒细节，不要只用纯色方块和圆形。
+- 性能：每帧可调用；不在 draw 里创建大量临时对象，不用 ctx.filter。
+- 文件控制在 60KB 以内。只输出 HTML 本身，不要解释，不要代码块标记。`;
+
+export function assetsUser(topic, design, styleSvg) {
+  const d = topic.data || {};
+  return `游戏：${d.title}
+一句话：${d.logline}
+美术媒介：${topic.medium}；情绪基调：${topic.mood}
+美术方向：${d.art_direction}
+配色：${(d.palette || []).join(" ")}
+${topic.note ? "我的补充要求：" + topic.note + "\n" : ""}
+【设计文档（细纲）】
+${design}
+${styleSvg ? `\n【已确认的风格样板图（SVG 源码，资产的造型和配色要与它一致）】\n${styleSvg.slice(0, 9000)}\n` : ""}`;
+}
+
+// Mock review of a finished game. The real review history is the calibration set.
+// Calibrated against a blind run on 2026-10-26: the earlier wording ("2/2/2 is
+// the norm") plus misread compliance rules made it reject 3 of 4 real passes.
+/** @param {{redlines: string, positives: object[], borderline?: object[], negatives: object[]}} options */
+export function reviewSystem({ redlines, positives, borderline = [], negatives }) {
+  return `你是 PGC 游戏平台的审核员。你要像真实审核员一样体验并评分一款即将提交的竖屏小游戏，在它被真正打回之前找出问题。
+
+${DIRECTION}
+- 游戏面向海外玩家，界面全英文是平台要求。不要因为英文扣分，也不要建议改成中文；只有英文文案本身含糊、字太小看不清才算问题。
+
+【评分标准：每项 1–3 分，三项各自独立打分】
+美学
+- 3：美术媒介鲜明、完成度高，像一张有设计感的海报；动效和反馈清楚。
+- 2：整洁可用，但风格普通，或有明显瑕疵（长屏黑边、对比弱、元素难辨认）。
+- 1：粗糙、像不会动的贴图、颜色混乱或画面出错。
+易玩性
+- 3：5 秒内明白怎么玩，操作跟手，失败原因一看就懂。
+- 2：能玩明白但有摩擦：某条规则要试几次才懂，或某个操作不太顺。
+- 1：看不懂怎么赢、为什么死，或操控明显不跟手、方向反、惯性失控。
+可玩性
+- 3：有一个说得出口的新机制，30–60 秒内持续出现新东西，让人想再来一局。
+- 2：能玩但普通或重复：同类常见、一会儿就重复、刷分动力弱。
+- 1：没有失败压力（不操作或乱点也死不了）、内容很快耗尽，或核心玩法不成立。
+
+【真实审核的分数分布，打分前先读】
+- 通过线是总分 ≥ 7。通过的游戏大多恰好 7 分：只有一项拿到 3，另外两项是 2；8–9 分是少数。
+- 打回的版本里三分之二是 2/2/2：没有致命错误，但没有任何一项出彩。
+- 所以每一项都要单独判断"它在 PGC 游戏里算不算出彩"。不要默认给 2/2/2，也不要因为别的维度有问题而压低这一项。
 
 ${redlines}
 
-【真实审核的校准样本：通过的（≥ 8 分）】
+【合规判定（优先于上面的雷区清单，避免误判）】
+- 打开即玩：页面加载后直接显示游戏场景，叠一层手势提示，第一次触摸就开局，这是合规的，模板就要求这样做。只有独立的标题页或封面页、必须先点"开始"按钮才看得到游戏场景、必须手动关闭的弹窗，才算违规。
+- 一命制：街机式一碰就死，但能立刻重开、单局较短，是正常设计。只有单局很长、死后要从头再熬很久，才算容错问题。
+- 能快速修好的技术缺陷（缺 BGM、长屏黑边、某处文字太小）：列为"高"并写进修改指令，但最多让它所属的那一项少 1 分，不要连带压低其他两项。真实审核里，美术出色的游戏即使有这类问题，也拿到过美学 3 分。
+
+【校准样本：高分通过（8–9 分）】
 ${positives.map(gameLine).join("\n")}
 
-【真实审核的校准样本：打回的及原话】
-${negatives.map((g) => gameLine(g) + `\n    审核原话：${g.feedback}`).join("\n")}
+【校准样本：刚好通过（7 分）】
+${borderline.map(gameLine).join("\n") || "（暂无）"}
+
+【校准样本：打回的及审核原话】
+${negatives.map((g) => gameLine(g) + `\n    审核原话：${clip(g.feedback)}`).join("\n")}
 
 【你会拿到】
 - 截图：手机竖屏实际运行画面，图片前会标明是哪种屏幕比例、开局前还是开局后几秒。整张图就是手机屏幕，图里的黑边或色块就是玩家会看到的黑边。
-- 自动体检报告：报错、画布覆盖率、边缘色块、音频节点启动次数（判断有没有 BGM）、偷懒策略机器人的存活时间。机器人存活到上限时间说明"不操作/乱点也死不了"。
+- 自动体检报告：报错、画布覆盖率、边缘色块、音频节点启动次数（判断有没有 BGM）、偷懒策略机器人的存活时间。机器人存活到上限时间，说明"不操作或乱点也死不了"。脚本开局只点一次就不再操作，所以"开局后 10 秒"的截图常常已经是失败画面，这本身不算问题。
 - 源码（过长的行已省略）。
 
-【要求】
-- 打分和真实审核员一样严格：2/2/2 是常态，只有确实出彩才给 3；有明显违反平台方向或雷区的项给 1。总分 ≥ 7 才算通过。
-- 问题必须有证据：引用截图里看到的、体检报告里的数字，或源码里的具体位置（函数名、TUNING 字段）。不要泛泛而谈。
-- 按严重程度排序：会直接导致打回的为"高"。
+【输出要求】
+- 先对照校准样本给三项分数，再列问题。
+- verdict 以"通过"或"打回"开头（总分 ≥ 7 为通过），后面用一句话说明最关键的原因。
+- issues 按严重程度排序。"高"：单独就会导致打回，必须修；"中"：明显影响分数；"低"：建议优化。每条都要有证据：引用截图里看到的内容、体检报告里的数字，或源码里的具体位置（函数名、TUNING 字段）。不要泛泛而谈。
+- strengths 写这款游戏真正出彩的地方，它决定哪一项能拿 3。
 - reviewer_comment 用真实审核员的口吻写一两句最可能的审核意见。
-- fix_prompt 是一段可以直接发给写代码的 AI 的中文修改指令：逐条列出要改什么、改成什么、改到什么程度（给数值），不要重写整个游戏，不要改动没问题的部分。`;
+- fix_prompt 是一段可以直接发给写代码的 AI 的中文修改指令：逐条列出要改什么、改成什么、改到什么程度（给数值）。不要重写整个游戏，不要改动没问题的部分。`;
 }
 
 export const REVIEW_SCHEMA = {
@@ -224,8 +307,9 @@ export function tagSystem(vocabByDim) {
 ${DIMS.filter((d) => d !== "subject").map((d) => `${DIM_LABEL[d]}（${d}）：${vocabByDim[d].join("、")}`).join("\n")}`;
 }
 
+// Spreadsheet imports have no description; the review text is the best clue to the game.
 export function tagUser(games) {
-  return games.map((g) => `id=${g.id}｜${g.title}｜${g.descr}`).join("\n");
+  return games.map((g) => `id=${g.id}｜${g.title}｜${g.descr || (g.feedback ? "审核意见：" + clip(g.feedback, 160) : "")}`).join("\n");
 }
 
 export const TAG_SCHEMA = {

@@ -1,4 +1,4 @@
-import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, validateModelFields, decryptKey } from './settings';
+import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, saveRoutes, validateModelFields, decryptKey } from './settings';
 import type { AppSecrets, ConfigStore } from './settings';
 import { modelTransport } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
@@ -37,6 +37,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       const body=await smallJson(request) as {profile?:unknown};
       return json(publicConfig(await activateProfile(body.profile,store)));
     }
+    if(url.pathname==='/api/admin/config/routes'&&request.method==='POST')return json(publicConfig(await saveRoutes(await smallJson(request),store)));
     if(url.pathname==='/api/admin/test'&&request.method==='POST'){
       const raw=await smallJson(request) as Record<string, unknown>;
       const fields=validateModelFields(raw);
@@ -48,8 +49,14 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       if(!apiKey)return json({error:'请先填写 API Key。'},400);
       const transport=modelTransport({...fields,apiKey},{DB});
       const started=Date.now();
-      const text=await transport([{role:'user',content:[{type:'text',text:'这是模型接口与图片输入测试。请只回复 READY。'},{type:'image_url',image_url:{url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfPXCY1iiH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBVNChh70khwUAAAAASUVORK5CYII='}}]}]);
-      return json({ok:true,durationMs:Date.now()-started,message:text.slice(0,150)});
+      // Text first: a connection that works but cannot take images is still
+      // usable for creation, or for review with screenshots turned off.
+      const text=await transport([{role:'user',content:[{type:'text',text:'这是模型接口测试。请只回复 READY。'}]}]);
+      const durationMs=Date.now()-started;
+      let vision=true,visionError='';
+      try{await transport([{role:'user',content:[{type:'text',text:'这是图片输入测试。请只回复 READY。'},{type:'image_url',image_url:{url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfPXCY1iiH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBVNChh70khwUAAAAASUVORK5CYII='}}]}]);}
+      catch(error){vision=false;visionError=(error instanceof Error?error.message:String(error)).slice(0,200);}
+      return json({ok:true,durationMs,message:text.slice(0,150),vision,visionError});
     }
     return json({error:'接口不存在。'},404);
   }catch(error){return json({error:error instanceof Error?error.message:'操作未完成，请重试。'},400);}

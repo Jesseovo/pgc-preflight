@@ -1,6 +1,7 @@
 // PGC Forge front end. Vanilla JS, no build step.
 import { mountReviewWorkspace } from './review-workspace.js';
 import { startTask, withProgress, progressHtml } from './progress.js';
+import { readXlsxRows, listMembers, sheetToWorks } from './review-sheet.js';
 
 const DIMS = ["subject", "medium", "gesture", "structure", "mood"];
 const DIM_LABEL = { subject: "题材", medium: "美术媒介", gesture: "手势", structure: "挑战结构", mood: "情绪基调" };
@@ -164,12 +165,14 @@ function topicCard(t, mode) {
   }
   acts.push(`<button class="ghost" data-act="preview">${t.has_preview ? "看样板图" : "生成样板图"}</button>`);
   acts.push(`<button class="${mode === "picks" ? "primary" : "ghost"}" data-act="brief">${t.brief_status === 'running' ? "查看生成进度" : t.has_brief ? "看简报" : "生成简报"}</button>`);
+  if (mode === "picks" && t.has_brief) acts.push(`<button class="ghost" data-act="assets">${t.assets_status === 'running' ? "查看资产进度" : t.has_assets ? "看资产" : "生成资产"}</button>`);
   return `<article class="card state-${t.status}" data-id="${t.id}">
     <div class="art" style="${artStyle(d)}"><div class="title">${esc(d.title)}</div><div class="score" title="预估 美学/易玩性/可玩性">${esc(sc)}</div></div>
     <div class="body">
       ${chipsHtml(t)}
       <div>${esc(d.logline)}</div>
       ${t.brief_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'制作简报',detail:'后台排队或生成中，可查看进度。'})}</div>` : ''}
+      ${t.assets_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'生成资产',detail:'后台排队或生成中，可查看进度。'})}</div>` : ''}
       ${t.status === "dup" ? `<div class="small bad">与「${esc(d.dup_of)}」撞题</div>` : ""}
       <div class="kv"><b>新机制</b>${esc(d.twist)}</div>
       <div class="kv"><b>操作</b>${esc(d.controls)}</div>
@@ -197,8 +200,9 @@ function bindCards(root, list, rerender) {
     const t = list().find((x) => x.id === id);
     const act = btn.dataset.act;
     const repaint = () => { if (root.isConnected) rerender(); };
-    if (act === "brief" && (!t.has_brief || t.brief_status === 'running' || briefRequests.get(id)?.pending)) {
-      generateBrief(t, repaint); return;
+    const job = TOPIC_JOBS[act];
+    if (job && (!t[job.has] || t[job.status] === 'running' || jobRequests.get(`${act}-${id}`)?.pending)) {
+      generateTopicJob(act, t, repaint); return;
     }
     await guard(btn, async (progress) => {
       if (act === "like" || act === "reject" || act === "make" || act === "unmake") {
@@ -219,9 +223,9 @@ function bindCards(root, list, rerender) {
           rerender();
         }
         showPreview(t, svg);
-      } else if (act === "brief") {
-        const md = (await api("GET", `topics/${id}`)).brief_md;
-        if (root.isConnected) showBrief(t, md);
+      } else if (job) {
+        const saved = await api("GET", `topics/${id}`);
+        if (root.isConnected) job.show(t, job.read(saved));
       }
     });
   });
@@ -235,74 +239,95 @@ function bindCards(root, list, rerender) {
     });
   });
   // Restore observation after a reload without starting a second model job.
-  for (const topic of list()) if (topic.brief_status === 'running' && !briefRequests.has(topic.id)) {
-    generateBrief(topic, () => { if (root.isConnected) rerender(); }, false, { show: false, resume: true });
+  for (const [kind, job] of Object.entries(TOPIC_JOBS)) {
+    for (const topic of list()) if (topic[job.status] === 'running' && !jobRequests.has(`${kind}-${topic.id}`)) {
+      generateTopicJob(kind, topic, () => { if (root.isConnected) rerender(); }, false, { show: false, resume: true });
+    }
   }
 }
 
-const briefRequests = new Map();
-function showBriefProgress(entry) {
-  openModal(`${entry.topic.data.title} · 制作简报`, `<p class="muted small">简报在后台生成。可以关闭窗口或切换栏目，右下角会保留任务进度。</p><div id="briefProgress" class="pgc-inline-wait"></div>`, entry);
-  entry.task.attach($("#briefProgress"));
+// Background jobs that produce one artifact per topic. They share queueing,
+// progress, reconnect and reclaim behaviour; only names and outputs differ.
+const TOPIC_JOBS = {
+  brief: {
+    label: "制作简报", noun: "简报", status: "brief_status", error: "brief_error", has: "has_brief",
+    output: (saved) => saved?.brief_md, read: (saved) => saved?.brief_export || saved?.brief_md,
+    done: "简报已生成，可以复制或下载。", show: (t, md) => showBrief(t, md),
+  },
+  assets: {
+    label: "生成资产", noun: "资产", status: "assets_status", error: "assets_error", has: "has_assets",
+    output: (saved) => saved?.assets_html, read: (saved) => saved?.assets_html,
+    done: "资产已生成，可以预览或下载。", show: (t, html) => showAssets(t, html),
+  },
+};
+const jobRequests = new Map();
+function showJobProgress(kind, entry) {
+  const job = TOPIC_JOBS[kind];
+  openModal(`${entry.topic.data.title} · ${job.label}`, `<p class="muted small">${job.noun}在后台生成。可以关闭窗口或切换栏目，右下角会保留任务进度。</p><div id="${kind}Progress" class="pgc-inline-wait"></div>`, entry);
+  entry.task.attach($(`#${kind}Progress`));
 }
-function generateBrief(topic, repaint = () => {}, regenerate = false, { show = true, resume = false } = {}) {
-  const current = briefRequests.get(topic.id);
-  if (current?.pending) { showBriefProgress(current); return; }
+function generateTopicJob(kind, topic, repaint = () => {}, regenerate = false, { show = true, resume = false } = {}) {
+  const job = TOPIC_JOBS[kind];
+  const key = `${kind}-${topic.id}`;
+  const current = jobRequests.get(key);
+  if (current?.pending) { showJobProgress(kind, current); return; }
   const entry = {topic, pending:true};
-  entry.task = startTask(`制作简报 · ${topic.data.title}`, {key:`brief-${topic.id}`, retain:true, detail:resume ? "已恢复后台任务，正在读取生成状态…" : "正在提交后台…", action:() => showBriefProgress(entry), actionLabel:"查看进度"});
+  entry.task = startTask(`${job.label} · ${topic.data.title}`, {key, retain:true, detail:resume ? "已恢复后台任务，正在读取生成状态…" : "正在提交后台…", action:() => showJobProgress(kind, entry), actionLabel:"查看进度"});
   if (current) current.task.dismiss();
-  briefRequests.set(topic.id, entry);
-  topic.brief_status = 'running'; repaint(); if (show) showBriefProgress(entry);
+  jobRequests.set(key, entry);
+  topic[job.status] = 'running'; repaint(); if (show) showJobProgress(kind, entry);
   void (async () => {
     try {
-      const md = await requestBrief(topic.id, regenerate, detail => entry.task.update({detail}), resume);
-      topic.has_brief = 1; topic.brief_status = '';
-      if (topic.status !== 'made') topic.status = 'liked';
-      entry.task.done("简报已生成，可以复制或下载。", () => showBrief(topic, md));
+      const value = await requestTopicJob(kind, topic.id, regenerate, detail => entry.task.update({detail}), resume);
+      topic[job.has] = 1; topic[job.status] = '';
+      if (kind === 'brief' && topic.status !== 'made') topic.status = 'liked';
+      entry.task.done(job.done, () => job.show(topic, value));
       repaint();
-      if (modalOwner === entry && !$("#modal").hidden) showBrief(topic, md);
+      if (modalOwner === entry && !$("#modal").hidden) job.show(topic, value);
     } catch (error) {
-      topic.brief_status = 'error';
+      topic[job.status] = 'error';
       entry.task.fail(error.message);
-      entry.task.update({action:() => generateBrief(topic, repaint, regenerate),actionLabel:"重试 / 继续等待"});
+      entry.task.update({action:() => generateTopicJob(kind, topic, repaint, regenerate),actionLabel:"重试 / 继续等待"});
       repaint();
     } finally { entry.pending = false; }
   })();
 }
-async function requestBrief(id, regenerate = false, update = () => {}, resume = false) {
+async function requestTopicJob(kind, id, regenerate = false, update = () => {}, resume = false) {
+  const job = TOPIC_JOBS[kind];
   if (!resume) try {
-    const started = await api("POST", `topics/${id}/brief${regenerate ? '?regenerate=1' : ''}`);
-    if (started?.brief) return started.brief;
-    update("后台已接收，正在排队或生成简报。可以继续使用工作台。");
+    const started = await api("POST", `topics/${id}/${kind}${regenerate ? '?regenerate=1' : ''}`);
+    if (started?.[kind]) return started[kind];
+    update(`后台已接收，正在排队或生成${job.noun}。可以继续使用工作台。`);
   } catch (error) {
-    // The Worker writes the brief before sending its response. If the relay
+    // The Worker writes the result before sending its response. If the relay
     // or browser timed out, recover the saved result before asking the model
     // to run again.
     if (!/超时|timeout|409|5\d\d|网络|failed to fetch|fetch failed|network/i.test(String(error?.message || error))) throw error;
     update("提交响应中断，正在向后台确认任务状态…");
   }
   let reclaimed = false;
+  const failed = `${job.noun}生成失败`;
   for (let attempt = 0; attempt < 210; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
     try {
       const saved = await api("GET", `topics/${id}`);
-      if (saved?.brief_status === 'error') throw new Error(`简报生成失败：${saved.brief_error || "请重试或切换模型。"}`);
-      if (saved?.brief_md && saved.brief_status !== 'running') return saved.brief_md;
-      update(saved?.brief_error || "后台排队或生成中，正在等待完整简报返回。");
+      if (saved?.[job.status] === 'error') throw new Error(`${failed}：${saved[job.error] || "请重试或切换模型。"}`);
+      if (job.output(saved) && saved[job.status] !== 'running') return job.read(saved);
+      update(saved?.[job.error] || `后台排队或生成中，正在等待完整${job.noun}返回。`);
       // A waitUntil task can be cut off by the edge while the model gateway is
       // still working. Re-submit once after the lease expires so the server
       // can reclaim the stale job instead of polling forever.
-      if (!reclaimed && attempt >= 28 && saved?.brief_status === 'running') {
+      if (!reclaimed && attempt >= 28 && saved?.[job.status] === 'running') {
         reclaimed = true;
         update("正在确认后台任务并恢复等待…");
-        await api("POST", `topics/${id}/brief`);
+        await api("POST", `topics/${id}/${kind}`);
       }
     } catch (error) {
-      if (error instanceof Error && /简报生成失败/.test(error.message)) throw error;
+      if (error instanceof Error && error.message.startsWith(failed)) throw error;
       update("暂时无法读取进度，正在重新连接；后台任务会继续运行。");
     }
   }
-  throw new Error("简报仍在生成中，请稍后刷新候选列表查看结果。");
+  throw new Error(`${job.noun}仍在生成中，请稍后刷新候选列表查看结果。`);
 }
 
 function showPreview(t, svg) {
@@ -324,7 +349,18 @@ function showBrief(t, md) {
     <a class="btn" id="dlBrief" href="/api/forge/topics/${t.id}/brief" download style="text-decoration:none">下载 .md</a><button class="ghost" id="regenBrief">重新生成</button></div>
     <pre class="md">${esc(md)}</pre>`);
   $("#cpBrief").onclick = () => copyText(md);
-  $("#regenBrief").onclick = () => generateBrief(t, () => {}, true);
+  $("#regenBrief").onclick = () => generateTopicJob('brief', t, () => {}, true);
+}
+
+// The asset file is model-generated HTML: preview it only in an opaque-origin
+// sandbox, never in the workbench origin.
+function showAssets(t, html) {
+  openModal(`${t.data.title} · 美术资产`, `<p class="muted small">上面是合成的游戏画面（概念图），下面是逐个资产。确认后下载 HTML，和简报一起交给 Claude Code；简报里已写明要原样使用其中的 GAME_ASSETS。</p>
+    <div class="row" style="margin-bottom:8px"><a class="btn primary" id="dlAssets" href="/api/forge/topics/${t.id}/assets" download style="text-decoration:none">下载资产 HTML</a>
+    <button class="ghost" id="regenAssets">重新生成</button><span class="muted small">${Math.round(html.length / 1024)} KB</span></div>
+    <iframe class="assets-frame" sandbox="allow-scripts" title="美术资产预览"></iframe>`);
+  $("#modalBody .assets-frame").srcdoc = html;
+  $("#regenAssets").onclick = () => generateTopicJob('assets', t, () => {}, true);
 }
 
 // ---------- 选题台 ----------
@@ -781,7 +817,16 @@ async function renderGames(alive) {
   const filtered = games.filter((g) =>
     (!f.source || g.source === f.source) && (!f.status || g.status === f.status) &&
     (!f.q || (g.title + g.descr + g.feedback + DIMS.map((d) => g[d]).join("")).toLowerCase().includes(f.q.toLowerCase())));
-  view.innerHTML = `<details class="box section"><summary><b>从 PGC 导入最新审核结果</b></summary>
+  view.innerHTML = `<details class="box section" open><summary><b>导入总审核的审核记录表格</b>（.xlsx）</summary>
+      <p class="small muted">总审核导出的「版本审核记录」表格：每行一条初审或终审记录。同名游戏会合并更新分数和意见，保留已有的简介和标签。组员姓名只在这台电脑上用来区分"我的"和"他人"，不会上传。</p>
+      <div class="locks">
+        <label class="field">表格文件<input type="file" id="sheetFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>
+        <label class="field">哪一位是你<select id="sheetSelf" disabled><option value="">先选择文件</option></select></label>
+        <label class="field">&nbsp;<button class="primary" id="sheetImport" disabled>导入表格</button></label>
+      </div>
+      <p class="small muted" id="sheetInfo"></p>
+    </details>
+    <details class="box section"><summary><b>从 PGC 导入最新审核结果</b></summary>
       <ol class="small">
         <li>在电脑上登录 PGC 平台（creator-hub），按 F12 打开控制台。</li>
         <li>点 <button class="ghost small" id="cpSnippet">复制导出脚本</button>，粘贴到控制台回车。脚本只读取你账号能看到的作品和审核意见，不会修改任何东西。</li>
@@ -822,6 +867,34 @@ async function renderGames(alive) {
   $("#fSource").onchange = (e) => { f.source = e.target.value; render(); };
   $("#fStatus").onchange = (e) => { f.status = e.target.value; render(); };
   $("#fQ").onchange = (e) => { f.q = e.target.value; render(); };
+  let sheetRows = null;
+  const SELF_KEY = "forge_sheet_self";
+  $("#sheetFile").onchange = (e) => guard(null, async () => {
+    sheetRows = null;
+    $("#sheetImport").disabled = true;
+    const file = e.target.files[0];
+    if (!file) return;
+    sheetRows = await readXlsxRows(await file.arrayBuffer());
+    const works = sheetToWorks(sheetRows);
+    const members = listMembers(sheetRows);
+    let saved = "";
+    try { saved = localStorage.getItem(SELF_KEY) || ""; } catch {}
+    $("#sheetSelf").innerHTML = `<option value="">都不是我（全部算他人）</option>` +
+      members.map((m) => `<option value="${esc(m)}" ${m === saved ? "selected" : ""}>${esc(m)}</option>`).join("");
+    $("#sheetSelf").disabled = !members.length;
+    const scored = works.filter((w) => w.versions.some((v) => v.s || v.ps)).length;
+    $("#sheetInfo").textContent = `读到 ${works.length} 款游戏、${works.reduce((n, w) => n + w.versions.length, 0)} 个版本，其中 ${scored} 款有评分。`;
+    $("#sheetImport").disabled = false;
+  }, "读取表格");
+  $("#sheetImport").onclick = (e) => guard(e.target, async () => {
+    if (!sheetRows) throw new Error("先选择表格文件");
+    const self = $("#sheetSelf").value;
+    try { localStorage.setItem(SELF_KEY, self); } catch {}
+    const r = await api("POST", "import", { works: sheetToWorks(sheetRows, { self }) });
+    toast(`新增 ${r.inserted}，更新 ${r.updated}，${r.untagged} 个待打标签`, 5000);
+    await refreshStatus();
+    render();
+  }, "导入表格");
   $("#cpSnippet").onclick = () => copyText(EXPORT_SNIPPET);
   $("#importBtn").onclick = (e) => guard(e.target, async () => {
     let data;

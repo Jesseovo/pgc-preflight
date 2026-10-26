@@ -17,6 +17,14 @@
 .profile-tab.active small { color: #5d8864; }
 .active-model-note { padding: 10px 12px; margin-bottom: 20px; border-left: 2px solid #a9c5a2; background: #f5f9f3; color: #708076; font-size: 11px; line-height: 1.75; }
 .active-model-note b { color: #4f7156; font-weight: 650; }
+.model-routes { border: 1px solid var(--line); border-radius: 6px; padding: 14px 14px 10px; margin-bottom: 22px; }
+.model-routes h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: #36463e; }
+.model-routes .field { margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px; }
+.model-routes .field > span { font-size: 12px; color: #36463e; }
+.model-routes select { width: 100%; min-height: 40px; border: 1px solid #d4dcd3; border-radius: 5px; padding: 8px 10px; font: inherit; font-size: 13px; color: #36463e; background: #fcfdfb; }
+.model-routes p { font-size: 11px; color: #656d76; line-height: 1.7; margin: 2px 0 10px; }
+.model-routes .subtle-button { min-height: 36px; font-size: 11px; }
+.model-routes .form-message { margin-top: 6px; min-height: 0; }
 .model-action-group { display: flex; align-items: center; gap: 9px; }
 .model-action-group .subtle-button { min-height: 42px; font-size: 11px; }
 .field { margin-bottom: 24px; }

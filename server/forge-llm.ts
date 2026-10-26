@@ -1,4 +1,5 @@
 import { activeModelProfile, decryptKey } from './settings';
+import type { ModelConfig, ModelPurpose } from './settings';
 import { modelTransport } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
 
@@ -15,6 +16,21 @@ export function activeModel(cfg: Record<string, string>) { return cfg.openai_mod
 
 function jsonTail(schema: unknown) {
   return schema ? '\n\n只输出一个 JSON 对象，不要任何解释或代码块标记。不要尾随逗号；字符串内换行写成 \\n。它必须符合这个 JSON Schema：\n' + JSON.stringify(schema) : '';
+}
+
+// A text-only model gets a note in place of the screenshots, so the report
+// says its visual judgement rests on the source and the run log.
+export function withoutImages(user: unknown) {
+  if (typeof user === 'string') return user;
+  const parts = user as Array<Record<string, string>>;
+  const images = parts.filter(part => part.type === 'image').length;
+  // Drop the "截图：…" captions that only introduced an image.
+  const rest = parts.filter((part, i) => part.type !== 'image' && parts[i + 1]?.type !== 'image');
+  return images ? [{ type: 'text', text: `（当前审核模型不能看图片，${images} 张截图没有发送。美学请依据源码里的绘制代码和运行记录判断，并在报告里说明这一点。）` }, ...rest] : rest;
+}
+
+export function routedModel(config: ModelConfig | null, purpose: ModelPurpose) {
+  return activeModelProfile(config, purpose)?.profile.model || '';
 }
 
 function toMessages(system: string, user: unknown, schema: unknown) {
@@ -34,10 +50,11 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void> }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose }) {
   const configured = await env.modelStore.get();
-  const active = activeModelProfile(configured);
-  if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError('管理员尚未配置并启用审核模型。', 503);
+  const active = activeModelProfile(configured, req.purpose || 'create');
+  if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError(req.purpose === 'review' ? '管理员尚未配置并启用审核模型。' : '管理员尚未配置并启用创作模型。', 503);
+  if (active.profile.vision === false) req = { ...req, user: withoutImages(req.user) };
   let apiKey: string;
   try { apiKey = await decryptKey(active.profile.encryptedKey, env.SETTINGS_KEY); }
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }

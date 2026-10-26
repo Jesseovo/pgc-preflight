@@ -3,14 +3,14 @@
 import { SEED_GAMES, SEED_VOCAB } from "./forge/seed.js";
 import { DEFAULT_SETTINGS, DEFAULT_REDLINES, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_F } from "./forge/defaults.js";
 import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "./forge/logic.js";
-import { complete, providerStatus, activeModel, LLMError } from "./forge-llm";
+import { complete, providerStatus, activeModel, routedModel, LLMError } from "./forge-llm";
 import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob } from './review-jobs';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
 import {
   expandSystem, expandUser, EXPAND_SCHEMA, PREVIEW_SYSTEM, previewUser,
-  briefSystem, briefUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
+  briefSystem, briefUser, ASSETS_SYSTEM, assetsUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
   reviewSystem, REVIEW_SCHEMA,
 } from "./forge/prompts.js";
 
@@ -47,7 +47,14 @@ export interface ForgeEnv {
   REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
 }
 
-export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'review'; id: string };
+export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'review'; id: string };
+
+// Per-topic background jobs share one claim/lease/recovery path.
+type TopicJobKind = 'brief' | 'assets';
+const TOPIC_JOBS = {
+  brief: { status: 'brief_status', error: 'brief_error', output: 'brief_md' },
+  assets: { status: 'assets_status', error: 'assets_error', output: 'assets_html' },
+} as const;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -80,6 +87,18 @@ async function runBatch(env, statements) {
   for (let i = 0; i < statements.length; i += 50) await env.DB.batch(statements.slice(i, i + 50));
 }
 
+// Generated files are always downloaded, never rendered in the app origin.
+function attachment(content, type, topic, suffix) {
+  const filename = `${String(topic.data.title || 'pgc').replace(/[^\p{L}\p{N}._-]+/gu, '-')}-${suffix}`;
+  return new Response(content, { headers: {
+    'Content-Type': type,
+    'Content-Disposition': `attachment; filename="pgc-${suffix}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'Cache-Control': 'private, no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': 'sandbox',
+  } });
+}
+
 async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
   if (a === 'review' && b === 'jobs') {
@@ -110,21 +129,24 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "POST draw": return draw(env, await body(request));
     case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
-    case "GET topics/:id": return getTopic(env, id);
+    case "GET topics/:id": {
+      const topic = await getTopic(env, id);
+      return { ...topic, brief_export: composeBrief(topic) };
+    }
     case "GET topics/:id/brief": {
       const topic = await getTopic(env, id);
       if (!topic.brief_md?.trim()) throw new HttpError(409, "简报尚未生成，请稍后再下载。");
-      const filename = `${String(topic.data.title || 'pgc').replace(/[^\p{L}\p{N}._-]+/gu, '-')}-brief.md`;
-      return new Response(topic.brief_md, { headers: {
-        'Content-Type': 'text/markdown; charset=utf-8',
-        'Content-Disposition': `attachment; filename="pgc-brief.md"; filename*=UTF-8''${encodeURIComponent(filename)}`,
-        'Cache-Control': 'private, no-store',
-        'X-Content-Type-Options': 'nosniff',
-      } });
+      return attachment(composeBrief(topic), 'text/markdown; charset=utf-8', topic, 'brief.md');
+    }
+    case "GET topics/:id/assets": {
+      const topic = await getTopic(env, id);
+      if (!topic.assets_html?.trim()) throw new HttpError(409, "资产尚未生成，请稍后再下载。");
+      return attachment(topic.assets_html, 'text/html; charset=utf-8', topic, 'assets.html');
     }
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
     case "POST topics/:id/preview": return preview(env, id);
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
+    case "POST topics/:id/assets": return startTopicJob(env, 'assets', id, ctx, new URL(request.url).searchParams.get('regenerate') === '1', assetsJob);
     case "POST review": return review(env, await body(request), ownerId);
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
@@ -298,12 +320,15 @@ async function addGame(env, data) {
   return first(env, "SELECT * FROM games WHERE id = ?", r.meta.last_row_id);
 }
 
-// Accepts the JSON produced by the PGC export snippet (see the 导入 page).
+// Accepts the JSON produced by the PGC export snippet (see the 导入 page), and
+// the head reviewer's spreadsheet converted in the browser (match: "title":
+// no platform IDs, no descriptions).
 async function importWorks(env, { works }) {
   if (!Array.isArray(works)) throw new HttpError(400, "缺少 works 数组");
-  const existing = await all(env, "SELECT id, ext_id, title FROM games");
+  const existing = await all(env, "SELECT id, ext_id, title, source FROM games");
   const byExt = new Map(existing.filter((g) => g.ext_id).map((g) => [g.ext_id, g]));
   const byTitle = new Map(existing.filter((g) => !g.ext_id).map((g) => [norm(g.title), g]));
+  const byTitleSource = new Map(existing.map((g) => [norm(g.title) + "|" + g.source, g]));
   let inserted = 0, updated = 0;
   const stmts = [];
   for (const w of works) {
@@ -312,16 +337,20 @@ async function importWorks(env, { works }) {
     const scored = [...versions].reverse().find((v) => v.s || v.ps);
     const parts = scored ? String(scored.s || scored.ps).split("/").map(Number) : [null, null, null];
     const score = parts.every((x) => Number.isFinite(x)) ? parts[0] + parts[1] + parts[2] : null;
-    const feedback = versions.map((v) => v.fb || v.pfb).filter(Boolean).map((t) => t.replace(/\s+/g, " ").trim()).join(" / ").slice(0, 1200);
+    const feedback = versions.flatMap((v) => [v.pfb, v.fb]).filter(Boolean).map((t) => t.replace(/\s+/g, " ").trim()).join(" / ").slice(0, 1200);
     const status = mapStatus(w.status, w.deleted);
     const revisions = versions.length ? Math.max(...versions.map((v) => v.r)) : 1;
     const descr = String(w.desc || "").replace(/\s+/g, " ").slice(0, 300);
     const source = w.source === "peer" ? "peer" : "mine";
-    const hit = byExt.get(w.id) || byTitle.get(norm(w.title));
+    const hit = byExt.get(w.id)
+      || (w.match === "title" ? byTitleSource.get(norm(w.title) + "|" + source) : null)
+      || byTitle.get(norm(w.title));
     if (hit) {
+      // Keep a real platform ID over a spreadsheet one, and an existing description over an empty one.
+      const extId = w.match === "title" && hit.ext_id ? hit.ext_id : w.id;
       stmts.push(env.DB.prepare(
-        `UPDATE games SET ext_id = ?, title = ?, descr = ?, status = ?, score = ?, aes = ?, ease = ?, play = ?, revisions = ?, feedback = ?, source = ?, updated_at = ? WHERE id = ?`,
-      ).bind(w.id, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now(), hit.id));
+        `UPDATE games SET ext_id = ?, title = ?, descr = COALESCE(NULLIF(?, ''), descr), status = ?, score = ?, aes = ?, ease = ?, play = ?, revisions = ?, feedback = ?, source = ?, updated_at = ? WHERE id = ?`,
+      ).bind(extId, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now(), hit.id));
       updated++;
     } else {
       stmts.push(env.DB.prepare(
@@ -329,6 +358,10 @@ async function importWorks(env, { works }) {
       ).bind(w.id, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now()));
       inserted++;
     }
+    // Two rows in one file for the same game must not both insert.
+    const row = hit || { id: null, ext_id: w.id, title: w.title, source };
+    byExt.set(w.id, row);
+    byTitleSource.set(norm(w.title) + "|" + source, row);
   }
   await runBatch(env, stmts);
   const untagged = await first(env, "SELECT COUNT(*) AS n FROM games WHERE gesture = '' OR medium = ''");
@@ -368,7 +401,8 @@ async function listTopics(env, params) {
   const limit = Math.min(Number(params.get("limit")) || 100, 500);
   const marks = statuses.map(() => "?").join(",");
   const rows = await all(env, `SELECT id, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
-      preview_svg IS NOT NULL AS has_preview, brief_md IS NOT NULL AS has_brief, brief_status, brief_error
+      preview_svg IS NOT NULL AS has_preview, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
+      assets_html IS NOT NULL AS has_assets, assets_status, assets_error
     FROM topics WHERE status IN (${marks}) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses, limit);
   return rows.map(hydrate);
 }
@@ -386,7 +420,7 @@ const JOB_LEASE_MS = 75_000;
 function staleJobBefore() {
   return new Date(Date.now() - JOB_LEASE_MS).toISOString();
 }
-async function withTopicLease<T>(env, ids: number[], statusColumn: 'expand_status' | 'brief_status', work: () => Promise<T>): Promise<T> {
+async function withTopicLease<T>(env, ids: number[], statusColumn: 'expand_status' | 'brief_status' | 'assets_status', work: () => Promise<T>): Promise<T> {
   const marks = ids.map(() => "?").join(",");
   const touch = () => run(env, `UPDATE topics SET updated_at = ? WHERE id IN (${marks}) AND ${statusColumn} = 'running'`, now(), ...ids).catch(() => {});
   const timer = setInterval(() => { void touch(); }, 20_000);
@@ -455,7 +489,7 @@ async function expandBatch(env, ids) {
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
-  const slowModel = /opus|claude/i.test(String((await env.modelStore.get())?.model || ''));
+  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'create'));
   const [cfg, games, prior] = await Promise.all([
     getSettings(env),
     all(env, "SELECT * FROM games ORDER BY id"),
@@ -561,10 +595,10 @@ async function readReviewBody(request) {
 }
 
 // Long minified/base64 lines carry no reviewable logic and cost many tokens.
-function trimSource(html) {
+function trimSource(html, max = MAX_SOURCE) {
   const lines = String(html || "").split("\n").map((l) => (l.length > 3000 ? `/* [省略一行 ${l.length} 字符] */` : l));
   let out = lines.join("\n");
-  if (out.length > MAX_SOURCE) out = out.slice(0, MAX_SOURCE) + `\n/* [源码过长，后面 ${out.length - MAX_SOURCE} 字符已省略] */`;
+  if (out.length > max) out = out.slice(0, max) + `\n/* [源码过长，后面 ${out.length - max} 字符已省略] */`;
   return out;
 }
 
@@ -572,7 +606,9 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
   const images = (Array.isArray(shots) ? shots : []).filter((s) => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data)).slice(0, 6);
   const [cfg, games] = await Promise.all([getSettings(env), all(env, "SELECT * FROM games ORDER BY id")]);
-  const { positives, negatives } = exampleSets(games);
+  // The calibration set is for the scoring scale, not for recalling this
+  // game's own past result: a known score would anchor (or leak) the verdict.
+  const { positives, borderline, negatives } = exampleSets(games.filter((g) => !sameGame(g.title, title)));
   let design = "";
   if (topic_id) {
     const t = hydrate(await first(env, "SELECT * FROM topics WHERE id = ?", topic_id));
@@ -580,12 +616,15 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   }
   const parts = [];
   for (const s of images) parts.push({ type: "text", text: `截图：${s.label}` }, { type: "image", data: s.data });
-  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【自动体检报告】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html)}` });
+  // DeepSeek's context and output limits are smaller than Claude's.
+  const smallModel = /deepseek/i.test(routedModel(await env.modelStore.get(), 'review'));
+  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【自动体检报告】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
   const result = await complete(env, cfg, {
-    system: reviewSystem({ redlines: cfg.redlines, positives, negatives }),
+    system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives }),
     user: parts,
     schema: REVIEW_SCHEMA,
-    maxTokens: 16000,
+    purpose: 'review',
+    maxTokens: smallModel ? 8192 : 16000,
     timeoutMs: 300000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
     onWait: jobId ? message => run(env, "UPDATE review_jobs SET error = ? WHERE id = ? AND status = 'running'", message, jobId) : undefined,
@@ -596,10 +635,29 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   }
   for (const k of ["aes", "ease", "play"]) result[k] = Math.max(1, Math.min(3, Number(result[k]) || 1));
   const score = result.aes + result.ease + result.play;
+  result.verdict = consistentVerdict(result.verdict, score);
   const r = await run(env, "INSERT OR IGNORE INTO reviews (owner_id, title, topic_id, score, result, probe, shots, created_at, job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     ownerId || 'admin', String(title || "未命名").slice(0, 120), topic_id || null, score, JSON.stringify(result), JSON.stringify(probe || {}), JSON.stringify(images), now(), jobId);
   const persisted = jobId ? await first(env, 'SELECT id FROM reviews WHERE job_id = ?', jobId) : null;
   return getReview(env, persisted?.id || r.meta.last_row_id, ownerId);
+}
+
+// The pass line is arithmetic (total ≥ 7); the verdict text must agree with it.
+export function consistentVerdict(verdict, score) {
+  const text = String(verdict || '').trim();
+  const passed = score >= 7;
+  if ((passed ? /^(模拟)?通过/ : /^(模拟)?打回/).test(text)) return text;
+  return `${passed ? '通过' : '打回'}（${score}/9）${text ? '。' + text : ''}`;
+}
+
+// "UMBRA" and "UMBRA — Shadow Theatre" are the same game; very short keys
+// must match exactly so "Up" does not swallow every title containing it.
+export function sameGame(a, b) {
+  const key = (s) => String(s || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const x = key(a), y = key(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  return Math.min(x.length, y.length) >= 4 && (x.includes(y) || y.includes(x));
 }
 
 async function listReviews(env, ownerId) {
@@ -618,24 +676,34 @@ async function getReview(env, id, ownerId = 'admin') {
   return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots) };
 }
 
-async function brief(env, id, ctx, regenerate = false) {
+function brief(env, id, ctx, regenerate = false) {
+  return startTopicJob(env, 'brief', id, ctx, regenerate, briefJob);
+}
+
+async function startTopicJob(env, kind: TopicJobKind, id, ctx, regenerate, job: (env, id, t) => Promise<unknown>) {
+  const k = TOPIC_JOBS[kind];
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
+  if (kind === 'assets' && !t.brief_md?.trim()) throw new HttpError(409, "先生成简报（细纲），资产要按它来做。");
   // A previous request may have completed after the browser lost its
-  // connection. Return the persisted brief instead of generating it again.
+  // connection. Return the persisted result instead of generating it again.
   const staleBefore = staleJobBefore();
-  if (t.brief_status === 'running' && !(String(t.updated_at || '') < staleBefore)) return { id, status: 'pending' };
-  if (!regenerate && typeof t.brief_md === "string" && t.brief_md.trim()) return { id, brief: t.brief_md };
+  if (t[k.status] === 'running' && !(String(t.updated_at || '') < staleBefore)) return { id, status: 'pending' };
+  if (!regenerate && typeof t[k.output] === "string" && t[k.output].trim()) return { id, [kind]: t[k.output] };
   if (env.FORGE_QUEUE || ctx?.waitUntil) {
-    const claim = await run(env, "UPDATE topics SET brief_status = 'running', brief_error = '', updated_at = ? WHERE id = ? AND (brief_status = '' OR brief_status = 'error' OR (brief_status = 'running' AND updated_at < ?))", now(), id, staleBefore);
+    const claim = await run(env, `UPDATE topics SET ${k.status} = 'running', ${k.error} = '', updated_at = ? WHERE id = ? AND (${k.status} = '' OR ${k.status} = 'error' OR (${k.status} = 'running' AND updated_at < ?))`, now(), id, staleBefore);
     if (!claim.meta?.changes) return { id, status: 'pending' };
-    if (env.FORGE_QUEUE) await env.FORGE_QUEUE.send({ type: 'brief', id });
-    else ctx.waitUntil(briefJob(env, id, t).catch(async error => {
-      await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ?", String(error?.message || error).slice(0, 500), now(), id).catch(() => {});
-    }));
+    if (env.FORGE_QUEUE) await env.FORGE_QUEUE.send({ type: kind, id });
+    else ctx.waitUntil(job(env, id, t).catch(error => markTopicJobError(env, kind, id, error)));
     return { id, status: 'pending' };
   }
-  return briefJob(env, id, t);
+  return job(env, id, t);
+}
+
+function markTopicJobError(env, kind: TopicJobKind, id, error, onlyIfRunning = false) {
+  const k = TOPIC_JOBS[kind];
+  return run(env, `UPDATE topics SET ${k.status} = 'error', ${k.error} = ?, updated_at = ? WHERE id = ?${onlyIfRunning ? ` AND ${k.status} = 'running'` : ''}`,
+    String(error?.message || error).slice(0, 500), now(), id).catch(() => {});
 }
 
 export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
@@ -647,16 +715,82 @@ export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
       throw error;
     }
   }
-  try { return await briefJob(env, job.id, await getTopic(env, job.id)); }
+  const run_ = job.type === 'assets' ? assetsJob : briefJob;
+  try { return await run_(env, job.id, await getTopic(env, job.id)); }
   catch (error) {
-    await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ? AND brief_status = 'running'", String(error?.message || error).slice(0, 500), now(), job.id).catch(() => {});
+    await markTopicJobError(env, job.type, job.id, error, true);
+    throw error;
+  }
+}
+
+// ---------- assets ----------
+
+const ASSET_SECTION = `
+
+## H. 美术资产（必须使用）
+- 本简报附带同名的 assets.html（在工作台候选卡片里下载），用浏览器打开就能看到全部资产和一张合成的游戏画面。
+- 把其中 <script id="game-assets"> 整段原样复制进游戏，所有角色、敌人、道具、背景、HUD 和特效都调用 GAME_ASSETS 里的绘制函数，不要重新设计造型和配色。
+- sprites / ui 的 draw 以 (0, 0) 为中心、单位是逻辑像素；状态和动画由参数里的 t、state、frame 控制；backgrounds 铺满 (0, 0, w, h)；fx 用进度 p。
+- 资产里没有的元素，按 meta.style 的风格规范和同一套配色补画，并在交付自检里列出补了哪些。
+`;
+
+export function composeBrief(t) {
+  if (!t?.brief_md?.trim()) return '';
+  return t.assets_html?.trim() ? t.brief_md.trimEnd() + ASSET_SECTION : t.brief_md;
+}
+
+// The F part (from "## F.") is the design the assets must cover; the fixed
+// A–G platform rules before it are not needed for drawing.
+function designPart(md) {
+  const text = String(md || '');
+  const at = text.search(/^##\s*F[.．、\s]/m);
+  return (at >= 0 ? text.slice(at) : text).slice(0, 20000);
+}
+
+export function cleanAssetsHtml(text) {
+  const raw = String(text || '').replace(/^\s*```(?:html)?\s*/i, '').replace(/\s*```\s*$/, '');
+  const start = raw.search(/<!doctype html|<html[\s>]/i);
+  const end = raw.toLowerCase().lastIndexOf('</html>');
+  if (start < 0 || end < start) throw new LLMError('模型没有返回完整的资产 HTML（可能输出被截断），请重新生成。', 502);
+  const html = raw.slice(start, end + 7)
+    .replace(/<script\b[^>]*\bsrc\s*=[^>]*>\s*<\/script>/gi, '')
+    .replace(/<link\b[^>]*>/gi, '')
+    .replace(/<(iframe|object|embed)\b[\s\S]*?(<\/\1>|\/>)/gi, '')
+    .replace(/<base\b[^>]*>/gi, '')
+    .replace(/<meta\b[^>]*http-equiv[^>]*>/gi, '')
+    .replace(/@import[^;]*;/gi, '');
+  if (!/<script\b[^>]*\bid\s*=\s*["']game-assets["']/i.test(html) || !/GAME_ASSETS/.test(html)) {
+    throw new LLMError('资产 HTML 里缺少 <script id="game-assets"> 和 GAME_ASSETS，请重新生成。', 502);
+  }
+  if (html.length > 400_000) throw new LLMError('资产 HTML 超过 400KB，请重新生成。', 502);
+  return html;
+}
+
+async function assetsJob(env, id, t) {
+  const cfg = await getSettings(env);
+  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'create'));
+  try {
+    const text = await withTopicLease(env, [id], 'assets_status', () => complete(env, cfg, {
+      system: ASSETS_SYSTEM,
+      user: assetsUser(t, designPart(t.brief_md), t.preview_svg || ''),
+      // A 40–60KB HTML file is roughly 15k tokens.
+      maxTokens: 20000,
+      timeoutMs: slowModel ? 300000 : 180000,
+      idempotencyKey: `pgc-assets-${id}-${Date.now()}`,
+      onWait: message => run(env, "UPDATE topics SET assets_error = ? WHERE id = ? AND assets_status = 'running'", message, id),
+    }));
+    const html = cleanAssetsHtml(text);
+    await run(env, "UPDATE topics SET assets_html = ?, assets_status = '', assets_error = '', updated_at = ? WHERE id = ?", html, now(), id);
+    return { id, assets: html };
+  } catch (error) {
+    await markTopicJobError(env, 'assets', id, error);
     throw error;
   }
 }
 
 async function briefJob(env, id, t) {
   const cfg = await getSettings(env);
-  const slowModel = /opus|claude/i.test(String((await env.modelStore.get())?.model || ''));
+  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'create'));
   try {
     const md = await withTopicLease(env, [id], 'brief_status', () => complete(env, cfg, {
         system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),

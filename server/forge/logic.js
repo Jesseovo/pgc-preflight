@@ -120,12 +120,18 @@ export function exampleSets(games) {
   const scored = games.filter((g) => gameSignal(g) != null);
   const byScore = (a, b) => (b.score - a.score) || ((a.revisions || 1) - (b.revisions || 1)) || a.title.localeCompare(b.title);
   const positives = scored.filter((g) => g.status !== "rejected" && g.score >= 8).sort(byScore).slice(0, 24);
+  // Most real passes sit exactly on the line; the reviewer must see what 7 looks like.
+  const borderline = scored.filter((g) => g.status !== "rejected" && g.score === 7)
+    .sort((a, b) => ((a.revisions || 1) - (b.revisions || 1)) || a.title.localeCompare(b.title))
+    .slice(0, 16);
+  // Hardest lessons first: still rejected, then the ones that took the most rounds.
   const negatives = scored
     .filter((g) => g.status === "rejected" || (g.revisions || 1) >= 3)
     .filter((g) => g.feedback)
-    .sort((a, b) => a.title.localeCompare(b.title))
+    .sort((a, b) => (Number(b.status === "rejected") - Number(a.status === "rejected"))
+      || ((b.revisions || 1) - (a.revisions || 1)) || a.title.localeCompare(b.title))
     .slice(0, 36);
-  return { positives, negatives };
+  return { positives, borderline, negatives };
 }
 
 export function norm(s) {

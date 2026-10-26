@@ -1,10 +1,16 @@
 export type ModelProtocol = 'openai' | 'anthropic';
 export type ModelProfileId = 'deepseek' | 'opus';
-export interface StoredModelProfile { baseUrl: string; model: string; protocol: ModelProtocol; encryptedKey: string; enabled: boolean; updatedAt: string }
+// `vision: false` marks a text-only model: review then sends no screenshots.
+export interface StoredModelProfile { baseUrl: string; model: string; protocol: ModelProtocol; encryptedKey: string; enabled: boolean; updatedAt: string; vision?: boolean }
+// What a model call is for. Each purpose can be routed to its own profile;
+// an unrouted purpose follows the active profile.
+export type ModelPurpose = 'review' | 'create';
+export const MODEL_PURPOSES = ['review', 'create'] as const;
+export type ModelRoutes = Partial<Record<ModelPurpose, ModelProfileId>>;
 // The top-level fields keep old rows and callers compatible. New rows also
 // carry both encrypted profiles so switching models never requires retyping a
 // key or replacing the currently active configuration.
-export interface ModelConfig extends StoredModelProfile { activeProfile?: ModelProfileId; profiles?: Partial<Record<ModelProfileId, StoredModelProfile>> }
+export interface ModelConfig extends StoredModelProfile { activeProfile?: ModelProfileId; profiles?: Partial<Record<ModelProfileId, StoredModelProfile>>; routes?: ModelRoutes }
 export interface ModelRuntime { baseUrl: string; model: string; protocol?: ModelProtocol; apiKey: string }
 export interface ConfigStore { get(): Promise<ModelConfig | null>; set(config: ModelConfig): Promise<void> }
 export interface AppSecrets { ADMIN_PASSWORD: string; SETTINGS_KEY: string }
@@ -22,7 +28,7 @@ export async function decryptKey(value: string, secret: string): Promise<string>
   const [iv, ciphertext] = value.split('.');
   return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv) }, await encryptionKey(secret), fromBase64(ciphertext)));
 }
-export function validateModelFields(value: unknown): { baseUrl: string; model: string; protocol: ModelProtocol; apiKey: string; enabled: boolean } {
+export function validateModelFields(value: unknown): { baseUrl: string; model: string; protocol: ModelProtocol; apiKey: string; enabled: boolean; vision: boolean } {
   const fields = value as Record<string, unknown>;
   if (!fields || typeof fields !== 'object') throw new Error('请填写模型配置。');
   if (typeof fields.baseUrl !== 'string' || typeof fields.model !== 'string') throw new Error('请填写接口地址和模型名称。');
@@ -38,7 +44,7 @@ export function validateModelFields(value: unknown): { baseUrl: string; model: s
   if (fields.apiKey !== undefined && typeof fields.apiKey !== 'string') throw new Error('API Key 格式不正确。');
   const apiKey = String(fields.apiKey || '').trim();
   if (apiKey.length > 2000) throw new Error('API Key 过长。');
-  return { baseUrl, model: fields.model.trim(), protocol, apiKey, enabled: fields.enabled !== false };
+  return { baseUrl, model: fields.model.trim(), protocol, apiKey, enabled: fields.enabled !== false, vision: fields.vision !== false };
 }
 
 const PROFILE_DEFAULTS: Record<ModelProfileId, Pick<StoredModelProfile, 'baseUrl' | 'model' | 'protocol'>> = {
@@ -61,17 +67,36 @@ export function modelProfiles(config: ModelConfig | null): Partial<Record<ModelP
   return profiles;
 }
 
-export function activeModelProfile(config: ModelConfig | null): { id: ModelProfileId; profile: StoredModelProfile } | null {
+export function activeModelProfile(config: ModelConfig | null, purpose?: ModelPurpose): { id: ModelProfileId; profile: StoredModelProfile } | null {
   const profiles = modelProfiles(config);
+  const routed = purpose ? config?.routes?.[purpose] : undefined;
+  if (routed && profiles[routed]) return { id: routed, profile: profiles[routed]! };
   const preferred: ModelProfileId = config?.activeProfile && profiles[config.activeProfile] ? config.activeProfile : profiles.deepseek ? 'deepseek' : 'opus';
   const profile = profiles[preferred];
   return profile ? { id: preferred, profile } : null;
 }
 
-function configWithProfiles(profiles: Partial<Record<ModelProfileId, StoredModelProfile>>, activeProfile: ModelProfileId): ModelConfig {
+function configWithProfiles(profiles: Partial<Record<ModelProfileId, StoredModelProfile>>, activeProfile: ModelProfileId, routes?: ModelRoutes): ModelConfig {
   const active = profiles[activeProfile] || profiles.deepseek || profiles.opus;
   if (!active) throw new Error('请先保存至少一个模型配置。');
-  return { ...active, activeProfile, profiles };
+  return { ...active, activeProfile, profiles, ...(routes && Object.keys(routes).length ? { routes } : {}) };
+}
+
+export async function saveRoutes(body: unknown, store: ConfigStore): Promise<ModelConfig> {
+  const raw = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const previous = await store.get();
+  const profiles = modelProfiles(previous);
+  const routes: ModelRoutes = {};
+  for (const purpose of MODEL_PURPOSES) {
+    const value = raw[purpose];
+    if (value === '' || value == null) continue;
+    if (value !== 'deepseek' && value !== 'opus') throw new Error('模型用途设置不正确。');
+    if (!profiles[value]?.encryptedKey) throw new Error(`${value === 'opus' ? 'Claude Opus 5.5' : 'DeepSeek'} 还没有保存 API Key，不能分配用途。`);
+    routes[purpose] = value;
+  }
+  const config = configWithProfiles(profiles, previous?.activeProfile || 'deepseek', routes);
+  await store.set(config);
+  return config;
 }
 
 export async function resolveModel(config: ModelConfig | null, secret: string): Promise<ModelRuntime | null> {
@@ -89,9 +114,9 @@ export async function saveConfig(body: unknown, store: ConfigStore, secret: stri
   if (!fields.apiKey && !current?.encryptedKey) throw new Error('首次配置需要填写 API Key。');
   if (!fields.apiKey && current && (fields.baseUrl !== current.baseUrl || fields.protocol !== current.protocol)) throw new Error('更换接口地址或协议时，请重新填写 API Key，避免把旧密钥发送到新地址。');
   const updatedAt = new Date().toISOString();
-  profiles[profileId] = { baseUrl: fields.baseUrl, model: fields.model, protocol: fields.protocol, enabled: fields.enabled, encryptedKey: fields.apiKey ? await encryptKey(fields.apiKey, secret) : current!.encryptedKey, updatedAt };
+  profiles[profileId] = { baseUrl: fields.baseUrl, model: fields.model, protocol: fields.protocol, enabled: fields.enabled, vision: fields.vision, encryptedKey: fields.apiKey ? await encryptKey(fields.apiKey, secret) : current!.encryptedKey, updatedAt };
   const active = previous?.activeProfile || (previous ? 'deepseek' : profileId);
-  const config = configWithProfiles(profiles, active);
+  const config = configWithProfiles(profiles, active, previous?.routes);
   await store.set(config);
   return config;
 }
@@ -100,7 +125,7 @@ export async function activateProfile(profileId: unknown, store: ConfigStore): P
   const previous = await store.get();
   const profiles = modelProfiles(previous);
   if (!profiles[id]?.encryptedKey) throw new Error('这个模型还没有保存 API Key，请先保存配置。');
-  const config = configWithProfiles(profiles, id);
+  const config = configWithProfiles(profiles, id, previous?.routes);
   await store.set(config);
   return config;
 }
@@ -109,9 +134,11 @@ export function publicConfig(config: ModelConfig | null) {
   const profiles = modelProfiles(config);
   const publicProfiles = Object.fromEntries(MODEL_PROFILES.map(id => {
     const p = profiles[id];
-    return [id, p ? { baseUrl: p.baseUrl, model: p.model, protocol: p.protocol || PROFILE_DEFAULTS[id].protocol, enabled: p.enabled, hasKey: !!p.encryptedKey, updatedAt: p.updatedAt } : { ...PROFILE_DEFAULTS[id], enabled: true, hasKey: false, updatedAt: '' }];
+    return [id, p ? { baseUrl: p.baseUrl, model: p.model, protocol: p.protocol || PROFILE_DEFAULTS[id].protocol, enabled: p.enabled, vision: p.vision !== false, hasKey: !!p.encryptedKey, updatedAt: p.updatedAt } : { ...PROFILE_DEFAULTS[id], enabled: true, vision: true, hasKey: false, updatedAt: '' }];
   }));
-  return { baseUrl: active?.profile.baseUrl || '', model: active?.profile.model || '', protocol: active?.profile.protocol || 'openai', enabled: active?.profile.enabled ?? true, hasKey: !!active?.profile.encryptedKey, updatedAt: active?.profile.updatedAt || '', activeProfile: active?.id || 'deepseek', profiles: publicProfiles };
+  const routes = Object.fromEntries(MODEL_PURPOSES.map(purpose => [purpose, config?.routes?.[purpose] || '']));
+  const effective = Object.fromEntries(MODEL_PURPOSES.map(purpose => [purpose, activeModelProfile(config, purpose)?.id || '']));
+  return { baseUrl: active?.profile.baseUrl || '', model: active?.profile.model || '', protocol: active?.profile.protocol || 'openai', enabled: active?.profile.enabled ?? true, hasKey: !!active?.profile.encryptedKey, updatedAt: active?.profile.updatedAt || '', activeProfile: active?.id || 'deepseek', profiles: publicProfiles, routes, effective };
 }
 
 async function hmac(text: string, secret: string): Promise<string> {
