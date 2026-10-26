@@ -59,7 +59,7 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
     : `模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`, response.status, wait, code);
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; json?: boolean; reasoningEffort?: 'low' } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onProgress?: (characters: number) => Promise<void>; json?: boolean; reasoningEffort?: 'low'; outputEffort?: 'low' } = {}): ModelTransport {
   const throttle = createModelThrottle(options.DB, config);
   return async messages => {
     const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), 24000);
@@ -84,7 +84,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
       const response = await fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST', headers,
-        body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens) } : {
+        body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens), ...(options.outputEffort ? {thinking:{type:'adaptive'},output_config:{effort:options.outputEffort}} : {}) } : {
           model:config.model,messages,max_tokens:maxTokens,stream:deepseek,
           ...(deepseek && options.json ? { response_format: { type: 'json_object' } } : {}),
           ...(deepseek && options.reasoningEffort ? { reasoning_effort: options.reasoningEffort } : {}),
@@ -102,6 +102,8 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         let truncated = false;
         let ended = false;
         let thinking = false;
+        let lastProgress = 0;
+        let lastCharacters = -1;
         const event = (line: string) => {
           if (!line.startsWith('data:')) return false;
           const payload = line.slice(5).trim();
@@ -138,6 +140,10 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
             while ((newline = buffer.indexOf('\n')) >= 0) {
               const line = buffer.slice(0, newline).replace(/\r$/, ''); buffer = buffer.slice(newline + 1);
               if (event(line)) touch();
+            }
+            if (options.onProgress && content.length !== lastCharacters && Date.now() - lastProgress >= 5000) {
+              lastProgress = Date.now(); lastCharacters = content.length;
+              await options.onProgress(content.length).catch(() => {});
             }
           }
           if (buffer.trim()) event(buffer);

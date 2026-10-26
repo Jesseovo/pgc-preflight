@@ -608,7 +608,7 @@ async function renderProducts(alive) {
   if (!alive()) return;
   const products = list.filter(topic => topic.has_product || ['queued', 'running', 'error'].includes(topic.product_status));
   view.innerHTML = `<div class="row section"><h2 class="grow">成品</h2><span class="muted small">${products.length} 款</span></div>
-    <p class="muted small section">Opus 生成的 HTML 游戏保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
+    <p class="muted small section">Opus 生成的可试玩首版保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
     <div class="cards" id="productCards"></div>`;
   const paint = () => {
     if (!alive()) return;
@@ -628,7 +628,7 @@ async function renderProducts(alive) {
 
 function productCard(topic) {
   const data = topic.data || {};
-  return `<article class="card" data-id="${topic.id}"><div class="art" style="${artStyle(data)}"><div class="title">${esc(data.title || 'Untitled')}</div><div class="score">${esc(topic.score ?? '—')}/9</div></div><div class="body">${chipsHtml(topic)}<p>${esc(data.logline || '')}</p><p class="muted small">单文件 HTML · ${esc(topic.updated_at || '')}</p></div><div class="acts"><button class="primary" data-act="viewProduct">查看成品</button><a class="btn" href="/api/forge/topics/${topic.id}/product-file">下载 HTML</a></div></article>`;
+  return `<article class="card" data-id="${topic.id}"><div class="art" style="${artStyle(data)}"><div class="title">${esc(data.title || 'Untitled')}</div><div class="score">可试玩</div></div><div class="body">${chipsHtml(topic)}<p>${esc(data.logline || '')}</p><p class="muted small">单文件 HTML · ${esc(topic.updated_at || '')}</p></div><div class="acts"><button class="primary" data-act="viewProduct">查看成品</button><a class="btn" href="/api/forge/topics/${topic.id}/product-file">下载 HTML</a></div></article>`;
 }
 
 function bindProductCards(root, list, paint) {
@@ -644,7 +644,7 @@ function bindProductCards(root, list, paint) {
 
 const productRequests = new Map();
 function productProgress(topic, entry) {
-  openModal(`${topic.data?.title || '游戏'} · Opus 制作`, `<p class="muted small">制作任务在服务器后台运行。可关闭此窗口或切换栏目，右下角会保留等待进度。</p><div id="productProgress" class="pgc-inline-wait"></div>`, entry);
+  openModal(`${topic.data?.title || '游戏'} · Opus 制作`, `<p class="muted small">先制作包含核心玩法和美术方向的可试玩首版，后期扩展留待迭代。任务在服务器后台运行，可关闭此窗口或切换栏目，右下角会保留等待进度。</p><div id="productProgress" class="pgc-inline-wait"></div>`, entry);
   entry.task.attach($('#productProgress'));
 }
 

@@ -79,6 +79,7 @@ describe('Opus 制作任务与成品接口', () => {
     expect(row().brief_md).toContain('Tiny Garden');
     await processForgeJob(env, job);
     expect(fetcher).toHaveBeenCalledTimes(2);
+    for (const call of fetcher.mock.calls) expect(JSON.parse(String((call[1] as RequestInit).body)).output_config).toEqual({effort:'low'});
     const list = await (await request('GET', ['products'])).json();
     expect(list[0]).toMatchObject({ id: 9, has_product: 1 });
     expect(list[0]).not.toHaveProperty('product_html');
@@ -113,6 +114,22 @@ describe('Opus 制作任务与成品接口', () => {
     const notCandidate = await setup({ status: 'new' });
     expect((await notCandidate.request('POST', ['topics', '9', 'game'])).status).toBe(409);
     expect(notCandidate.send).not.toHaveBeenCalled();
+  });
+
+  it('游戏超出输出预算时明确失败，不在后台付费重跑整款游戏', async () => {
+    const { sqlite, env, request, row, send } = await setup();
+    sqlite.exec("UPDATE topics SET brief_md = 'Existing brief'");
+    const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body)).max_tokens).toBe(16000);
+      expect(JSON.parse(String(init?.body)).output_config).toEqual({effort:'low'});
+      expect(JSON.parse(String(init?.body)).thinking).toEqual({type:'adaptive'});
+      return Response.json({ content: [{ type: 'text', text: html }], stop_reason: 'max_tokens' });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    await request('POST', ['topics', '9', 'game']);
+    await expect(processForgeJob(env, send.mock.calls[0][0])).rejects.toThrow('长度上限');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(row()).toMatchObject({ product_status: 'error', product_html: null });
   });
 
   it('已生成成品可以安全预览并单独读取源码', async () => {

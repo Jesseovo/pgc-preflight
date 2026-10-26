@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { cleanGameHtml, gameUser } from '../server/game-generation';
+import { gameBrief } from '../server/forge/prompts.js';
 
 const page = '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="https://example.invalid/game.css"><script src="https://example.invalid/game.js"></script></head><body><img src="https://example.invalid/hero.png"><script>document.body.textContent="Playable"</script></body></html>';
 
@@ -27,5 +28,11 @@ describe('Opus 游戏成品', () => {
     expect(prompt).toContain('Leaf Dodge');
     expect(prompt).toContain(brief);
     expect(prompt).toContain('const GAME_ASSETS');
+  });
+  it('首版提取核心操作和循环，保留完整简报原文供后续制作', () => {
+    const brief = '# Production\n1200–2000 lines\n## F. Design\n### F1. Identity\nGhost tower\n### F2. Art\nPaper shadows\n### F3. Controls\nHold and release\n### F4. Core loop\nHush then jump\n### F5. Tuning\nlarge table\n### F6. Late enemies\nBosses';
+    const compact = gameBrief(brief);
+    expect(compact).toContain('Hold and release');expect(compact).toContain('Hush then jump');expect(compact).toContain('Paper shadows');
+    expect(compact).not.toContain('large table');expect(brief).toContain('large table');
   });
 });

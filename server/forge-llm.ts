@@ -50,7 +50,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (req.requiredProfile && (active?.id !== req.requiredProfile || active.profile.model !== 'claude-opus-5-5')) throw new LLMError('制作任务要求 Claude Opus 5.5；创作模型已切换，请重新配置后重试。', 409);
@@ -68,7 +68,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     // Only explicitly pending idempotent requests are retried by transport.
     // Other gateway conflicts must preserve their exact cause. Completed but
     // unusable outputs get a fresh key and format feedback for regeneration.
-    const attempts = req.idempotencyKey ? 3 : 1;
+    const attempts = req.maxAttempts ?? (req.idempotencyKey ? 3 : 1);
     // A Queue consumer has a finite wall-clock lifetime. Leave time to persist
     // an actionable error rather than being killed during the final retry.
     const deadline = Math.min(req.deadline ?? Infinity, Date.now() + 12 * 60 * 1000);
@@ -80,6 +80,8 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, {
         DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
         json: Boolean(req.schema), reasoningEffort: req.purpose === 'review' ? 'low' : undefined,
+        onProgress: req.onProgress,
+        outputEffort: req.outputEffort,
         onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
       try {

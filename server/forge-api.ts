@@ -876,7 +876,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
       await stage('Opus 正在生成制作简报…');
       const md = await complete(env, cfg, {
         system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }), user: briefUser(topic),
-        maxTokens: 8000, timeoutMs: 300000, deadline, idempotencyKey: `pgc-product-brief-${requestId}`, purpose: 'create', requiredProfile: 'opus',
+        maxTokens: 8000, timeoutMs: 300000, deadline, idempotencyKey: `pgc-product-brief-${requestId}`, purpose: 'create', requiredProfile: 'opus', maxAttempts: 1, outputEffort: 'low',
         onWait: message => stage(message || 'Opus 正在生成制作简报…'),
       });
       if (!String(md).trim()) throw new Error('模型没有返回制作简报。');
@@ -887,17 +887,19 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
     const text = await withTopicLease(env, [id], 'product_status', () => complete(env, cfg, {
       system: GAME_SYSTEM,
       user: gameUser(topic, composeBrief(topic), topic.assets_html),
-      maxTokens: 24000,
+      maxTokens: 16000,
       timeoutMs: 300000,
       deadline, idempotencyKey: `pgc-game-${requestId}`, requiredProfile: 'opus', outputFormat: 'html',
-      purpose: 'create',
+      purpose: 'create', maxAttempts: 1, outputEffort: 'low',
       onWait: message => stage(message || 'Opus 正在编写完整 HTML 游戏…'),
+      onProgress: characters => stage(characters ? `Opus 正在编写游戏，已接收 ${characters.toLocaleString('en-US')} 个字符…` : 'Opus 正在准备游戏代码…'),
     }));
     const html = cleanGameHtml(text);
     await run(env, "UPDATE topics SET product_html = ?, product_status = '', product_error = '', status = 'made', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", html, now(), id, requestId);
     return { id, status: 'done' };
   } catch (error) {
-    await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", String(error?.message || error).slice(0, 500), now(), id, requestId).catch(() => {});
+    const reason = /模型响应超时/.test(String(error?.message)) ? 'Opus 未能在制作时限内返回完整游戏，本次未保存成品；请稍后重试。' : String(error?.message || error);
+    await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", reason.slice(0, 500), now(), id, requestId).catch(() => {});
     throw error;
   }
   });

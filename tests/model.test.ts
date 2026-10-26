@@ -78,6 +78,7 @@ describe('模型传输',()=>{
   });
 
   it('读取 Anthropic 流式文本，并带上幂等键',async()=>{
+    const progress = vi.fn(async (_characters: number) => {});
     const fetchMock=vi.fn(async(_input:unknown,_init?:RequestInit)=>new Response([
       'event: message_start\n',
       'data: {"type":"message_start"}\n\n',
@@ -86,10 +87,11 @@ describe('模型传输',()=>{
       'data: [DONE]\n\n',
     ].join(''),{headers:{'content-type':'text/event-stream'}}));
     vi.stubGlobal('fetch',fetchMock);
-    await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{idempotencyKey:'expand-42'})([
+    await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{idempotencyKey:'expand-42',onProgress:progress})([
       {role:'user',content:'test'},
     ])).resolves.toBe('READY');
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toMatchObject({'Idempotency-Key':'expand-42','Accept':'text/event-stream'});
+    expect(progress).toHaveBeenCalledWith(5);
   });
 
   it('DeepSeek流式读取思考与正文，只有报告正文返回给调用方',async()=>{
