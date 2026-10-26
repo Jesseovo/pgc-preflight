@@ -1,5 +1,6 @@
 // PGC Forge front end. Vanilla JS, no build step.
 import { mountReviewWorkspace } from './review-workspace.js';
+import { startTask, withProgress, progressHtml } from './progress.js';
 
 const DIMS = ["subject", "medium", "gesture", "structure", "mood"];
 const DIM_LABEL = { subject: "题材", medium: "美术媒介", gesture: "手势", structure: "挑战结构", mood: "情绪基调" };
@@ -51,10 +52,10 @@ async function api(method, path, data) {
   return out;
 }
 
-async function guard(btn, fn) {
+async function guard(btn, fn, label) {
   if (btn) btn.disabled = true;
   try {
-    return await fn();
+    return await withProgress(label || btn?.textContent?.trim() || "正在保存", fn);
   } catch (e) {
     toast(e.message, 4200);
   } finally {
@@ -62,10 +63,13 @@ async function guard(btn, fn) {
   }
 }
 
-function openModal(title, html) {
+let modalOwner = null;
+function openModal(title, html, owner = null) {
+  modalOwner = owner;
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = html;
   $("#modal").hidden = false;
+  if (window.frameElement) window.frameElement.scrollIntoView({ block: 'center', behavior: 'instant' });
 }
 $("#modalClose").onclick = () => ($("#modal").hidden = true);
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("#modal").hidden = true; });
@@ -121,7 +125,9 @@ function render() {
   const seq = ++renderSeq;
   const alive = () => seq === renderSeq;
   const fn = { draw: renderDraw, picks: renderPicks, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings }[state.tab];
-  fn(alive).catch((e) => { if (alive()) view.innerHTML = `<div class="box bad">${esc(e.message)}</div>`; });
+  const label = {draw:"读取选题台",picks:"读取候选选题",review:"读取审核工作台",vocab:"读取词库",games:"读取作品库",settings:"读取设置"}[state.tab];
+  view.innerHTML = `<div class="pgc-inline-wait">${progressHtml({label,detail:"正在读取最新数据…"})}</div>`;
+  withProgress(label, () => fn(alive)).catch((e) => { if (alive()) view.innerHTML = `<div class="box bad">${esc(e.message)}</div>`; });
 }
 
 // ---------- topic cards ----------
@@ -141,7 +147,7 @@ function topicCard(t, mode) {
   if (t.status === "drawn") {
     return `<article class="card pending" data-id="${t.id}">
       <div class="art"><div class="title">…</div></div>
-      <div class="body">${chipsHtml(t)}<div class="small">${t._error ? `<span class="bad">${esc(t._error)}</span>` : "AI 扩写中…"}</div></div>
+      <div class="body">${chipsHtml(t)}<div class="small">${t._error ? `<span class="bad">${esc(t._error)}</span>` : progressHtml({label:"AI 扩写中",detail:"后台排队与生成中…"})}</div></div>
       ${t._error ? `<div class="acts"><button class="ghost" data-act="retry">重试</button></div>` : ""}
     </article>`;
   }
@@ -163,6 +169,7 @@ function topicCard(t, mode) {
     <div class="body">
       ${chipsHtml(t)}
       <div>${esc(d.logline)}</div>
+      ${t.brief_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'制作简报',detail:'后台排队或生成中，可查看进度。'})}</div>` : ''}
       ${t.status === "dup" ? `<div class="small bad">与「${esc(d.dup_of)}」撞题</div>` : ""}
       <div class="kv"><b>新机制</b>${esc(d.twist)}</div>
       <div class="kv"><b>操作</b>${esc(d.controls)}</div>
@@ -189,7 +196,11 @@ function bindCards(root, list, rerender) {
     const id = Number(card.dataset.id);
     const t = list().find((x) => x.id === id);
     const act = btn.dataset.act;
-    await guard(btn, async () => {
+    const repaint = () => { if (root.isConnected) rerender(); };
+    if (act === "brief" && (!t.has_brief || t.brief_status === 'running' || briefRequests.get(id)?.pending)) {
+      generateBrief(t, repaint); return;
+    }
+    await guard(btn, async (progress) => {
       if (act === "like" || act === "reject" || act === "make" || act === "unmake") {
         const status = { like: "liked", reject: "rejected", make: "made", unmake: "liked" }[act];
         Object.assign(t, await api("PATCH", `topics/${id}`, { status }));
@@ -201,7 +212,7 @@ function bindCards(root, list, rerender) {
         let svg;
         if (t.has_preview) svg = (await api("GET", `topics/${id}`)).preview_svg;
         else {
-          toast("正在画样板图，约 30–60 秒…", 60000);
+          progress.update({detail:"模型正在绘制风格样板，返回后会展示图片。"});
           svg = (await api("POST", `topics/${id}/preview`)).svg;
           t.has_preview = 1;
           toast("样板图好了");
@@ -209,17 +220,8 @@ function bindCards(root, list, rerender) {
         }
         showPreview(t, svg);
       } else if (act === "brief") {
-        let md;
-        if (t.has_brief && t.brief_status !== 'running') md = (await api("GET", `topics/${id}`)).brief_md;
-        else {
-          toast("简报已交给后台生成，可以离开页面。Opus 长简报可能需要数分钟…", 180000);
-          md = await requestBrief(id);
-          t.has_brief = 1;
-          if (t.status !== "made") t.status = "liked";
-          toast("简报好了");
-          rerender();
-        }
-        showBrief(t, md);
+        const md = (await api("GET", `topics/${id}`)).brief_md;
+        if (root.isConnected) showBrief(t, md);
       }
     });
   });
@@ -232,17 +234,52 @@ function bindCards(root, list, rerender) {
       toast("补充要求已保存；已生成的简报需要重新生成才会包含它");
     });
   });
+  // Restore observation after a reload without starting a second model job.
+  for (const topic of list()) if (topic.brief_status === 'running' && !briefRequests.has(topic.id)) {
+    generateBrief(topic, () => { if (root.isConnected) rerender(); }, false, { show: false, resume: true });
+  }
 }
 
-async function requestBrief(id, regenerate = false) {
-  try {
+const briefRequests = new Map();
+function showBriefProgress(entry) {
+  openModal(`${entry.topic.data.title} · 制作简报`, `<p class="muted small">简报在后台生成。可以关闭窗口或切换栏目，右下角会保留任务进度。</p><div id="briefProgress" class="pgc-inline-wait"></div>`, entry);
+  entry.task.attach($("#briefProgress"));
+}
+function generateBrief(topic, repaint = () => {}, regenerate = false, { show = true, resume = false } = {}) {
+  const current = briefRequests.get(topic.id);
+  if (current?.pending) { showBriefProgress(current); return; }
+  const entry = {topic, pending:true};
+  entry.task = startTask(`制作简报 · ${topic.data.title}`, {key:`brief-${topic.id}`, retain:true, detail:resume ? "已恢复后台任务，正在读取生成状态…" : "正在提交后台…", action:() => showBriefProgress(entry), actionLabel:"查看进度"});
+  if (current) current.task.dismiss();
+  briefRequests.set(topic.id, entry);
+  topic.brief_status = 'running'; repaint(); if (show) showBriefProgress(entry);
+  void (async () => {
+    try {
+      const md = await requestBrief(topic.id, regenerate, detail => entry.task.update({detail}), resume);
+      topic.has_brief = 1; topic.brief_status = '';
+      if (topic.status !== 'made') topic.status = 'liked';
+      entry.task.done("简报已生成，可以复制或下载。", () => showBrief(topic, md));
+      repaint();
+      if (modalOwner === entry && !$("#modal").hidden) showBrief(topic, md);
+    } catch (error) {
+      topic.brief_status = 'error';
+      entry.task.fail(error.message);
+      entry.task.update({action:() => generateBrief(topic, repaint, regenerate),actionLabel:"重试 / 继续等待"});
+      repaint();
+    } finally { entry.pending = false; }
+  })();
+}
+async function requestBrief(id, regenerate = false, update = () => {}, resume = false) {
+  if (!resume) try {
     const started = await api("POST", `topics/${id}/brief${regenerate ? '?regenerate=1' : ''}`);
     if (started?.brief) return started.brief;
+    update("后台已接收，正在排队或生成简报。可以继续使用工作台。");
   } catch (error) {
     // The Worker writes the brief before sending its response. If the relay
     // or browser timed out, recover the saved result before asking the model
     // to run again.
     if (!/超时|timeout|409|5\d\d|网络|failed to fetch|fetch failed|network/i.test(String(error?.message || error))) throw error;
+    update("提交响应中断，正在向后台确认任务状态…");
   }
   let reclaimed = false;
   for (let attempt = 0; attempt < 210; attempt++) {
@@ -251,15 +288,18 @@ async function requestBrief(id, regenerate = false) {
       const saved = await api("GET", `topics/${id}`);
       if (saved?.brief_status === 'error') throw new Error(`简报生成失败：${saved.brief_error || "请重试或切换模型。"}`);
       if (saved?.brief_md && saved.brief_status !== 'running') return saved.brief_md;
+      update("后台排队或生成中，正在等待完整简报返回。");
       // A waitUntil task can be cut off by the edge while the model gateway is
       // still working. Re-submit once after the lease expires so the server
       // can reclaim the stale job instead of polling forever.
       if (!reclaimed && attempt >= 28 && saved?.brief_status === 'running') {
         reclaimed = true;
+        update("正在确认后台任务并恢复等待…");
         await api("POST", `topics/${id}/brief`);
       }
     } catch (error) {
       if (error instanceof Error && /简报生成失败/.test(error.message)) throw error;
+      update("暂时无法读取进度，正在重新连接；后台任务会继续运行。");
     }
   }
   throw new Error("简报仍在生成中，请稍后刷新候选列表查看结果。");
@@ -271,8 +311,8 @@ function showPreview(t, svg) {
     <div class="row" style="margin-top:10px"><button class="ghost" id="dlSvg">下载 SVG</button>
     <button class="ghost" id="regenSvg">重新生成</button></div>`);
   $("#dlSvg").onclick = () => download(`${t.data.title}.svg`, svg, "image/svg+xml");
-  $("#regenSvg").onclick = (e) => guard(e.target, async () => {
-    toast("重新生成中…", 60000);
+  $("#regenSvg").onclick = (e) => guard(e.target, async (progress) => {
+    progress.update({label:"重新生成样板图",detail:"模型正在绘制新的风格样板…"});
     const r = await api("POST", `topics/${t.id}/preview`);
     showPreview(t, r.svg);
   });
@@ -284,12 +324,7 @@ function showBrief(t, md) {
     <a class="btn" id="dlBrief" href="/api/forge/topics/${t.id}/brief" download style="text-decoration:none">下载 .md</a><button class="ghost" id="regenBrief">重新生成</button></div>
     <pre class="md">${esc(md)}</pre>`);
   $("#cpBrief").onclick = () => copyText(md);
-  $("#regenBrief").onclick = (e) => guard(e.target, async () => {
-    toast("重新生成中…", 120000);
-    const md = await requestBrief(t.id, true);
-    t.has_brief = 1;
-    showBrief(t, md);
-  });
+  $("#regenBrief").onclick = () => generateBrief(t, () => {}, true);
 }
 
 // ---------- 选题台 ----------
@@ -370,7 +405,6 @@ function paintLowStock() {
 }
 
 async function suggestWords(dim) {
-  toast(`AI 正在想新的${DIM_LABEL[dim]}，约 30 秒…`, 60000);
   const r = await api("POST", "suggest", { dim, n: 30 });
   state.vocab = null;
   await refreshStatus();
@@ -402,8 +436,13 @@ async function expandIds(ids) {
   const size = slowModel ? 1 : Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
   const chunks = [];
   for (let i = 0; i < unique.length; i += size) chunks.push(unique.slice(i, i + size));
+  const outcomes = new Map();
   const updateTopic = (topic) => {
     if (!topic || !Number.isFinite(Number(topic.id))) return;
+    if (topic.data?.title) {
+      outcomes.set(Number(topic.id), 'done');
+      pendingExpandIds.delete(Number(topic.id));
+    }
     const local = state.drawn.find((item) => item.id === Number(topic.id));
     if (!local) return;
     Object.assign(local, topic);
@@ -413,18 +452,26 @@ async function expandIds(ids) {
       pendingExpandIds.delete(Number(topic.id));
     }
   };
+  const progress = startTask("选题扩写", {value:0,total:unique.length,detail:"正在提交扩写队列…"});
+  let settled = false;
   const paintProgress = () => {
+    const done = unique.filter(id => outcomes.get(id) === 'done').length;
+    const failed = unique.filter(id => outcomes.get(id) === 'error').length;
+    const remaining = unique.length - done - failed;
+    const detail = `${done} 个已生成${failed ? ` · ${failed} 个未完成` : ''}${remaining ? ` · ${remaining} 个排队或生成中` : ''}`;
+    const status = remaining ? 'running' : failed ? 'error' : 'done';
+    progress.update({value:done,detail,status});
     const p = $("#progress");
-    if (!p) return;
-    const waiting = [...pendingExpandIds].filter((id) => !state.drawn.find((item) => item.id === id)?.data?.title).length;
-    if (!waiting) { p.textContent = ""; return; }
-    const done = unique.length - waiting;
-    p.textContent = slowModel
-      ? `Opus 扩写队列中 · 已完成 ${done}/${unique.length} 个，后台会继续处理…`
-      : `AI 扩写队列中 · 已完成 ${done}/${unique.length} 个…`;
+    if (p) p.innerHTML = progressHtml({label:slowModel ? "Opus 选题扩写" : "AI 选题扩写",value:done,total:unique.length,detail,status});
+    if (!remaining && !settled) {
+      settled = true;
+      if (failed) progress.fail(detail + "，可在对应卡片重试。");
+      else progress.done(detail);
+    }
   };
   for (const id of unique) {
     const t = state.drawn.find((item) => item.id === id);
+    if (t?.data?.title) outcomes.set(id, 'done');
     if (t && !t.data?.title) { t._inflight = true; t._error = ""; pendingExpandIds.add(id); }
   }
   paintDrawn();
@@ -441,6 +488,7 @@ async function expandIds(ids) {
         for (const id of chunk) {
           const t = state.drawn.find((item) => item.id === id);
           if (t) { t._error = message; t._inflight = false; }
+          outcomes.set(id, 'error');
           pendingExpandIds.delete(id);
         }
       }
@@ -464,6 +512,7 @@ async function expandIds(ids) {
         const local = state.drawn.find((item) => item.id === id);
         if (topic?.expand_status === "error" && !topic.data?.title) {
           if (local) { local._error = topic.expand_error || "扩写失败，请点击重试。"; local._inflight = false; }
+          outcomes.set(id, 'error');
           pendingExpandIds.delete(id);
         }
         paintDrawn();
@@ -473,6 +522,7 @@ async function expandIds(ids) {
     if (pendingExpandIds.has(id)) {
       const local = state.drawn.find((item) => item.id === id);
       if (local) { local._error = "任务仍在队列中，点击重试可继续等待。"; local._inflight = false; }
+      outcomes.set(id, 'error');
       pendingExpandIds.delete(id);
       paintDrawn();
       paintProgress();
@@ -564,7 +614,7 @@ async function probeGame(html, box, log) {
     return f;
   });
   try {
-    log("等待游戏加载…");
+    log("等待游戏加载…", 0, 6);
     const loaded = await Promise.all(frames.map((f) => Promise.race([f.ready.then(() => true), wait(8000).then(() => false)])));
     await wait(1500);
     const shots = [];
@@ -577,20 +627,20 @@ async function probeGame(html, box, log) {
       }
       return out;
     };
-    log("截取开局前画面…");
+    log("截取开局前画面…", 1, 6);
     const before = await snapAll("开局前");
     const readyReports = (await Promise.all(frames.map((f) => ask(f, "report")))).map((r) => r && r.report);
-    log("模拟第一次触摸…");
+    log("模拟第一次触摸…", 2, 6);
     frames.forEach((f) => ask(f, "tap", 500));
     await wait(3000);
-    log("开局后 3 秒…");
+    log("开局后 3 秒…", 3, 6);
     const mid = await ask(frames[1], "snap");
     if (mid && mid.img) shots.push({ label: "9:19.5 开局后 3 秒", data: mid.img, ratio: "9:19.5", when: "开局后 3 秒" });
     await wait(7000);
-    log("开局后 10 秒…");
+    log("开局后 10 秒…", 4, 6);
     const after = await snapAll("开局后 10 秒");
     const reports = (await Promise.all(frames.map((f) => ask(f, "report")))).map((r) => r && r.report);
-    log("偷懒策略机器人试玩…");
+    log("偷懒策略机器人试玩…", 5, 6);
     const bots = await ask(frames[0], "bots", 30000);
     const main = reports[1] || reports[0] || {};
     const errors = [...new Set(reports.flatMap((r) => (r ? r.errors : [])))];
@@ -611,6 +661,7 @@ async function probeGame(html, box, log) {
       pageWasHidden: wasHidden,
       note: "截图和触摸都是脚本模拟的：开局时在屏幕中下方点一次，之后不再操作，所以「开局后 10 秒」可能已经是失败画面，这本身不算问题。flatBands 是顶部/底部 5% 区域里单一颜色的占比，接近 1 可能是黑边，也可能只是纯色背景或结算面板。音频启动次数只是 BGM 的间接证据（一条长循环音轨只会启动 1 次）。",
     };
+    log("游戏画面采集完成", 6, 6);
     return { probe, shots };
   } finally {
     document.removeEventListener("visibilitychange", onVis);
@@ -779,13 +830,14 @@ async function renderGames(alive) {
     await refreshStatus();
     render();
   });
-  $("#tagBtn").onclick = (e) => guard(e.target, async () => {
+  $("#tagBtn").onclick = (e) => guard(e.target, async (progress) => {
     let left = untagged;
+    progress.update({label:"AI 自动打标签",total:untagged,value:0,detail:`剩余 ${left} 个`});
     while (left > 0) {
-      toast(`AI 打标签中，还剩 ${left} 个…`, 60000);
       const r = await api("POST", "tag");
-      if (!r.tagged) break;
+      if (!r.tagged && r.remaining > 0) throw new Error(`仍有 ${r.remaining} 个未完成，请重试。`);
       left = r.remaining;
+      progress.update({value:untagged-left,detail:`已完成 ${untagged-left} 个，剩余 ${left} 个`});
     }
     toast("标签打完了，可以在表格里手动修正");
     render();
@@ -857,7 +909,7 @@ async function renderSettings(alive) {
     const data = await api("GET", "export");
     download(`pgc-forge-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), "application/json");
   });
-  $("#logoutBtn").onclick = async () => { try { await fetch('/api/admin/logout', { method: 'POST' }); } finally { location.assign('/admin'); } };
+  $("#logoutBtn").onclick = async () => { try { await withProgress('退出登录', () => fetch('/api/admin/logout', { method: 'POST' })); } finally { location.assign('/admin'); } };
 }
 
 // ---------- boot ----------
@@ -875,4 +927,4 @@ async function boot() {
   }
 }
 
-boot();
+withProgress("连接创作工作台", boot);

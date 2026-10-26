@@ -1,10 +1,11 @@
+import { progressHtml } from './progress';
 import './style.css';
 
 if (/^\/admin\/?$/.test(location.pathname)) await import('./admin');
 else if (/^\/login\/?$/.test(location.pathname)) await import('./login');
 else {
   const app = document.querySelector('#app')!;
-  app.innerHTML = '<div class="session-loading" role="status">正在确认登录状态…</div>';
+  app.innerHTML = `<div class="session-loading"><div class="pgc-inline-wait">${progressHtml({label:'正在确认登录状态',detail:'即将打开检查台…'})}</div></div>`;
   try {
     const response = await fetch('/api/auth/me', { cache: 'no-store' });
     if (response.status === 401) location.replace('/login');

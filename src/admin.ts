@@ -1,3 +1,4 @@
+import { withProgress, progressHtml } from './progress';
 import {createIcons,icons} from 'lucide';
 import './style.css';
 import './admin.css';
@@ -14,15 +15,18 @@ let selectedProfile:ProfileId='deepseek';
 let adminTab:'model'|'members'|'forge'='forge';
 const $=<T extends Element=HTMLElement>(selector:string)=>document.querySelector<T>(selector)!;
 const iconsReady=()=>createIcons({icons,attrs:{'stroke-width':1.7}});
-app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><div class="header-actions"><span class="back-link">${icon('panels-top-left')}团队工作空间</span></div></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">CREATOR WORKSPACE</div><h1>从灵感，到下一款游戏<span>。</span></h1><p>选题、制作简报与基础预审，在一个工作台里完成。</p></div>${catWalk}</section><div id="admin-content"><div class="admin-loading">正在读取管理配置…</div></div><footer><span>PGC Preflight / Model-driven review</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
+app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><div class="header-actions"><span class="back-link">${icon('panels-top-left')}团队工作空间</span></div></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">CREATOR WORKSPACE</div><h1>从灵感，到下一款游戏<span>。</span></h1><p>选题、制作简报与基础预审，在一个工作台里完成。</p></div>${catWalk}</section><div id="admin-content"><div class="admin-loading">${progressHtml({label:"正在读取管理配置",detail:"正在确认登录状态…"})}</div></div><footer><span>PGC Preflight / Model-driven review</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
 iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){
+  const label=path==='test'?'测试模型连接与图片输入':path==='login'?'管理员登录':path==='logout'?'退出登录':path==='config/active'?'切换全局模型':path==='config'?(method==='GET'?'读取模型配置':'保存模型配置'):path==='members'?(method==='GET'?'读取成员列表':'开通成员账号'):'更新成员权限与账号';
+  return withProgress(label, async () => {
   const response=await fetch(`/api/admin/${path}`,{method,headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined});
   const data=await response.json();
   if(response.status===401&&path!=='login'){renderLogin();throw new Error('登录已过期，请重新登录。');}
   if(!response.ok)throw new Error(data.error||'请求未完成，请稍后重试。');
   return data;
+  }, {detail:path==='test'?'正在请求模型并验证图片输入，请等待接口返回。':'正在连接管理服务…'});
 }
 async function init(){try{saved=await api('config');selectedProfile=saved.activeProfile;renderSettings();}catch(error){if(!document.querySelector('#login-form'))renderLogin(error instanceof Error?error.message:'管理服务暂不可用。');}}
 void init();
@@ -52,7 +56,9 @@ function renderSettings(){
     <label class="enable-toggle"><input id="model-enabled" type="checkbox" ${profile.enabled?'checked':''}/><span><b>启用此模型</b><small>关闭后不能切换到它，但不会删除已保存配置。</small></span></label>
     <div class="form-actions"><button type="button" class="subtle-button" id="test-model">${icon('plug-zap')}测试连接与图片输入</button><div class="model-action-group"><button type="submit" class="primary-button" id="save-model">${icon('check')}保存配置</button><button type="button" class="subtle-button" id="activate-model" ${isActive||!profile.hasKey?'disabled':''}>${icon('arrow-left-right')}${isActive?'当前使用中':'切换到此模型'}</button></div></div><div id="config-message" class="form-message" role="status" aria-live="polite"></div>
   </form></section><aside class="admin-aside"><div class="model-flow"><span class="eyebrow">HOW IT WORKS</span><h2>模型判断，浏览器取证。</h2><div class="flow-step"><span>1</span><div><h3>打开游戏</h3><p>独立浏览器运行 HTML，收集真实画面与运行记录。</p></div></div><div class="flow-step"><span>2</span><div><h3>模型操作</h3><p>模型结合截图决定点击、长按或滑动，再查看结果。</p></div></div><div class="flow-step"><span>3</span><div><h3>模拟评分</h3><p>按原 Forge 标准评估美学、易玩性、可玩性，并引用证据给修改建议。</p></div></div><div class="admin-boundary">这是 AI 模拟预审分数。<br>最终是否提交仍由人工决定。</div></div><div class="config-meta"><span>当前生效</span><b>${escape(saved.model||'未配置')}</b><span>上次保存</span><b>${saved.updatedAt?new Date(saved.updatedAt).toLocaleString('zh-CN'):'尚未配置'}</b><button class="text-button" id="logout">${icon('log-out')}退出管理</button></div></aside></div>`;
-  $('#admin-content').insertAdjacentHTML('beforeend','<section id="members-panel" hidden></section><section id="forge-panel" hidden><div class="forge-embed-heading"><div><span class="eyebrow">PGC FORGE</span><h2>选题与作品工作台</h2><p>从选题到简报，沿用同一份全局模型配置。</p></div><a class="subtle-button" href="/admin" target="_blank" rel="noreferrer">新窗口打开 ↗</a></div><iframe id="forge-embed" title="PGC Forge 管理工作台" src="/forge/?embedded=1"></iframe></section>');
+  $('#admin-content').insertAdjacentHTML('beforeend','<section id="members-panel" hidden></section><section id="forge-panel" hidden><div class="forge-embed-heading"><div><span class="eyebrow">PGC FORGE</span><h2>选题与作品工作台</h2><p>从选题到简报，沿用同一份全局模型配置。</p></div><a class="subtle-button" href="/admin" target="_blank" rel="noreferrer">新窗口打开 ↗</a></div><div id="forge-loading" class="pgc-inline-wait"></div><iframe id="forge-embed" title="PGC Forge 管理工作台" src="/forge/?embedded=1"></iframe></section>');
+  $('#forge-loading').innerHTML=progressHtml({label:'加载创作工作台',detail:'正在读取工作台页面…'});
+  $('#forge-embed').addEventListener('load',()=>{if(document.querySelector('#forge-loading'))$('#forge-loading').hidden=true;});
   const selectTab=(name:'model'|'members'|'forge')=>{ adminTab=name; $('#model-panel').hidden=name!=='model';$('#members-panel').hidden=name!=='members';$('#forge-panel').hidden=name!=='forge';for(const [id,active] of [['tab-model',name==='model'],['tab-members',name==='members'],['tab-forge',name==='forge']] as const)$( `#${id}`).classList.toggle('active',active); };
   $('#tab-model').addEventListener('click',()=>selectTab('model'));
   $('#tab-members').addEventListener('click',()=>{selectTab('members');if(!$('#members-panel').children.length)void renderMembers();});

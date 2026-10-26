@@ -1,3 +1,4 @@
+import { startTask, withProgress, progressHtml } from './progress.js';
 // Shared by the member workspace and the administrator's review tab.
 const LIMIT = 20;
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -70,11 +71,13 @@ async function pollJob(job) {
           if (!jobs.find(item => item.id === selected)?.result) selected = job.id;
           void dependencies.updateHistory?.();
         }
+        if (job.status === 'done') job.progress?.done('审核报告已生成');
+        if (job.status === 'error') job.progress?.fail(job.error || '审核未完成，请重试。');
         refresh();
         if (['done', 'error'].includes(job.status)) break;
       } catch (error) {
         if (error.status === 404 && ++missing >= 3) {
-          job.status = 'error'; job.error = '后台没有找到这次任务，请重试提交。'; job.remoteFailed = true;
+          job.status = 'error'; job.error = '后台没有找到这次任务，请重试提交。'; job.remoteFailed = true; job.progress?.fail(job.error);
           refresh(); break;
         }
         // A transient poll failure must never resubmit a model request.
@@ -91,6 +94,7 @@ async function pollJob(job) {
 
 async function submit(job) {
   job.status = 'submitting';
+  job.note = '正在提交游戏源码和截图…';
   job.requestId ||= crypto.randomUUID();
   refresh();
   try {
@@ -109,6 +113,7 @@ async function submit(job) {
       else void pollJob(job);
     } catch { job.status = 'error'; job.error = error.message; }
   }
+  if (job.status === 'error') job.progress?.fail(job.error);
   refresh();
 }
 
@@ -119,12 +124,14 @@ async function pump() {
     while (activeCount() < concurrency) {
       const job = jobs.find(item => item.status === 'waiting');
       if (!job) break;
+      job.startedAt ||= Date.now();
+      job.progress ||= startTask(`AI 审核 · ${job.title}`, {detail:'准备采集游戏画面…',startedAt:job.startedAt});
       try {
         if (!job.prepared) {
           job.status = 'probing';
           refresh();
           dependencies.setProbing(true);
-          const { probe, shots } = await dependencies.probeGame(job.html, dependencies.captureBox(), message => { job.note = message; refresh(); });
+          const { probe, shots } = await dependencies.probeGame(job.html, dependencies.captureBox(), (message, value, total) => { job.note = message; job.captureProgress = {value,total}; refresh(); });
           if (probe.pageWasHidden) throw new Error('采集时页面进入了后台，请保持页面在前台后重试。');
           const pick = (ratio, when) => shots.find(shot => shot.ratio === ratio && shot.when === when);
           job.prepared = { probe, shots: [pick('9:19.5', '开局前'), pick('9:19.5', '开局后 3 秒'), pick('9:16', '开局后 10 秒'), pick('9:21', '开局后 10 秒')].filter(Boolean).map(({ label, data }) => ({ label, data })) };
@@ -135,6 +142,7 @@ async function pump() {
       } catch (error) {
         job.status = 'error';
         job.error = error.message;
+        job.progress?.fail(job.error);
         dependencies.setProbing(false);
         dependencies.clearCapture();
         refresh();
@@ -166,10 +174,12 @@ addEventListener('beforeunload', event => {
 });
 
 function addFiles(files) {
-  adding = adding.then(async () => {
+  adding = adding.then(() => withProgress('读取游戏文件', async progress => {
     const rejected = [];
     let added = 0;
-    for (const file of files) {
+    progress.update({value:0,total:files.length});
+    for (const [index,file] of files.entries()) {
+      progress.update({value:index,total:files.length,detail:`读取 ${file.name} · ${index+1}/${files.length}`});
       if (!/\.html?$/i.test(file.name)) { rejected.push(`${file.name}：只支持 HTML`); continue; }
       if (!file.size || file.size > MAX_BYTES) { rejected.push(`${file.name}：文件为空或超过 8 MB`); continue; }
       if (jobs.filter(pending).length >= LIMIT) { rejected.push('每批最多 20 个待审核游戏'); break; }
@@ -177,7 +187,7 @@ function addFiles(files) {
       if (jobs.some(job => job.signature === signature)) { rejected.push(`${file.name}：已在列表中`); continue; }
       const html = await file.text();
       const title = new DOMParser().parseFromString(html, 'text/html').querySelector('title')?.textContent?.trim() || file.name.replace(/\.html?$/i, '');
-      const job = { id: crypto.randomUUID(), signature, file, filename: file.name, bytes: file.size, html, title, topicId: dependencies.topicId(), status: started ? 'waiting' : 'staged', note: '', error: '' };
+      const job = { id: crypto.randomUUID(), signature, file, filename: file.name, bytes: file.size, html, title, topicId: dependencies.topicId(), status: started ? 'waiting' : 'staged', startedAt:started ? Date.now() : null, note: '', error: '' };
       jobs.push(job);
       selected ||= job.id;
       added++;
@@ -185,7 +195,7 @@ function addFiles(files) {
     dependencies.feedback(rejected.join('；') || (added ? `已添加 ${added} 个游戏，准备好后开始审核。` : '没有添加新文件。'), !!rejected.length);
     refresh();
     void pump();
-  }).catch(error => dependencies.feedback(`文件读取失败：${error.message}`, true));
+  })).catch(error => dependencies.feedback(`文件读取失败：${error.message}`, true));
   return adding;
 }
 
@@ -194,7 +204,7 @@ export async function mountReviewWorkspace(options) {
   view.innerHTML = `<div class="review-page"><section class="review-intro"><div><div class="eyebrow"><span></span>PGC AI SIMULATION REVIEW</div><h1>下一款好游戏，准备出发<span>。</span></h1><p>一次上传，逐个体验。让每一份修改建议都有据可依。</p><div class="review-intro-tags"><span>多文件拖放</span><i>·</i><span>3 路 AI 并发</span><i>·</i><span>独立评分报告</span></div></div><img class="review-mascot" src="/artwork/pixel-cat.png" width="74" height="74" alt=""></section>
     <section class="review-workspace"><div class="review-upload-panel"><div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>每批最多 20 个</b></div><div class="review-dropzone" id="rvDropzone"><div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div><h2>把游戏们，一起拖进来。</h2><p>支持拖到页面任意位置，也可以选择多个文件</p><button type="button" class="rr-button rr-button-dark" id="rvChoose">${svg('upload')}选择游戏文件</button><input type="file" id="rvFile" accept=".html,.htm,text/html" multiple hidden><div class="upload-meta"><span>.html / .htm</span><span>单个 ≤ 8 MB</span><span>支持多选</span></div></div><p class="rv-feedback" id="rvFeedback" role="status" aria-live="polite">文件只用于审核，评分完成后可在历史记录中查看报告。</p><div class="review-action-row"><label class="rv-concurrency">AI 并发<select id="rvConcurrency" aria-label="AI 审核并发数"><option value="1">1 路</option><option value="2">2 路</option><option value="3" selected>3 路</option></select></label>${topics.length ? `<label class="rv-topic">关联选题<select id="rvTopic"><option value="">不关联</option>${topics.map(t => `<option value="${t.id}">${esc(t.data.title)}</option>`).join('')}</select></label>` : ''}<button type="button" class="rr-button rr-button-dark" id="rvGo" disabled>开始审核 ${svg('arrow')}</button></div></div>
     <aside class="review-scope-panel"><div class="section-label"><span><i class="step-number">02</i>同一份审核标准</span></div><div class="rv-criteria">${[['01', '美学', '画面协调、风格表达、视觉反馈'], ['02', '易玩性', '规则理解、上手门槛、操作引导'], ['03', '可玩性', '机制趣味、挑战节奏、重玩动力']].map(([n, t, d]) => `<div><span>${n}</span><section><h3>${t}<small>3 分</small></h3><p>${d}</p></section></div>`).join('')}</div><div class="rv-threshold"><strong>7<span> / 9</span></strong><div><b>模拟通过线</b><p>2 + 2 + 2 = 6，仍需修改</p></div></div><p class="rv-scope-foot">沿用 Forge 真实审核校准样本<br>AI 模拟评分 · 人工最终确认</p></aside></section>
-    <section class="rv-batch" id="rvBatch" hidden><div class="rv-batch-heading"><div><span class="rr-kicker">REVIEW QUEUE</span><h2>这一批，逐个变好。<span id="rvQueueCount"></span></h2></div><div class="rv-batch-actions"><span id="rvBatchStats" role="status" aria-live="polite"></span><button type="button" class="rr-button" id="rvClear">清除已结束</button></div></div><div class="rv-batch-progress" aria-hidden="true"><span id="rvBatchProgress"></span></div><div class="rv-results-grid"><div class="rv-job-list" id="rvJobs" aria-label="审核任务"></div><div id="rvResult" class="rv-selected" aria-live="polite"></div></div></section>
+    <section class="rv-batch" id="rvBatch" hidden><div class="rv-batch-heading"><div><span class="rr-kicker">REVIEW QUEUE</span><h2>这一批，逐个变好。<span id="rvQueueCount"></span></h2></div><div class="rv-batch-actions"><span id="rvBatchStats" role="status" aria-live="polite"></span><button type="button" class="rr-button" id="rvClear">清除已结束</button></div></div><div id="rvBatchMeter"></div><div class="rv-results-grid"><div class="rv-job-list" id="rvJobs" aria-label="审核任务"></div><div id="rvResult" class="rv-selected" aria-live="polite"></div></div></section>
     <section class="rv-capture" id="rvCapture" hidden><div class="rr-section-heading"><h3>采集游戏画面</h3><span id="rvCaptureTitle"></span></div><p>正在运行三种手机比例，请保持此页面在前台。已提交的 AI 审核会同时在后台进行。</p><div class="phones" id="rvPhones"></div></section>
     <section class="review-history"><div class="rr-section-heading"><div><span class="rr-kicker">PREVIOUS REVIEWS</span><h2>每一次迭代，都有迹可循。</h2></div><button type="button" class="rr-button" id="rvRefreshHistory">刷新记录</button></div><div id="rvHistory"><p class="rr-empty-note">正在读取审核记录…</p></div></section></div>`;
   const root = view.querySelector('.review-page');
@@ -219,7 +229,15 @@ export async function mountReviewWorkspace(options) {
     const shots = arr(report.shots).filter(s => safeImage(s.data));
     $('#rvResult').querySelectorAll('[data-shot]').forEach(button => { button.onclick = () => { const shot = shots[Number(button.dataset.shot)]; openModal(shot.label, `<img class="rr-lightbox" src="${esc(shot.data)}" alt="${esc(shot.label)}">`); }; });
   };
+  const jobProgress = job => ({label:labels[job.status] || '正在处理',detail:job.note || '等待前面的游戏完成采集…',startedAt:job.startedAt,...(job.status === 'probing' ? job.captureProgress : {})});
   refresh = () => {
+    for (const job of jobs.filter(active)) {
+      const signature = JSON.stringify([job.status,job.note,job.captureProgress]);
+      if (job.progress && signature !== job.progressSignature) {
+        job.progressSignature = signature;
+        job.progress.update({...jobProgress(job),label:`${labels[job.status]} · ${job.title}`,value:job.status === 'probing' ? job.captureProgress?.value : undefined,total:job.status === 'probing' ? job.captureProgress?.total : undefined});
+      }
+    }
     if (!current()) return;
     $('#rvBatch').hidden = !jobs.length;
     const staged = jobs.filter(job => job.status === 'staged').length;
@@ -227,12 +245,12 @@ export async function mountReviewWorkspace(options) {
     const errors = jobs.filter(job => job.status === 'error').length;
     $('#rvQueueCount').textContent = String(jobs.length).padStart(2, '0');
     $('#rvBatchStats').textContent = `${done} 已完成${activeCount() ? ` · ${activeCount()} 进行中` : ''}${errors ? ` · ${errors} 未完成` : ''}`;
-    $('#rvBatchProgress').style.width = `${jobs.length ? (done + errors) / jobs.length * 100 : 0}%`;
+    $('#rvBatchMeter').innerHTML = progressHtml({label:'本批报告',value:done,total:jobs.length,status:jobs.some(job => pending(job) && job.status !== 'staged') ? 'running' : errors ? 'error' : done === jobs.length ? 'done' : 'running',detail:`${done} 个报告已生成${errors ? ` · ${errors} 个未完成，可单独重试` : ''}${jobs.length-done-errors ? ` · ${jobs.length-done-errors} 个待完成` : ''}`});
     $('#rvGo').disabled = !staged;
     $('#rvGo').innerHTML = `${staged ? `开始审核 ${staged} 个` : started ? '添加游戏继续审核' : '开始审核'} ${svg('arrow')}`;
     $('#rvClear').disabled = !done && !errors;
     if (!jobs.some(job => job.id === selected)) selected = jobs[0]?.id || '';
-    $('#rvJobs').innerHTML = jobs.map(job => `<article class="rv-job ${job.id === selected ? 'is-selected' : ''}" data-job="${job.id}"><button type="button" class="rv-job-select" data-select="${job.id}" aria-pressed="${job.id === selected}"><span class="rv-file-icon">${svg(job.status === 'done' ? 'check' : 'file')}</span><span class="rv-job-info"><b>${esc(job.title)}</b><small>${esc(job.filename || '后台任务')}${job.bytes ? ` · ${size(job.bytes)}` : ''}</small><span class="rv-job-status ${active(job) ? 'is-active' : job.status}">${active(job) ? '<i class="rv-spinner"></i>' : '<i></i>'}${labels[job.status] || '处理中'}${job.result ? ` · ${job.result.score}/9` : ''}</span></span></button>${job.status === 'staged' ? `<button type="button" class="rv-job-remove" data-remove="${job.id}" aria-label="移除 ${esc(job.title)}">×</button>` : ''}${job.status === 'error' ? `<button type="button" class="rv-job-retry" data-retry="${job.id}">${svg('retry')}重试</button>` : ''}</article>`).join('');
+    $('#rvJobs').innerHTML = jobs.map(job => `<article class="rv-job ${job.id === selected ? 'is-selected' : ''}" data-job="${job.id}"><button type="button" class="rv-job-select" data-select="${job.id}" aria-pressed="${job.id === selected}"><span class="rv-file-icon">${svg(job.status === 'done' ? 'check' : 'file')}</span><span class="rv-job-info"><b>${esc(job.title)}</b><small>${esc(job.filename || '后台任务')}${job.bytes ? ` · ${size(job.bytes)}` : ''}</small><span class="rv-job-status ${active(job) ? 'is-active' : job.status}">${active(job) ? '<i class="rv-spinner"></i>' : '<i></i>'}${labels[job.status] || '处理中'}${job.result ? ` · ${job.result.score}/9` : ''}</span>${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</span></button>${job.status === 'staged' ? `<button type="button" class="rv-job-remove" data-remove="${job.id}" aria-label="移除 ${esc(job.title)}">×</button>` : ''}${job.status === 'error' ? `<button type="button" class="rv-job-retry" data-retry="${job.id}">${svg('retry')}重试</button>` : ''}</article>`).join('');
     const job = jobs.find(item => item.id === selected) || jobs[0];
     if (!job) { $('#rvResult').innerHTML = ''; renderedId = ''; renderedResult = null; return; }
     selected = job.id;
@@ -241,14 +259,14 @@ export async function mountReviewWorkspace(options) {
     } else {
       renderedResult = null;
       renderedId = '';
-      $('#rvResult').innerHTML = `<div class="rv-result-placeholder ${job.status === 'error' ? 'is-error' : ''}"><span class="rv-placeholder-icon">${active(job) ? '<i class="rv-spinner"></i>' : svg(job.status === 'error' ? 'retry' : 'sparkle')}</span><span class="rr-kicker">${job.status === 'error' ? 'LET’S TRY AGAIN' : 'A BETTER GAME, ONE STEP AWAY'}</span><h3>${esc(job.title)}</h3><p>${esc(job.status === 'error' ? job.error : job.note || (job.status === 'staged' ? '文件已准备好，点击「开始审核」一起出发。' : '等待前面的任务，随后自动开始。'))}</p>${job.status === 'error' ? '<small>这次未完成审核，没有给游戏打分。</small>' : '<div class="rv-placeholder-steps"><span>采集画面</span><i>→</i><span>AI 评分</span><i>→</i><span>修改建议</span></div>'}</div>`;
+      $('#rvResult').innerHTML = `<div class="rv-result-placeholder ${job.status === 'error' ? 'is-error' : ''}"><span class="rv-placeholder-icon">${active(job) ? '<i class="rv-spinner"></i>' : svg(job.status === 'error' ? 'retry' : 'sparkle')}</span><span class="rr-kicker">${job.status === 'error' ? 'LET’S TRY AGAIN' : 'A BETTER GAME, ONE STEP AWAY'}</span><h3>${esc(job.title)}</h3><p>${esc(job.status === 'error' ? job.error : job.note || (job.status === 'staged' ? '文件已准备好，点击「开始审核」一起出发。' : '等待前面的任务，随后自动开始。'))}</p>${job.status === 'error' ? '<small>这次未完成审核，没有给游戏打分。</small>' : '<div class="rv-placeholder-steps"><span>采集画面</span><i>→</i><span>AI 评分</span><i>→</i><span>修改建议</span></div>'}${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</div>`;
     }
   };
   $('#rvChoose').onclick = () => $('#rvFile').click();
   $('#rvFile').onchange = event => { const files = [...event.target.files]; event.target.value = ''; void addFiles(files); };
   $('#rvConcurrency').value = String(concurrency);
   $('#rvConcurrency').onchange = event => { concurrency = Number(event.target.value); void pump(); };
-  $('#rvGo').onclick = () => { started = true; for (const job of jobs) if (job.status === 'staged') job.status = 'waiting'; refresh(); void pump(); };
+  $('#rvGo').onclick = () => { started = true; for (const job of jobs) if (job.status === 'staged') { job.status = 'waiting'; job.startedAt = Date.now(); } refresh(); void pump(); };
   $('#rvJobs').onclick = event => {
     const select = event.target.closest('[data-select]');
     if (select) { selected = select.dataset.select; refresh(); }
@@ -261,13 +279,14 @@ export async function mountReviewWorkspace(options) {
       // Known model failures start a new attempt. An uncertain submit failure
       // keeps the old ID, so recovery cannot call the model twice.
       if (job.remoteFailed) { job.requestId = null; job.remoteFailed = false; }
+      job.progress?.dismiss(); job.progress = null; job.progressSignature = ''; job.captureProgress = null; job.startedAt = Date.now();
       job.error = ''; job.status = 'waiting'; started = true; refresh(); void pump();
     }
   };
   $('#rvClear').onclick = () => { for (let i = jobs.length - 1; i >= 0; i--) if (['done', 'error'].includes(jobs[i].status)) jobs.splice(i, 1); refresh(); };
   const history = async () => {
     try {
-      const list = await api('GET', 'reviews');
+      const list = await withProgress('读取审核记录', () => api('GET', 'reviews'));
       if (!current()) return;
       $('#rvHistory').innerHTML = list.length ? list.map(report => `<button type="button" class="rv-history-item" data-history="${report.id}"><span class="rv-history-mark ${report.score >= 7 ? 'is-pass' : ''}">${svg(report.score >= 7 ? 'check' : 'file')}</span><b>${esc(report.title)}</b><span class="rv-history-score">${esc(report.score)}<small>/9</small></span><span class="rr-verdict ${report.score >= 7 ? 'is-pass' : 'is-revise'}">${report.score >= 7 ? '模拟通过' : '建议修改'}</span><time>${esc(date(report.created_at))}</time><span>↗</span></button>`).join('') : '<p class="rr-empty-note">还没有历史报告。上传第一款游戏，开始一次模拟审核。</p>';
     } catch (error) { if (current()) $('#rvHistory').textContent = `记录暂时无法读取：${error.message}`; }
@@ -277,7 +296,7 @@ export async function mountReviewWorkspace(options) {
     if (!button) return;
     button.disabled = true;
     try {
-      const report = await api('GET', `reviews/${button.dataset.history}`);
+      const report = await withProgress('读取审核报告', () => api('GET', `reviews/${button.dataset.history}`));
       if (!current()) return;
       let job = jobs.find(item => item.result?.id === report.id);
       if (!job) { job = { id: `history-${report.id}`, title: report.title, result: report, status: 'done' }; jobs.push(job); }
@@ -290,10 +309,12 @@ export async function mountReviewWorkspace(options) {
   refresh();
   void history();
   try {
-    const remote = await api('GET', 'review/jobs');
+    const remote = await withProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
     for (const item of remote) {
       if (!['queued', 'running'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
       const job = { id: item.id, requestId: item.id, title: item.title, status: item.status, note: '恢复后台审核任务' };
+      job.startedAt = Date.parse(item.created_at) || Date.now();
+      job.progress = startTask(`AI 审核 · ${job.title}`,{detail:job.note,startedAt:job.startedAt});
       jobs.push(job); selected ||= job.id; started = true; void pollJob(job);
     }
     refresh();

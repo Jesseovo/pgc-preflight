@@ -1,3 +1,4 @@
+import { startTask } from './progress';
 import { createIcons, icons } from 'lucide';
 import './style.css';
 import './admin.css';
@@ -35,12 +36,18 @@ document.querySelector('#member-login')!.addEventListener('submit', async event 
   const message = document.querySelector('#login-message')!;
   button.disabled = true;
   message.textContent = '正在登录…';
+  const progress=startTask('登录检查台',{detail:'正在验证账号并打开工作台…'});
   try {
     const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: document.querySelector<HTMLInputElement>('#username')!.value.trim(), password: document.querySelector<HTMLInputElement>('#password')!.value }) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '登录失败。');
+    progress.update({detail:'登录成功，正在打开检查台…'});
     location.replace('/');
-  } catch (error) { message.textContent = error instanceof Error ? error.message : '登录失败，请重试。'; }
+  } catch (error) { message.textContent = error instanceof Error ? error.message : '登录失败，请重试。'; progress.fail(message.textContent); }
   finally { button.disabled = false; }
 });
-void fetch('/api/auth/me', { cache: 'no-store' }).then(async response => { if (response.ok) { const user=await response.json(); location.replace(user.role==='admin'?'/admin':'/'); } }).catch(() => {});
+const sessionProgress=startTask('确认登录状态',{detail:'正在检查是否已有登录会话…'});
+void fetch('/api/auth/me', { cache: 'no-store' }).then(async response => {
+  if (response.ok) { const user=await response.json(); sessionProgress.update({detail:'正在打开工作台…'}); location.replace(user.role==='admin'?'/admin':'/'); }
+  else sessionProgress.dismiss();
+}).catch(() => sessionProgress.dismiss());
