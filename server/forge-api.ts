@@ -6,13 +6,13 @@ import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "
 import { complete, providerStatus, activeModel, routedModel, LLMError } from "./forge-llm";
 import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob } from './review-jobs';
-import { reviewReportErrors } from './review-report';
+import { generateReview } from './review-generation';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
 import {
   expandSystem, expandUser, EXPAND_SCHEMA, PREVIEW_SYSTEM, previewUser,
   briefSystem, briefUser, ASSETS_SYSTEM, assetsUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
-  reviewSystem, REVIEW_SCHEMA,
+  reviewSystem,
 } from "./forge/prompts.js";
 
 const TEXT_DEFAULTS = { redlines: DEFAULT_REDLINES, template: DEFAULT_TEMPLATE, template_f: DEFAULT_TEMPLATE_F };
@@ -616,6 +616,10 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   // The calibration set is for the scoring scale, not for recalling this
   // game's own past result: a known score would anchor (or leak) the verdict.
   const { positives, borderline, negatives } = exampleSets(games.filter((g) => !sameGame(g.title, title)));
+  // Old reviewer notes mix verified defects with subjective observations this
+  // preflight cannot test (feel, listening, sustained play). Keep the real
+  // historical scores as anchors, but do not teach those unsupported claims.
+  const supportedNegatives = negatives.map((game) => ({ ...game, feedback: '' }));
   let design = "";
   if (topic_id) {
     const t = hydrate(await first(env, "SELECT * FROM topics WHERE id = ?", topic_id));
@@ -629,14 +633,10 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
     : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
   parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
-  const result = await complete(env, cfg, {
-    system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives }),
+  const result = await generateReview(env, cfg, {
+    system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),
     user: parts,
-    schema: REVIEW_SCHEMA,
-    validate: reviewReportErrors,
-    purpose: 'review',
     maxTokens: smallModel ? 24000 : 16000,
-    timeoutMs: 300000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
     onWait: jobId ? message => run(env, "UPDATE review_jobs SET error = ? WHERE id = ? AND status = 'running'", message, jobId) : undefined,
   });

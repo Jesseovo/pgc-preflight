@@ -50,7 +50,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; purpose?: ModelPurpose }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError(req.purpose === 'review' ? '管理员尚未配置并启用审核模型。' : '管理员尚未配置并启用创作模型。', 503);
@@ -70,8 +70,9 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     const attempts = req.idempotencyKey ? 3 : 1;
     // A Queue consumer has a finite wall-clock lifetime. Leave time to persist
     // an actionable error rather than being killed during the final retry.
-    const deadline = Date.now() + 12 * 60 * 1000;
+    const deadline = Math.min(req.deadline ?? Infinity, Date.now() + 12 * 60 * 1000);
     for (let attempt = 0; attempt < attempts; attempt++) {
+      if (Date.now() >= deadline) throw new LLMError('模型处理时限已到，本次未生成完整报告，请重试。', 504);
       const attemptMessages = retryHint ? [...messages, { role: 'user', content: retryHint }] : messages;
       const idempotencyKey = await keyedRequestId(req.idempotencyKey, attemptMessages);
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
