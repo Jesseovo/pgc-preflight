@@ -10,6 +10,7 @@ const topic = (id: number) => ({ id, status: 'liked', subject: '光点', medium:
 const topics = [topic(1), topic(2)];
 let requests = 0, complete = false, fail = false, interrupt = true;
 let modelTest = false;
+let adminSignedIn = false;
 let expansionFinished = false;
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const server = createServer(async (request, response) => {
@@ -40,6 +41,8 @@ const server = createServer(async (request, response) => {
       return json(t);
     }
     if (url.pathname.startsWith('/api/admin/')) {
+      if (url.pathname.endsWith('/login')) { adminSignedIn = true; return json({ ok: true }); }
+      if (!adminSignedIn) return json({ error: 'not signed in' }, 401);
       if (url.pathname.endsWith('/test')) { modelTest = true; await pause(2300); return json({ durationMs: 2300 }); }
       const profile = { baseUrl: 'https://example.com/v1', model: 'test-vision', protocol: 'openai', enabled: true, hasKey: true, updatedAt: '' };
       return json({ ...profile, activeProfile: 'deepseek', profiles: { deepseek: profile, opus: { ...profile, protocol: 'anthropic' } } });
@@ -162,6 +165,9 @@ try {
 
   const admin = await browser.newPage();
   await admin.goto(`${origin}/admin`);
+  await admin.waitForSelector('#admin-password');
+  assert.equal(await admin.$('.pgc-task[data-task-state="error"]'), null, 'The expected initial login gate must not leave a failed task');
+  await admin.type('#admin-password', 'synthetic-admin'); await admin.click('#login-form button');
   await admin.waitForSelector('#tab-model'); await admin.click('#tab-model');
   await admin.click('#test-model');
   await admin.waitForFunction('document.querySelector(".pgc-task-tray").textContent.includes("测试模型连接")');

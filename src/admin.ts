@@ -20,10 +20,10 @@ iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){
   const label=path==='test'?'测试模型连接与图片输入':path==='login'?'管理员登录':path==='logout'?'退出登录':path==='config/active'?'切换全局模型':path==='config'?(method==='GET'?'读取模型配置':'保存模型配置'):path==='members'?(method==='GET'?'读取成员列表':'开通成员账号'):'更新成员权限与账号';
-  return withProgress(label, async () => {
+  return withProgress(label, async progress => {
   const response=await fetch(`/api/admin/${path}`,{method,headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined});
   const data=await response.json();
-  if(response.status===401&&path!=='login'){renderLogin();throw new Error('登录已过期，请重新登录。');}
+  if(response.status===401&&path!=='login'){progress.dismiss();renderLogin();throw new Error('登录已过期，请重新登录。');}
   if(!response.ok)throw new Error(data.error||'请求未完成，请稍后重试。');
   return data;
   }, {detail:path==='test'?'正在请求模型并验证图片输入，请等待接口返回。':'正在连接管理服务…'});
