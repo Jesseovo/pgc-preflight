@@ -66,10 +66,13 @@ export default {
     const redirect = await guardForgePage(request, members, env) || await guardReviewPage(request, members, env) || await guardCheckPage(request, members, env);
     if (redirect) return redirect;
     if (url.pathname === '/forge') return env.ASSETS.fetch(new Request(new URL('/forge/index.html', url), request));
-    if (url.pathname === '/review') return env.ASSETS.fetch(new Request(new URL('/review.html', url), request));
+    // Cloudflare Assets clean URLs redirect a direct `/review.html` fetch to
+    // `/review`. Read the canonical asset path here so a member visiting `/`
+    // does not bounce between the two guarded routes.
+    if (url.pathname === '/review') return env.ASSETS.fetch(new Request(new URL('/review', url), request));
     if (url.pathname === '/' || url.pathname === '/index.html') {
       const user = await identity(request.headers.get('Cookie'), members, env);
-      if (user?.role === 'member') return env.ASSETS.fetch(new Request(new URL('/review.html', url), request));
+      if (user?.role === 'member') return env.ASSETS.fetch(new Request(new URL('/review', url), request));
     }
     return env.ASSETS.fetch(request);
   },
