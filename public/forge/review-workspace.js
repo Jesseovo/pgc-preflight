@@ -62,7 +62,7 @@ async function pollJob(job) {
         job.status = remote.status;
         job.error = remote.error;
         job.remoteFailed = remote.status === 'error';
-        job.note = remote.status === 'running' ? '模型正在结合画面、源码与校准样本评分' : '后台排队中，可继续添加游戏';
+        job.note = remote.status === 'running' ? remote.error || '模型正在结合画面、源码与校准样本评分' : '后台排队中，可继续添加游戏';
         if (remote.status === 'done') {
           job.note = '报告已生成';
           job.html = null;

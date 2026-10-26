@@ -147,7 +147,7 @@ function topicCard(t, mode) {
   if (t.status === "drawn") {
     return `<article class="card pending" data-id="${t.id}">
       <div class="art"><div class="title">…</div></div>
-      <div class="body">${chipsHtml(t)}<div class="small">${t._error ? `<span class="bad">${esc(t._error)}</span>` : progressHtml({label:"AI 扩写中",detail:"后台排队与生成中…"})}</div></div>
+      <div class="body">${chipsHtml(t)}<div class="small">${t._error ? `<span class="bad">${esc(t._error)}</span>` : progressHtml({label:"AI 扩写中",detail:t.expand_error || "后台排队与生成中…"})}</div></div>
       ${t._error ? `<div class="acts"><button class="ghost" data-act="retry">重试</button></div>` : ""}
     </article>`;
   }
@@ -288,7 +288,7 @@ async function requestBrief(id, regenerate = false, update = () => {}, resume = 
       const saved = await api("GET", `topics/${id}`);
       if (saved?.brief_status === 'error') throw new Error(`简报生成失败：${saved.brief_error || "请重试或切换模型。"}`);
       if (saved?.brief_md && saved.brief_status !== 'running') return saved.brief_md;
-      update("后台排队或生成中，正在等待完整简报返回。");
+      update(saved?.brief_error || "后台排队或生成中，正在等待完整简报返回。");
       // A waitUntil task can be cut off by the edge while the model gateway is
       // still working. Re-submit once after the lease expires so the server
       // can reclaim the stale job instead of polling forever.
@@ -458,7 +458,8 @@ async function expandIds(ids) {
     const done = unique.filter(id => outcomes.get(id) === 'done').length;
     const failed = unique.filter(id => outcomes.get(id) === 'error').length;
     const remaining = unique.length - done - failed;
-    const detail = `${done} 个已生成${failed ? ` · ${failed} 个未完成` : ''}${remaining ? ` · ${remaining} 个排队或生成中` : ''}`;
+    const waitingNote = unique.map(id => state.drawn.find(t => t.id === id)).find(t => t?.expand_status === 'running' && t.expand_error)?.expand_error;
+    const detail = `${done} 个已生成${failed ? ` · ${failed} 个未完成` : ''}${remaining ? ` · ${remaining} 个排队或生成中` : ''}${waitingNote ? ` · ${waitingNote}` : ''}`;
     const status = remaining ? 'running' : failed ? 'error' : 'done';
     progress.update({value:done,detail,status});
     const p = $("#progress");

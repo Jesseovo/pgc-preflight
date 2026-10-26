@@ -1,5 +1,6 @@
 import { activeModelProfile, decryptKey } from './settings';
 import { modelTransport } from './model';
+import type { ModelThrottleDatabase } from './model-throttle';
 
 export class LLMError extends Error {
   status: number;
@@ -33,7 +34,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; maxTokens?: number; timeoutMs?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void> }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured);
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError('管理员尚未配置并启用审核模型。', 503);
@@ -54,7 +55,10 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     const deadline = Date.now() + 12 * 60 * 1000;
     for (let attempt = 0; attempt < attempts; attempt++) {
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
-      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, { maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey });
+      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, {
+        DB: env.DB, maxTokens: req.maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
+        onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
+      });
       try {
         const text = await transport(messages);
         if (!req.schema) return text;
@@ -64,7 +68,9 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = /模型返回的不是合法 JSON/.test(message);
         const emptyResponse = /模型没有返回可读的审核内容/.test(message);
-        const busy = /返回 (409|429|503)|\b409\b/.test(message);
+        // HTTP 429 is already retried with Retry-After by modelTransport.
+        // A second retry loop would multiply requests and hit the key again.
+        const busy = /返回 (409|503)|\b409\b/.test(message);
         if (attempt + 1 >= attempts || Date.now() >= deadline || (!parseFailure && !emptyResponse && !busy)) throw error;
         if (parseFailure || emptyResponse) freshRequest = true;
         await new Promise(resolve => setTimeout(resolve, parseFailure || emptyResponse ? 1200 : 5000 * (attempt + 1)));

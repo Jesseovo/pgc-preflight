@@ -1,5 +1,6 @@
 import type { CheckReport, Finding, Status } from '../src/types';
 import type { ModelRuntime } from './settings';
+import { createModelThrottle, pauseModel, retryAfterMs, type ModelThrottleDatabase, type ModelWait } from './model-throttle';
 
 export const REVIEW_PROMPT = `你是单 HTML 手机小游戏的基础预审员。只检查浅显、能举证的基础故障：打不开/白屏、关键资源缺失、脚本异常、无法开始、明确输入没有响应、关键文字/按钮明显出界或被遮挡、实际到达的结算/重试失效。
 不得评判操作手感、精美程度、玩法好坏、难度、创意，不打分，不代替人工最终审核。
@@ -36,90 +37,114 @@ function anthropicText(data: any) {
   return (data?.content || []).filter((part: any) => part?.type === 'text').map((part: any) => String(part.text || '')).join('\n');
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string } = {}): ModelTransport {
+export class ModelHttpError extends Error {
+  constructor(message: string, public upstreamStatus: number, public retryMs?: number, public code = '') { super(message); }
+}
+async function upstreamError(response: Response, apiKey: string): Promise<ModelHttpError> {
+  let detail: any = {};
+  try { detail = await response.json(); } catch {}
+  const code = String(detail?.error?.code || detail?.error?.type || '');
+  const raw = String(detail?.error?.message || '').replaceAll(apiKey, '[REDACTED]').replace(/sk-[\w-]+/g, '[REDACTED]').slice(0, 300);
+  const wait = retryAfterMs(response.headers.get('retry-after'));
+  return new ModelHttpError(response.status === 429
+    ? `模型接口限流（429）${raw ? `：${raw}` : '，请求过多，请等待后重试。'}`
+    : `模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`, response.status, wait, code);
+}
+
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait } = {}): ModelTransport {
+  const throttle = createModelThrottle(options.DB, config);
   return async messages => {
     const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), 24000);
     const anthropic = config.protocol === 'anthropic';
     const controller = new AbortController();
-    let timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
-    const totalTimeout = options.totalTimeoutMs ? setTimeout(() => controller.abort(), options.totalTimeoutMs) : undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const totalMs = options.totalTimeoutMs || Math.max(300000, (options.timeoutMs || 90000) * 2);
+    const deadline = Date.now() + totalMs;
+    const totalTimeout = setTimeout(() => controller.abort(), totalMs);
     const touch = () => {
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
     };
-    const idempotency = options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {};
-    let response: Response;
-    try {
+    const once = async () => {
+      await throttle.wait(controller.signal, options.onWait);
+      await options.onWait?.(0, 'pace');
+      touch();
       const headers: Record<string, string> = anthropic
         ? {'Content-Type':'application/json','Accept':'text/event-stream','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
         : {'Content-Type':'application/json',Authorization:`Bearer ${config.apiKey}`};
-      Object.assign(headers, idempotency);
-      response = await fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
-        method:'POST',
-        headers,
+      if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
+      const response = await fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
+        method:'POST', headers,
         body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens) } : {model:config.model,messages,max_tokens:maxTokens,stream:false}),
         signal:controller.signal, redirect:'manual',
       });
-    } catch (error) {
-      clearTimeout(timeout);
-      clearTimeout(totalTimeout);
-      if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) throw new Error('模型响应超时，请重试或切换到 DeepSeek。');
-      throw error;
-    }
-    try {
       if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
-      if (!response.ok) throw new Error(`模型接口返回 ${response.status}。请在管理页检查模型配置、额度和图片输入支持。`);
+      if (!response.ok) throw await upstreamError(response, config.apiKey);
       const contentType = response.headers.get('content-type') || '';
       if (anthropic && contentType.includes('text/event-stream') && response.body) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
         let content = '';
-        while (true) {
-          const part = await reader.read();
-          if (part.done) break;
-          buffer += decoder.decode(part.value, { stream: true });
-          let progressed = false;
-          let newline;
-          while ((newline = buffer.indexOf('\n')) >= 0) {
-            const line = buffer.slice(0, newline).replace(/\r$/, '');
-            buffer = buffer.slice(newline + 1);
-            if (!line.startsWith('data:')) continue;
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
-            try {
-              const event = JSON.parse(payload);
-              if (event.type === 'content_block_delta') {
-                const deltaType = event.delta?.type;
-                if (deltaType === 'text_delta') content += String(event.delta.text || '');
-                if (deltaType === 'text_delta' || deltaType === 'thinking_delta' || deltaType === 'signature_delta') progressed = true;
-              }
-            } catch {}
+        let truncated = false;
+        const event = (line: string) => {
+          if (!line.startsWith('data:')) return false;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') return false;
+          let data: any;
+          try { data = JSON.parse(payload); } catch { return false; }
+          if (data.type === 'error') {
+            const busy = /rate_limit|overloaded/.test(String(data.error?.type));
+            throw new ModelHttpError(busy ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。' : '模型流式生成被接口中断，请重试。', busy ? 429 : 502, undefined, String(data.error?.type || ''));
           }
-          // Riffle may send ping events while a request is queued. They keep
-          // the TCP connection open but are not model progress and must not
-          // postpone the idle timeout.
-          if (progressed) touch();
-        }
+          if (data.type === 'message_delta' && data.delta?.stop_reason === 'max_tokens') truncated = true;
+          if (data.type !== 'content_block_delta') return false;
+          if (data.delta?.type === 'text_delta') content += String(data.delta.text || '');
+          return ['text_delta','thinking_delta','signature_delta'].includes(data.delta?.type);
+        };
+        try {
+          while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            buffer += decoder.decode(part.value, { stream: true });
+            let newline;
+            while ((newline = buffer.indexOf('\n')) >= 0) {
+              const line = buffer.slice(0, newline).replace(/\r$/, ''); buffer = buffer.slice(newline + 1);
+              if (event(line)) touch();
+            }
+          }
+          if (buffer.trim()) event(buffer);
+        } catch (error) { await reader.cancel().catch(() => {}); throw error; }
+        finally { reader.releaseLock(); }
+        if (truncated) throw new Error('模型输出达到长度上限，内容不完整，请减少单批选题数量后重试。');
         if (content) return content;
-        // The stream body has already been consumed. Do not fall through to
-        // response.json(), which would mask the real empty-stream error with
-        // “Body has already been used”.
         throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Anthropic Messages。');
       }
       const data = await response.json() as {choices?:{message?:{content?:string}}[];content?:{type?:string;text?:string}[]};
       const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
       if (!content) throw new Error('模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。');
       return content;
+    };
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try { return await once(); }
+        catch (error) {
+          clearTimeout(timeout);
+          if (!(error instanceof ModelHttpError) || error.upstreamStatus !== 429 || /quota|balance|credit|billing/i.test(error.code)) throw error;
+          const wait = Math.max(1000, error.retryMs ?? 15000 * 2 ** attempt);
+          await throttle.cooldown(wait);
+          if (attempt >= 3 || Date.now() + wait + 1000 >= deadline) throw error;
+          await options.onWait?.(wait, 'rate_limit');
+          await pauseModel(wait, controller.signal);
+        }
+      }
     } catch (error) {
       if (controller.signal.aborted) throw new Error('模型响应超时，请重试或切换到 DeepSeek。');
       throw error;
-    } finally {
-      clearTimeout(timeout);
-      clearTimeout(totalTimeout);
-    }
+    } finally { clearTimeout(timeout); clearTimeout(totalTimeout); }
   };
 }
+
 export function parseDecision(raw: string): ModelDecision {
   const text = raw.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
   const value = JSON.parse(text);

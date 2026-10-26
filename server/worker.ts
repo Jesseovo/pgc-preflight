@@ -25,7 +25,7 @@ export default {
     const store=configStore(env.DB),members=memberStore(env.DB);
     if(url.pathname.startsWith('/api/admin/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`admin:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
-      return (await adminApi(request,store,env,members))!;
+      return (await adminApi(request,store,env,members,env.DB))!;
     }
     if(url.pathname.startsWith('/api/auth/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`auth:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'登录操作较频繁，请稍后重试。'},429);}
@@ -54,7 +54,7 @@ export default {
         const model=await resolveModel(await store.get(),env.SETTINGS_KEY);
         if(!model)return json({error:'管理员尚未配置审核模型。请先在 /admin 中保存并启用支持图片输入的模型。'},503);
         browser = await puppeteer.launch(env.BROWSER);
-        const report = await inspectGame(browser as unknown as Browser, input, modelTransport(model));
+        const report = await inspectGame(browser as unknown as Browser, input, modelTransport(model,{DB:env.DB}));
         return json(report);
       } catch (error) {
         // Do not publish platform exception details or uploaded source in logs.

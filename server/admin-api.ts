@@ -1,10 +1,11 @@
 import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, validateModelFields, decryptKey } from './settings';
 import type { AppSecrets, ConfigStore } from './settings';
 import { modelTransport } from './model';
+import type { ModelThrottleDatabase } from './model-throttle';
 import {createMember,updateMember,publicMember} from './members';
 import type {MemberStore} from './members';
 
-export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore):Promise<Response|null> {
+export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase):Promise<Response|null> {
   const url=new URL(request.url);
   if(!url.pathname.startsWith('/api/admin/'))return null;
   const json=(value:unknown,status=200,headers:Record<string,string>={})=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
@@ -45,7 +46,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       if(!fields.apiKey&&savedProfile&&(fields.baseUrl!==savedProfile.baseUrl||fields.protocol!==(savedProfile.protocol||'openai')))return json({error:'更换接口地址或协议时，请重新填写 API Key。'},400);
       const apiKey=fields.apiKey||(savedProfile?.encryptedKey?await decryptKey(savedProfile.encryptedKey,secrets.SETTINGS_KEY):'');
       if(!apiKey)return json({error:'请先填写 API Key。'},400);
-      const transport=modelTransport({...fields,apiKey});
+      const transport=modelTransport({...fields,apiKey},{DB});
       const started=Date.now();
       const text=await transport([{role:'user',content:[{type:'text',text:'这是模型接口与图片输入测试。请只回复 READY。'},{type:'image_url',image_url:{url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfPXCY1iiH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBVNChh70khwUAAAAASUVORK5CYII='}}]}]);
       return json({ok:true,durationMs:Date.now()-started,message:text.slice(0,150)});

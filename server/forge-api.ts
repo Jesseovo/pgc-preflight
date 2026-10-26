@@ -455,6 +455,7 @@ async function expandBatch(env, ids) {
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
+  const slowModel = /opus|claude/i.test(String((await env.modelStore.get())?.model || ''));
   const [cfg, games, prior] = await Promise.all([
     getSettings(env),
     all(env, "SELECT * FROM games ORDER BY id"),
@@ -477,15 +478,16 @@ async function expandBatch(env, ids) {
         // Extended-thinking Opus responses can spend part of the output
         // budget on reasoning. Give each Opus item enough room to finish the
         // requested JSON instead of cutting it off mid-object.
-        maxTokens: /opus|claude/i.test(String(cfg.openai_model || cfg.anthropic_model || ''))
+        maxTokens: slowModel
           ? Math.min(24000, 7000 * pending.length)
           : 2800 + 1200 * pending.length,
         // Opus can spend more than 90 seconds reasoning before its first
         // useful chunk. Queue jobs are allowed to run longer than an HTTP
         // request, so keep the relay open long enough for the model stream to
         // make progress instead of recording a false timeout.
-        timeoutMs: /opus|claude/i.test(String(cfg.openai_model || cfg.anthropic_model || '')) ? 300000 : 150000,
+        timeoutMs: slowModel ? 300000 : 150000,
       idempotencyKey: `pgc-expand-${pending.map((topic) => topic.id).join('-')}-${Date.now()}`,
+      onWait: message => run(env, `UPDATE topics SET expand_error = ? WHERE id IN (${pending.map(() => '?').join(',')}) AND expand_status = 'running'`, message, ...pending.map(topic => topic.id)),
       }));
   } catch (error) {
     // Riffle returns 409 when another tab is already processing the same
@@ -586,6 +588,7 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
     maxTokens: 16000,
     timeoutMs: 300000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
+    onWait: jobId ? message => run(env, "UPDATE review_jobs SET error = ? WHERE id = ? AND status = 'running'", message, jobId) : undefined,
   });
   if (!result || !['aes', 'ease', 'play'].every(k => Number.isInteger(result[k]) && result[k] >= 1 && result[k] <= 3)
     || !Array.isArray(result.issues) || typeof result.reviewer_comment !== 'string' || typeof result.fix_prompt !== 'string') {
@@ -653,6 +656,7 @@ export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
 
 async function briefJob(env, id, t) {
   const cfg = await getSettings(env);
+  const slowModel = /opus|claude/i.test(String((await env.modelStore.get())?.model || ''));
   try {
     const md = await withTopicLease(env, [id], 'brief_status', () => complete(env, cfg, {
         system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
@@ -661,8 +665,9 @@ async function briefJob(env, id, t) {
         // 6k output tokens. A smaller cap keeps the relay responsive while the
         // longer idle window accommodates Opus's streamed reasoning.
         maxTokens: 8000,
-        timeoutMs: /opus|claude/i.test(String(cfg.openai_model || cfg.anthropic_model || '')) ? 300000 : 180000,
+        timeoutMs: slowModel ? 300000 : 180000,
         idempotencyKey: `pgc-brief-${id}-${Date.now()}`,
+        onWait: message => run(env, "UPDATE topics SET brief_error = ? WHERE id = ? AND brief_status = 'running'", message, id),
       }));
     const body = String(md).trim();
     if (!body) throw new LLMError("模型没有返回简报内容", 502);
