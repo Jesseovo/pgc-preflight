@@ -5,6 +5,7 @@ import { DEFAULT_SETTINGS, DEFAULT_REDLINES, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_
 import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "./forge/logic.js";
 import { complete, providerStatus, activeModel, LLMError } from "./forge-llm";
 import { identity } from './members';
+import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob } from './review-jobs';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
 import {
@@ -32,7 +33,7 @@ export async function forgeApi(request: Request, env: ForgeEnv, route: string[],
     const res = await dispatch(request.method, route, request, env, user.id, ctx);
     return res instanceof Response ? res : json(res);
   } catch (err) {
-    const status = err instanceof HttpError || err instanceof LLMError ? err.status : 500;
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
     return json({ error: err.message || String(err) }, status);
   }
 }
@@ -43,9 +44,10 @@ export interface ForgeEnv {
   SETTINGS_KEY: string;
   modelStore: ConfigStore;
   FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
+  REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
 }
 
-export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number };
+export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'review'; id: string };
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -80,6 +82,16 @@ async function runBatch(env, statements) {
 
 async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
+  if (a === 'review' && b === 'jobs') {
+    if (method === 'GET' && !c) return listReviewJobs(env, ownerId);
+    if (method === 'GET' && c) return getReviewJob(env, c, ownerId);
+    if (method === 'POST' && !c) {
+      const input = await readReviewBody(request);
+      const job = await enqueueReview(env, { ...input, html: trimSource(input.html) }, ownerId);
+      return json(job, 202);
+    }
+    throw new HttpError(405, '审核任务不支持这个操作。');
+  }
   const id = b != null ? Number(b) : null;
   switch (`${method} ${a}${c ? "/:id/" + c : b != null ? "/:id" : ""}`) {
     case "GET state": return getState(env);
@@ -535,6 +547,17 @@ export function sanitizeSvg(text) {
 
 const MAX_SOURCE = 240000;
 
+async function readReviewBody(request) {
+  if (Number(request.headers.get('Content-Length')) > 13 * 1024 * 1024) throw new HttpError(413, '审核文件过大。');
+  const text = await request.text();
+  if (new TextEncoder().encode(text).length > 13 * 1024 * 1024) throw new HttpError(413, '审核文件过大。');
+  let input;
+  try { input = JSON.parse(text); } catch { throw new HttpError(400, '审核内容不是合法 JSON。'); }
+  if (typeof input?.html !== 'string' || !input.html.trim()) throw new HttpError(400, '缺少游戏源码。');
+  if (new TextEncoder().encode(input.html).length > 8 * 1024 * 1024) throw new HttpError(413, '单个 HTML 不能超过 8 MB。');
+  return input;
+}
+
 // Long minified/base64 lines carry no reviewable logic and cost many tokens.
 function trimSource(html) {
   const lines = String(html || "").split("\n").map((l) => (l.length > 3000 ? `/* [省略一行 ${l.length} 字符] */` : l));
@@ -543,7 +566,7 @@ function trimSource(html) {
   return out;
 }
 
-async function review(env, { title, topic_id, html, probe, shots }, ownerId) {
+async function review(env, { title, topic_id, html, probe, shots }, ownerId, jobId = null) {
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
   const images = (Array.isArray(shots) ? shots : []).filter((s) => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data)).slice(0, 6);
   const [cfg, games] = await Promise.all([getSettings(env), all(env, "SELECT * FROM games ORDER BY id")]);
@@ -561,12 +584,19 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId) {
     user: parts,
     schema: REVIEW_SCHEMA,
     maxTokens: 16000,
+    timeoutMs: 300000,
+    idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
   });
+  if (!result || !['aes', 'ease', 'play'].every(k => Number.isInteger(result[k]) && result[k] >= 1 && result[k] <= 3)
+    || !Array.isArray(result.issues) || typeof result.reviewer_comment !== 'string' || typeof result.fix_prompt !== 'string') {
+    throw new LLMError('模型没有返回完整评分与报告，请重试。', 502);
+  }
   for (const k of ["aes", "ease", "play"]) result[k] = Math.max(1, Math.min(3, Number(result[k]) || 1));
   const score = result.aes + result.ease + result.play;
-  const r = await run(env, "INSERT INTO reviews (owner_id, title, topic_id, score, result, probe, shots, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ownerId || 'admin', String(title || "未命名").slice(0, 120), topic_id || null, score, JSON.stringify(result), JSON.stringify(probe || {}), JSON.stringify(images), now());
-  return getReview(env, r.meta.last_row_id, ownerId);
+  const r = await run(env, "INSERT OR IGNORE INTO reviews (owner_id, title, topic_id, score, result, probe, shots, created_at, job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ownerId || 'admin', String(title || "未命名").slice(0, 120), topic_id || null, score, JSON.stringify(result), JSON.stringify(probe || {}), JSON.stringify(images), now(), jobId);
+  const persisted = jobId ? await first(env, 'SELECT id FROM reviews WHERE job_id = ?', jobId) : null;
+  return getReview(env, persisted?.id || r.meta.last_row_id, ownerId);
 }
 
 async function listReviews(env, ownerId) {
@@ -606,6 +636,7 @@ async function brief(env, id, ctx, regenerate = false) {
 }
 
 export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
+  if (job.type === 'review') return processReviewJob(env, job.id, (payload, ownerId, jobId) => review(env, payload, ownerId, jobId));
   if (job.type === 'expand') {
     try { return await expandBatch(env, job.ids); }
     catch (error) {

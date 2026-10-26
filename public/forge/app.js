@@ -1,4 +1,5 @@
 // PGC Forge front end. Vanilla JS, no build step.
+import { mountReviewWorkspace } from './review-workspace.js';
 
 const DIMS = ["subject", "medium", "gesture", "structure", "mood"];
 const DIM_LABEL = { subject: "题材", medium: "美术媒介", gesture: "手势", structure: "挑战结构", mood: "情绪基调" };
@@ -29,7 +30,9 @@ function toast(msg, ms = 2600) {
 }
 
 async function api(method, path, data) {
+  const options = path === 'review/jobs' && method === 'POST' ? { signal: AbortSignal.timeout(60000) } : {};
   const res = await fetch("/api/forge/" + path, {
+    ...options,
     method,
     headers: { "content-type": "application/json" },
     body: data === undefined ? undefined : JSON.stringify(data),
@@ -105,6 +108,7 @@ async function refreshStatus() {
 $("#tabs").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-tab]");
   if (!b || (memberOnly && b.dataset.tab !== "review")) return;
+  if (state.reviewProbing) { toast('正在采集游戏画面，采集结束后即可切换。'); return; }
   state.tab = b.dataset.tab;
   for (const x of $("#tabs").children) x.classList.toggle("on", x === b);
   render();
@@ -653,102 +657,11 @@ function checksHtml(checks) {
   return `<ul class="checks">${checks.map((c) => `<li><span class="mark">${mark[c.level]}</span><span>${esc(c.text)}</span></li>`).join("")}</ul>`;
 }
 
-function reviewHtml(r) {
-  const x = r.result;
-  const shots = (r.shots || []).map((s) => `<figure><img src="${esc(s.data)}" alt=""><figcaption>${esc(s.label)}</figcaption></figure>`).join("");
-  return `<div class="box section">
-    <div class="verdict"><div class="bigscore">${esc(r.score)}<small> / 9</small></div>
-      <div><div><b>美学 ${esc(x.aes)} · 易玩性 ${esc(x.ease)} · 可玩性 ${esc(x.play)}</b></div>
-      <span class="pill ${r.score >= 7 ? "approved" : "rejected"}">${esc(x.verdict)}</span> <span class="small muted">${esc(r.title)} · ${esc(String(r.created_at).slice(0, 16).replace("T", " "))}</span></div></div>
-    <p class="quote">${esc(x.reviewer_comment)}</p>
-    ${x.strengths && x.strengths.length ? `<p class="small"><b>亮点：</b>${x.strengths.map(esc).join("；")}</p>` : ""}
-    <h3>问题清单</h3>
-    ${(x.issues || []).map((i) => `<div class="issue"><span class="sev sev-${esc(i.severity)}">${esc(i.severity)}</span><b>${esc(i.area)}</b>：${esc(i.problem)}
-      <div class="small muted">证据：${esc(i.evidence)}</div><div class="small">改法：${esc(i.fix)}</div></div>`).join("") || `<p class="muted">没有发现问题。</p>`}
-    <div class="row" style="margin:12px 0 6px"><h3 class="grow">修改提示词</h3><button class="primary" data-copy-fix>复制</button></div>
-    <pre class="md">${esc(x.fix_prompt)}</pre>
-    ${r.probe ? `<details><summary>自动体检</summary>${checksHtml(probeChecks(r.probe))}</details>` : ""}
-    ${shots ? `<h3 style="margin-top:12px">截图</h3><div class="shots">${shots}</div>` : ""}
-  </div>`;
-}
-
 async function renderReview(alive) {
-  const [history, topics] = memberOnly
-    ? [await api("GET", "reviews"), []]
-    : await Promise.all([api("GET", "reviews"), api("GET", "topics?status=liked,made&limit=200")]);
+  const topics = memberOnly ? [] : await api("GET", "topics?status=liked,made&limit=200");
   if (!alive()) return;
-  view.innerHTML = `<section class="review-intro"><div><div class="eyebrow"><span></span>PGC AI SIMULATION REVIEW</div><h1>上传前，先模拟一次<span>。</span></h1><p>AI 按真实审核标准体验游戏，给出美学、易玩性、可玩性评分和修改建议。</p></div><div class="review-cat-note" aria-hidden="true">✦<br><b>AI<br>SCORE</b></div></section>
-    <section class="review-workspace">
-      <div class="review-upload-panel">
-        <div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>支持单个 HTML</b></div>
-        <div class="review-dropzone" id="rvDropzone">
-          <div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div>
-          <h2>把游戏拖到这里</h2>
-          <p>一次放入一个 HTML，接下来交给我们</p>
-          <button type="button" class="primary-button" id="rvChoose"><span class="review-plus">＋</span>选择游戏文件</button>
-          <input type="file" id="rvFile" accept=".html,.htm,text/html" hidden>
-          <div class="upload-meta"><span>.html / .htm</span><span>单个 ≤ 8 MB</span><span>AI 模拟审核</span></div>
-          <div class="review-file-name" id="rvFileName">还未选择文件</div>
-        </div>
-        <div class="review-fields">
-          <label class="field">游戏名<input type="text" id="rvTitle" placeholder="自动读取 HTML title"></label>
-          <label class="field">对应的选题（可选）<select id="rvTopic"><option value="">不关联</option>${topics.map((t) => `<option value="${t.id}">${esc(t.data.title)}</option>`).join("")}</select></label>
-        </div>
-        <div class="review-action-row"><span class="progress" id="rvLog"></span><button type="button" class="primary-button" id="rvGo" disabled>开始审核</button></div>
-      </div>
-      <aside class="review-scope-panel"><div class="section-label"><span><i class="step-number">02</i>我们会检查</span><span class="small-tag">BASIC</span></div>
-        <div class="scope-items"><div class="scope-item"><div class="scope-icon">▣</div><div><h3>打开与加载</h3><p>白屏、缺失资源、加载异常</p></div></div><div class="scope-item"><div class="scope-icon">⌁</div><div><h3>开始与操作</h3><p>能否进入，输入是否有响应</p></div></div><div class="scope-item"><div class="scope-icon">▯</div><div><h3>手机显示</h3><p>关键文字、按钮是否明显出界</p></div></div><div class="scope-item"><div class="scope-icon">↻</div><div><h3>基础流程</h3><p>是否能到达结算与重试</p></div></div></div>
-        <div class="human-note"><span class="review-human-icon">♧</span><p><b>AI 模拟评分</b><br>美学 · 易玩性 · 可玩性，各 1–3 分；总分 ≥ 7 通过</p></div>
-      </aside>
-    </section>
-    <section class="review-live" id="rvLive"><div class="progress" id="rvLiveHint">上传 HTML 后，体检结果会显示在这里。</div><div class="phones" id="rvPhones"></div><div id="rvChecks"></div></section>
-    <div id="rvResult"></div>
-    <section class="review-history"><div class="results-heading"><div><h2>审核记录 <span>${history.length}</span></h2><p>点击一条记录查看完整报告</p></div></div>
-      ${history.length ? `<table><tbody>${history.map((h) => `<tr data-rid="${h.id}" style="cursor:pointer"><td><b>${esc(h.title)}</b></td><td>${esc(h.score)}/9</td><td><span class="pill ${h.score >= 7 ? "approved" : "rejected"}">${esc(h.verdict)}</span></td><td class="small muted">${esc(String(h.created_at).slice(0, 16).replace("T", " "))}</td></tr>`).join("")}</tbody></table>` : `<p class="muted small">还没有记录。</p>`}
-    </section>`;
-  let html = "";
-  const acceptFile = async (file) => {
-    if (!file) return;
-    html = await file.text();
-    const t = /<title>([^<]*)<\/title>/i.exec(html);
-    $("#rvTitle").value = (t && t[1].trim()) || file.name.replace(/\.html?$/i, "");
-    $("#rvFileName").textContent = file.name;
-    $("#rvDropzone").classList.add("has-file");
-    $("#rvGo").disabled = false;
-  };
-  $("#rvChoose").onclick = () => $("#rvFile").click();
-  $("#rvFile").onchange = async (e) => acceptFile(e.target.files[0]);
-  $("#rvDropzone").ondragover = (e) => { e.preventDefault(); $("#rvDropzone").classList.add("drag-over"); };
-  $("#rvDropzone").ondragleave = () => $("#rvDropzone").classList.remove("drag-over");
-  $("#rvDropzone").ondrop = async (e) => { e.preventDefault(); $("#rvDropzone").classList.remove("drag-over"); await acceptFile(e.dataTransfer.files[0]); };
-  const showResult = (r) => {
-    $("#rvResult").innerHTML = reviewHtml(r);
-    $("#rvResult [data-copy-fix]").onclick = () => copyText(r.result.fix_prompt);
-    $("#rvResult").scrollIntoView({ behavior: "smooth", block: "start" });
-  };
-  $("#rvGo").onclick = (e) => guard(e.target, async () => {
-    const log = (s) => ($("#rvLog").textContent = s);
-    $("#rvChecks").innerHTML = "";
-    $("#rvResult").innerHTML = "";
-    const { probe, shots } = await probeGame(html, $("#rvPhones"), log);
-    $("#rvChecks").innerHTML = `<h3 style="margin:12px 0 6px">自动体检</h3>` + checksHtml(probeChecks(probe));
-    if (probe.pageWasHidden) return log("页面在体检时被切到了后台，已跳过 AI 审核。保持页面在前台，再点一次开始审核。");
-    log("AI 审核中，约 1–2 分钟…");
-    const pick = (ratio, when) => shots.find((s) => s.ratio === ratio && s.when === when);
-    const send = [pick("9:19.5", "开局前"), pick("9:19.5", "开局后 3 秒"), pick("9:16", "开局后 10 秒"), pick("9:21", "开局后 10 秒")]
-      .filter(Boolean).map(({ label, data }) => ({ label, data }));
-    try {
-      const r = await api("POST", "review", { title: $("#rvTitle").value.trim(), topic_id: Number($("#rvTopic").value) || null, html, probe, shots: send });
-      log("");
-      showResult(r);
-    } catch (err) {
-      log("AI 审核失败：" + err.message + "（上面的自动体检结果仍然有效）");
-      throw err;
-    }
-  });
-  view.querySelector("tbody")?.addEventListener("click", (e) => {
-    const tr = e.target.closest("tr[data-rid]");
-    if (tr) guard(null, async () => showResult(await api("GET", `reviews/${tr.dataset.rid}`)));
+  await mountReviewWorkspace({ view, api, alive, topics, probeGame, checksHtml, probeChecks, copyText, download, openModal,
+    setProbing: value => { state.reviewProbing = value; },
   });
 }
 

@@ -11,10 +11,11 @@ import {authApi} from './auth-api';
 import {identity} from './members';
 import {guardCheckPage,guardForgePage,guardReviewPage} from './page-access';
 import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
+import {purgeReviewInputs} from './review-jobs';
 
 interface QueueMessage<T> { body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
-interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
+interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 
@@ -33,7 +34,7 @@ export default {
     if(url.pathname.startsWith('/api/forge/')){
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
-      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE},route,members,ctx);
+      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE,REVIEW_QUEUE:env.REVIEW_QUEUE},route,members,ctx);
     }
     if (url.pathname === '/api/health') {const config=await store.get();return json({ ok:true,configured:!!config?.enabled&&!!config?.encryptedKey,engine:'vision-model',version:'0.2.0',maxFileMB:8,maxBatch:20 });}
     if (url.pathname === '/api/check') {
@@ -76,6 +77,9 @@ export default {
     }
     return env.ASSETS.fetch(request);
   },
+  async scheduled(_event: unknown, env: Env): Promise<void> {
+    await purgeReviewInputs(env);
+  },
   async queue(batch: QueueBatch<ForgeJob>, env: Env): Promise<void> {
     const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB) };
     for (const message of batch.messages) {
@@ -84,7 +88,7 @@ export default {
         message.ack();
       } catch {
         if ((message.attempts || 1) >= 3) message.ack();
-        else message.retry({ delaySeconds: Math.min(60, 10 * (message.attempts || 1)) });
+        else message.retry({ delaySeconds: message.body.type === 'review' ? 800 : Math.min(60, 10 * (message.attempts || 1)) });
       }
     }
   },

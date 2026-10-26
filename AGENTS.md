@@ -35,3 +35,6 @@ GitHub repository: `Jesseovo/pgc-preflight`, private. This is not a 见识星球
 
 - Topic expansion and brief generation run through `pgc-forge-jobs`, with consumer concurrency 1 and short HTTP enqueue responses. Keep the D1 lease heartbeat and recoverable error states.
 - Long model retries must fit within the Queue consumer lifetime; never reintroduce browser-side cross-tab locks.
+- Batch AI review uses the separate `pgc-review-jobs` Queue, with at most 3 concurrent consumers. The browser captures each game's three phone frames sequentially, pipelines captured games to background model jobs, and tracks each result independently. Never change Forge scoring prompts or calibration to implement queue transport.
+- Review input is temporarily stored in `review_inputs` in small D1 chunks, removed after success/failure, and purged after 24 hours by the hourly scheduled handler. Completed reviews retain the existing report/evidence behavior. Never store the original HTML permanently.
+- `npx tsx scripts/verify-review.ts` verifies multi-file picker and page-wide drag/drop, bounded concurrent model submissions, isolated retry, report actions, mobile overflow, and the real browser probe using synthetic reports.

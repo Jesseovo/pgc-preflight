@@ -64,7 +64,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = /模型返回的不是合法 JSON/.test(message);
         const emptyResponse = /模型没有返回可读的审核内容/.test(message);
-        const busy = /返回 409|\b409\b/.test(message);
+        const busy = /返回 (409|429|503)|\b409\b/.test(message);
         if (attempt + 1 >= attempts || Date.now() >= deadline || (!parseFailure && !emptyResponse && !busy)) throw error;
         if (parseFailure || emptyResponse) freshRequest = true;
         await new Promise(resolve => setTimeout(resolve, parseFailure || emptyResponse ? 1200 : 5000 * (attempt + 1)));
