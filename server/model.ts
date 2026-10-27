@@ -79,13 +79,19 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
   const code = String(detail?.error?.code || detail?.error?.type || '');
   const raw = redact(String(detail?.error?.message || ''), apiKey);
   const wait = retryAfterMs(response.headers.get('retry-after'));
+  // Riffle sometimes wraps an Anthropic 503 in an HTTP 502 envelope. It is
+  // retryable only when the body explicitly identifies the upstream failure;
+  // unrelated 502 responses remain non-retryable because their outcome is
+  // ambiguous.
+  const wrapped503 = response.status === 502 && /(?:UPSTREAM_STREAM_ERROR|\b503\b|service[_ -]?unavailable|temporarily unavailable)/i.test(`${code} ${raw}`);
+  const status = wrapped503 ? 503 : response.status;
   return new ModelHttpError(response.status === 429
     ? `模型接口限流（429）${raw ? `：${raw}` : '，请求过多，请等待后重试。'}`
     : response.status === 409
       ? `模型网关请求冲突（409）${raw ? `：${raw}` : '，这次请求未完成，请稍后重试。'}${code ? ` [${code}]` : ''}`
-    : response.status === 503
+    : status === 503
       ? `模型网关上游暂时不可用（503）${raw ? `：${raw}` : '，请稍后重试。'}${code ? ` [${code}]` : ''}`
-    : `模型接口返回 ${response.status}${raw ? `：${raw}` : '。请检查模型配置、额度和图片输入支持。'}${code ? ` [${code}]` : ''}`, response.status, wait, code);
+    : `模型接口返回 ${response.status}${raw ? `：${raw}` : '。请检查模型配置、额度和图片输入支持。'}${code ? ` [${code}]` : ''}`, status, wait, code);
 }
 
 export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string; stream?: boolean } = {}): ModelTransport {
