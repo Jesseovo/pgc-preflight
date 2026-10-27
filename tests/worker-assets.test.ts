@@ -16,4 +16,18 @@ describe('智能助手说明的中文编码', () => {
     expect(response.headers.get('ETag')).toBe('fixture');
     expect(await response.text()).toBe(text);
   });
+
+  it('广场 API 在控制面代理之前执行登录校验', async () => {
+    let proxied = false;
+    const env: any = {
+      DB: {},
+      ADMIN_PASSWORD: 'fixture-admin',
+      SETTINGS_KEY: 'fixture-secret',
+      ASSETS: { fetch: async () => new Response('asset') },
+      CONTROL_PLANE: { idFromName: () => 'square', get: () => ({ fetch: async () => { proxied = true; return new Response('proxied', { status: 418 }); } }) },
+    };
+    const response = await worker.fetch(new Request('https://pgc.example/api/square/games'), env, { waitUntil() {} });
+    expect(response.status).toBe(401);
+    expect(proxied).toBe(false);
+  });
 });

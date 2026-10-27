@@ -40,6 +40,9 @@ const app = {
     const url = new URL(request.url);
     const deviceBoundary=guardDeviceScope(request);
     if(deviceBoundary)return deviceBoundary;
+    // Gallery browsing is a member-session surface backed by D1. Route it
+    // before the generic control-plane proxy so its auth and admin checks run.
+    if(url.pathname.startsWith('/api/square/'))return (await galleryApi(request,env)) || json({error:'接口不存在。'},404);
     // The ordinary Free Worker only routes API traffic. JSON processing and
     // control-plane work use the free SQLite Durable Object CPU allowance.
     if(url.pathname.startsWith('/api/')&&(env as any).CONTROL_PLANE){
@@ -47,7 +50,6 @@ const app = {
       return binding.get(binding.idFromName('review-control-v1')).fetch(request);
     }
     const store=configStore(env.DB),members=memberStore(env.DB);
-    if(url.pathname.startsWith('/api/square/'))return (await galleryApi(request,env)) || json({error:'接口不存在。'},404);
     if(url.pathname.startsWith('/api/forge-agent/')){
       if(url.pathname.endsWith('/pair')){const rate=await env.CHECK_RATE_LIMIT.limit({key:`forge-pair:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'配对操作较多，请稍后重试。'},429);}
       return forgeAgentApi(request,{...env,modelStore:store});
