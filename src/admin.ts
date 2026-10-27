@@ -2,17 +2,17 @@ import { withProgress, progressHtml } from './progress';
 import {createIcons,icons} from 'lucide';
 import './style.css';
 import './admin.css';
-import {catWalk} from './artwork';
 import {mountModelPanel} from './model-panel';
 
 const icon=(name:string)=>`<i data-lucide="${name}" aria-hidden="true"></i>`;
 const escape=(value:string)=>value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
 const app=document.querySelector<HTMLDivElement>('#app')!;
 let saved:import('./model-panel').ModelView;
-let adminTab:'model'|'members'|'forge'='forge';
+type AdminTab='members'|'forge'|'activity'|'public'|'upload'|'model';
+let adminTab:AdminTab='members';
 const $=<T extends Element=HTMLElement>(selector:string)=>document.querySelector<T>(selector)!;
 const iconsReady=()=>createIcons({icons,attrs:{'stroke-width':1.7}});
-app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/admin"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><div class="header-actions"><span class="back-link">${icon('panels-top-left')}团队管理</span></div></div></header><main class="admin-main"><section class="intro"><div><div class="eyebrow">TEAM MANAGEMENT</div><h1>管理团队的创作空间<span>。</span></h1><p>维护公共资料，查看成员内容、任务和 Agent，管理账号权限。</p></div>${catWalk}</section><div id="admin-content"><div class="admin-loading">${progressHtml({label:"正在读取管理配置",detail:"正在确认登录状态…"})}</div></div><footer><span>PGC Preflight / 团队管理</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
+app.innerHTML=`<header class="header"><div class="header-inner"><a class="brand" href="/admin"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>Preflight</b></span><span class="beta">ADMIN</span></a><div class="header-actions"><span class="back-link">${icon('panels-top-left')}管理后台</span></div></div></header><main class="admin-main"><div id="admin-content"><div class="admin-loading">${progressHtml({label:"正在读取管理配置",detail:"正在确认登录状态…"})}</div></div><footer><span>PGC Preflight / 管理后台</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
 iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){
@@ -39,43 +39,58 @@ function renderLogin(initialMessage=''){
   });
 }
 function renderSettings(){
-  $('#admin-content').innerHTML='<nav class="admin-tabs" aria-label="管理功能"><button id="tab-forge">'+icon('panels-top-left')+'内容与公共资料</button><button id="tab-model">'+icon('brain-circuit')+'模型配置</button><button id="tab-members">'+icon('users')+'成员管理</button><button id="logout" class="admin-logout">'+icon('log-out')+'退出</button></nav><div id="model-panel" hidden></div><section id="members-panel" hidden></section><section id="forge-panel"></section>';
+  $('#admin-content').innerHTML='<nav class="admin-tabs" aria-label="管理功能"><button id="tab-members">'+icon('users')+'成员</button><button id="tab-forge">'+icon('layers')+'内容与任务</button><button id="tab-activity">'+icon('clipboard-check')+'审核记录</button><button id="tab-public">'+icon('library')+'公共资料</button><button id="tab-upload">'+icon('upload')+'手动上传</button><button id="tab-model">'+icon('brain-circuit')+'模型配置</button><button id="logout" class="admin-logout">'+icon('log-out')+'退出</button></nav><div id="model-panel" hidden></div><section id="members-panel" hidden></section><section id="forge-panel" hidden></section><section id="activity-panel" hidden></section><section id="public-panel" hidden></section><section id="upload-panel" hidden></section>';
   mountModelPanel($('#model-panel'),saved,api,value=>{saved=value;});
   $('#admin-content').insertAdjacentHTML('afterbegin','<section class="worker-status" id="worker-status" role="status">正在读取成员 Agent 状态…</section>');
   void loadWorkerStatus();
   void renderManagement();
-  const selectTab=(name:'model'|'members'|'forge')=>{
-    adminTab=name; $('#model-panel').hidden=name!=='model';$('#members-panel').hidden=name!=='members';$('#forge-panel').hidden=name!=='forge';
-    for(const [id,active] of [['tab-model',name==='model'],['tab-members',name==='members'],['tab-forge',name==='forge']] as const)$('#'+id).classList.toggle('active',active);
+  const selectTab=(name:AdminTab)=>{
+    adminTab=name;
+    for(const tab of ['members','forge','activity','public','upload','model'] as const){$('#'+tab+'-panel').hidden=tab!==name;const button=$('#tab-'+tab);button.classList.toggle('active',tab===name);button.setAttribute('aria-current',tab===name?'page':'false');}
+    if(name==='members'&&!$('#members-panel').children.length)void renderMembers();
+    if(name==='activity'&&!$('#activity-panel').children.length)void mountActivity();
   };
-  $('#tab-model').onclick=()=>selectTab('model');
-  $('#tab-forge').onclick=()=>selectTab('forge');
-  $('#tab-members').onclick=()=>{selectTab('members');if(!$('#members-panel').children.length)void renderMembers();};
+  for(const tab of ['members','forge','activity','public','upload','model'] as const)$('#tab-'+tab).onclick=()=>selectTab(tab);
   $('#logout').onclick=async()=>{try{await api('logout','POST');renderLogin();}catch(error){alert(error instanceof Error?error.message:'退出失败。');}};
-  selectTab(adminTab);if(adminTab==='members')void renderMembers();iconsReady();
+  selectTab(adminTab);iconsReady();
 }
 
 const safeText=(value:unknown)=>escape(String(value??''));
 const adminDims={subject:'题材',medium:'美术媒介',gesture:'手势',structure:'挑战结构',mood:'情绪基调'};
 let managementOwner='';
 let managementSuggestions:any[]=[];
+let workspaceRequest=0;
+function filterRows(container:Element,query:string){
+  const term=query.trim().toLocaleLowerCase();
+  container.querySelectorAll<HTMLElement>('tbody tr').forEach(row=>{row.hidden=!!term&&!row.textContent?.toLocaleLowerCase().includes(term);});
+}
 async function renderManagement(){
   const panel=$('#forge-panel');
   panel.innerHTML=`<div class="members-heading"><div><span class="eyebrow">TEAM CONTENT</span><h2>成员内容与运行状态</h2><p>成员的创作内容各自独立；管理员维护公共资料并查看团队记录。</p></div><button class="subtle-button" id="workspace-refresh">刷新</button></div><div class="activity-filters"><label>成员<select id="workspace-owner"><option value="">全部成员</option></select></label><span id="workspace-counts" role="status"></span></div><p id="management-message" class="form-message" role="status"></p><div id="workspace-records"></div><details class="management-section" open><summary>管理员手动上传</summary><p>上传游戏后，点击审核按钮才使用平台模型；成员由自己的 Agent 完成采集、初评和复核。</p><div class="management-pair"><form id="admin-game-upload" class="management-form"><h3>上传 HTML 游戏并审核</h3><label>游戏文件<input id="admin-game-file" type="file" accept=".html,.htm,text/html" required></label><label>标题（可选）<input id="admin-game-title" maxlength="200"></label><button class="primary-button" type="submit">上传并用平台模型审核</button></form><form id="admin-report-import" class="management-form"><h3>导入已有审核报告</h3><label>报告 JSON<input id="admin-report-file" type="file" accept=".json,application/json" required></label><label>报告标题（可选）<input id="admin-report-title" maxlength="200"></label><label>归属成员<select id="admin-report-owner"><option value="admin">管理员</option></select></label><button class="subtle-button" type="submit">导入报告</button></form></div></details><details class="management-section"><summary>公共规则与制作模板</summary><div id="public-settings"></div></details><details class="management-section"><summary>公共词库与建议审批</summary><div id="public-vocab"></div></details><dialog id="management-detail" class="activity-report"><div class="activity-dialog-head"><b id="management-detail-title">内容详情</b><button type="button" id="management-detail-close" class="subtle-button">关闭</button></div><div id="management-detail-content"></div></dialog><dialog id="activity-report" class="activity-report"><div class="activity-dialog-head"><b>审核报告</b><button type="button" id="activity-close" class="subtle-button">关闭</button></div><div id="activity-report-content" class="review-page"></div></dialog>`;
+  const sections=panel.querySelectorAll<HTMLDetailsElement>(':scope > .management-section');
+  $('#upload-panel').append(sections[0]);
+  $('#public-panel').append(sections[1],sections[2]);
+  $('#admin-content').append($('#management-detail'),$('#activity-report'));
+  sections[1].open=true;
+  panel.querySelector('.activity-filters')!.insertAdjacentHTML('beforeend','<label>搜索<input id="workspace-search" type="search" placeholder="搜索内容、任务或成员"></label>');
+  $('#workspace-search').oninput=()=>filterRows($('#workspace-records'),$<HTMLInputElement>('#workspace-search').value);
+  $('#upload-panel').insertAdjacentHTML('afterbegin','<div class="members-heading"><h2>手动上传</h2></div><p id="upload-message" class="form-message" role="status"></p>');
+  $('#public-panel').insertAdjacentHTML('afterbegin','<div class="members-heading"><h2>公共资料</h2></div><p id="public-message" class="form-message" role="status"></p>');
   $('#management-detail-close').onclick=()=>$<HTMLDialogElement>('#management-detail').close();
   $('#activity-close').onclick=()=>$<HTMLDialogElement>('#activity-report').close();
   $('#workspace-refresh').onclick=()=>void loadManagementWorkspace();
   $('#workspace-owner').onchange=()=>{managementOwner=$<HTMLSelectElement>('#workspace-owner').value;void loadManagementWorkspace();};
-  $('#admin-game-upload').onsubmit=event=>{event.preventDefault();const button=$<HTMLButtonElement>('#admin-game-upload button');button.disabled=true;void(async()=>{try{const file=$<HTMLInputElement>('#admin-game-file').files?.[0];if(!file)throw new Error('请选择游戏文件。');if(!/\.html?$/i.test(file.name)||file.size>8*1024*1024)throw new Error('请选择不超过 8 MB 的 HTML 游戏。');const html=await file.text();const title=$<HTMLInputElement>('#admin-game-title').value.trim()||new DOMParser().parseFromString(html,'text/html').title||file.name;await api('review-upload','POST',{html,title,filename:file.name,request_id:crypto.randomUUID()});$('#management-message').textContent='审核已提交，任务与报告会显示在下方记录中。';$<HTMLFormElement>('#admin-game-upload').reset();await loadManagementWorkspace();}catch(error){managementError(error);}finally{button.disabled=false;}})();};
-  $('#admin-report-import').onsubmit=event=>{event.preventDefault();const button=$<HTMLButtonElement>('#admin-report-import button');button.disabled=true;void(async()=>{try{const file=$<HTMLInputElement>('#admin-report-file').files?.[0];if(!file)throw new Error('请选择报告 JSON。');const report=JSON.parse(await file.text());await api('review-import','POST',{title:$<HTMLInputElement>('#admin-report-title').value.trim()||report.title||file.name,filename:report.filename||file.name,request_id:crypto.randomUUID(),result:report.result||report,probe:report.probe,shots:report.shots||[],owner_id:$<HTMLSelectElement>('#admin-report-owner').value});$('#management-message').textContent='报告已导入。';$<HTMLFormElement>('#admin-report-import').reset();await loadManagementWorkspace();}catch(error){managementError(error);}finally{button.disabled=false;}})();};
+  $('#admin-game-upload').onsubmit=event=>{event.preventDefault();const button=$<HTMLButtonElement>('#admin-game-upload button');button.disabled=true;void(async()=>{try{const file=$<HTMLInputElement>('#admin-game-file').files?.[0];if(!file)throw new Error('请选择游戏文件。');if(!/\.html?$/i.test(file.name)||file.size>8*1024*1024)throw new Error('请选择不超过 8 MB 的 HTML 游戏。');const html=await file.text();const title=$<HTMLInputElement>('#admin-game-title').value.trim()||new DOMParser().parseFromString(html,'text/html').title||file.name;await api('review-upload','POST',{html,title,filename:file.name,request_id:crypto.randomUUID()});$('#upload-message').textContent='审核已提交，可在内容与任务中查看进度。';$<HTMLFormElement>('#admin-game-upload').reset();await loadManagementWorkspace();}catch(error){managementError(error);}finally{button.disabled=false;}})();};
+  $('#admin-report-import').onsubmit=event=>{event.preventDefault();const button=$<HTMLButtonElement>('#admin-report-import button');button.disabled=true;void(async()=>{try{const file=$<HTMLInputElement>('#admin-report-file').files?.[0];if(!file)throw new Error('请选择报告 JSON。');const report=JSON.parse(await file.text());await api('review-import','POST',{title:$<HTMLInputElement>('#admin-report-title').value.trim()||report.title||file.name,filename:report.filename||file.name,request_id:crypto.randomUUID(),result:report.result||report,probe:report.probe,shots:report.shots||[],owner_id:$<HTMLSelectElement>('#admin-report-owner').value});$('#upload-message').textContent='报告已导入。';$<HTMLFormElement>('#admin-report-import').reset();await loadManagementWorkspace();}catch(error){managementError(error);}finally{button.disabled=false;}})();};
   await Promise.allSettled([loadManagementWorkspace(),loadPublicData()]);
 }
-function managementError(error:unknown){const target=document.querySelector('#management-message')||document.querySelector('#member-message');if(target)target.textContent=error instanceof Error?error.message:'操作未完成。';}
+function managementError(error:unknown){const target=document.querySelector(adminTab==='upload'?'#upload-message':adminTab==='public'?'#public-message':'#management-message')||document.querySelector('#member-message');if(target)target.textContent=error instanceof Error?error.message:'操作未完成。';}
 async function loadManagementWorkspace(){
   if(!document.querySelector('#workspace-records'))return;
+  const request=++workspaceRequest;
   try{
     const data=await api(`workspace${managementOwner?'?owner='+encodeURIComponent(managementOwner):''}`);
-    if(!document.querySelector('#workspace-records'))return;
+    if(request!==workspaceRequest||!document.querySelector('#workspace-records'))return;
     const members=data.members||[];
     const owner=$<HTMLSelectElement>('#workspace-owner');owner.innerHTML='<option value="">全部成员</option>'+members.map((m:any)=>`<option value="${safeText(m.id)}">${safeText(m.displayName||m.display_name||m.username)}${m.star?' · ★':''}</option>`).join('');owner.value=managementOwner;
     const reportOwner=$<HTMLSelectElement>('#admin-report-owner'),selectedOwner=reportOwner.value;reportOwner.innerHTML='<option value="admin">管理员</option>'+members.map((m:any)=>`<option value="${safeText(m.id)}">${safeText(m.displayName||m.display_name||m.username)}</option>`).join('');reportOwner.value=selectedOwner;
@@ -84,13 +99,16 @@ async function loadManagementWorkspace(){
     const names=new Map(members.map((m:any)=>[m.id,m.displayName||m.display_name||m.username]));
     const who=(row:any)=>safeText(names.get(row.owner_id)||row.owner_id||'管理员');
     const contentRows=[...topics.map((t:any)=>({row:t,type:'选题',title:t.data?.title||t.title||`选题 ${t.id}`})),...games.map((g:any)=>({row:g,type:'作品',title:g.title}))];
+    const openSections=Array.from($('#workspace-records').querySelectorAll<HTMLDetailsElement>('details'),section=>section.open);
     $('#workspace-records').innerHTML=`<details class="management-section" open><summary>内容记录（${contentRows.length}）</summary><div class="management-table"><table><thead><tr><th>成员</th><th>内容</th><th>状态</th><th>操作</th></tr></thead><tbody>${contentRows.map(({row,type,title},index)=>`<tr><td>${who(row)}</td><td><small>${type}</small><strong>${safeText(title)}</strong></td><td>${safeText(row.status)}</td><td><button type="button" class="text-button" data-content-index="${index}">查看详情</button>${type==='作品'?`<button class="text-button" data-publish-game="${safeText(row.id)}">发布到公共作品库</button>`:''}</td></tr>`).join('')||'<tr><td colspan="4">还没有内容。</td></tr>'}</tbody></table></div></details><details class="management-section" open><summary>任务与 Agent 状态</summary><div class="management-table"><table><thead><tr><th>成员</th><th>任务</th><th>状态 / 阶段</th><th>最近更新</th></tr></thead><tbody>${[...tasks,...reviewJobs].map((t:any)=>`<tr><td>${who(t)}</td><td>${safeText(t.kind||'审核')} · ${safeText(t.title||t.topic_id||t.id)}</td><td>${safeText(t.status)}${t.stage?' / '+safeText(t.stage):''}<small>${safeText(t.detail||t.error)}</small></td><td>${safeText(t.updated_at||t.created_at)}</td></tr>`).join('')||'<tr><td colspan="4">暂无任务。</td></tr>'}</tbody></table></div><div class="management-agent-list">${agents.map((a:any)=>`<div><strong>${who(a)} · ${safeText(a.name||'Agent')}</strong><span>${a.revoked?'已撤销':a.online?'最近连接':'已授权'} · 最近连接 ${safeText(a.last_seen||'尚未连接')}</span></div>`).join('')||'<p>尚无创作 Agent 授权。</p>'}</div></details><details class="management-section"><summary>审核报告（${reviews.length}）</summary><div class="management-table"><table><tbody>${reviews.map((r:any)=>`<tr><td>${who(r)}</td><td>${safeText(r.title)}</td><td>${safeText(r.model_executor==='agent'?'成员 Agent':/import|manual-admin/.test(r.model_executor||'')?'管理员导入':'平台模型')}</td><td><button class="text-button" data-activity-report="${Number(r.id)}">${Number(r.score)} / 9 · 查看报告</button></td></tr>`).join('')||'<tr><td>暂无报告。</td></tr>'}</tbody></table></div></details>`;
     $('#workspace-records').querySelectorAll<HTMLButtonElement>('[data-content-index]').forEach(button=>button.onclick=()=>void showManagementContent(contentRows[Number(button.dataset.contentIndex)],button));
+    $('#workspace-records').querySelectorAll<HTMLDetailsElement>('details').forEach((section,index)=>{if(openSections[index]!==undefined)section.open=openSections[index];});
     $('#workspace-records').querySelectorAll<HTMLButtonElement>('[data-activity-report]').forEach(button=>button.onclick=()=>void showActivityReport(button));
+    filterRows($('#workspace-records'),$<HTMLInputElement>('#workspace-search').value);
     $('#workspace-records').querySelectorAll<HTMLButtonElement>('[data-publish-game]').forEach(button=>button.onclick=()=>void publicAction(button,{action:'publish-game',id:Number(button.dataset.publishGame)}));
     managementSuggestions=data.suggestions||[];
     renderSuggestions(managementSuggestions);
-  }catch(error){managementError(error);}
+  }catch(error){if(request===workspaceRequest)managementError(error);}
 }
 const materialLabels:Record<string,string>={expand:'选题扩写',brief:'制作简报',preview:'样板图 SVG',assets:'美术资产 HTML',game:'游戏成品 HTML',product:'游戏成品 HTML'};
 async function readManagementContent(path:string){
@@ -116,7 +134,7 @@ async function showManagementContent(item:{row:any;type:string;title:string},but
     },{compact:true}).catch(managementError).finally(()=>{versionButton.disabled=false;});});
   }catch(error){managementError(error);}finally{button.disabled=false;}
 }
-async function publicAction(button:HTMLButtonElement,payload:unknown){button.disabled=true;try{await api('public-data','POST',payload);$('#management-message').textContent='公共资料已更新。';await loadPublicData();await loadManagementWorkspace();}catch(error){managementError(error);}finally{button.disabled=false;}}
+async function publicAction(button:HTMLButtonElement,payload:unknown){button.disabled=true;try{await api('public-data','POST',payload);$(adminTab==='forge'?'#management-message':'#public-message').textContent='公共资料已更新。';await loadPublicData();await loadManagementWorkspace();}catch(error){managementError(error);}finally{button.disabled=false;}}
 function renderSuggestions(rows:any[]){
   if(!document.querySelector('#public-suggestions'))return;
   $('#public-suggestions').innerHTML=`<h3>待审批词库建议</h3>${rows.filter(row=>!row.status||row.status==='pending').map(row=>`<div class="management-suggestion"><span><b>${safeText(row.word||(Array.isArray(row.words)?row.words.map((word:any)=>typeof word==='string'?word:word.word).join('、'):row.words)||row.content)}</b><small>${safeText(row.dim)} · ${safeText(row.owner_id)}</small></span><button class="text-button" data-suggestion="${safeText(row.id)}" data-action="suggestion-approve">批准</button><button class="text-button" data-suggestion="${safeText(row.id)}" data-action="suggestion-reject">拒绝</button></div>`).join('')||'<p>暂无待审批建议。</p>'}`;
@@ -151,6 +169,8 @@ type MemberView={id:string;username:string;displayName:string;enabled:boolean;ca
 async function renderMembers(){
   $('#members-panel').innerHTML=`<div class="members-heading"><div><span class="eyebrow">TEAM ACCESS</span><h2>给创作者，开一扇门。</h2><p>管理成员权限与审核记录。平台历史额度仅用于平台模型，本机 Agent 审核不限次。</p></div><button class="primary-button" id="show-create">${icon('user-plus')}开通成员账号</button></div><form id="create-member-form" class="member-create" hidden><div class="member-create-fields"><div class="field"><label for="member-username">登录账号</label><input id="member-username" required minlength="3" maxlength="32" pattern="[a-zA-Z0-9][a-zA-Z0-9._-]{2,31}" placeholder="如 creator01" autocomplete="off"/></div><div class="field"><label for="member-displayname">成员姓名</label><input id="member-displayname" required maxlength="50" placeholder="组员姓名或昵称" autocomplete="off"/></div><div class="field"><label for="member-password">初始密码</label><input id="member-password" type="password" required minlength="6" maxlength="128" placeholder="至少 6 位" autocomplete="new-password"/></div></div><div class="field"><label for="member-limit">平台审核历史每日额度</label><input id="member-limit" type="number" min="0" max="10000" step="1" value="50" required/></div><div class="create-bottom"><div><label><input id="member-review" type="checkbox" checked/>允许 Agent 审核</label><label><input id="member-star" type="checkbox"/>星标成员：开放个人创作工作台</label></div><div><button type="button" class="subtle-button" id="cancel-create">取消</button><button type="submit" class="primary-button">${icon('check')}确认开通</button></div></div></form><p id="member-message" class="form-message" role="status"></p><div class="members-list" id="members-list">正在读取成员…</div>`;
   iconsReady();
+  $('#members-list').insertAdjacentHTML('beforebegin','<label class="member-search">搜索成员<input id="member-search" type="search" placeholder="姓名或登录账号"></label>');
+  $('#member-search').oninput=()=>filterMembers();
   $('#show-create').addEventListener('click',()=>{$('#create-member-form').hidden=false;$<HTMLInputElement>('#member-username').focus();});
   $('#cancel-create').addEventListener('click',()=>{$('#create-member-form').hidden=true;$<HTMLFormElement>('#create-member-form').reset();});
   $('#create-member-form').addEventListener('submit',async event=>{
@@ -159,13 +179,12 @@ async function renderMembers(){
     catch(error){memberError(error);}finally{button.disabled=false;}
   });
   await refreshMembers();
-  await mountActivity();
 }
 function memberError(error:unknown){const target=document.querySelector('#member-message');if(target){target.textContent=error instanceof Error?error.message:'操作未完成。';target.classList.remove('success');}else managementError(error);}
 let activityPage=1, activityRequest=0;
 const beijingDay=()=>new Date(Date.now()+8*3600000).toISOString().slice(0,10);
 async function mountActivity(){
-  $('#members-panel').insertAdjacentHTML('beforeend',`<section class="review-activity"><div class="members-heading"><div><span class="eyebrow">DAILY REVIEWS</span><h2>每一天，审核了什么。</h2><p>记录成员 Agent 提交的审核与管理员上传的游戏、报告。成员模型由本机 Agent 提供。</p></div><button id="activity-refresh" class="subtle-button">刷新记录</button></div><div class="activity-filters"><label>审核日期<input id="activity-date" type="date" value="${beijingDay()}" required/></label><label>成员<select id="activity-member"><option value="">全部成员</option></select></label><span id="activity-total" role="status"></span></div><div id="activity-summary" class="activity-summary"></div><p id="activity-error" role="status"></p><div id="activity-records" class="activity-records"></div><div class="activity-pager"><button class="subtle-button" id="activity-prev">上一页</button><span id="activity-page"></span><button class="subtle-button" id="activity-next">下一页</button></div></section>`);
+  $('#activity-panel').insertAdjacentHTML('beforeend',`<section class="review-activity"><div class="members-heading"><div><h2>审核记录</h2><p>按日期和成员查看审核结果与平台额度。</p></div><button id="activity-refresh" class="subtle-button">刷新记录</button></div><div class="activity-filters"><label>审核日期<input id="activity-date" type="date" value="${beijingDay()}" required/></label><label>成员<select id="activity-member"><option value="">全部成员</option></select></label><span id="activity-total" role="status"></span></div><div id="activity-summary" class="activity-summary"></div><p id="activity-error" role="status"></p><div id="activity-records" class="activity-records"></div><div class="activity-pager"><button class="subtle-button" id="activity-prev">上一页</button><span id="activity-page"></span><button class="subtle-button" id="activity-next">下一页</button></div></section>`);
   $('#activity-close').onclick=()=>$<HTMLDialogElement>('#activity-report').close();
   $('#activity-refresh').onclick=()=>void loadActivity();
   for(const selector of ['#activity-date','#activity-member'])$(selector).addEventListener('change',()=>{activityPage=1;void loadActivity();});
@@ -226,6 +245,11 @@ async function refreshMembers(){
     document.querySelectorAll<HTMLButtonElement>('[data-show-reset]').forEach(button=>button.addEventListener('click',()=>{const form=document.querySelector<HTMLFormElement>(`[data-reset-form="${button.dataset.showReset}"]`)!;form.hidden=!form.hidden;if(!form.hidden)form.querySelector('input')!.focus();}));
     document.querySelectorAll<HTMLFormElement>('[data-reset-form]').forEach(form=>form.addEventListener('submit',async event=>{event.preventDefault();const button=form.querySelector('button')!;button.disabled=true;try{await api(`members/${form.dataset.resetForm}`,'PATCH',{password:form.querySelector('input')!.value});$('#member-message').textContent='密码已重置，旧登录状态已失效。请告知该成员新密码。';$('#member-message').classList.add('success');await refreshMembers();}catch(error){memberError(error);}finally{button.disabled=false;}}));
     document.querySelectorAll<HTMLFormElement>('[data-quota]').forEach(form=>form.onsubmit=async event=>{event.preventDefault();const button=form.querySelector('button')!;button.disabled=true;try{await api(`members/${form.dataset.quota}`,'PATCH',{dailyReviewLimit:Number(form.querySelector('input')!.value)});$('#member-message').textContent='平台历史每日额度已保存；仅适用于平台模型，本机 Agent 审核不受影响。';$('#member-message').classList.add('success');await refreshMembers();await loadActivity();}catch(error){memberError(error);}finally{button.disabled=false;}});
+    filterMembers();
     iconsReady();
   }catch(error){memberError(error);}
+}
+function filterMembers(){
+  const term=$<HTMLInputElement>('#member-search').value.trim().toLocaleLowerCase();
+  $('#members-list').querySelectorAll<HTMLElement>('.member-row').forEach(row=>{row.hidden=!!term&&!row.querySelector('.member-person')?.textContent?.toLocaleLowerCase().includes(term);});
 }

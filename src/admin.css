@@ -91,6 +91,17 @@
 .auth-main footer { width: 100%; padding: 22px 2px calc(26px + env(safe-area-inset-bottom)); }
 
 .admin-tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--line); margin-bottom: 24px; padding-bottom: 12px; }
+.admin-main { padding-top: 24px; }
+.admin-tabs { overflow-x: auto; scrollbar-width: thin; }
+.admin-tabs button { flex-shrink: 0; white-space: nowrap; }
+.admin-tabs button.active { font-weight: 600; }
+.admin-tabs button:focus-visible, .management-section summary:focus-visible { outline: 2px solid #678b78; outline-offset: 2px; }
+.member-search { display: grid; gap: 6px; max-width: 320px; margin: 0 0 16px; font-size: 12px; color: #53645a; }
+.member-search input, #workspace-search { width: 100%; min-height: 38px; border: 1px solid #d4dcd3; border-radius: 4px; padding: 8px 10px; font: inherit; background: #fff; }
+.member-row[hidden], .management-table tr[hidden] { display: none; }
+#upload-panel > .management-section, #public-panel > .management-section { margin-top: 12px; }
+#activity-panel .review-activity { margin-top: 0; }
+.admin-main h2 { letter-spacing: 0; }
 .admin-tabs button { display: flex; align-items: center; gap: 7px; min-height: 40px; padding: 9px 14px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #656d76; font-size: 12px; }
 .admin-tabs button svg { width: 16px; height: 16px; }
 .admin-tabs button.active { background: #f0f4ec; border-color: #dce4d6; color: #536f5c; }
