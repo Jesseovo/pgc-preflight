@@ -14,6 +14,8 @@ import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
 import {purgeReviewInputs} from './review-jobs';
 import {captureReview} from './review-probe';
 import {acquireBrowser} from './browser-capacity';
+import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
+export {ReviewRunner} from './review-runner';
 
 interface QueueMessage<T> { body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
@@ -29,10 +31,25 @@ function captureFor(env:Env){return async (html:string,onWait?:(message:string)=
   }finally{await browser?.close().catch(()=>{});}
 };}
 
-export default {
+const app = {
   async fetch(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {
     const url = new URL(request.url);
+    // The ordinary Free Worker only routes API traffic. JSON processing and
+    // control-plane work use the free SQLite Durable Object CPU allowance.
+    if(url.pathname.startsWith('/api/')&&(env as any).CONTROL_PLANE){
+      const binding=(env as any).CONTROL_PLANE;
+      return binding.get(binding.idFromName('review-control-v1')).fetch(request);
+    }
     const store=configStore(env.DB),members=memberStore(env.DB);
+    if(url.pathname.startsWith('/api/review-device/')){
+      if(url.pathname.endsWith('/pair')){const rate=await env.CHECK_RATE_LIMIT.limit({key:`pair:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'配对操作较多，请稍后重试。'},429);}
+      return reviewDeviceApi(request,{...env,modelStore:store});
+    }
+    if(url.pathname.startsWith('/api/forge/review/device/'))return reviewDeviceWeb(request,{...env,modelStore:store});
+    if(url.pathname==='/api/admin/review-workers'){
+      const user=await identity(request.headers.get('Cookie'),members,env);
+      return user?.role==='admin'?json(await deviceStatus(env.DB)):json({error:'请先以管理员登录。'},403);
+    }
     if(url.pathname.startsWith('/api/admin/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`admin:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       return (await adminApi(request,store,env,members,env.DB))!;
@@ -45,7 +62,7 @@ export default {
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
       return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE,REVIEW_QUEUE:env.REVIEW_QUEUE,
-        captureReview: captureFor(env),
+        reviewExecutor:'device',
       },route,members,ctx);
     }
     if (url.pathname === '/api/health') {const config=await store.get();return json({ ok:true,configured:!!config?.enabled&&!!config?.encryptedKey,engine:'vision-model',version:'0.2.0',maxFileMB:8,maxBatch:20 });}
@@ -91,6 +108,12 @@ export default {
     return env.ASSETS.fetch(request);
   },
   async scheduled(_event: unknown, env: Env): Promise<void> {
+    if((env as any).CONTROL_PLANE){
+      const binding=(env as any).CONTROL_PLANE;
+      const response=await binding.get(binding.idFromName('review-control-v1')).fetch(new Request('https://internal/__maintenance',{method:'POST'}));
+      if(!response.ok)throw new Error('Review maintenance unavailable');
+      return;
+    }
     await purgeReviewInputs(env);
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ?")
@@ -109,6 +132,20 @@ export default {
     }
   },
 };
+
+export default app;
+// JSON control requests use the free SQLite DO CPU budget. Each game's model
+// execution runs in its own alarm object, separately from this control plane.
+export class ReviewControlPlane {
+  constructor(private state:WorkerContext,private env:Env){}
+  async fetch(request:Request){
+    const env={...this.env,CONTROL_PLANE:undefined} as Env;
+    if(request.url==='https://internal/__maintenance'){
+      await app.scheduled({},env);return new Response('ok');
+    }
+    return app.fetch(request,env,this.state);
+  }
+}
 
 async function readLimitedJson(request: Request): Promise<unknown> {
   if (Number(request.headers.get('Content-Length')) > MAX_REQUEST_BYTES) throw new Error('请求内容过大。');

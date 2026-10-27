@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build",
+    "build:agent": "tsx scripts/build-review-assistant.ts",
+    "build": "tsc --noEmit && npm run build:agent && vite build",
     "test": "vitest run",
     "test:runtime": "tsx scripts/verify-runtime.ts",
     "deploy": "npm run build && wrangler deploy",
@@ -16,10 +17,13 @@
     "lucide": "^0.468.0"
   },
   "overrides": {
-    "@cloudflare/puppeteer": { "@puppeteer/browsers": "^3.2.6" }
+    "@cloudflare/puppeteer": {
+      "@puppeteer/browsers": "^3.2.6"
+    }
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
     "puppeteer-core": "^25.16.0",
     "tsx": "^4.20.0",
     "typescript": "~5.9.3",

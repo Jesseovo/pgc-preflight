@@ -1,6 +1,7 @@
 // Background transport only. Scoring and calibration stay in the Forge review.
 import { activeModelProfile } from './settings';
 import { reviewDay, reviewUsage } from './review-usage';
+import { recoverDeviceReviews } from './review-device-state';
 
 type ReviewJob = { type: 'review'; id: string };
 export interface ReviewJobEnv {
@@ -8,16 +9,17 @@ export interface ReviewJobEnv {
   REVIEW_QUEUE?: { send(message: ReviewJob): Promise<void> };
   modelStore: { get(): Promise<any> };
   captureReview?: (html:string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
+  reviewExecutor?: 'device';
 }
 const stamp = () => new Date().toISOString();
 const fail = (message: string, status = 400) => Object.assign(new Error(message), { status });
 const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged });
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
-  if (!env.REVIEW_QUEUE) throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
+  if (!env.REVIEW_QUEUE && env.reviewExecutor!=='device') throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
   if (typeof payload?.html !== 'string' || !payload.html.trim()) throw fail('缺少游戏源码。');
   if (new TextEncoder().encode(payload.html).length > 8 * 1024 * 1024) throw fail('单个 HTML 不能超过 8 MB。', 413);
-  if (!env.captureReview) throw fail('后台画面采集服务尚未就绪。', 503);
+  if (!env.captureReview && env.reviewExecutor!=='device') throw fail('后台画面采集服务尚未就绪。', 503);
   const config = await env.modelStore.get();
   for (const purpose of ['review', 'review_verify'] as const) {
     const model = activeModelProfile(config, purpose);
@@ -33,12 +35,12 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
-  const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at)
-    SELECT ?, ?, ?, ?, 'capture', ?, ?, ? WHERE
+  const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at,executor,input_ready)
+    SELECT ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0 WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
-    .bind(id, ownerId, title, filename, day, now, now, ownerId, ownerId, ownerId, ownerId, day).run();
+    .bind(id, ownerId, title, filename, day, now, now,env.reviewExecutor||'cloud', ownerId, ownerId, ownerId, ownerId, day).run();
   if (!inserted.meta.changes) {
     const duplicate = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
     if (duplicate) return publicJob(duplicate);
@@ -60,7 +62,8 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
       i = end;
     }
     await env.DB.batch(chunks);
-    await env.REVIEW_QUEUE.send({ type: 'review', id });
+    await env.DB.prepare('UPDATE review_jobs SET input_ready=1 WHERE id=?').bind(id).run();
+    if(env.reviewExecutor!=='device')await env.REVIEW_QUEUE!.send({ type: 'review', id });
   } catch {
     await env.DB.prepare('DELETE FROM review_jobs WHERE id = ? AND status = ?').bind(id, 'queued').run();
     await deleteInput(env, id).catch(() => {});
@@ -77,17 +80,19 @@ export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
 }
 
 export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string) {
+  await recoverDeviceReviews(env.DB);
   const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-  await env.DB.prepare(`UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台审核已中断，未发布评分，请重新上传或重试。', updated_at = ? WHERE status = 'running' AND updated_at < ?${ownerId ? ' AND owner_id = ?' : ''}`)
+  await env.DB.prepare(`UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台审核已中断，未发布评分，请重新上传或重试。', updated_at = ? WHERE executor!='device' AND status = 'running' AND updated_at < ?${ownerId ? ' AND owner_id = ?' : ''}`)
     .bind(stamp(),cutoff,...(ownerId ? [ownerId] : [])).run();
   await env.DB.prepare("DELETE FROM review_inputs WHERE job_id IN (SELECT id FROM review_jobs WHERE status = 'error')").bind().run();
 }
 
 export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: string) {
+  await recoverDeviceReviews(env.DB);
   let row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
   if (!row) throw fail('审核任务不存在。', 404);
   const stale = row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000
-    || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > 3 * 60 * 60 * 1000;
+    || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > (row.executor==='device'?24:3) * 60 * 60 * 1000;
   if (stale) {
     await env.DB.prepare("UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台任务已中断，请重试。', updated_at = ? WHERE id = ? AND updated_at = ?")
       .bind(stamp(), id, row.updated_at).run();
@@ -112,6 +117,7 @@ export async function purgeReviewInputs(env: { DB: any }) {
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   await env.DB.batch([
     env.DB.prepare('DELETE FROM review_inputs WHERE created_at < ?').bind(cutoff),
+    env.DB.prepare('DELETE FROM review_evidence WHERE created_at < ?').bind(cutoff),
     env.DB.prepare("UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '任务已过期，请重新上传。', updated_at = ? WHERE created_at < ? AND status IN ('queued', 'running')").bind(stamp(), cutoff),
   ]);
 }
@@ -119,6 +125,7 @@ export async function purgeReviewInputs(env: { DB: any }) {
 export async function processReviewJob(env: ReviewJobEnv, id: string, evaluate: (payload: any, ownerId: string, jobId: string) => Promise<any>) {
   const row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ?').bind(id).first();
   if (!row) return;
+  if (row.executor==='device') return;
   if (row.status === 'done' || row.status === 'error') {
     await deleteInput(env, id);
     return;

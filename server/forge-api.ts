@@ -9,6 +9,7 @@ import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, updateReviewProgress } from './review-jobs';
 import { generateReview } from './review-generation';
 import { reviewUsage } from './review-usage';
+import { deviceStatus } from './review-device-api';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
 import {
@@ -50,6 +51,7 @@ export interface ForgeEnv {
   FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
   REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
   captureReview?: (html: string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
+  reviewExecutor?: 'device';
 }
 
 export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string } | { type: 'review'; id: string };
@@ -107,6 +109,7 @@ function attachment(content, type, topic, suffix) {
 async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
   if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
+  if(a==='review'&&b==='worker-status'&&!c&&method==='GET')return deviceStatus(env.DB,ownerId);
   if (a === 'review' && b === 'probe' && !c && method === 'POST') {
     if(ownerId!=='admin')throw new HttpError(403,'请使用后台审核队列，系统会自动采集画面并核算次数。');
     const input = await readReviewBody(request);
@@ -654,7 +657,7 @@ function trimSource(html, max = MAX_SOURCE) {
   return out;
 }
 
-async function review(env, { title, topic_id, html, probe, shots, deadline }, ownerId, jobId = null) {
+export async function prepareReview(env, { title, topic_id, html, probe, shots }) {
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
   const images = (Array.isArray(shots) ? shots : []).filter((s) => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data)).slice(0, 6);
   const [cfg, games] = await Promise.all([getSettings(env), all(env, "SELECT * FROM games ORDER BY id")]);
@@ -679,14 +682,18 @@ async function review(env, { title, topic_id, html, probe, shots, deadline }, ow
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
     : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
   parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
+  return {system:reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),user:parts,maxTokens:16000,images};
+}
+
+async function review(env, payload, ownerId, jobId = null) {
+  const {title,topic_id,probe,deadline}=payload;
+  const {images,...request}=await prepareReview(env,payload);
   // Count only jobs that actually reach the model stage. Captures and queue
   // failures are refunded without erasing the administrator's audit record.
-  const result = await generateReview(env, cfg, {
+  const result = await generateReview(env, {}, {
+    ...request,
     deadline,
     onStart: jobId ? () => run(env,"UPDATE review_jobs SET model_started_at=COALESCE(model_started_at,?) WHERE id=? AND status='running'",now(),jobId) : undefined,
-    system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),
-    user: parts,
-    maxTokens: 16000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
     onWait: jobId ? message => updateReviewProgress(env, jobId, message) : undefined,
   });

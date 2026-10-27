@@ -12,6 +12,7 @@ function setup() {
   sqlite.exec(readFileSync('migrations/0006_review_jobs.sql', 'utf8'));
   sqlite.exec(`CREATE TABLE members (id TEXT PRIMARY KEY, enabled INTEGER, can_review INTEGER,username TEXT,display_name TEXT,created_at TEXT); INSERT INTO members VALUES ('a', 1, 1,'a','甲','now'), ('b', 1, 1,'b','乙','now')`);
   sqlite.exec(readFileSync('migrations/0014_review_capacity.sql','utf8'));
+  sqlite.exec(readFileSync('migrations/0015_local_review_worker.sql','utf8'));
   const DB = {
     prepare(sql: string) {
       return { bind(...params: any[]) {

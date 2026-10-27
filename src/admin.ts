@@ -41,6 +41,8 @@ function renderLogin(initialMessage=''){
 function renderSettings(){
   $('#admin-content').innerHTML='<nav class="admin-tabs" aria-label="管理功能"><button id="tab-forge">'+icon('sparkles')+'创作工作台</button><button id="tab-model">'+icon('brain-circuit')+'模型配置</button><button id="tab-members">'+icon('users')+'成员管理</button><button id="logout" class="admin-logout">'+icon('log-out')+'退出</button></nav><div id="model-panel" hidden></div><section id="members-panel" hidden></section><section id="forge-panel"><div class="forge-embed-heading"><div><span class="eyebrow">PGC FORGE</span><h2>选题与作品工作台</h2><p>从灵感到成品，使用统一配置的模型。</p></div></div><div id="forge-loading" class="pgc-inline-wait"></div><iframe id="forge-embed" title="PGC Forge 管理工作台" src="/forge/?embedded=1"></iframe></section>';
   mountModelPanel($('#model-panel'),saved,api,value=>{saved=value;});
+  $('#admin-content').insertAdjacentHTML('afterbegin','<section class="worker-status" id="worker-status" role="status">正在读取成员 Agent 状态…</section>');
+  void loadWorkerStatus();
   $('#forge-loading').innerHTML=progressHtml({label:'加载创作工作台',detail:'正在读取工作台页面…'});
   $('#forge-embed').addEventListener('load',()=>{if(document.querySelector('#forge-loading'))$('#forge-loading').hidden=true;});
   const selectTab=(name:'model'|'members'|'forge')=>{
@@ -53,6 +55,16 @@ function renderSettings(){
   $('#logout').onclick=async()=>{try{await api('logout','POST');renderLogin();}catch(error){alert(error instanceof Error?error.message:'退出失败。');}};
   selectTab(adminTab);if(adminTab==='members')void renderMembers();iconsReady();
 }
+
+async function loadWorkerStatus(){
+  if(!document.querySelector('#worker-status'))return;
+  try{
+    const response=await fetch('/api/admin/review-workers');if(!response.ok)throw new Error();const data=await response.json();
+    if(!document.querySelector('#worker-status'))return;
+    $('#worker-status').innerHTML=`<div><span class="status-dot ${data.online?'online':''}"></span><strong>成员 Agent</strong><span>${data.devices.filter((d:any)=>d.online).length} 台最近连接 · 本机采集，云端审核</span></div><small>${data.devices.filter((d:any)=>!d.revoked&&Date.parse(d.expires_at)>Date.now()).map((d:any)=>`${escape(d.display_name|| (d.owner_id==='admin'?'管理员':d.owner_id))} / ${escape(d.name)} · ${d.online?'最近连接':'已授权'}`).join('；')||'尚无设备授权；成员在审核页复制接入指令给 Agent 即可'}</small>`;
+  }catch{if(document.querySelector('#worker-status'))$('#worker-status').textContent='成员 Agent 状态暂时无法读取，请稍后刷新。';}
+}
+setInterval(()=>{if(!document.hidden)void loadWorkerStatus();},20000);
 
 type MemberView={id:string;username:string;displayName:string;enabled:boolean;canReview:boolean;createdAt:string;dailyReviewLimit:number};
 async function renderMembers(){

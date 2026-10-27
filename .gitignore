@@ -5,6 +5,8 @@ dist/
 .env*
 !.env.example
 artifacts/
+public/agent/*.mjs
+public/agent.md
 *.log
 .DS_Store
 .local-settings.json

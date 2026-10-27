@@ -129,7 +129,7 @@ async function pollJob(job) {
 
 async function submit(job) {
   job.status = 'submitting';
-  job.note = '正在上传，随后由后台采集画面并审核…';
+  job.note = '正在上传，随后由你的 Agent 采集画面…';
   job.requestId ||= crypto.randomUUID();
   refresh();
   try {
@@ -137,7 +137,7 @@ async function submit(job) {
     job.stage = result.stage;
     job.status = result.status === 'error' ? 'error' : 'queued';
     if (result.status === 'error') { job.error = result.error; job.remoteFailed = true; }
-    job.note = '后台已接收，自动采集与审核；关闭页面后仍会继续';
+    job.note = '已接收，请让你的 Agent 采集此任务；截图上传后云端独立审核';
     void pollJob(job);
   } catch (error) {
     // Check the idempotent job before offering retry if the enqueue response
@@ -355,6 +355,22 @@ export async function mountReviewWorkspace(options) {
       $('#rvQuota').textContent=usage.limit===null?'管理员审核 · 不限每日次数':`今日剩余 ${usage.remaining} / ${usage.limit} 次 · 已使用 ${usage.used} 次`;
     } catch { if(current())$('#rvQuota').textContent='次数暂时无法读取，提交时以服务端额度为准'; }
   };
+  $('#rvQuota').insertAdjacentHTML('afterend','<span id="rvWorkerStatus" class="rv-quota" role="status">正在读取 Agent 授权状态…</span>');
+  $('#rvDropzone').closest('.review-upload-panel').insertAdjacentHTML('beforeend',`<details class="rv-device"><summary>Agent 接入 <span>一句话，自动送审</span></summary><p>把下面这句话交给你的 Agent，它会读取本地游戏、采集画面并取回审核报告。首次授权一次即可，无需手动下载或安装助手。</p><div class="rv-agent-prompt"><b>复制给你的 Agent</b><p id="rvAgentText">请阅读 https://pgc.ovoxin.top/agent.md，接入 PGC 游戏审核。完成账号授权后，直接审核我指定的本地 HTML 游戏，采集画面并取回完整报告，不需要我手动上传或下载安装助手。</p><button class="rr-button" id="rvCopyAgent">复制接入指令</button></div><div class="rv-device-actions"><button class="rr-button" id="rvPair">生成一次性配对码</button><a class="rr-button" href="/agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p>配对码 5 分钟有效，仅授权当前账号的审核任务。截图上传后由云端完成初评与复核，Agent 无需持续在线。</p><div id="rvPairCode" role="status"></div><div id="rvDevices"></div></details>`);
+  $('#rvPair').onclick=async()=>{
+    const button=$('#rvPair');button.disabled=true;
+    try{const value=await withProgress('生成本机配对码',()=>api('POST','review/device/pairing',{}));if(!current())return;$('#rvPairCode').innerHTML=`<label>配对码 · 5 分钟内一次有效<input type="text" readonly value="${esc(value.code)}" aria-label="配对码"></label><button class="rr-button" id="rvCopyCode">复制配对码</button>`;$('#rvCopyCode').onclick=()=>copyText(value.code);setTimeout(()=>{if(current())$('#rvPairCode').replaceChildren();},300000);}
+    catch(error){dependencies.feedback(error.message,true);}finally{button.disabled=false;}
+  };
+  $('#rvCopyAgent').onclick=()=>copyText($('#rvAgentText').textContent);
+  const workerStatus=async()=>{
+    if(!current())return;
+    try{const status=await api('GET','review/worker-status');if(!current())return;const authorized=status.devices.filter(d=>!d.revoked&&Date.parse(d.expires_at)>Date.now());$('#rvWorkerStatus').textContent=status.online?'Agent 最近已连接 · 本机采集，云端审核':authorized.length?'Agent 已授权 · 按需执行即可':'尚未授权 Agent · 展开下方接入';$('#rvDevices').innerHTML=authorized.map(d=>`<div class="rv-device-row"><span><b>${esc(d.name)}</b> · ${d.online?'最近已连接':'已授权'}<small>授权至 ${esc(date(d.expires_at))}${d.last_seen?' · 最近连接 '+esc(date(d.last_seen)):''}</small></span><button class="rr-button" data-revoke="${esc(d.id)}">撤销授权</button></div>`).join('')||'<p>尚未授权设备，让 Agent 按接入说明完成一次配对。</p>';}
+    catch{if(current())$('#rvWorkerStatus').textContent='Agent 授权状态暂时无法读取';}
+  };
+  $('#rvDevices').onclick=async event=>{const button=event.target.closest('[data-revoke]');if(!button)return;button.disabled=true;try{await withProgress('撤销 Agent 授权',()=>api('POST','review/device/revoke',{id:button.dataset.revoke}));await workerStatus();}catch(error){dependencies.feedback(error.message,true);button.disabled=false;}};
+  void workerStatus();
+  const workerTimer=setInterval(()=>{if(!current()){clearInterval(workerTimer);return;}if(!document.hidden)void workerStatus();},20000);
   refresh();
   void dependencies.updateUsage();
   void history();
