@@ -1,9 +1,9 @@
 import {authorized} from './settings';
 import type {AppSecrets} from './settings';
 
-export interface Member {id:string;username:string;displayName:string;passwordHash:string;passwordSalt:string;enabled:boolean;canReview:boolean;dailyReviewLimit?:number;sessionVersion:number;createdAt:string;updatedAt:string}
+export interface Member {id:string;username:string;displayName:string;passwordHash:string;passwordSalt:string;enabled:boolean;canReview:boolean;star?:boolean;dailyReviewLimit?:number;sessionVersion:number;createdAt:string;updatedAt:string}
 export interface MemberStore {list():Promise<Member[]>;byUsername(username:string):Promise<Member|null>;byId(id:string):Promise<Member|null>;save(member:Member):Promise<void>}
-export interface Identity {id:string;username:string;displayName:string;role:'admin'|'member';canReview:boolean}
+export interface Identity {id:string;username:string;displayName:string;role:'admin'|'member';canReview:boolean;star?:boolean}
 const encoder=new TextEncoder();
 const hex=(value:ArrayBuffer|Uint8Array)=>[...new Uint8Array(value)].map(b=>b.toString(16).padStart(2,'0')).join('');
 const unhex=(value:string)=>Uint8Array.from(value.match(/.{2}/g)||[],v=>parseInt(v,16));
@@ -23,16 +23,16 @@ export function validateAccount(value:unknown){
   const password=validatePassword(body.password);
   const displayName=typeof body.displayName==='string'?body.displayName.trim():body.username;
   if(!displayName||displayName.length>50)throw new Error('成员姓名需要 1–50 个字。');
-  return{username:body.username.toLowerCase(),displayName,password,canReview:body.canReview!==false,dailyReviewLimit:validateReviewLimit(body.dailyReviewLimit ?? 50)};
+  return{username:body.username.toLowerCase(),displayName,password,canReview:body.canReview!==false,star:body.star===true,dailyReviewLimit:validateReviewLimit(body.dailyReviewLimit ?? 50)};
 }
-export function validateReviewLimit(value:unknown):number{if(!Number.isInteger(value)||Number(value)<0||Number(value)>10000)throw new Error('每日审核次数需要是 0–10000 的整数，0 表示暂停新审核。');return Number(value);}
+export function validateReviewLimit(value:unknown):number{if(!Number.isInteger(value)||Number(value)<0||Number(value)>10000)throw new Error('平台模型每日次数需要是 0–10000 的整数；本地 Agent 审核不受此额度限制。');return Number(value);}
 export function validatePassword(password:unknown):string{if(typeof password!=='string'||password.length<6||password.length>128)throw new Error('密码需要 6–128 位字符。');return password;}
 export async function createMember(value:unknown,store:MemberStore):Promise<Member>{
   const fields=validateAccount(value);
   if(await store.byUsername(fields.username))throw new Error('这个账号已经存在。');
   const credential=await hashPassword(fields.password);
   const now=new Date().toISOString();
-  const member:Member={id:crypto.randomUUID(),username:fields.username,displayName:fields.displayName,passwordHash:credential.hash,passwordSalt:credential.salt,enabled:true,canReview:fields.canReview,dailyReviewLimit:fields.dailyReviewLimit,sessionVersion:1,createdAt:now,updatedAt:now};
+  const member:Member={id:crypto.randomUUID(),username:fields.username,displayName:fields.displayName,passwordHash:credential.hash,passwordSalt:credential.salt,enabled:true,canReview:fields.canReview,star:fields.star,dailyReviewLimit:fields.dailyReviewLimit,sessionVersion:1,createdAt:now,updatedAt:now};
   await store.save(member);return member;
 }
 export async function updateMember(id:string,value:unknown,store:MemberStore):Promise<Member>{
@@ -40,6 +40,7 @@ export async function updateMember(id:string,value:unknown,store:MemberStore):Pr
   const body=value as Record<string,unknown>;if(!body||typeof body!=='object')throw new Error('修改内容不正确。');
   if(body.enabled!==undefined){if(typeof body.enabled!=='boolean')throw new Error('账号状态格式不正确。');member.enabled=body.enabled;}
   if(body.canReview!==undefined){if(typeof body.canReview!=='boolean')throw new Error('检查权限格式不正确。');member.canReview=body.canReview;}
+  if(body.star!==undefined){if(typeof body.star!=='boolean')throw new Error('Star 权限格式不正确。');member.star=body.star;}
   if(body.password!==undefined){const next=await hashPassword(validatePassword(body.password));member.passwordHash=next.hash;member.passwordSalt=next.salt;}
   if(body.dailyReviewLimit!==undefined)member.dailyReviewLimit=validateReviewLimit(body.dailyReviewLimit);
   if(body.enabled!==undefined||body.canReview!==undefined||body.password!==undefined)member.sessionVersion++;
@@ -54,11 +55,11 @@ export async function memberLogin(username:string,password:string,store:MemberSt
   return`${payload}.${await sign(payload,secret)}`;
 }
 export async function identity(cookie:string|null,store:MemberStore,secrets:AppSecrets):Promise<Identity|null>{
-  if(await authorized(cookie,secrets))return{id:'admin',username:'admin',displayName:'管理员',role:'admin',canReview:true};
+  if(await authorized(cookie,secrets))return{id:'admin',username:'admin',displayName:'超级管理员',role:'admin',canReview:true};
   const token=cookie?.match(/(?:^|;\s*)pgc_member=([^;]+)/)?.[1];if(!token||!secrets.SETTINGS_KEY)return null;
   const[id,version,expires,signature]=token.split('.');
   if(!id||!signature||!Number.isFinite(Number(expires))||Number(expires)<=Date.now()||Number(expires)>Date.now()+8*60*60*1000)return null;
   if(!same(signature,await sign(`${id}.${version}.${expires}`,secrets.SETTINGS_KEY)))return null;
   const member=await store.byId(id);if(!member?.enabled||member.sessionVersion!==Number(version))return null;
-  return{id:member.id,username:member.username,displayName:member.displayName,role:'member',canReview:member.canReview};
+  return{id:member.id,username:member.username,displayName:member.displayName,role:'member',canReview:member.canReview,star:!!member.star};
 }

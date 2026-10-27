@@ -57,7 +57,7 @@ async function api(action:string,body:any={}):Promise<any>{
 }
 function option(name:string){const i=args.indexOf(name);if(i<0)return undefined;const value=args[i+1];if(!value||value.startsWith('--'))throw new Error(`${name} 缺少值`);args.splice(i,2);return value;}
 const alsoWait=args.includes('--wait');if(alsoWait)args.splice(args.indexOf('--wait'),1);
-const output=option('--out'),requestId=option('--request-id');
+const output=option('--out'),requestId=option('--request-id'),jsonInput=option('--json');
 async function saveReport(id:string){const report=await api('report',{id});if(output){await mkdir(output,{recursive:true});await atomic(join(output,`${id}.json`),JSON.stringify(report,null,2));}print({event:'report',jobId:id,report});return report;}
 async function waitFor(ids:string[]){
   const pending=new Set(ids),last=new Map<string,string>(),failures:string[]=[];const end=Date.now()+30*60000;
@@ -66,6 +66,9 @@ async function waitFor(ids:string[]){
     for(const id of [...pending]){
       const job=await api('job',{id}),state=`${job.status}:${job.stage}:${job.error}`;
       if(state!==last.get(id)){print({event:'progress',...job});last.set(id,state);}
+      if(job.model_executor==='agent'&&!['done','error'].includes(job.status)){
+        print({event:'action_required',jobId:id,stage:job.stage,message:'此任务由你的 Agent 和本地模型完成；请执行 capture/material，再提交 draft 和 complete。平台不会自动调用模型。'});pending.delete(id);continue;
+      }
       if(job.status==='error'){pending.delete(id);failures.push(`${id}: ${job.error}`);}
       if(job.status==='done'){await saveReport(id);pending.delete(id);}
     }
@@ -77,6 +80,48 @@ async function waitFor(ids:string[]){
 function seal(value:any){const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',createHash('sha256').update(token).digest(),iv);const body=Buffer.concat([cipher.update(JSON.stringify(value)),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),body]);}
 function unseal(value:Buffer){const decipher=createDecipheriv('aes-256-gcm',createHash('sha256').update(token).digest(),value.subarray(0,12));decipher.setAuthTag(value.subarray(12,28));return JSON.parse(Buffer.concat([decipher.update(value.subarray(28)),decipher.final()]).toString());}
 const leaseBody=(job:any)=>({id:job.id,lease:job.lease});
+async function localLease(id:string){
+  const claimPath=join(dataDir,'claims',`${id}.json`);
+  let claim:any;try{claim=JSON.parse(await readFile(claimPath,'utf8'));}catch{}
+  if(!claim){claim={claimId:randomUUID()};await atomic(claimPath,JSON.stringify(claim));}
+  const job=await api('claim',{...claim,id,version:'agent-local-review-v2'});
+  if(!job)throw new Error('此任务未在当前设备领取，或已经结束；请使用 status/report 查询。');
+  if(job.model_executor!=='agent')throw new Error('这是旧平台审核任务，请使用 status/wait 查询。');
+  await atomic(claimPath,JSON.stringify({claimId:job.lease}));
+  return leaseBody(job);
+}
+async function material(id:string,directory=output){
+  const job=await api('job',{id});
+  if(job.status==='done')return saveReport(id);
+  const value=await api('material',await localLease(id));
+  if(!directory){print({event:'material',...value});return value;}
+  const target=resolve(directory);await mkdir(target,{recursive:true,mode:0o700});
+  const materialPath=join(target,`${id}.material.json`);
+  await atomic(materialPath,JSON.stringify(value,null,2));
+  const screenshots=[];
+  for(const [index,part] of value.user.entries())if(part.type==='image'){
+    const match=String(part.data).match(/^data:image\/(jpeg|png|webp);base64,(.*)$/s);
+    if(match){const path=join(target,`${id}.shot-${screenshots.length+1}.${match[1]==='jpeg'?'jpg':match[1]}`);await atomic(path,Buffer.from(match[2],'base64'));screenshots.push({path,label:value.user[index-1]?.text||''});}
+  }
+  print({event:'material',jobId:id,stage:value.stage,evidenceHash:value.evidenceHash,draftHash:value.draftHash,model:value.model,materialPath,screenshots,next:value.next,message:'读取材料中的 system/user/schema，查看四张真实截图；用你自己的相同模型依次初评和复核，再提交 JSON。'});
+  return value;
+}
+async function submitLocal(action:'draft'|'complete',id:string){
+  if(!jsonInput)throw new Error('请用 --json 提供包含 model、evidenceHash、report 的 JSON 文件；complete 还需要 verification。');
+  const bytes=await readFile(resolve(jsonInput));if(bytes.length>2*1024*1024)throw new Error('报告 JSON 不能超过 2 MB。');
+  let value:any;try{value=JSON.parse(bytes.toString('utf8'));}catch{throw new Error('报告文件不是合法 JSON。');}
+  const job=await api('job',{id});
+  // Keep the original lease after completion for safe, immutable retries.
+  let lease:any;
+  if(job.status==='done'){
+    const saved=JSON.parse(await readFile(join(dataDir,'claims',`${id}.json`),'utf8'));lease={id,lease:saved.claimId};
+  }else lease=await localLease(id);
+  const body={...value,...lease},path=join(dataDir,'outbox',`${id}-${action}.bin`);
+  await atomic(path,seal(body));
+  const result=await api(action,body);await unlink(path);
+  print({event:action,jobId:id,...result});
+  if(action==='complete')await saveReport(id);
+}
 async function capture(id:string){
   const outbox=join(dataDir,'outbox',`${id}.bin`),claimPath=join(dataDir,'claims',`${id}.json`);
   let job=await api('job',{id});
@@ -86,13 +131,13 @@ async function capture(id:string){
   try{pending=unseal(await readFile(outbox));}catch(e){if((e as any).code!=='ENOENT')throw new Error('本机待传证据无法解密，可能已重新授权；请用 jobs/status 查询旧任务，不要盲目重新提交。');}
   if(pending){
     current=leaseBody(pending);
-    try{await api('evidence',pending);await unlink(outbox);await unlink(claimPath).catch(()=>{});current=null;print({event:'capture',jobId:id,stage:'uploaded'});return;}
+    try{const accepted=await api('evidence',pending);await unlink(outbox);if(accepted.model_executor!=='agent')await unlink(claimPath).catch(()=>{});current=null;print({event:'capture',jobId:id,stage:'uploaded',...accepted});return;}
     catch(e){if((e as any).status!==409)throw e;await unlink(outbox);await unlink(claimPath).catch(()=>{});current=null;}
   }
   if(job.stage!=='capture'){print({event:'capture',jobId:id,stage:'already_uploaded',status:job.status});return;}
   let claim:any;try{claim=JSON.parse(await readFile(claimPath,'utf8'));}catch{}
   if(!claim){claim={claimId:randomUUID()};await atomic(claimPath,JSON.stringify(claim));}
-  job=await api('claim',{...claim,id,version:'agent-capture-v1'});
+  job=await api('claim',{...claim,id,version:'agent-local-review-v2'});
   if(!job){
     const status=await api('job',{id});
     if(status.status==='done'||status.stage!=='capture')return;
@@ -106,9 +151,9 @@ async function capture(id:string){
     // Save before upload. A disconnected Agent can resume this exact evidence.
     await atomic(outbox,seal({...leaseBody(job),...evidence}));
   }catch(e){await api('fail',{...leaseBody(job),message:String((e as Error).message).slice(0,500)}).catch(()=>{});current=null;throw e;}
-  await api('evidence',{...leaseBody(job),...evidence});
-  await unlink(outbox);await unlink(claimPath).catch(()=>{});current=null;
-  print({event:'capture',jobId:id,stage:'uploaded',message:'截图已上传，云端正在初评与复核。'});
+  const accepted=await api('evidence',{...leaseBody(job),...evidence});
+  await unlink(outbox);if(accepted.model_executor!=='agent')await unlink(claimPath).catch(()=>{});current=null;
+  print({event:'capture',jobId:id,stage:'uploaded',...accepted,message:accepted.model_executor==='agent'?'证据已锁定，请读取 material 并使用你自己的模型初评与复核。':'旧任务已上传，请查询进度。'});
 }
 async function submit(path:string){
   if(!/\.html?$/i.test(path))throw new Error('只支持 .html / .htm 文件。');
@@ -130,11 +175,11 @@ async function submit(path:string){
 let lockPath:string|undefined,lockOwned=false,heartbeat:ReturnType<typeof setInterval>|undefined;
 try{
   if(command==='help'){
-    print({commands:['pair (PGC_PAIR_CODE or stdin)','review <file.html> [more.html] [--out directory] [--request-id UUID]','submit <file.html> [more.html] [--wait]','capture <job-id> [--wait]','status <job-id>','jobs','wait <job-id> [--out directory]','report <job-id> [--out directory]'],note:'按需执行，无常驻进程。review 完成提交、采集和等待；同内容重跑复用任务。模型 Key 仅在云端。'});
+    print({commands:['pair (PGC_PAIR_CODE or stdin)','review <file.html> [more.html] [--out directory] [--request-id UUID]','submit <file.html> [more.html]','capture <job-id>','material <job-id> [--out directory]','draft <job-id> --json draft.json','complete <job-id> --json verified.json [--out directory]','status <job-id>','jobs','wait <job-id>','report <job-id> [--out directory]'],note:'review 提交、采集并导出可执行的审核材料后返回；Agent 使用自己的模型初评和同模型复核，分别提交 draft/complete。工具不配置、持有或调用模型 API。'});
   }else{
     await mkdir(dataDir,{recursive:true,mode:0o700});
     for(const sub of ['submissions','claims','outbox'])await mkdir(join(dataDir,sub),{recursive:true,mode:0o700});
-    if(['pair','submit','review','capture'].includes(command)){
+    if(['pair','review','capture'].includes(command)){
       lockPath=join(dataDir,'capture.lock');
       let old:any;try{old=JSON.parse(await readFile(lockPath,'utf8'));}catch{}
       if(old){try{process.kill(old.pid,0);throw new Error('此设备已有智能助手操作运行，请等待该命令结束。');}catch(e){if((e as any).code!=='ESRCH')throw e;await unlink(lockPath);}}
@@ -160,20 +205,22 @@ try{
         heartbeat=setInterval(()=>{void api('heartbeat',{version:'agent-capture-v1',freeMemoryMB:Math.floor(freemem()/1048576),job:current}).catch(()=>{});},20000);
       }
       if(command==='submit'||command==='review'){
-        if(!args.length||args.length>20||requestId&&args.length!==1)throw new Error('每批 1–20 个 HTML；--request-id 仅支持单文件。');
+        if(!args.length||requestId&&args.length!==1)throw new Error('请提供 HTML 文件；--request-id 仅支持单文件。');
         const ids:string[]=[],errors:string[]=[];
         for(const path of args)try{ids.push(await submit(path));}catch(e){errors.push((e as Error).message);print({event:'error',file:basename(path),message:(e as Error).message});}
         const captured:string[]=[];
-        if(command==='review')for(const id of ids)try{await capture(id);captured.push(id);}catch(e){errors.push((e as Error).message);print({event:'error',jobId:id,message:(e as Error).message});}
-        if(command==='review'||alsoWait)try{await waitFor(command==='review'?captured:ids);}catch(e){errors.push((e as Error).message);}
+        if(command==='review')for(const id of ids)try{await capture(id);const job=await api('job',{id});if(job.status==='done')await saveReport(id);else await material(id,output||join(dataDir,'materials',id));captured.push(id);}catch(e){errors.push((e as Error).message);print({event:'error',jobId:id,message:(e as Error).message});}
+        if(alsoWait)try{await waitFor(command==='review'?captured:ids);}catch(e){errors.push((e as Error).message);}
         if(errors.length)throw new Error(errors.join('\n'));
       }else if(command==='jobs')print(await api('jobs'));
-      else if(['status','report','wait','capture'].includes(command)){
+      else if(['status','report','wait','capture','material','draft','complete'].includes(command)){
         if(args.length!==1||!uuid(args[0]))throw new Error('请提供一个任务编号（UUID）。');
         const id=args[0];
         if(command==='wait')await waitFor([id]);
         else if(command==='capture'){await capture(id);if(alsoWait)await waitFor([id]);}
         else if(command==='report')await saveReport(id);
+        else if(command==='material')await material(id);
+        else if(command==='draft'||command==='complete')await submitLocal(command,id);
         else print(await api('job',{id}));
       }else throw new Error('未知命令，请运行 help。');
     }

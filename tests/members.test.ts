@@ -17,7 +17,7 @@ describe('成员账号与权限',()=>{
     await updateMember(member.id,{dailyReviewLimit:0},store);
     expect(await identity(`pgc_member=${token}`,store,secrets)).toMatchObject({role:'member'});
     expect(member.dailyReviewLimit).toBe(0);
-    for(const value of [-1,1.2,'50',10001])await expect(updateMember(member.id,{dailyReviewLimit:value},store)).rejects.toThrow('每日审核次数');
+    for(const value of [-1,1.2,'50',10001])await expect(updateMember(member.id,{dailyReviewLimit:value},store)).rejects.toThrow('平台模型每日次数');
   });
   it('开通账号后可登录，公开数据不包含密码摘要或盐',async()=>{
     const store=memoryStore();const member=await createMember({username:'Creator01',displayName:'测试创作者',password:'test-only-password'},store);

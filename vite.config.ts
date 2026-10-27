@@ -49,6 +49,7 @@ function localCheckApi(): Plugin {
         if (request.method !== 'POST') { send({ error: '请使用 POST 提交游戏。' }, 405); return; }
         const user=await identity(request.headers.cookie||null,members,await secrets());
         if(!user){send({error:'请先使用管理员开通的账号登录。'},401);return;}
+        if(user.role!=='admin'){send({error:'成员请通过自己的 Agent 提交本地审核。'},403);return;}
         if(!user.canReview){send({error:'当前账号未开通检查权限，请联系管理员。'},403);return;}
         let input;
         try {

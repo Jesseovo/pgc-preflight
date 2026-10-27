@@ -16,11 +16,13 @@ async function setup() {
   return { env, members, account, request, adminCookie };
 }
 describe('审核画面采集权限与上传边界', () => {
-  it('要求登录与当前审核权限，成员只能走计数队列，不能绕过次数采集或同步评分', async () => {
+  it('要求登录与当前审核权限，成员网页不能提交游戏、采集或同步评分，只能经本人Agent审核', async () => {
     const { env, members, account, request } = await setup();
     expect((await forgeApi(request({ html: '<html></html>' }, ''), env, ['review', 'probe'], members)).status).toBe(401);
     expect((await forgeApi(request({ html: '<html></html>' }), env, ['review', 'probe'], members)).status).toBe(403);
-    expect((await forgeApi(request({ html: '<html></html>' }), env, ['review'], members)).status).toBe(410);
+    expect((await forgeApi(request({ html: '<html></html>' }), env, ['review'], members)).status).toBe(403);
+    expect((await forgeApi(request({ html: '<html></html>' }), env, ['review','jobs'], members)).status).toBe(403);
+    expect((await forgeApi(request({ result: {} }), env, ['review','manual'], members)).status).toBe(403);
     expect(env.captureReview).toHaveBeenCalledTimes(0);
     const deletion=new Request('https://test.invalid/api/forge/reviews/1',{method:'DELETE',headers:request({}).headers});
     expect((await forgeApi(deletion,env,['reviews','1'],members)).status).toBe(403);

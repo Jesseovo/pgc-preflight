@@ -38,7 +38,7 @@ $('#modal').onclick = event => { if (event.target === $('#modal')) $('#modal').h
 $('#loginForm').onsubmit = event => { event.preventDefault(); location.replace('/login'); };
 $('#view').innerHTML = progressHtml({ label: '正在连接审核工作台', detail: '正在读取本人的审核记录…' });
 withProgress('连接审核工作台', () => mountReviewWorkspace({
-  view: $('#view'), api, alive: () => true, topics: [],
+  view: $('#view'), api, allowUpload: false, alive: () => true, topics: [],
   setProbing: () => {}, probeChecks, copyText, download, openModal,
   checksHtml: checks => `<ul class="checks">${checks.map(check => `<li><span>${check.level === 'ok' ? '✓' : '·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
-})).catch(error => { $('#view').textContent = error.message; });
+}), {compact:true}).catch(error => { $('#view').textContent = error.message; });

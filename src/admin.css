@@ -178,6 +178,29 @@
   @media (max-width: 700px) { .auth-welcome .pixel-companion img { width: 38px; height: 38px; margin: 6px auto; } }
 }
 .admin-tabs .admin-logout { margin-left: auto; color: #7e8881; }
+.management-section { border:1px solid var(--line); border-radius:6px; padding:18px; margin:16px 0; background:#fff; }
+.management-section > summary { cursor:pointer; font-weight:600; color:#405b49; }
+.management-section p { font-size:12px; color:#748078; line-height:1.8; }
+.management-pair { display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:18px; }
+.management-form { display:grid; gap:15px; padding-top:15px; }
+.management-form h3 { margin:0; font-size:14px; }
+.management-form label { display:grid; gap:8px; color:#65766a; font-size:12px; }
+.management-form input,.management-form select,.management-form textarea,.management-vocab-add input,.management-vocab-add select,.management-table input { box-sizing:border-box; width:100%; min-width:0; border:1px solid #dfe6de; border-radius:4px; background:#fff; color:#405b49; padding:9px; font:inherit; }
+.management-form textarea { resize:vertical; line-height:1.7; }
+.management-form button { justify-self:start; }
+.management-table { overflow:auto; margin-top:16px; }
+.management-table table { width:100%; border-collapse:collapse; text-align:left; font-size:12px; }
+.management-table th,.management-table td { padding:12px 10px; border-bottom:1px solid #edf0ea; vertical-align:top; }
+.management-table th { color:#7a887f; font-weight:500; white-space:nowrap; }
+.management-table td strong,.management-table td small { display:block; margin:3px 0; overflow-wrap:anywhere; }
+.management-table td small { color:#87938a; max-width:430px; }
+.management-table input[type=number] { width:80px; }.management-table input[type=checkbox] { width:auto; accent-color:var(--green); }
+.management-vocab-add { display:grid; grid-template-columns:130px 1fr 1fr 80px auto; gap:10px; margin-top:20px; }
+.management-agent-list { display:grid; gap:10px; margin-top:18px; font-size:12px; }.management-agent-list > div,.management-suggestion { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:12px; padding:12px; background:#f7f9f5; }.management-agent-list span,.management-suggestion small { color:#7a887f; }.management-suggestion { margin:8px 0; }.management-suggestion span { flex:1; }.management-suggestion small { display:block; margin-top:5px; }
+.management-json { white-space:pre-wrap; overflow-wrap:anywhere; padding:18px; font:12px/1.8 ui-monospace,Consolas,monospace; }
+.management-detail-body { padding:0 20px 20px; }.management-detail-body > p { font-size:12px; color:#748078; line-height:1.8; }.management-detail-body .management-json { padding:8px 0; margin:12px 0; }.management-version { display:flex; justify-content:space-between; align-items:center; gap:16px; padding:12px 0; border-bottom:1px solid #edf0ea; font-size:12px; }.management-version span { min-width:0; }.management-version small { display:block; margin-top:6px; color:#7a887f; overflow-wrap:anywhere; }.management-version button { flex-shrink:0; }
+.member-permissions { display:grid; gap:9px; }.create-bottom > div:first-child { display:grid; gap:9px; font-size:12px; color:#65766a; }.member-list-header,.member-row { grid-template-columns:minmax(150px,1fr) 140px 160px 90px 100px; }
+@media(max-width:700px){.management-pair { grid-template-columns:1fr; }.management-vocab-add { grid-template-columns:1fr 1fr; }.management-section { padding:14px; }.admin-tabs { overflow:auto; }.admin-tabs button { white-space:nowrap; }.member-row { grid-template-columns:1fr 1fr; }}
 .model-library, .model-routing { margin-top: 22px; }
 .model-library .settings-heading h2, .model-routing h2 { font-size: 23px; letter-spacing: -.7px; }
 .model-intro { font-size: 12px; color: #7a867e; margin: 9px 0 0; line-height: 1.8; }

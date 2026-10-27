@@ -1,17 +1,15 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,readdirSync} from 'node:fs';
-import {forgeApi} from '../server/forge-api';
+import {dispatch as dispatchForge} from '../server/forge-api';
 import {executeForgeTask,ForgeRunner} from '../server/forge-runner';
 import {enqueueForgeTask,failForgeTask,readForgeTask} from '../server/forge-tasks';
 import {complete} from '../server/forge-llm';
-import {login,saveConfig} from '../server/settings';
+import {saveConfig} from '../server/settings';
 import type {ModelConfig} from '../server/settings';
-import type {MemberStore} from '../server/members';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{vi.unstubAllGlobals();vi.useRealTimers();databases.splice(0).forEach(db=>db.close());});
-const members:MemberStore={list:async()=>[],byId:async()=>null,byUsername:async()=>null,save:async()=>{}};
 async function setup(){
   const sqlite=new DatabaseSync(':memory:');databases.push(sqlite);
   for(const file of readdirSync('migrations').filter(n=>n.endsWith('.sql')).sort())sqlite.exec(readFileSync(`migrations/${file}`,'utf8'));
@@ -25,8 +23,12 @@ async function setup(){
   sqlite.prepare("INSERT INTO topics(id,batch,subject,medium,gesture,structure,mood,status,data,created_at,updated_at) VALUES(9,'test','light','pixel','tap','rhythm','calm','liked',?,?,?)").run(JSON.stringify({title:'Test Stars',core_loop:'Catch stars',controls:'Tap',art_direction:'Pixel'}),at,at);
   const dispatch=vi.fn(async()=>Response.json({ok:true}));
   const env:any={...secrets,DB,modelStore,FORGE_RUNNER:{idFromName:(id:string)=>id,get:()=>({fetch:dispatch})}};
-  const cookie=`pgc_admin=${await login(secrets.ADMIN_PASSWORD,secrets)}`;
-  const request=(method:string,path:string,data?:unknown)=>forgeApi(new Request(`https://test.example/api/forge/${path}`,{method,headers:{Cookie:cookie,'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}),env,path.split('/'),members);
+  // Historical platform tasks still exercise the internal runner and transport.
+  // Public creation authorization is covered by star-workspaces/forge-agent.
+  const request=async(method:string,path:string,data?:unknown)=>{
+    try{const result=await dispatchForge(method,path.split('/'),new Request(`https://test.example/api/forge/${path}`,{method,headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}),env,'admin',undefined);return result instanceof Response?result:Response.json(result);}
+    catch(error){return Response.json({error:(error as Error).message},{status:(error as any).status||500});}
+  };
   const row=()=>sqlite.prepare('SELECT * FROM topics WHERE id=9').get() as any;
   const task=(id:string)=>sqlite.prepare('SELECT * FROM forge_tasks WHERE id=?').get(id) as any;
   return {sqlite,env,request,dispatch,row,task};

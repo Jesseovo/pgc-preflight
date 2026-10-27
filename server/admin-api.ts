@@ -5,10 +5,12 @@ import { inferenceOptions } from '../src/model-options';
 import type { ModelThrottleDatabase } from './model-throttle';
 import {createMember,updateMember,publicMember} from './members';
 import type {MemberStore} from './members';
+import {adminWorkspaceApi} from './admin-workspace-api';
 import {reviewActivity} from './review-usage';
 
-export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase):Promise<Response|null> {
+export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
+  if(request.headers.has('Authorization'))return Response.json({error:'设备凭据不能访问管理接口。'},{status:403});
   if(!url.pathname.startsWith('/api/admin/'))return null;
   const json=(value:unknown,status=200,headers:Record<string,string>={})=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
   if(!secrets.ADMIN_PASSWORD||!secrets.SETTINGS_KEY)return json({error:'管理员凭据尚未初始化，请在部署环境中配置。'},503);
@@ -24,6 +26,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json({ok:true},200,{'Set-Cookie':sessionCookie(token,8*60*60)});
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
+    const workspace=await adminWorkspaceApi(request,{...secrets,DB,modelStore:store,...runtime});if(workspace)return workspace;
     if(url.pathname==='/api/admin/logout'&&request.method==='POST')return json({ok:true},200,{'Set-Cookie':sessionCookie('',0)});
     if(url.pathname==='/api/admin/review-activity'&&request.method==='GET'){
       if(!DB)return json({error:'审核记录服务尚未就绪。'},503);

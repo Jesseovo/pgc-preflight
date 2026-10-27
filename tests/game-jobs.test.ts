@@ -1,12 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
-import { forgeApi, processForgeJob } from '../server/forge-api';
+import { readFileSync, readdirSync } from 'node:fs';
+import { dispatch, forgeApi, processForgeJob } from '../server/forge-api';
 import { saveConfig, saveRoutes } from '../server/settings';
 import type { ConfigStore, ModelConfig } from '../server/settings';
 import type { MemberStore } from '../server/members';
 import { hashPassword, memberLogin } from '../server/members';
-import { login } from '../server/settings';
 
 const secrets = { ADMIN_PASSWORD: 'fixture-admin', SETTINGS_KEY: 'fixture-secret' };
 const members: MemberStore = { list: async () => [], byId: async () => null, byUsername: async () => null, save: async () => {} };
@@ -19,18 +18,17 @@ async function setup({ model = 'claude-opus-5-5', status = 'liked', product = ''
   const modelStore: ConfigStore = { get: async () => config, set: async value => { config = value; } };
   await saveConfig({ profile: 'opus', protocol: 'anthropic', baseUrl: 'https://fixture.example', model, apiKey: 'test-only-key' }, modelStore, secrets.SETTINGS_KEY);
   const sqlite = new DatabaseSync(':memory:'); databases.push(sqlite);
-  for (const file of ['0003_forge', '0005_forge_jobs', '0008_forge_assets', '0009_products']) sqlite.exec(readFileSync(`migrations/${file}.sql`, 'utf8'));
-  sqlite.exec('CREATE TABLE settings (id TEXT PRIMARY KEY, value TEXT, updated_at TEXT)');
+  for (const file of readdirSync('migrations').filter(name=>name.endsWith('.sql')).sort()) sqlite.exec(readFileSync(`migrations/${file}`, 'utf8'));
   sqlite.prepare("INSERT INTO topics (id,batch,subject,medium,gesture,structure,mood,status,data,product_html,created_at,updated_at) VALUES (9,'test','light','pixel','tap','rhythm','calm',?,?,?,?,?)").run(status, JSON.stringify({ title: 'Tiny Garden', logline: 'A test game' }), product || null, new Date().toISOString(), new Date().toISOString());
   const send = vi.fn(async (_message: any) => {});
-  const DB = { prepare: (sql: string) => ({ bind: (...values: any[]) => {
-    const statement = sqlite.prepare(sql);
-    return { first: async () => statement.get(...values) || null, all: async () => ({ results: statement.all(...values) }),
-      run: async () => ({ meta: { changes: Number(statement.run(...values).changes) } }) };
-  } }) };
-  const token = await login(secrets.ADMIN_PASSWORD, secrets);
+  const DB:any={prepare(sql:string){let params:any[]=[];const statement:any={bind(...values:any[]){params=values;return statement;},first:async()=>sqlite.prepare(sql).get(...params)||null,all:async()=>({results:sqlite.prepare(sql).all(...params)}),run:async()=>{const result=sqlite.prepare(sql).run(...params);return{meta:{changes:Number(result.changes),last_row_id:Number(result.lastInsertRowid)}};},execute:()=>{const result=sqlite.prepare(sql).run(...params);return{meta:{changes:Number(result.changes),last_row_id:Number(result.lastInsertRowid)}};}};return statement;},batch:async(statements:any[])=>{sqlite.exec('BEGIN');try{const result=statements.map(statement=>statement.execute());sqlite.exec('COMMIT');return result;}catch(error){sqlite.exec('ROLLBACK');throw error;}}};
   const env = { ...secrets, modelStore, DB, FORGE_QUEUE: { send } } as any;
-  const request = (method: string, route: string[]) => forgeApi(new Request(`https://pgc.example/api/forge/${route.join('/')}`, { method, headers: { Cookie: `pgc_admin=${token}` } }), env, route, members);
+  // Preserve internal legacy queue/transport coverage without granting a
+  // public administrator or member a cloud creation endpoint.
+  const request=async(method:string,route:string[])=>{
+    try{const result=await dispatch(method,route,new Request(`https://pgc.example/api/forge/${route.join('/')}`,{method}),env,'admin',undefined);return result instanceof Response?result:Response.json(result);}
+    catch(error){return Response.json({error:(error as Error).message},{status:(error as any).status||500});}
+  };
   const row = () => sqlite.prepare('SELECT * FROM topics WHERE id = 9').get() as Record<string, any>;
   return { sqlite, row, send, request, env };
 }

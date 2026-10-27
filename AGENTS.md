@@ -4,38 +4,42 @@
 
 - 批量预审单文件 HTML 游戏的网站，域名为 `pgc.ovoxin.top`。旧版根路径预审接口只检查基础加载、明显运行错误、输入响应、明显移动端布局问题和可达的重新开始流程。
 - 当前 AI 模拟审核沿用迁移的 PGC Forge 规则：美学、易玩性、可玩性各 1–3 分，使用原校准集并给出有证据的修改建议。模拟评分不能代替人工终审。
-- 所有审核判断必须来自所配置的模型。程序只验证上传、运行浏览器、采集证据、执行有界模型动作和验证报告结构；不能加入规则打分兜底。无法验证的项目标为 `review`，不能自动判通过或失败；未配置模型时拒绝审核。动画截图变化不能证明操作有效。
+- 所有审核判断必须来自实际执行的模型（成员自己的 Agent 模型，或管理员明确使用的平台模型）。程序只验证上传、运行浏览器、采集证据、执行有界模型动作和验证报告结构；不能加入规则打分兜底。无法验证的项目标为 `review`，不能自动判通过或失败；只有平台模型审核需要平台配置，本地审核不读取平台模型配置。动画截图变化不能证明操作有效。
 - 上传的 HTML 不可信，必须在独立浏览器上下文运行，限制导航和外部资源，最终关闭浏览器；不能在平台同源页面执行。游戏文件、截图和临时输入不得长期保存，不提交真实团队游戏和内部研究资料。
 - `/admin` 最多保存 24 份模型配置，包括名称、地址、模型、协议、启用状态、视觉能力、加密 Key、思考强度和可选输出上限（0 表示任务默认值）。每份配置对应一个 Key，同模型可用不同 Key 建多份配置。保留 DeepSeek 和 Claude Opus 预设，响应和日志不得回显 Key。
 - 模型选择只分两组：AI 审核 `review`（含复核）和其他功能 `create`（扩写、简报、预览、资产、制作、标签、词库）。两组原子保存，其他功能也作为兼容默认；忽略旧逐阶段覆盖并在保存时删除。禁止删除正在使用的配置。旧根路径预审沿用活动配置。
-- 游戏制作必须使用启用且有 Key 的 Anthropic Claude Opus 5.5：优先选中的 Opus，再选已保存预设或其他有效 Opus。没有可用 Opus 就拒绝制作，不能降到 DeepSeek。`vision: false` 的审核配置不发送截图，并明确视觉判断只依赖源码和日志；视觉模型不能静默丢图。
-- `/admin` 管理成员、密码、启用状态、`canReview` 和每日次数；`/login` 为成员登录。服务端逐次验证会话与当前审核权限；停用、密码或角色变化撤销旧会话，单改额度不撤销会话。
-- `/` 和 `/index.html` 无会话时在渲染工作台前跳到 `/login`；管理员到 `/admin`，成员在 `/` 使用 AI 模拟审核。公开和成员页面不放管理员入口，管理员直接访问 `/admin`。
+- 旧平台制作兼容执行必须使用启用且有 Key 的 Anthropic Claude Opus 5.5（成员本地 Agent 不受型号、预算和行数约束）：优先选中的 Opus，再选已保存预设或其他有效 Opus。没有可用 Opus 就拒绝制作，不能降到 DeepSeek。`vision: false` 的审核配置不发送截图，并明确视觉判断只依赖源码和日志；视觉模型不能静默丢图。
+- `/admin` 为超级管理员管理后台，管理成员、密码、启用状态、`star`、`canReview` 和平台审核每日次数；`/login` 为成员登录。服务端逐次验证会话与当前审核权限；停用、密码或角色变化撤销旧会话，单改额度不撤销会话。
+- `/` 和 `/index.html` 无会话时在渲染工作台前跳到 `/login`；超级管理员到 `/admin`，Star 成员到 `/forge/` 个人创作工作台，普通成员在 `/` 使用 AI 模拟审核。公开和成员页面不放管理员入口，管理员直接访问 `/admin`。
 - 美术沿用 Jesseovo GitHub 主页：白底、细边框、柔和鼠尾草绿、紧凑布局、原像素猫（`public/artwork/`）；不用花园背景或过大装饰卡片。
 
 ## 工作台与成员接入
 
-- 完整 Forge 工作台内嵌在 `/admin`；`/forge` 为仅管理员可用的兼容嵌入页，`/review` 转到角色对应的规范入口。后台、提示词、权重、选题库、作品库、简报和模拟审核以 `C:\Users\Administrator\Desktop\05 Riffle\pgc-forge` 为准。全部模型调用共享 `/admin` 中的加密配置，不能在 Forge 再配置模型或 Key。
-- 旧 PGC Preflight 接口仅作兼容。成员只加载审核脚本和共享样式，不加载完整创作脚本或管理员模块；这些管理资源由服务端验证管理员会话，禁止缓存给成员。设备 `Bearer` 凭据只允许 `/api/review-device/` 下明确列出的本人审核操作，同时携带管理员 Cookie 也不能升级权限。
-- 成员把 `https://pgc.ovoxin.top/agent.md` 交给智能助手，用 5 分钟一次性配对码授权本人账号。说明和成员文案用中文；技术命令、协议字段保留原标识。说明不链接开发规则或列出无关管理功能。`/agent.md` 必须返回 `text/plain; charset=utf-8`，禁止缓存旧编码响应。
-- 无需成员手动下载安装、ZIP、常驻助手、计划任务或管理员电脑常开。智能助手可以把自包含客户端缓存到自己的工具目录，使用已有 Node 22+ 与 Chrome/Edge，也可按审核 HTTP 协议接入。截图本机按需采集，模型 Key 和评分留在云端。
-- 配对令牌仅属于一个成员，服务端只存 SHA-256，30 天有效并绑定当前账号和会话版本；最多授权 3 台设备，网页可撤销。Windows 用当前用户 DPAPI 保存凭据，其他平台用 `0600` 私有文件。禁止记录令牌和配对码。设备和网页使用同样的额度、归属与请求编号规则。
-- 成员仅能读写本人审核任务、原文件和报告，不能读取模型配置、提示词、Key、其他成员资料或数据库。后端检查权限与归属，不能仅靠文档限制。
+- 超级管理员只管理平台，不作为个人创作账号；管理页不嵌入 Forge。Star 是成员布尔权限，默认关闭，授权后可用个人全部创作功能；普通成员仅审核。公共词库、规则、模板和明确公开的案例由管理员维护。
+- 选题、候选、简报、样板图、资产、成品、个人作品、任务与版本按 owner_id 隔离。管理员可查看全站；成员和其 Agent 只能读取本人及明确公开的资料。个人作品外部编号按成员唯一；导入不能指定 owner_id 或 is_public。成员可导入个人作品历史记录，但不能通过网页提交 HTML 审核或上传审核报告。
+- 题材全站去重，subject_reservations 在 SQLite 原子插入中占用，抽签和自由命题一致；只返回是否可用，不泄漏他人内容。个人偏好只取本人记录。旧管理员内容保留为历史档案，不自动分配或公开。
+- 创作和审核均由成员自己的 Agent 及模型执行。平台不配置或接收用户模型 Key，不为任何成员新任务调用平台模型；成员网页提交审核、手动导入报告和请求平台执行均由后端拒绝。只有超级管理员可网页上传游戏并明确执行平台模型审核，或导入带 manual-admin 来源的报告。
+- 成员使用 `https://pgc.ovoxin.top/agent.md` 接入本地完整审核；Star 使用独立的 `/forge-agent.md` 接入创作。分别配对、分别凭据，5 分钟一次性码、30 天授权、每类最多 3 台。Bearer 只允许对应设备协议，即使带管理员 Cookie 也不能扩大权限。
+- Agent 按需使用 Node 22+；截图使用已有 Chrome/Edge，工具可缓存在 Agent 目录。无需手动安装、常驻服务或计划任务。Windows 凭据与创作回执使用当前用户 DPAPI；其他平台使用 0600 私有文件。禁止记录配对码、令牌、回执或模型 Key。
+- 创作协议只传任务、材料、实际进度和结果；并发、模型、API 与工具完全由 Agent 决定。用户明确要求开始接单后在当前会话查询，不自动唤醒关闭的 Agent。选题筛选和后续制作需要明确指令，不自动推进。
+- 撤销 Star 不改变成员审核权限或审核凭据；立即拒绝新建、领取和取创作资料，保留内容和未执行任务，原设备只能用原任务回执完成此前已领取任务。停用、改密码或撤销设备后拒绝所有设备访问。重新授予 Star 可恢复待执行任务。
+- 每个创作结果保存不可覆盖的历史版本；输入修改后的回传存为 pending，由用户选择采用。恢复历史版产生新记录。材料记录输入版本，上游变更提示 stale。旧数据迁移为初始版本，HTML 继续隔离预览和附件下载。
+- 成员补词结果仅作为公共词库建议，管理员审批后入库；个人作品打标仅修改本人资料。所有权、权限和提交幂等由后端保证，不依赖文档或按钮隐藏。
 
 ## 开发与发布
 
 - 仓库为私有 GitHub `Jesseovo/pgc-preflight`；该项目发布使用 `origin main`，与其他代码托管平台的分支规则无关。
 - `npm run dev`：本地网站与浏览器检查接口，需要 Chrome/Edge，可用 `PGC_CHROME_PATH` 指定。
-- `npm run build`：类型检查、打包按需审核客户端、生产构建。`public/agent.md` 从 `docs/agent-integration.md` 生成；`public/agent/review-agent.mjs` 从 `scripts/review-agent.ts` 生成，不能直接改生成文件。
+- `npm run build`：类型检查、打包按需审核客户端、生产构建。`public/agent.md` 和 `/forge-agent.md` 分别从 docs 下对应接入文档生成；两个 `public/agent/*.mjs` 分别从 `scripts/review-agent.ts` / `forge-agent.ts` 生成，不能直接改生成文件。
 - `npm test`：验证、网络策略、权限、报告等回归测试。`npm run test:runtime` 为真实浏览器配合合成游戏与脚本模型响应，不能证明真实模型准确率。
 - `npm run deploy`：发布 Cloudflare Worker 静态资源、Browser Rendering 和 D1 配置；域名在 `wrangler.jsonc`。先应用 D1 迁移并配置 `ADMIN_PASSWORD` / `SETTINGS_KEY`。不得开通付费套餐。
 
 ## 后台创作
 
-- 扩写、简报、样板图、资产、制作、词库和标签使用 `forge_tasks` 持久记录和每任务独立的 Free SQLite `ForgeRunner` DO alarm，HTTP 只短暂提交。需迁移 `0016_forge_tasks.sql` 和 DO `v2-forge-runner`。活动 scope 唯一，重复提交返回原任务；调度响应丢失只能恢复同编号。旧 `pgc-forge-jobs` 消息按消息 ID 确定任务 ID，只调度 alarm，不在普通 Free Queue 执行模型或重放已完成任务。
-- 管理员对已扩写候选点击「开始制作」后使用 Opus。任务原子领取 `queued` → `running`，维持心跳，模型总期限 12 分钟、14 分钟中断看门狗。未知中断明确失败，不自动重放付费调用。不要隐式先生成长简报；生产选题 31 曾因此耗尽 Token。失败需用户明确重试并生成新编号，刷新只读取持久状态；排队超过 24 小时明确失败。
-- 成品存于选题 `product_html`，出现在管理员「成品」页；列表与状态接口省略 HTML。预览用 `sandbox allow-scripts`、禁网络、无 `allow-same-origin`；下载作为附件。需要迁移 `0009_products.sql`。
-- 制作目标为紧凑可玩的第一版，提示限制 220 行和 15KB（不含已有资产库），预算 32,768 Token，思考与 HTML 共用。Anthropic Opus 传输明确允许超过旧 24k 限制，其他模型和审核预算不变。2026-10-27，生产 Misprint 在 16k 时没有文本；同输入 32,768 在 283 秒完成、HTML 14,634 字符。流式字符反馈最多每 5 秒更新一次，不展示未完成源码。截断必须失败，不自动发起新的付费生成。
+- 成员扩写、简报、样板图、资产、制作、补词建议和标签使用 `forge_tasks` 的 executor=agent 持久记录，仅由 Agent 领取回传。旧平台任务 executor=platform 才使用每任务独立 Free SQLite ForgeRunner DO alarm。调度、恢复和执行入口都排除 Agent，不能套用云端 14 分钟超时。需迁移 `0016_forge_tasks.sql` 和 DO `v2-forge-runner`。活动 scope 唯一，重复提交返回原任务；调度响应丢失只能恢复同编号。旧 `pgc-forge-jobs` 消息按消息 ID 确定任务 ID，只调度 alarm，不在普通 Free Queue 执行模型或重放已完成任务。
+- 旧平台制作兼容逻辑使用 Opus；新成员制作一律由本地 Agent 完成。任务原子领取 `queued` → `running`，维持心跳，模型总期限 12 分钟、14 分钟中断看门狗。未知中断明确失败，不自动重放付费调用。不要隐式先生成长简报；生产选题 31 曾因此耗尽 Token。失败需用户明确重试并生成新编号，刷新只读取持久状态；排队超过 24 小时明确失败。
+- 成品存于选题 `product_html`，出现在所属成员「成品」页与管理员管理视图；列表与状态接口省略 HTML。预览用 `sandbox allow-scripts`、禁网络、无 `allow-same-origin`；下载作为附件。需要迁移 `0009_products.sql`。
+- 旧云端制作目标为紧凑可玩的第一版，提示限制 220 行和 15KB（不含已有资产库），预算 32,768 Token，思考与 HTML 共用。Anthropic Opus 传输明确允许超过旧 24k 限制，其他模型和审核预算不变。2026-10-27，生产 Misprint 在 16k 时没有文本；同输入 32,768 在 283 秒完成、HTML 14,634 字符。流式字符反馈最多每 5 秒更新一次，不展示未完成源码。截断必须失败，不自动发起新的付费生成。
 - 第一版保留扩写主题、核心循环、操作、美术与配色；缺失时 `gameBrief` 从简报 F1–F4 提取。完整简报和下载约定保留。界面明确是可玩的第一版，后期 Boss 等留后续迭代。真实长简报 Opus 在 low 下也曾只思考直到上限，不能把短诊断成功说成完整规格制作已验证。
 - Riffle `/v1/models` 声明 Opus 5.5 支持自适应思考和 `output_config.effort` 的 `low`、`medium`、`high`、`xhigh`、`max`。游戏制作在 Anthropic `claude-opus-5-5` 同时发 `thinking: {type: 'adaptive'}` 与 `output_config: {effort: 'low'}`；单发 effort 曾耗尽预算，明确组合后短诊断成功。不能发送不支持的 `thinking: disabled` 或把 Opus 专用字段发给其他模型，不改变其他流程的推理参数。
 - 资产生成要求已有简报，返回自包含 HTML 美术审查图，`<script id="game-assets">` 定义 `GAME_ASSETS` 绘制函数，成品原样复用。只在无同源权限的脚本沙箱预览，下载附加 `Content-Security-Policy: sandbox`，保存前清外部资源。已有资产时简报下载附加 H 节复用说明。
@@ -43,14 +47,14 @@
 
 ## 审核执行与证据
 
-- 当前审核使用成员智能助手采集，每款游戏独立 SQLite Durable Object alarm。公开 Worker 将 `/api/*` 转给 `ReviewControlPlane`，证据提交后 `ReviewRunner` 执行原初评与复核。不能把这项工作放回普通 Free Queue CPU 预算。旧 `pgc-review-jobs` 仅作兼容，必须忽略设备任务，其 20 消费者配置不是智能助手并发上限。
-- 客户端沿用原 `captureReview`：三种手机比例、独立来源页面、四张真实 Chromium 完整视口图，包含 DOM/CSS 和全部 Canvas；同浏览器内可信触摸手势顺序执行，维持原时序和网络限制。每台设备一次采集一款，上传后云端可同时审核不同游戏。服务端仅管理员诊断 `/api/forge/review/probe` 沿用相同规则。禁止最大 Canvas 截图冒充整页、禁止 `html2canvas` 和 `--no-sandbox`；采集失败不能打分。
+- 新审核由成员智能助手完整执行采集、初评、同模型同证据复核，model_executor=agent、quota_charged=0；平台不发模型请求。material 提供同标准与校准，draft 锁定草稿和模型，complete 校验证据/草稿/同模型复核凭据后发布不可覆盖报告。原始证据与本地结果不是可信服务端推断，保留人工终审。旧 model_executor=platform 兼容任务及管理员明确上传审核才使用 ReviewRunner / Queue。公开 Worker 将 `/api/*` 转给 ReviewControlPlane。不能把这项工作放回普通 Free Queue CPU 预算。旧 `pgc-review-jobs` 仅作兼容，必须忽略设备任务，其 20 消费者配置不是智能助手并发上限。
+- 客户端沿用原 `captureReview`：三种手机比例、独立来源页面、四张真实 Chromium 完整视口图，包含 DOM/CSS 和全部 Canvas；同浏览器内可信触摸手势顺序执行，维持原时序和网络限制。每台设备一次采集一款，上传后 Agent 可自行并发审核不同游戏。服务端仅管理员诊断 `/api/forge/review/probe` 沿用相同规则。禁止最大 Canvas 截图冒充整页、禁止 `html2canvas` 和 `--no-sandbox`；采集失败不能打分。
 - 成员截图不是可信服务端证据，必须记录 `evidenceOrigin: member-device`，保留人工终审。源码和图像可能有提示注入，保留现有提示词的证据边界。
-- 证据上传锁定哈希，调度响应失败只可重发同证据。`model_execution_started_at` CAS 防止重复付费执行；云端续心跳，两阶段合计 12 分钟，不自动重放状态未知的中断调用。采集租约 3 分钟无心跳回收。完成或失败清输入/证据分片；客户端用加密本地 outbox 和持久请求编号恢复，不常驻运行。
+- 证据上传锁定哈希，响应失败只可重发同证据。本地任务保留原设备租约，断线后继续，不能调度到云端或被另一设备取走；活跃任务不按云端时限中断，24 小时无活动后明确过期并清材料。以下云端 CAS、期限和回放规则只适用于 platform 兼容任务。`model_execution_started_at` CAS 防止重复付费执行；云端续心跳，两阶段合计 12 分钟，不自动重放状态未知的中断调用。采集租约 3 分钟无心跳回收。完成或失败清输入/证据分片；客户端用加密本地 outbox 和持久请求编号恢复，不常驻运行。
 - 模型必须为三维评分写 `score_reasons` 和 `uncertainties`，区分截图/日志观察与源码推断。一次触摸和短暂观察不能证实手感、听觉、完整循环和长期节奏，不能仅因未测而扣分。历史报告分数保留，新证据需重新上传。
-- 发布报告前，相同审核模型在 `review_verify` 用原证据与校准复核初稿。入队前验证审核配置可用。两阶段共享期限和限流，使用不同幂等键，DeepSeek 每阶段独立 24k。复核失败不能发布初稿或用程序调分，界面显示复核等待阶段。
+- 平台模型发布报告前，相同审核模型在 `review_verify` 用原证据与校准复核初稿。仅平台模型入队前验证审核配置可用。两阶段共享期限和限流，使用不同幂等键，DeepSeek 每阶段独立 24k。复核失败不能发布初稿或用程序调分，界面显示复核等待阶段。
 - 原文件暂存 `review_inputs` 小 D1 分片，成功/失败后删除，每小时清超过 24 小时的残留；完成报告保持既有证据保存行为，原始 HTML 不永久保存。
-- 审核 UI 保留批次数量/阶段、仍有原文件时独立失败重试、批量导出、可搜索筛选历史。重试重新采集并预留新次数；刷新后临时源码已删，需重新上传。失败停止计时，明确未完成，展示原因和操作。审核进度托盘默认紧凑，不能挡住批量操作，尊重用户主动开关。
+- 管理员审核 UI 保留批次数量/阶段、仍有原文件时独立失败重试、批量导出、可搜索筛选历史。管理员平台审核重试重新采集并建立新任务；刷新后临时源码已删，需重新上传。成员页面仅提供 Agent 接入、任务、报告、导出与搜索，不提供网页上传或平台执行。失败停止计时，明确未完成，展示原因和操作。审核进度托盘默认紧凑，不能挡住批量操作，尊重用户主动开关。
 - 所有异步等待使用 `public/forge/progress.js`（`src/progress.ts` 共享）：已知完成数用真实计数，模型调用用不定进度条、阶段和耗时，不能从时间伪造完成百分比。嵌入工作台的任务显示在父后台视口。
 
 ## 模型传输与诊断
@@ -66,14 +70,16 @@
 
 ## 每日额度与上线证据（2026-10-27）
 
-- 每成员默认每天 50 次，`/admin` 可调 0–10000，北京零点重置；每游戏初评与复核合计一次。原子 SQLite `INSERT/SELECT` 校验额度并使用唯一请求编号，重复不能重复扣次。模型启动前失败退款，启动后仍计次。0 禁止新任务但不影响运行中任务；管理员无成员日限额。
+- 本轮 Star / Agent 改造已完成本地验收，尚未应用生产迁移或部署：26 个测试文件、200 项测试通过，`npm run build` 与 `npm run check:deploy` 通过；全新本地 D1 从头迁移至 0018 成功。实际审核 bundle 完成两款合成游戏、八张 Chromium 完整视口截图及本地初评/复核回传，平台模型调用和扣次均为零。合成评分不证明真实模型质量。
+- 本地完整 Worker + D1 + DO 已验证三类身份页面、成员平台调用拒绝、创作 Agent 配对/创建/领取/完成、幂等、管理员结果一致与 Bearer/Cookie 权限边界；前端另有 12 项 Chromium 检查通过。下列生产记录属于此前版本，不能用作本轮已经上线的证据。
+- 以下次数仅针对平台模型调用，本地 Agent 模型审核不扣次数且不受此限额。每成员原平台配置默认每天 50 次，`/admin` 可调 0–10000，北京零点重置；每游戏初评与复核合计一次。原子 SQLite `INSERT/SELECT` 校验额度并使用唯一请求编号，重复不能重复扣次。模型启动前失败退款，启动后仍计次。0 禁止新任务但不影响运行中任务；管理员无成员日限额。
 - 仅管理员 `/api/admin/review-activity` 支持北京日期/成员筛选、汇总、分页、游戏文件名、阶段、错误、评分、报告。成员仅本人任务/报告和 `/review/usage`；不能删除报告或隐藏管理员记录，禁止通过旧 `/api/check`、`/review/probe` 或同步 `/review` 绕过。
-- 每人最多 50 个排队/运行任务，每批最多 20 个。采集依赖本机智能助手；证据上传后云端独立继续。两阶段不改证据、校准、思考或 24k 预算。模型在 15 分钟 DO alarm 内最多 12 分钟，看门狗不能静默重放未知付费调用。
+- 平台模型兼容路径每人最多 50 个排队/运行任务；本地模型不套用此并发上限。审核工具每批最多 20 个。本地审核依赖智能助手完成全流程；旧平台任务证据上传后云端独立继续。两阶段不改证据、校准、思考或 24k 预算。模型在 15 分钟 DO alarm 内最多 12 分钟，看门狗不能静默重放未知付费调用。
 - 旧 Worker `5f3aa78f-55c2-4c40-bda3-52c821561bf8`，提交 `fc1828b599fe37cf973dba2be922548daabfcf86`，普通 Queue 已观测 CPU 50/98/242ms 超免费预算；付费 CPU 配置被 100328 拒绝。未授权或启用付费；Workflows Free 也有同类短 CPU 限制。
 - 免费 SQLite DO 迁移已上线：提交 `5e22da4`、Worker `c2f86114-6b50-4335-a733-be732d5c9281`，迁移 `0014_review_capacity.sql`、`0015_local_review_worker.sql` 已应用。之前同账号 Free DO 的五个合成并发 CPU 174–283ms 只说明运行时可用，不是实测真实审核并发上限。
 - 生产验收使用真实临时成员、公开工具、官方 `deepseek-flash`：两款合成可玩 HTML，各四张完整 Chromium 视口图，两轮初评/复核共四次调用全部成功，两报告、2/50 额度、管理员记录和重复请求不重复扣次均通过，临时材料和账号已清理。脱敏证据为 `artifacts/agent-live-evidence.json`。
 - 生产 tail 109 事件均 `ok`；两次审核 alarm CPU 2028/997ms、耗时 56582/49878ms，无 CPU 异常，脱敏证据为 `artifacts/agent-live-runtime-evidence.json`。仅实测两任务重叠；50 是接纳上限，不能宣称实测 50 并发或无限并发。
 - Free DO 仍受每日 100,000 请求、13,000 GB-s、D1 与模型供应商额度限制；本机采集避开 Browser Run 日分钟和会话获取限制，模型 API 费用仍按供应商计费。
-- 验证脚本：`scripts/verify-agent.ts` 使用实际 bundle、DPAPI、两款本机游戏、四次脚本模型调用、报告/清理/幂等/额度；`scripts/verify-review.ts` 验证多文件/全页拖放、并行提交、重试、报告和移动端；`scripts/verify-review-capacity.ts` 验证额度与记录；`scripts/verify-review-evidence.ts` 验证 DOM/多 Canvas/可信触摸/网络隔离；`scripts/verify-model-routing.ts` 验证两组模型与 Key 配置；`scripts/verify-products.ts` 验证制作幂等/刷新/重试/沙箱/下载；`scripts/verify-progress.ts` 验证等待反馈和恢复。合成响应不证明真实模型准确率。最新发布的变更需相称回归与线上验证，不能只凭本地测试判上线成功。
+- 验证脚本：`scripts/verify-agent.ts` 使用实际 bundle、DPAPI、两款本机游戏、四张/款真实浏览器截图、本地初评与复核报告、清理、幂等及零平台模型调用/扣次；`scripts/verify-review.ts` 验证多文件/全页拖放、并行提交、重试、报告和移动端；`scripts/verify-review-capacity.ts` 验证额度与记录；`scripts/verify-review-evidence.ts` 验证 DOM/多 Canvas/可信触摸/网络隔离；`scripts/verify-model-routing.ts` 验证两组模型与 Key 配置；`scripts/verify-products.ts` 验证制作幂等/刷新/重试/沙箱/下载；`scripts/verify-progress.ts` 验证等待反馈和恢复。合成响应不证明真实模型准确率。本次新增迁移 `0017_star_agent_workspaces.sql` 包含 star、owner、版本、全站题材占用、补词建议和审核执行来源；`0018_review_material_snapshot.sql` 保存本地审核首次材料的规则/校准快照，初评与复核共用，终止后清理。最新发布的变更需相称回归与线上验证，不能只凭本地测试判上线成功。
 - 文档与权限隔离修复 `13a8af9` 已部署为 Worker `39699ca1-db45-4679-bf9a-8e9241e8242b`：真实浏览器确认说明为 UTF-8；成员只加载审核模块，管理脚本/接口拒绝成员与设备访问，跨成员任务操作拒绝；管理员真实登录与内嵌工作台正常。验证未发模型调用，临时成员和任务已清理；脱敏证据为 `artifacts/agent-scope-live-evidence.json`。
 - 限制来源：https://developers.cloudflare.com/durable-objects/platform/limits/ 、https://developers.cloudflare.com/durable-objects/platform/pricing/ 、https://developers.cloudflare.com/browser-run/limits/ 。合成探针脱敏证据为 ignored 的 `artifacts/free-review-capacity-evidence.json`。

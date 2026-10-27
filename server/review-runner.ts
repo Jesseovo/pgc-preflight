@@ -8,7 +8,7 @@ import {deviceOwnerAllowed,failDeviceReview,readReviewInput,stamp} from './revie
 // A duplicate alarm can observe a lease, but never replay an unknown paid call.
 export async function executeDeviceReview(env:any,id:string){
   const DB=env.DB;
-  const claimed=await DB.prepare("UPDATE review_jobs SET model_execution_started_at=?,updated_at=? WHERE id=? AND executor='device' AND status='running' AND evidence_ready=1 AND model_execution_started_at IS NULL RETURNING *").bind(stamp(),stamp(),id).first();
+  const claimed=await DB.prepare("UPDATE review_jobs SET model_execution_started_at=?,updated_at=? WHERE id=? AND executor='device' AND model_executor='platform' AND status='running' AND evidence_ready=1 AND model_execution_started_at IS NULL RETURNING *").bind(stamp(),stamp(),id).first();
   if(!claimed)return;
   let heartbeat:ReturnType<typeof setInterval>|undefined;
   try{
@@ -17,7 +17,7 @@ export async function executeDeviceReview(env:any,id:string){
     const input=await readReviewInput(DB,id),evidence=await readReviewInput(DB,id,'review_evidence');
     const selected=JSON.parse(claimed.model_snapshot);
     const config={...selected.profile,activeProfile:selected.id,profiles:{[selected.id]:selected.profile},routes:{review:selected.id}};
-    const runtime={...env,modelStore:{get:async()=>config}};
+    const runtime={...env,ownerId:claimed.owner_id,modelStore:{get:async()=>config}};
     const {images,...request}=await prepareReview(runtime,{...input,...evidence});
     const result=await generateReview(runtime,{}, {...request,deadline:Date.now()+12*60000,idempotencyKey:`pgc-review-${id}`,
       onStart:async()=>{
@@ -40,16 +40,17 @@ export class ReviewRunner{
   constructor(private state:any,private env:any){}
   async fetch(request:Request){
     const id=await request.text();if(!/^[a-f0-9-]{36}$/.test(id))return new Response('Invalid job', {status:400});
-    // Persist the scheduled ID before acknowledging the evidence upload.
+    const row=await this.env.DB.prepare('SELECT status,evidence_ready,model_execution_started_at,model_executor FROM review_jobs WHERE id=?').bind(id).first();
+    if(!row||row.model_executor!=='platform')return Response.json({error:'此任务由成员 Agent 执行。'},{status:409});
+    // Persist only compatible platform work; local jobs never schedule alarms.
     await this.state.storage.put('jobId',id);
-    const row=await this.env.DB.prepare('SELECT status,evidence_ready,model_execution_started_at FROM review_jobs WHERE id=?').bind(id).first();
     if(row?.status==='running'&&row.evidence_ready&&!row.model_execution_started_at&&!await this.state.storage.getAlarm())await this.state.storage.setAlarm(Date.now()+100);
     return Response.json({ok:true});
   }
   async alarm(){
     const id=await this.state.storage.get('jobId');if(!id)return;
-    const row=await this.env.DB.prepare('SELECT status,model_execution_started_at FROM review_jobs WHERE id=?').bind(id).first();
-    if(row?.status!=='running'){await this.state.storage.deleteAlarm();await this.state.storage.deleteAll();return;}
+    const row=await this.env.DB.prepare('SELECT status,model_execution_started_at,model_executor FROM review_jobs WHERE id=?').bind(id).first();
+    if(row?.status!=='running'||row.model_executor!=='platform'){await this.state.storage.deleteAlarm();await this.state.storage.deleteAll();return;}
     if(row.model_execution_started_at){
       await failDeviceReview(this.env.DB,id,'云端执行意外中断，模型请求状态未知；未发布评分，请手动重试。');
     }else{

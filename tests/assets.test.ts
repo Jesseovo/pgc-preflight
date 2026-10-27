@@ -1,5 +1,5 @@
 import {describe,expect,it} from 'vitest';
-import {forgeApi,cleanAssetsHtml,composeBrief,sameGame} from '../server/forge-api';
+import {dispatch,forgeApi,cleanAssetsHtml,composeBrief,sameGame} from '../server/forge-api';
 import {login} from '../server/settings';
 import type {MemberStore} from '../server/members';
 
@@ -13,7 +13,12 @@ function env(topic:Record<string,unknown>){
 }
 async function call(path:string,route:string[],topic:Record<string,unknown>,method='GET'){
   const token=await login(secrets.ADMIN_PASSWORD,secrets);
-  return forgeApi(new Request(`https://pgc.example/api/forge/${path}`,{method,headers:{Cookie:`pgc_admin=${token}`}}),env(topic) as any,route,members);
+  const request=new Request(`https://pgc.example/api/forge/${path}`,{method,headers:{Cookie:`pgc_admin=${token}`}});
+  if(method==='GET')return forgeApi(request,env(topic) as any,route,members);
+  // The validation remains part of historical internal jobs; public creation
+  // now requires the member's paired Agent.
+  try{const result=await dispatch(method,route,request,env(topic),'admin',undefined);return result instanceof Response?result:Response.json(result);}
+  catch(error){return Response.json({error:(error as Error).message},{status:(error as any).status||500});}
 }
 
 describe('美术资产 HTML',()=>{

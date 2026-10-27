@@ -14,6 +14,7 @@ import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
 import {purgeReviewInputs} from './review-jobs';
 import {captureReview} from './review-probe';
 import {acquireBrowser} from './browser-capacity';
+import {forgeAgentApi,forgeAgentWeb} from './forge-agent-api';
 import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
 import {enqueueForgeTask,recoverForgeTasks,type ForgeRunnerBinding} from './forge-tasks';
 export {ReviewRunner} from './review-runner';
@@ -45,6 +46,11 @@ const app = {
       return binding.get(binding.idFromName('review-control-v1')).fetch(request);
     }
     const store=configStore(env.DB),members=memberStore(env.DB);
+    if(url.pathname.startsWith('/api/forge-agent/')){
+      if(url.pathname.endsWith('/pair')){const rate=await env.CHECK_RATE_LIMIT.limit({key:`forge-pair:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'配对操作较多，请稍后重试。'},429);}
+      return forgeAgentApi(request,{...env,modelStore:store});
+    }
+    if(url.pathname.startsWith('/api/forge/agent/'))return forgeAgentWeb(request,{...env,modelStore:store});
     if(url.pathname.startsWith('/api/review-device/')){
       if(url.pathname.endsWith('/pair')){const rate=await env.CHECK_RATE_LIMIT.limit({key:`pair:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'配对操作较多，请稍后重试。'},429);}
       return reviewDeviceApi(request,{...env,modelStore:store});
@@ -56,7 +62,7 @@ const app = {
     }
     if(url.pathname.startsWith('/api/admin/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`admin:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
-      return (await adminApi(request,store,env,members,env.DB))!;
+      return (await adminApi(request,store,env,members,env.DB,{captureReview:captureFor(env)}))!;
     }
     if(url.pathname.startsWith('/api/auth/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`auth:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'登录操作较频繁，请稍后重试。'},429);}
@@ -98,7 +104,7 @@ const app = {
       } finally { await browser?.close().catch(() => {}); }
     }
     if (url.pathname.startsWith('/api/')) return json({ error: '接口不存在。' }, 404);
-    if(url.pathname==='/agent.md'){
+    if(['/agent.md','/forge-agent.md'].includes(url.pathname)){
       const response=await env.ASSETS.fetch(request),headers=new Headers(response.headers);
       headers.set('Content-Type','text/plain; charset=utf-8');headers.set('X-Content-Type-Options','nosniff');
       headers.set('Cache-Control','no-cache');
@@ -141,9 +147,9 @@ const app = {
     }
     await purgeReviewInputs(env);
     await recoverForgeTasks({...env,modelStore:configStore(env.DB)});
-    await env.DB.prepare("DELETE FROM forge_tasks WHERE status IN ('done','error') AND updated_at < ?").bind(new Date(Date.now()-30*86400000).toISOString()).run();
+    await env.DB.prepare("DELETE FROM forge_tasks WHERE executor='platform' AND status IN ('done','error') AND updated_at < ?").bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
-    await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ?")
+    await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ? AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE forge_tasks.owner_id=topics.owner_id AND executor='agent' AND scope=topics.owner_id||':game:'||topics.id AND status IN ('queued','running'))")
       .bind(new Date().toISOString(), new Date(Date.now() - 15 * 60 * 1000).toISOString()).run();
   },
   async queue(batch: QueueBatch<ForgeJob>, env: Env): Promise<void> {

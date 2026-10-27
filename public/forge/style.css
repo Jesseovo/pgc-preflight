@@ -335,3 +335,15 @@ pre.md { background: #f7faf5; border: 1px solid #e5ece3; }
   .review-live, .review-history { margin-left: 0; margin-right: 0; }
   .review-history { padding: 17px; }
 }
+/* Personal workspace and explicit Agent connection. */
+.personal-requirements { margin-top:18px; }
+.personal-requirements textarea { min-height:80px; width:100%; box-sizing:border-box; }
+.custom-topic { padding-top:14px; border-top:1px solid var(--line,#e1e7df); margin-top:16px; }
+.custom-topic summary { cursor:pointer; margin-bottom:12px; color:var(--green,#53745d); }
+.personal-agent .md { white-space:pre-wrap; overflow-wrap:anywhere; }
+.agent-device-list { margin-top:20px; display:grid; gap:10px; }
+.agent-device,.version-row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 0; border-bottom:1px solid var(--line,#e1e7df); }
+.agent-device span,.version-row span { min-width:0; }.agent-device small,.version-row small { display:block; margin-top:6px; font-size:11px; color:#7a887f; overflow-wrap:anywhere; }
+.agent-code { width:140px; margin:0 10px; letter-spacing:2px; }.agent-password { display:grid; gap:16px; max-width:420px; }.agent-password button { justify-self:start; }
+.rr-legacy-note { overflow-wrap:anywhere; }
+@media(max-width:640px){.agent-device,.version-row { align-items:flex-start; flex-wrap:wrap; }.agent-code { margin:10px 0; }.top .status { width:100%; }.custom-topic .row { flex-wrap:wrap; }}

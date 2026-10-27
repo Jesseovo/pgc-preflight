@@ -8,6 +8,7 @@ import {generateReview} from '../server/review-generation';
 import {memberLogin,hashPassword} from '../server/members';
 import {memberStore} from '../server/storage';
 import {reviewUsage} from '../server/review-usage';
+import {enqueueReview} from '../server/review-jobs';
 vi.mock('../server/review-generation',()=>({generateReview:vi.fn()}));
 const databases:DatabaseSync[]=[];
 afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.resetAllMocks();});
@@ -29,11 +30,16 @@ function setup(){
   async function submit(owner:'a'|'b'='a',id=crypto.randomUUID()){
     const response=await call('submit',{request_id:id,title:`${owner} fixture`,filename:'fixture.html',html:'<html><title>ORIGINAL_GAME</title><canvas></canvas></html>'},owner);expect(response.status).toBe(200);return response.json() as Promise<any>;
   }
+  // Seed existing platform work through the internal compatibility path. New
+  // device submit requests always stay on the member's own Agent/model.
+  async function legacySubmit(owner:'a'|'b'='a'){
+    return enqueueReview({...env,reviewExecutor:'device',modelExecutor:'platform'},{request_id:crypto.randomUUID(),title:`${owner} legacy fixture`,filename:'fixture.html',html:'<html><title>ORIGINAL_GAME</title><canvas></canvas></html>'},owner);
+  }
   async function claim(owner:'a'|'b'='a',claimId=crypto.randomUUID()){return (await call('claim',{claimId},owner)).json() as Promise<any>;}
   const evidence=(job:any)=>({id:job.id,lease:job.lease,probe:{captureMethod:'browser-viewport-v1',observations:[]},shots:Array.from({length:4},(_,i)=>({label:`frame-${i}`,data:'data:image/jpeg;base64,YQ=='}))});
-  return {sqlite,DB,env,device,call,submit,claim,evidence,schedule};
+  return {sqlite,DB,env,device,call,submit,legacySubmit,claim,evidence,schedule};
 }
-describe('成员本机采集与云端审核',()=>{
+describe('成员设备授权及既有平台审核兼容',()=>{
   it('设备只允许明确列出的审核操作，嵌套路径不能借末尾名称绕过',async()=>{
     const s=setup();await s.device('a');
     for(const action of ['config','topics','settings','admin/jobs','nested/pair','nested/report','jobs/']){
@@ -79,19 +85,20 @@ describe('成员本机采集与云端审核',()=>{
     s.sqlite.exec("UPDATE members SET session_version=2 WHERE id='a'");
     expect((await s.call('jobs')).status).toBe(401);
   });
-  it('Agent提交沿用原子额度与幂等；领取仅本人，响应不泄漏模型配置，错误租约被拒绝',async()=>{
+  it('新Agent提交零平台扣次且幂等；领取仅本人，响应不泄漏模型配置，错误租约被拒绝',async()=>{
     const s=setup();await s.device('a');await s.device('b');s.sqlite.exec("UPDATE members SET daily_review_limit=1 WHERE id='a'");
     const a=await s.submit(),b=await s.submit('b');await s.submit('a',a.id);
-    expect(await reviewUsage(s.DB,'a')).toMatchObject({used:1,remaining:0});
-    expect((await s.call('submit',{request_id:crypto.randomUUID(),html:'<html></html>'})).status).toBe(429);
-    const job=await s.claim();expect(job.id).toBe(a.id);expect(Object.keys(job).sort()).toEqual(['html','id','lease','title']);
+    expect(await reviewUsage(s.DB,'a')).toMatchObject({used:0,remaining:1});
+    expect((await s.call('submit',{request_id:crypto.randomUUID(),html:'<html></html>',model_executor:'platform'})).status).toBe(200);
+    const job=await s.claim();expect(job.id).toBe(a.id);expect(Object.keys(job).sort()).toEqual(['evidenceHash','html','id','lease','model_executor','stage','title']);
+    expect(job.model_executor).toBe('agent');
     expect(await s.claim('a',job.lease)).toEqual(job);expect(await s.claim()).toBe(null);
     expect((await s.call('job',{id:b.id})).status).toBe(404);
     expect((await s.call('evidence',{...s.evidence(job),lease:crypto.randomUUID()})).status).toBe(409);
     expect((await s.claim('b')).id).toBe(b.id);
   });
   it('证据锁定与幂等，上传失败可恢复；云端模型执行只启动一次，完成后保留报告清理材料',async()=>{
-    const s=setup();await s.device('a');const j=await s.submit(),job=await s.claim();
+    const s=setup();await s.device('a');const j=await s.legacySubmit(),job=await s.claim();
     s.schedule.mockResolvedValueOnce(new Response('unavailable',{status:503}));
     expect((await s.call('evidence',s.evidence(job))).status).toBe(503);
     expect((await s.call('evidence',s.evidence(job))).status).toBe(200);
@@ -109,19 +116,19 @@ describe('成员本机采集与云端审核',()=>{
     expect(await reviewUsage(s.DB,'a')).toMatchObject({used:1});
   });
   it('采集断线回收lease，模型前失败退次；模型后失败不发布初稿且不退次',async()=>{
-    const s=setup();await s.device('a');const j=await s.submit(),job=await s.claim();
+    const s=setup();await s.device('a');const j=await s.legacySubmit(),job=await s.claim();
     s.sqlite.prepare('UPDATE review_jobs SET updated_at=? WHERE id=?').run(new Date(Date.now()-4*60000).toISOString(),j.id);
     await recoverDeviceReviews(s.DB);const reclaimed=await s.claim();expect(reclaimed.id).toBe(j.id);expect(reclaimed.lease).not.toBe(job.lease);
     expect((await s.call('evidence',s.evidence(job))).status).toBe(409);
     await s.call('fail',{...reclaimed,message:'capture failed'});expect(await reviewUsage(s.DB,'a')).toMatchObject({used:0});
-    const next=await s.submit(),claimed=await s.claim();await s.call('evidence',s.evidence(claimed));
+    const next=await s.legacySubmit(),claimed=await s.claim();await s.call('evidence',s.evidence(claimed));
     vi.mocked(generateReview).mockImplementation(async(_e,_c,req)=>{await req.onStart?.();throw new Error('verification failed');});
     await executeDeviceReview(s.env,next.id);expect(await reviewUsage(s.DB,'a')).toMatchObject({used:1});
     expect((await s.call('report',{id:next.id})).status).toBe(409);
     expect(s.sqlite.prepare('SELECT COUNT(*) n FROM reviews').get()).toMatchObject({n:0});
   });
   it('运行中断的alarm不会重放状态未知的模型请求；撤销设备立即失效',async()=>{
-    const s=setup();const device=await s.device('a');const j=await s.submit();await s.claim();
+    const s=setup();const device=await s.device('a');const j=await s.legacySubmit();await s.claim();
     s.sqlite.prepare('UPDATE review_jobs SET evidence_ready=1,model_execution_started_at=?,model_started_at=? WHERE id=?').run('started','started',j.id);
     const state={storage:{get:async()=>j.id,deleteAlarm:vi.fn(),deleteAll:vi.fn()}};
     await new ReviewRunner(state,s.env).alarm();expect(generateReview).not.toHaveBeenCalled();

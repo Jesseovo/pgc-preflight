@@ -1,7 +1,8 @@
+import {inputSnapshot} from './forge-workspace';
 import type { ForgeEnv, ForgeJob } from './forge-api';
 
 export interface ForgeRunnerBinding { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } }
-export interface ForgeTask { id: string; kind: string; scope: string; payload: string; status: string; detail: string; error: string; result: string | null; created_at: string; updated_at: string; started_at: string | null; model_started_at: string | null }
+export interface ForgeTask { owner_id?:string;executor?:string;input_snapshot?:string; id: string; kind: string; scope: string; payload: string; status: string; detail: string; error: string; result: string | null; created_at: string; updated_at: string; started_at: string | null; model_started_at: string | null }
 const stamp = () => new Date().toISOString();
 export const FORGE_TASK_LIMIT_MS = 14 * 60000;
 export const taskScope = (job: ForgeJob) => job.type === 'expand' ? `expand:${job.ids[0]}` : job.type === 'suggest' ? `vocab:${job.dim}` : job.type === 'tag' ? 'tags:all' : `${job.type}:${job.id}`;
@@ -12,7 +13,8 @@ export async function enqueueForgeTask(env: ForgeEnv, job: ForgeJob, taskId: str
   if (!env.FORGE_RUNNER) throw new Error('后台生成服务尚未就绪。');
   const id = taskId, scope = taskScope(job), at = stamp();
   if (job.type === 'game') job = {...job, requestId:id};
-  const statements = [env.DB.prepare("INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,created_at,updated_at,detail) VALUES(?,?,?,?,?,?,'等待后台执行…')").bind(id,job.type,scope,JSON.stringify(job),at,at)];
+  const owner=env.ownerId||'admin',snapshot=await inputSnapshot(env.DB,owner,job);
+  const statements = [env.DB.prepare("INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,created_at,updated_at,detail,owner_id,executor,input_snapshot) VALUES(?,?,?,?,?,?,'等待后台执行…',?,'platform',?)").bind(id,job.type,scope,JSON.stringify(job),at,at,owner,JSON.stringify(snapshot))];
   const owns = "EXISTS(SELECT 1 FROM forge_tasks WHERE id=? AND status='queued')";
   if (['expand','brief','assets','game'].includes(job.type)) {
     const column = job.type === 'game' ? 'product' : job.type;
@@ -27,7 +29,7 @@ export async function enqueueForgeTask(env: ForgeEnv, job: ForgeJob, taskId: str
 }
 
 export async function scheduleForgeTask(env: ForgeEnv, row: ForgeTask) {
-  if (row.status !== 'queued' || !env.FORGE_RUNNER) return;
+  if (row.executor==='agent' || row.status !== 'queued' || !env.FORGE_RUNNER) return;
   try {
     const binding = env.FORGE_RUNNER;
     const response = await binding.get(binding.idFromName(row.id)).fetch(new Request('https://internal/run',{method:'POST',body:row.id}));
@@ -55,6 +57,7 @@ export async function failForgeTask(env: ForgeEnv, row: ForgeTask, reason: strin
 export async function readForgeTask(env: ForgeEnv, id: string) {
   let row: ForgeTask | null = await env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
   if (!row) return null;
+  if(row.executor==='agent')return row;
   if ((row.status === 'running' && Date.now() - Date.parse(row.started_at!) > FORGE_TASK_LIMIT_MS) ||
       (row.status === 'queued' && Date.now() - Date.parse(row.created_at) > 86400000)) {
     await failForgeTask(env,row,'后台执行已中断，未自动重复调用模型。请检查后手动重试。');
@@ -65,12 +68,12 @@ export async function readForgeTask(env: ForgeEnv, id: string) {
 }
 
 export function publicForgeTask(row: ForgeTask) {
-  return {id:row.id,kind:row.kind,scope:row.scope,status:row.status,detail:row.detail,error:row.error,
+  return {executor:row.executor||'platform',owner_id:row.owner_id,id:row.id,kind:row.kind,scope:row.scope,status:row.status,detail:row.executor==='agent'&&row.status==='running'&&Date.now()-Date.parse(row.updated_at)>90000?'等待 Agent 重新连接':row.detail,error:row.error,
     result:row.status === 'done' && row.result ? JSON.parse(row.result) : null,created_at:row.created_at,started_at:row.started_at,updated_at:row.updated_at};
 }
 
 export async function recoverForgeTasks(env: ForgeEnv, topicId?: number) {
-  const rows: ForgeTask[] = (await env.DB.prepare(`SELECT * FROM forge_tasks WHERE status IN ('queued','running')${topicId == null ? '' : ' AND scope IN (?,?,?,?,?)'} ORDER BY created_at LIMIT 100`)
+  const rows: ForgeTask[] = (await env.DB.prepare(`SELECT * FROM forge_tasks WHERE executor='platform' AND status IN ('queued','running')${topicId == null ? '' : ' AND scope IN (?,?,?,?,?)'} ORDER BY created_at LIMIT 100`)
     .bind(...(topicId == null ? [] : ['expand','brief','assets','game','preview'].map(k=>`${k}:${topicId}`))).all()).results;
   for (const row of rows) await readForgeTask(env,row.id);
 }

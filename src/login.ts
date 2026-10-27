@@ -14,13 +14,13 @@ document.querySelector('#app')!.innerHTML = `
   <main class="auth-main">
     <section class="auth-sheet" aria-labelledby="welcome-title">
       <div class="sheet-label"><span class="pixel-mark"></span>创作者的小天地<span class="sheet-tag">成员专属</span></div>
-      <div class="auth-welcome"><div class="welcome-heading"><h1 id="welcome-title">你好，创作者<span>.</span></h1>${catWalk}</div><p>好游戏，准备出发。登录后开始你的游戏基础体检。</p><div class="auth-bottom"><span>认真做游戏，也不忘好玩。</span>${quietCorner}</div></div>
+      <div class="auth-welcome"><div class="welcome-heading"><h1 id="welcome-title">你好，创作者<span>.</span></h1>${catWalk}</div><p>好游戏，准备出发。登录后连接自己的 Agent，开始游戏审核与创作。</p><div class="auth-bottom"><span>认真做游戏，也不忘好玩。</span>${quietCorner}</div></div>
       <section class="login-card member-login-card" aria-labelledby="login-title">
         <div class="login-card-heading"><div class="login-symbol">${icon('gamepad-2')}</div><div><h2 id="login-title">欢迎回来</h2><p>登录你的团队账号</p></div></div>
         <form id="member-login" class="auth-form">
           <div class="auth-field"><label for="username">登录账号</label><input id="username" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="输入你的账号" required maxlength="32"/></div>
           <div class="auth-field"><label for="password">密码</label><input id="password" type="password" autocomplete="current-password" placeholder="输入密码" required maxlength="128"/></div>
-          <button class="primary-button" type="submit"><span>进入检查台</span>${icon('arrow-right')}</button>
+          <button class="primary-button" type="submit"><span>进入工作台</span>${icon('arrow-right')}</button>
           <p class="form-message" id="login-message" role="status" aria-live="polite"></p>
         </form>
         <div class="login-foot">${icon('user-round-check')}没有账号？联系管理员开通。</div>
@@ -42,12 +42,12 @@ document.querySelector('#member-login')!.addEventListener('submit', async event 
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '登录失败。');
     progress.update({detail:'登录成功，正在打开检查台…'});
-    location.replace('/');
+    location.replace(result.role==='admin'?'/admin':result.star?'/forge/':'/');
   } catch (error) { message.textContent = error instanceof Error ? error.message : '登录失败，请重试。'; progress.fail(message.textContent); }
   finally { button.disabled = false; }
 });
 const sessionProgress=startTask('确认登录状态',{detail:'正在检查是否已有登录会话…'});
 void fetch('/api/auth/me', { cache: 'no-store' }).then(async response => {
-  if (response.ok) { const user=await response.json(); sessionProgress.update({detail:'正在打开工作台…'}); location.replace(user.role==='admin'?'/admin':'/'); }
+  if (response.ok) { const user=await response.json(); sessionProgress.update({detail:'正在打开工作台…'}); location.replace(user.role==='admin'?'/admin':user.star?'/forge/':'/'); }
   else sessionProgress.dismiss();
 }).catch(() => sessionProgress.dismiss());

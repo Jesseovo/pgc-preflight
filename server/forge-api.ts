@@ -17,6 +17,8 @@ import {
   briefSystem, briefUser, ASSETS_SYSTEM, assetsUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
   reviewSystem, GAME_SYSTEM, gameUser,
 } from "./forge/prompts.js";
+import {createAgentTask,publicCreatorTask,validateAgentTask} from './forge-agent-api';
+import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnapshot} from './forge-workspace';
 import { cleanGameHtml } from './game-generation';
 import {enqueueForgeTask, recoverForgeTasks, readForgeTask, publicForgeTask, type ForgeRunnerBinding} from './forge-tasks';
 
@@ -31,12 +33,19 @@ const GAME_FIELDS = ["title", "descr", "status", "score", "aes", "ease", "play",
 
 export async function forgeApi(request: Request, env: ForgeEnv, route: string[], members: MemberStore, ctx?: { waitUntil(promise: Promise<unknown>): void }) {
   try {
+    if(request.headers.has('Authorization'))return json({error:'设备凭据不能访问网页接口。'},403);
     const user = await identity(request.headers.get('Cookie'), members, env);
     if (!user) return json({ error: '请先登录。' }, 401);
     const reviewOnly = route[0] === 'review' || route[0] === 'reviews';
-    if (user.role !== 'admin' && !reviewOnly) return json({ error: '成员账号只开放 AI 模拟审核。' }, 403);
-    if (user.role !== 'admin' && !user.canReview) return json({ error: '当前账号未开通 AI 模拟审核权限，请联系管理员。' }, 403);
-    const res = await dispatch(request.method, route, request, env, user.id, ctx);
+    if (user.role !== 'admin' && !user.star && !reviewOnly) return json({ error: '成员账号只开放 AI 模拟审核。' }, 403);
+    if (user.role !== 'admin' && reviewOnly && !user.canReview) return json({ error: '当前账号未开通 AI 模拟审核权限，请联系管理员。' }, 403);
+    if(user.role==='member' && request.method!=='GET' && reviewOnly) return json({error:'成员仅通过自己的 Agent 提交审核。'},403);
+    const a=route[0];
+    if(user.role==='admin' && request.method!=='GET' && ['draw','expand','suggest','tag','import'].includes(a))return json({error:'超级管理员仅管理平台，请使用 Star 成员账号创作。'},403);
+    if(user.role==='admin' && request.method==='POST' && a==='topics')return json({error:'超级管理员仅管理内容，请使用 Star 成员账号生成。'},403);
+    if(user.role==='member' && ((a==='settings'&&request.method!=='GET')||a==='seed'||(a==='vocab'&&request.method!=='GET')))return json({error:'公共词库、规则和模板由超级管理员维护。'},403);
+    const runtime={...env,ownerId:user.id,memberMode:user.role==='member'};
+    const res = await dispatch(request.method, route, request, runtime, user.id, ctx);
     return res instanceof Response ? res : json(res);
   } catch (err) {
     const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
@@ -46,6 +55,10 @@ export async function forgeApi(request: Request, env: ForgeEnv, route: string[],
 
 export interface ForgeEnv {
   DB: any;
+  ownerId?:string;
+  memberMode?:boolean;
+  modelExecutor?:'agent'|'platform';
+  generationSnapshot?:any;
   ADMIN_PASSWORD: string;
   SETTINGS_KEY: string;
   modelStore: ConfigStore;
@@ -93,6 +106,14 @@ const all = async (env, sql, ...b) => (await env.DB.prepare(sql).bind(...b).all(
 const first = (env, sql, ...b) => env.DB.prepare(sql).bind(...b).first();
 const run = (env, sql, ...b) => env.DB.prepare(sql).bind(...b).run();
 
+async function ownedGames(env,tail=''){return all(env,`SELECT * FROM games WHERE (?='admin' OR owner_id=?) ${tail}`,env.ownerId||'admin',env.ownerId||'admin');}
+async function visibleGames(env){return all(env,`SELECT * FROM games WHERE owner_id=? OR is_public=1 ORDER BY id`,env.ownerId||'admin');}
+
+async function persistGenerated(env,id,kind,content){
+  const topic=await getTopic(env,id),snapshot=env.generationSnapshot||await inputSnapshot(env.DB,topic.owner_id,{type:kind,...(kind==='expand'?{ids:[id]}:{id})});
+  return saveArtifact(env.DB,{owner:topic.owner_id,topicId:id,kind,content,revision:snapshot.revision,policyRevision:snapshot.policy_revision,heads:snapshot.heads,executor:'platform',taskId:env.generation?.id});
+}
+
 async function runBatch(env, statements) {
   for (let i = 0; i < statements.length; i += 50) await env.DB.batch(statements.slice(i, i + 50));
 }
@@ -109,16 +130,36 @@ function attachment(content, type, topic, suffix) {
   } });
 }
 
-async function dispatch(method, route, request, env, ownerId, ctx) {
+export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
   const [a, b, c] = route;
+  if(a==='topics'&&c==='versions'&&method==='GET'){
+    const topic=await getTopic(env,Number(b));
+    if(route[3]){const v=await first(env,'SELECT * FROM artifact_versions WHERE id=? AND topic_id=? AND owner_id=?',route[3],topic.id,topic.owner_id);if(!v)throw new HttpError(404,'版本不存在。');return v;}
+    return versionList(env.DB,topic.owner_id,topic.id);
+  }
+  if(a==='topics'&&c==='restore'&&method==='POST'){
+    const topic=await getTopic(env,Number(b)),data=await body(request);
+    const v=await first(env,'SELECT * FROM artifact_versions WHERE id=? AND topic_id=? AND owner_id=?',data.version_id,topic.id,topic.owner_id);if(!v)throw new HttpError(404,'版本不存在。');
+    return saveArtifact(env.DB,{owner:topic.owner_id,topicId:topic.id,kind:v.kind,content:v.content,revision:topic.content_revision,policyRevision:v.policy_revision,heads:JSON.parse(v.input_versions||'{}'),executor:'restore',restoredFrom:v.id,force:true});
+  }
+  if(env.memberMode && method==='POST' && a==='draw'){const data=await body(request);return reserveDraw(env.DB,ownerId,{...data,request_id:data.request_id||crypto.randomUUID()});}
+  if(env.memberMode && method==='POST' && (['expand','suggest','tag'].includes(a)||(a==='topics'&&['preview','brief','assets','game'].includes(c)))){
+    const data=await body(request).catch(()=>({}));
+    const jobs=a==='expand'?(Array.isArray(data.ids)?[...new Set(data.ids)]:[]).map(id=>({type:'expand',ids:[id]})):[a==='topics'?{type:c,id:Number(b)}:a==='suggest'?{type:'suggest',dim:data.dim,n:Math.min(60,Math.max(5,Number(data.n)||30))}:{type:'tag'}];
+    if(!jobs.length||jobs.length>40)throw new HttpError(400,'每批 1–40 个任务。');
+    const snapshots=[];for(const job of jobs)snapshots.push(await validateAgentTask(env.DB,ownerId,job));
+    const rows=[];for(let i=0;i<jobs.length;i++)rows.push(await createAgentTask(env,ownerId,jobs[i],undefined,snapshots[i]));
+    return {pending:true,id:Number(b)||undefined,jobId:rows[0].id,taskId:rows[0].id,status:'pending',tasks:rows.map(publicCreatorTask),...(a==='expand'?{topics:await Promise.all(data.ids.map(id=>getTopic(env,id)))}:{})};
+  }
   if(a==='generation-jobs'&&method==='GET'){
     if(b){
+      if(env.memberMode&&!await first(env,'SELECT id FROM forge_tasks WHERE id=? AND owner_id=?',b,ownerId))throw new HttpError(404,'生成任务不存在。');
       const row=await readForgeTask(env,b);
-      if(!row)throw new HttpError(404,'生成任务不存在。');
+      if(!row||(env.memberMode&&row.owner_id!==ownerId))throw new HttpError(404,'生成任务不存在。');
       return publicForgeTask(row);
     }
     await recoverForgeTasks(env);
-    return (await all(env,"SELECT * FROM forge_tasks WHERE status IN ('queued','running') OR updated_at > ? ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString())).map(publicForgeTask);
+    return (await all(env,"SELECT * FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString(),ownerId,ownerId)).map(publicForgeTask);
   }
   if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
   if(a==='review'&&b==='worker-status'&&!c&&method==='GET')return deviceStatus(env.DB,ownerId);
@@ -132,6 +173,7 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     if (method === 'GET' && !c) return listReviewJobs(env, ownerId);
     if (method === 'GET' && c) return getReviewJob(env, c, ownerId);
     if (method === 'POST' && !c) {
+      if(ownerId!=='admin')throw new HttpError(403,'成员仅通过 Agent 提交审核。');
       const input = await readReviewBody(request);
       const job = await enqueueReview(env, input, ownerId);
       return json(job, 202);
@@ -151,7 +193,7 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     }
     case "PATCH vocab/:id": return patchRow(env, "vocab", id, await body(request), ["word", "note", "base", "enabled"]);
     case "DELETE vocab/:id": return deleteRow(env, "vocab", id);
-    case "GET games": return all(env, "SELECT * FROM games ORDER BY id DESC");
+    case "GET games": return ownedGames(env,"ORDER BY id DESC");
     case "POST games": return addGame(env, await body(request));
     case "PATCH games/:id": return patchRow(env, "games", id, await body(request), GAME_FIELDS);
     case "DELETE games/:id": return deleteRow(env, "games", id);
@@ -186,7 +228,8 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
       let topic = await getTopic(env, id);
       const interrupted = topic.product_status === 'running' && Date.now() - Date.parse(topic.updated_at) > 15 * 60 * 1000;
       const expired = topic.product_status === 'queued' && Date.now() - Date.parse(topic.updated_at) > 24 * 60 * 60 * 1000;
-      if (interrupted || expired) {
+      const agentTask=await first(env,"SELECT id FROM forge_tasks WHERE owner_id=? AND executor='agent' AND scope=? AND status IN ('queued','running')",topic.owner_id,`${topic.owner_id}:game:${id}`);
+      if (!agentTask && (interrupted || expired)) {
         await run(env, "UPDATE topics SET product_status = 'error', product_error = '制作任务已中断或过期，请重新制作。', updated_at = ? WHERE id = ? AND updated_at = ?", now(), id, topic.updated_at);
         topic = await getTopic(env, id);
       }
@@ -239,7 +282,7 @@ async function startSimpleTask(env,job){
 
 // ---------- settings ----------
 
-async function getSettings(env) {
+export async function getSettings(env) {
   const rows = await all(env, "SELECT id AS key, value FROM settings WHERE id != 'model'");
   const s = { ...FORGE_DEFAULTS, ...TEXT_DEFAULTS };
   for (const r of rows) if (SETTING_KEYS.has(r.key)) s[r.key] = r.value;
@@ -260,15 +303,16 @@ async function putSettings(env, data) {
 
 async function getState(env) {
   const [games, vocab, topics, fresh] = await Promise.all([
-    first(env, "SELECT COUNT(*) AS n FROM games"),
+    first(env, "SELECT COUNT(*) AS n FROM games WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'),
     first(env, "SELECT COUNT(*) AS n FROM vocab"),
-    all(env, "SELECT status, COUNT(*) AS n FROM topics GROUP BY status"),
+    all(env, "SELECT status, COUNT(*) AS n FROM topics WHERE (?='admin' OR owner_id=?) GROUP BY status",env.ownerId||'admin',env.ownerId||'admin'),
     first(env, `SELECT COUNT(*) AS n FROM vocab v WHERE v.dim = 'subject' AND v.enabled = 1
-      AND lower(trim(v.word)) NOT IN (SELECT lower(trim(subject)) FROM games UNION SELECT lower(trim(subject)) FROM topics)`),
+      AND lower(trim(v.word)) NOT IN (SELECT subject_key FROM subject_reservations)`),
   ]);
   const s = await getSettings(env);
-  const model = await env.modelStore.get();
+  const model = env.memberMode?null:await env.modelStore.get();
   return {
+    executor:env.memberMode?'agent':'platform',
     games: games.n,
     vocab: vocab.n,
     fresh_subjects: fresh.n,
@@ -303,9 +347,9 @@ async function seed(env) {
 
 async function exportAll(env) {
   const [vocab, games, topics, settings, reviews] = await Promise.all([
-    all(env, "SELECT * FROM vocab"), all(env, "SELECT * FROM games"),
-    all(env, "SELECT * FROM topics"), all(env, "SELECT id AS key, value, updated_at FROM settings WHERE id != 'model'"),
-    all(env, "SELECT id, title, topic_id, score, result, probe, created_at FROM reviews"),
+    all(env, "SELECT * FROM vocab"), ownedGames(env),
+    all(env, "SELECT * FROM topics WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'), all(env, "SELECT id AS key, value, updated_at FROM settings WHERE id IN ('redlines','template','template_f','draw_size','expand_batch')"),
+    all(env, "SELECT id, title, topic_id, score, result, probe, created_at FROM reviews WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'),
   ]);
   return { exported_at: now(), vocab, games, topics, settings, reviews };
 }
@@ -313,6 +357,7 @@ async function exportAll(env) {
 // ---------- generic rows ----------
 
 async function patchRow(env, table, id, data, allowed) {
+  if(table==='games'&&env.memberMode&&!await first(env,'SELECT id FROM games WHERE id=? AND owner_id=?',id,env.ownerId))throw new HttpError(404,'作品不存在。');
   const keys = Object.keys(data || {}).filter((k) => allowed.includes(k));
   if (!keys.length) throw new HttpError(400, "没有可更新的字段");
   const extra = table === "games" ? ", updated_at = ?" : "";
@@ -323,6 +368,7 @@ async function patchRow(env, table, id, data, allowed) {
 }
 
 async function deleteRow(env, table, id) {
+  if(table==='games'&&env.memberMode&&!await first(env,'SELECT id FROM games WHERE id=? AND owner_id=?',id,env.ownerId))throw new HttpError(404,'作品不存在。');
   await run(env, `DELETE FROM ${table} WHERE id = ?`, id);
   return { ok: true };
 }
@@ -341,11 +387,11 @@ async function deleteReview(env, id, ownerId) {
 async function listVocab(env) {
   const [vocab, games, topics] = await Promise.all([
     all(env, "SELECT * FROM vocab ORDER BY dim, id"),
-    all(env, "SELECT * FROM games"),
-    all(env, "SELECT subject, medium, gesture, structure, mood, status FROM topics"),
+    ownedGames(env),
+    all(env, "SELECT subject, medium, gesture, structure, mood, status FROM topics WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'),
   ]);
   const factors = learnedFactors(games, topics);
-  const usedSubjects = new Set(games.concat(topics).map((x) => norm(x.subject)));
+  const usedSubjects = new Set((await all(env,"SELECT subject_key FROM subject_reservations")).map(x=>x.subject_key));
   return vocab.map((v) => {
     const f = factorFor(factors, v.dim, v.word);
     return { ...v, factor: f.factor, avg: f.avg, n: f.n, likes: f.likes, rejects: f.rejects, used: v.dim === "subject" && usedSubjects.has(norm(v.word)) };
@@ -366,7 +412,7 @@ async function suggestVocab(env, { dim, n = 30 }) {
   const [cfg, vocab, games] = await Promise.all([
     getSettings(env),
     all(env, "SELECT word FROM vocab WHERE dim = ? ORDER BY id", dim),
-    all(env, "SELECT * FROM games ORDER BY id"),
+    visibleGames(env),
   ]);
   const existing = vocab.map((v) => v.word).concat(dim === "subject" ? games.map((g) => g.subject).filter(Boolean) : []);
   const { positives } = exampleSets(games);
@@ -393,10 +439,10 @@ async function addGame(env, data) {
   const scores = ["aes", "ease", "play"].map((k) => (g[k] === "" || g[k] == null ? null : Number(g[k])));
   const score = scores.every((x) => x != null) ? scores[0] + scores[1] + scores[2] : null;
   const r = await run(env,
-    `INSERT INTO games (title, descr, status, score, aes, ease, play, revisions, feedback, subject, medium, gesture, structure, mood, source, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO games (title, descr, status, score, aes, ease, play, revisions, feedback, subject, medium, gesture, structure, mood, source, updated_at,owner_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     g.title, g.descr, g.status, score, scores[0], scores[1], scores[2], Number(g.revisions) || 1, g.feedback,
-    g.subject, g.medium, g.gesture, g.structure, g.mood, g.source === "peer" ? "peer" : "mine", now());
+    g.subject, g.medium, g.gesture, g.structure, g.mood, g.source === "peer" ? "peer" : "mine", now(),env.ownerId||'admin');
   return first(env, "SELECT * FROM games WHERE id = ?", r.meta.last_row_id);
 }
 
@@ -405,7 +451,7 @@ async function addGame(env, data) {
 // no platform IDs, no descriptions).
 async function importWorks(env, { works }) {
   if (!Array.isArray(works)) throw new HttpError(400, "缺少 works 数组");
-  const existing = await all(env, "SELECT id, ext_id, title, source FROM games");
+  const existing = await ownedGames(env);
   const byExt = new Map(existing.filter((g) => g.ext_id).map((g) => [g.ext_id, g]));
   const byTitle = new Map(existing.filter((g) => !g.ext_id).map((g) => [norm(g.title), g]));
   const byTitleSource = new Map(existing.map((g) => [norm(g.title) + "|" + g.source, g]));
@@ -428,14 +474,15 @@ async function importWorks(env, { works }) {
     if (hit) {
       // Keep a real platform ID over a spreadsheet one, and an existing description over an empty one.
       const extId = w.match === "title" && hit.ext_id ? hit.ext_id : w.id;
+      const owner=env.ownerId||'admin',where=hit.id?'id=? AND owner_id=?':'ext_id=? AND owner_id=?';
       stmts.push(env.DB.prepare(
-        `UPDATE games SET ext_id = ?, title = ?, descr = COALESCE(NULLIF(?, ''), descr), status = ?, score = ?, aes = ?, ease = ?, play = ?, revisions = ?, feedback = ?, source = ?, updated_at = ? WHERE id = ?`,
-      ).bind(extId, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now(), hit.id));
+        `UPDATE games SET ext_id = ?, title = ?, descr = COALESCE(NULLIF(?, ''), descr), status = ?, score = ?, aes = ?, ease = ?, play = ?, revisions = ?, feedback = ?, source = ?, updated_at = ? WHERE ${where}`,
+      ).bind(extId, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now(), hit.id||hit.ext_id,owner));
       updated++;
     } else {
       stmts.push(env.DB.prepare(
-        `INSERT INTO games (ext_id, title, descr, status, score, aes, ease, play, revisions, feedback, source, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).bind(w.id, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now()));
+        `INSERT INTO games (ext_id, title, descr, status, score, aes, ease, play, revisions, feedback, source, updated_at,owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(w.id, w.title, descr, status, score, parts[0], parts[1], parts[2], revisions, feedback, source, now(),env.ownerId||'admin'));
       inserted++;
     }
     // Two rows in one file for the same game must not both insert.
@@ -444,7 +491,7 @@ async function importWorks(env, { works }) {
     byTitleSource.set(norm(w.title) + "|" + source, row);
   }
   await runBatch(env, stmts);
-  const untagged = await first(env, "SELECT COUNT(*) AS n FROM games WHERE gesture = '' OR medium = ''");
+  const untagged = await first(env, "SELECT COUNT(*) AS n FROM games WHERE (gesture = '' OR medium = '') AND (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin');
   return { inserted, updated, untagged: untagged.n };
 }
 
@@ -484,20 +531,20 @@ async function listTopics(env, params) {
       preview_svg IS NOT NULL AS has_preview, expand_status, expand_error, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
       assets_html IS NOT NULL AS has_assets, assets_status, assets_error,
       product_html IS NOT NULL AS has_product, product_status, product_error
-    FROM topics WHERE status IN (${marks}) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses, limit);
+    FROM topics WHERE status IN (${marks}) AND (?='admin' OR owner_id=?) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses,env.ownerId||'admin',env.ownerId||'admin', limit);
   return rows.map(hydrate);
 }
 
 async function listProducts(env) {
   const rows = await all(env, `SELECT id, subject, medium, gesture, structure, mood, status, data, score, note, updated_at,
       product_html IS NOT NULL AS has_product, product_status, product_error
-    FROM topics WHERE product_html IS NOT NULL OR product_status IN ('queued', 'running', 'error')
-    ORDER BY updated_at DESC, id DESC LIMIT 300`);
+    FROM topics WHERE (product_html IS NOT NULL OR product_status IN ('queued', 'running', 'error')) AND (?='admin' OR owner_id=?)
+    ORDER BY updated_at DESC, id DESC LIMIT 300`,env.ownerId||'admin',env.ownerId||'admin');
   return rows.map(hydrate);
 }
 
 async function getTopic(env, id) {
-  const t = hydrate(await first(env, "SELECT * FROM topics WHERE id = ?", id));
+  const t = hydrate(await first(env, "SELECT * FROM topics WHERE id = ? AND (?='admin' OR owner_id=?)", id,env.ownerId||'admin',env.ownerId||'admin'));
   if (!t) throw new HttpError(404, "选题不存在");
   return t;
 }
@@ -521,7 +568,7 @@ async function patchTopic(env, id, data) {
   const t = await getTopic(env, id);
   const status = data.status ?? t.status;
   if (data.status != null && !TOPIC_STATUSES.has(data.status)) throw new HttpError(400, "状态不对");
-  await run(env, "UPDATE topics SET status = ?, note = ?, updated_at = ? WHERE id = ?", status, data.note ?? t.note, now(), id);
+  await run(env, "UPDATE topics SET status = ?, note = ?,content_revision=content_revision+1, updated_at = ? WHERE id = ?", status, data.note ?? t.note, now(), id);
   return getTopic(env, id);
 }
 
@@ -530,8 +577,8 @@ async function draw(env, { n, locks = {} } = {}) {
   const size = Math.min(Math.max(Number(n) || Number(cfg.draw_size) || 12, 1), 40);
   const [vocab, games, topics] = await Promise.all([
     all(env, "SELECT * FROM vocab"),
-    all(env, "SELECT * FROM games"),
-    all(env, "SELECT subject, medium, gesture, structure, mood, status FROM topics"),
+    ownedGames(env),
+    all(env, "SELECT subject, medium, gesture, structure, mood, status FROM topics WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'),
   ]);
   const cleanLocks = Object.fromEntries(Object.entries(locks).filter(([d, w]) => DIMS.includes(d) && w));
   const combos = drawCombos({ vocab, games, topics, n: size, locks: cleanLocks });
@@ -586,7 +633,7 @@ async function expandBatch(env, ids) {
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'expand'));
   const [cfg, games, prior] = await Promise.all([
     getSettings(env),
-    all(env, "SELECT * FROM games ORDER BY id"),
+    visibleGames(env),
     all(env, "SELECT data, subject FROM topics WHERE status IN ('new', 'liked', 'made') ORDER BY id"),
   ]);
   const { positives, negatives } = exampleSets(games);
@@ -632,8 +679,7 @@ async function expandBatch(env, ids) {
     if (!t) continue;
     const score = [item.aes, item.ease, item.play].map((x) => Math.max(1, Math.min(3, Number(x) || 1))).reduce((s, x) => s + x, 0);
     const status = item.dup_of && item.dup_of.trim() ? "dup" : "new";
-    stmts.push(env.DB.prepare("UPDATE topics SET data = ?, score = ?, status = ?, expand_status = '', expand_error = '', updated_at = ? WHERE id = ?")
-      .bind(JSON.stringify(item), score, status, now(), t.id));
+    await persistGenerated(env,t.id,'expand',JSON.stringify(item));
   }
   await runBatch(env, stmts);
   return (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
@@ -658,7 +704,7 @@ async function preview(env, id) {
   // completed key makes Riffle reject the request as IDEMPOTENCY_CONFLICT.
   const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 16000, idempotencyKey: `pgc-preview-${id}-${Date.now()}`, purpose: 'preview' });
   const svg = sanitizeSvg(text);
-  await run(env, "UPDATE topics SET preview_svg = ?, updated_at = ? WHERE id = ?", svg, now(), id);
+  await persistGenerated(env,id,'preview',svg);
   return { id, svg };
 }
 
@@ -697,10 +743,11 @@ function trimSource(html, max = MAX_SOURCE) {
   return out;
 }
 
-export async function prepareReview(env, { title, topic_id, html, probe, shots }) {
+export async function prepareReview(env, { title, topic_id, html, probe, shots },ownerId=env.ownerId||'admin') {
+  env={...env,ownerId};
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
   const images = (Array.isArray(shots) ? shots : []).filter((s) => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data)).slice(0, 6);
-  const [cfg, games] = await Promise.all([getSettings(env), all(env, "SELECT * FROM games ORDER BY id")]);
+  const [cfg, games] = await Promise.all([getSettings(env), visibleGames(env)]);
   // The calibration set is for the scoring scale, not for recalling this
   // game's own past result: a known score would anchor (or leak) the verdict.
   const { positives, borderline, negatives } = exampleSets(games.filter((g) => !sameGame(g.title, title)));
@@ -710,13 +757,13 @@ export async function prepareReview(env, { title, topic_id, html, probe, shots }
   const supportedNegatives = negatives.map((game) => ({ ...game, feedback: '' }));
   let design = "";
   if (topic_id) {
-    const t = hydrate(await first(env, "SELECT * FROM topics WHERE id = ?", topic_id));
+    const t = hydrate(await first(env, "SELECT * FROM topics WHERE id = ? AND owner_id=?", topic_id,ownerId));
     if (t && t.data.title) design = `【原定设计】${t.data.title}：${t.data.logline}\n新机制：${t.data.twist}\n节奏：${t.data.progression}\n美术：${t.data.art_direction}\n`;
   }
   const parts = [];
   for (const s of images) parts.push({ type: "text", text: `截图：${s.label}` }, { type: "image", data: s.data });
   // Keep the source bounded; thinking and report tokens share an output budget.
-  const reviewConfig = await env.modelStore.get();
+  const reviewConfig = env.modelExecutor==='agent'?null:await env.modelStore.get();
   const smallModel = ['review', 'review_verify'].some(purpose => /deepseek/i.test(routedModel(reviewConfig, purpose)));
   const captureNote = probe?.captureMethod === 'browser-viewport-v1'
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
@@ -766,8 +813,8 @@ export function sameGame(a, b) {
 async function listReviews(env, ownerId) {
   const isAdmin = ownerId === 'admin';
   const rows = isAdmin
-    ? await all(env, "SELECT id, title, topic_id, score, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews ORDER BY id DESC LIMIT 100")
-    : await all(env, "SELECT id, title, topic_id, score, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? ORDER BY id DESC LIMIT 100", ownerId);
+    ? await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews ORDER BY id DESC LIMIT 100")
+    : await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? ORDER BY id DESC LIMIT 100", ownerId);
   return rows;
 }
 
@@ -928,7 +975,7 @@ async function assetsJob(env, id, t) {
       onWait: message => run(env, "UPDATE topics SET assets_error = ? WHERE id = ? AND assets_status = 'running'", message, id),
     }));
     const html = cleanAssetsHtml(text);
-    await run(env, "UPDATE topics SET assets_html = ?, assets_status = '', assets_error = '', updated_at = ? WHERE id = ?", html, now(), id);
+    await persistGenerated(env,id,'assets',html);
     return { id, assets: html };
   } catch (error) {
     await markTopicJobError(env, 'assets', id, error);
@@ -962,7 +1009,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
       onProgress: characters => stage(characters ? `模型正在编写游戏，已接收 ${characters.toLocaleString('en-US')} 个字符…` : '模型正在准备游戏代码…'),
     }));
     const html = cleanGameHtml(text);
-    await run(env, "UPDATE topics SET product_html = ?, product_status = '', product_error = '', status = 'made', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", html, now(), id, requestId);
+    await persistGenerated(env,id,'game',html);
     return { id, status: 'done' };
   } catch (error) {
     const message = String(error?.message || error);
@@ -991,7 +1038,7 @@ async function briefJob(env, id, t) {
     const body = String(md).trim();
     if (!body) throw new LLMError("模型没有返回简报内容", 502);
     const full = cfg.template + body + "\n";
-    await run(env, "UPDATE topics SET brief_md = ?, brief_status = '', brief_error = '', status = CASE WHEN status = 'made' THEN status ELSE 'liked' END, updated_at = ? WHERE id = ?", full, now(), id);
+    await persistGenerated(env,id,'brief',full);
     return { id, brief: full };
   } catch (error) {
     await run(env, "UPDATE topics SET brief_status = 'error', brief_error = ?, updated_at = ? WHERE id = ?", String(error?.message || error).slice(0, 500), now(), id).catch(() => {});

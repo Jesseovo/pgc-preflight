@@ -4,13 +4,13 @@ import {failForgeTask, FORGE_TASK_LIMIT_MS, type ForgeTask} from './forge-tasks'
 
 export async function executeForgeTask(env: ForgeEnv, id: string) {
   const at = new Date().toISOString();
-  const row: ForgeTask | null = await env.DB.prepare("UPDATE forge_tasks SET status='running',started_at=?,updated_at=?,detail='正在准备生成材料…' WHERE id=? AND status='queued' RETURNING *").bind(at,at,id).first();
+  const row: ForgeTask | null = await env.DB.prepare("UPDATE forge_tasks SET status='running',started_at=?,updated_at=?,detail='正在准备生成材料…' WHERE id=? AND executor='platform' AND status='queued' RETURNING *").bind(at,at,id).first();
   if (!row) return;
   const update = (detail:string) => env.DB.prepare("UPDATE forge_tasks SET detail=?,updated_at=? WHERE id=? AND status='running'").bind(detail,new Date().toISOString(),id).run();
   const timer = setInterval(()=>{void env.DB.prepare("UPDATE forge_tasks SET updated_at=? WHERE id=? AND status='running'").bind(new Date().toISOString(),id).run().catch(()=>{});},30000);
   try {
     const job: ForgeJob = JSON.parse(row.payload);
-    const result = await processForgeJob({...env,generation:{id,deadline:Date.now()+12*60000,
+    const result = await processForgeJob({...env,ownerId:row.owner_id||'admin',generationSnapshot:row.input_snapshot?JSON.parse(row.input_snapshot):null,generation:{id,deadline:Date.now()+12*60000,
       onStart:async()=>{
         const result = await env.DB.prepare("UPDATE forge_tasks SET model_started_at=COALESCE(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(new Date().toISOString(),new Date().toISOString(),id).run();
         if (!result.meta.changes) throw new Error('生成任务已停止。');
@@ -32,14 +32,15 @@ export class ForgeRunner {
     const id = await request.text();
     if (!/^[a-f0-9-]{36}$/.test(id)) return new Response('Invalid task',{status:400});
     await this.state.storage.put('taskId',id);
-    const row = await this.env.DB.prepare('SELECT status FROM forge_tasks WHERE id=?').bind(id).first();
-    if (row?.status === 'queued' && !await this.state.storage.getAlarm()) await this.state.storage.setAlarm(Date.now()+100);
+    const row = await this.env.DB.prepare('SELECT status,executor FROM forge_tasks WHERE id=?').bind(id).first();
+    if (row?.executor!=='agent' && row?.status === 'queued' && !await this.state.storage.getAlarm()) await this.state.storage.setAlarm(Date.now()+100);
     return Response.json({ok:true});
   }
   async alarm() {
     const id = await this.state.storage.get('taskId');
     if (!id) return;
     const row: ForgeTask | null = await this.env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
+    if(row?.executor==='agent'){await this.state.storage.deleteAlarm();await this.state.storage.deleteAll();return;}
     if (row?.status === 'queued') {
       await this.state.storage.setAlarm(Date.now()+FORGE_TASK_LIMIT_MS);
       await executeForgeTask({...this.env,modelStore:configStore(this.env.DB)},id);

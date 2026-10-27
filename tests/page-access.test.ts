@@ -41,15 +41,31 @@ describe('检查台的登录前置', () => {
       expect(await guardCheckPage(page(path), memoryStore(), secrets)).toBe(null);
     }
   });
-  it('管理员可以进入 Forge 全功能台，成员只进入模拟审核台', async () => {
+  it('管理员进入管理台，普通成员进入审核台，Star 进入个人 Forge', async () => {
     const store = memoryStore();
     const member = await createMember({ username: 'creator02', password: 'test-only-password' }, store);
     const memberToken = await memberLogin('creator02', 'test-only-password', store, secrets.SETTINGS_KEY);
     const adminToken = await login(secrets.ADMIN_PASSWORD, secrets);
     expect(await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets)).toMatchObject({ status: 302 });
     expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
-    expect(await guardForgePage(page('/forge', `pgc_admin=${adminToken}`), store, secrets)).toBe(null);
+    expect((await guardForgePage(page('/forge', `pgc_admin=${adminToken}`), store, secrets))?.headers.get('Location')).toBe('/admin');
     expect((await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
+    await updateMember(member.id, { star: true }, store);
+    expect(await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets)).toBe(null);
+    expect((await guardCheckPage(page('/', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/forge/');
+    expect((await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/forge/');
+    await updateMember(member.id, { star: false }, store);
+    expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
+  });
+  it('Star 可以读取个人工作台脚本，但不能读取管理员模块；撤销后即时收回', async () => {
+    const store=memoryStore();
+    const member=await createMember({username:'starcreator',password:'test-only-password',star:true},store);
+    const token=await memberLogin('starcreator','test-only-password',store,secrets.SETTINGS_KEY),cookie=`pgc_member=${token}`;
+    for(const path of ['/forge/app.js','/forge/review-sheet.js','/forge/%61pp.js'])expect(await guardPrivateAsset(page(path,cookie),store,secrets),path).toBe(null);
+    for(const path of ['/assets/admin-abc123.js','/assets/%61dmin-abc123.js','/assets/admin-abc123.js.map'])expect((await guardPrivateAsset(page(path,cookie),store,secrets))?.status,path).toBe(403);
+    await updateMember(member.id,{star:false},store);
+    expect((await guardPrivateAsset(page('/forge/app.js',cookie),store,secrets))?.status).toBe(403);
+    expect(await guardPrivateAsset(page('/forge/member-review.js',cookie),store,secrets)).toBe(null);
   });
   it('成员和未登录用户不能读取管理脚本，管理员可读，审核共享资源不受影响', async () => {
     const store = memoryStore();
@@ -74,6 +90,7 @@ describe('检查台的登录前置', () => {
       expect(guardDeviceScope(request)?.status, path).toBe(403);
     }
     expect(guardDeviceScope(new Request('https://pgc.example/api/review-device/jobs', { headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }))).toBe(null);
+    expect(guardDeviceScope(new Request('https://pgc.example/api/forge-agent/jobs', { headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }))).toBe(null);
     expect(guardDeviceScope(page('/api/admin/config'))).toBe(null);
   });
 });

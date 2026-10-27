@@ -10,33 +10,46 @@ export interface ReviewJobEnv {
   modelStore: { get(): Promise<any> };
   captureReview?: (html:string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
   reviewExecutor?: 'device';
+  modelExecutor?: 'agent' | 'platform';
 }
 const stamp = () => new Date().toISOString();
 const fail = (message: string, status = 400) => Object.assign(new Error(message), { status });
-const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged });
+const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model });
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
-  if (!env.REVIEW_QUEUE && env.reviewExecutor!=='device') throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
+  const local = env.modelExecutor !== 'platform';
+  if (!local && !env.REVIEW_QUEUE && env.reviewExecutor!=='device') throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
   if (typeof payload?.html !== 'string' || !payload.html.trim()) throw fail('缺少游戏源码。');
   if (new TextEncoder().encode(payload.html).length > 8 * 1024 * 1024) throw fail('单个 HTML 不能超过 8 MB。', 413);
-  if (!env.captureReview && env.reviewExecutor!=='device') throw fail('后台画面采集服务尚未就绪。', 503);
-  const config = await env.modelStore.get();
-  for (const purpose of ['review', 'review_verify'] as const) {
-    const model = activeModelProfile(config, purpose);
-    if (!model?.profile.enabled || !model.profile.encryptedKey) throw fail(`管理员尚未配置并启用${purpose === 'review' ? '审核初评' : '评分复核'}模型。`, 503);
+  if (!local && !env.captureReview && env.reviewExecutor!=='device') throw fail('后台画面采集服务尚未就绪。', 503);
+  if (!local) {
+    const config = await env.modelStore.get();
+    for (const purpose of ['review', 'review_verify'] as const) {
+      const model = activeModelProfile(config, purpose);
+      if (!model?.profile.enabled || !model.profile.encryptedKey) throw fail(`管理员尚未配置并启用${purpose === 'review' ? '审核初评' : '评分复核'}模型。`, 503);
+    }
   }
   const id = payload.request_id;
   if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw fail('审核请求标识无效，请重新提交。');
   const existing = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
   if (existing) return publicJob(existing);
+  if(payload.topic_id!==undefined&&payload.topic_id!==null){
+    if(!Number.isInteger(payload.topic_id)||payload.topic_id<1)throw fail('选题编号无效。');
+    const topic=await env.DB.prepare('SELECT owner_id FROM topics WHERE id=?').bind(payload.topic_id).first();
+    if(!topic||(ownerId!=='admin'&&topic.owner_id!==ownerId))throw fail('选题不存在。',404);
+  }
   const title = String(payload.title || '未命名').slice(0, 120);
   const filename = String(payload.filename || '').slice(0, 200);
   const now = stamp();
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
-  const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at,executor,input_ready)
-    SELECT ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0 WHERE
+  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged)
+    SELECT ?,?,?,?,'capture',?,?,?,'device',0,'agent',0 WHERE
+    (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))`)
+    .bind(id,ownerId,title,filename,day,now,now,ownerId,ownerId).run()
+    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor)
+    SELECT ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform' WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
@@ -47,6 +60,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
     if(ownerId !== 'admin'){
       const member=await env.DB.prepare('SELECT enabled,can_review FROM members WHERE id=?').bind(ownerId).first();
       if(!member?.enabled||!member.can_review)throw fail('当前账号已停用或审核权限已撤销。',403);
+      if(local)throw fail('审核请求标识已被使用，请生成新的请求编号。',409);
       const usage=await reviewUsage(env.DB,ownerId);
       if(!usage.remaining)throw fail(`今日审核次数已用完（${usage.used}/${usage.limit}）。北京时间零点重置，可联系管理员调整。`,429);
     }
@@ -63,18 +77,18 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
     }
     await env.DB.batch(chunks);
     await env.DB.prepare('UPDATE review_jobs SET input_ready=1 WHERE id=?').bind(id).run();
-    if(env.reviewExecutor!=='device')await env.REVIEW_QUEUE!.send({ type: 'review', id });
+    if(!local&&env.reviewExecutor!=='device')await env.REVIEW_QUEUE!.send({ type: 'review', id });
   } catch {
     await env.DB.prepare('DELETE FROM review_jobs WHERE id = ? AND status = ?').bind(id, 'queued').run();
     await deleteInput(env, id).catch(() => {});
     throw fail('审核任务提交失败，请重试。', 503);
   }
-  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:1 };
+  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform' };
 }
 
 export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
   await recoverInterruptedReviews(env, ownerId);
-  const { results } = await env.DB.prepare('SELECT * FROM review_jobs WHERE owner_id = ? AND created_at > ? ORDER BY created_at DESC LIMIT 100')
+  const { results } = await env.DB.prepare("SELECT * FROM review_jobs WHERE owner_id = ? AND (created_at > ? OR (model_executor='agent' AND status IN ('queued','running'))) ORDER BY created_at DESC LIMIT 100")
     .bind(ownerId, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()).all();
   return (results || []).map(publicJob);
 }
@@ -82,7 +96,7 @@ export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
 export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string) {
   await recoverDeviceReviews(env.DB);
   const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-  await env.DB.prepare(`UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台审核已中断，未发布评分，请重新上传或重试。', updated_at = ? WHERE executor!='device' AND status = 'running' AND updated_at < ?${ownerId ? ' AND owner_id = ?' : ''}`)
+  await env.DB.prepare(`UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台审核已中断，未发布评分，请重新上传或重试。', updated_at = ? WHERE model_executor='platform' AND executor!='device' AND status = 'running' AND updated_at < ?${ownerId ? ' AND owner_id = ?' : ''}`)
     .bind(stamp(),cutoff,...(ownerId ? [ownerId] : [])).run();
   await env.DB.prepare("DELETE FROM review_inputs WHERE job_id IN (SELECT id FROM review_jobs WHERE status = 'error')").bind().run();
 }
@@ -91,8 +105,8 @@ export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: strin
   await recoverDeviceReviews(env.DB);
   let row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
   if (!row) throw fail('审核任务不存在。', 404);
-  const stale = row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000
-    || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > (row.executor==='device'?24:3) * 60 * 60 * 1000;
+  const stale = row.model_executor!=='agent' && (row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000
+    || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > (row.executor==='device'?24:3) * 60 * 60 * 1000);
   if (stale) {
     await env.DB.prepare("UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台任务已中断，请重试。', updated_at = ? WHERE id = ? AND updated_at = ?")
       .bind(stamp(), id, row.updated_at).run();
@@ -116,16 +130,15 @@ export async function purgeReviewInputs(env: { DB: any }) {
   await recoverInterruptedReviews(env);
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   await env.DB.batch([
-    env.DB.prepare('DELETE FROM review_inputs WHERE created_at < ?').bind(cutoff),
-    env.DB.prepare('DELETE FROM review_evidence WHERE created_at < ?').bind(cutoff),
-    env.DB.prepare("UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '任务已过期，请重新上传。', updated_at = ? WHERE created_at < ? AND status IN ('queued', 'running')").bind(stamp(), cutoff),
+    ...['review_inputs','review_evidence','review_material'].map(table=>env.DB.prepare(`DELETE FROM ${table} WHERE created_at < ? AND NOT EXISTS(SELECT 1 FROM review_jobs WHERE review_jobs.id=${table}.job_id AND model_executor='agent' AND status IN ('queued','running') AND updated_at>=?)`).bind(cutoff,cutoff)),
+    env.DB.prepare("UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '任务已过期，请重新上传。', updated_at = ? WHERE model_executor='platform' AND created_at < ? AND status IN ('queued', 'running')").bind(stamp(), cutoff),
   ]);
 }
 
 export async function processReviewJob(env: ReviewJobEnv, id: string, evaluate: (payload: any, ownerId: string, jobId: string) => Promise<any>) {
   const row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ?').bind(id).first();
   if (!row) return;
-  if (row.executor==='device') return;
+  if (row.executor==='device'||row.model_executor==='agent') return;
   if (row.status === 'done' || row.status === 'error') {
     await deleteInput(env, id);
     return;

@@ -13,6 +13,8 @@ function setup() {
   sqlite.exec(`CREATE TABLE members (id TEXT PRIMARY KEY, enabled INTEGER, can_review INTEGER,username TEXT,display_name TEXT,created_at TEXT); INSERT INTO members VALUES ('a', 1, 1,'a','甲','now'), ('b', 1, 1,'b','乙','now')`);
   sqlite.exec(readFileSync('migrations/0014_review_capacity.sql','utf8'));
   sqlite.exec(readFileSync('migrations/0015_local_review_worker.sql','utf8'));
+  sqlite.exec(readFileSync('migrations/0018_review_material_snapshot.sql','utf8'));
+  sqlite.exec("ALTER TABLE review_jobs ADD COLUMN model_executor TEXT NOT NULL DEFAULT 'platform'; ALTER TABLE review_jobs ADD COLUMN local_model TEXT;");
   const DB = {
     prepare(sql: string) {
       return { bind(...params: any[]) {
@@ -28,7 +30,9 @@ function setup() {
     async batch(statements: any[]) { sqlite.exec('BEGIN'); try { const results = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return results; } catch (error) { sqlite.exec('ROLLBACK'); throw error; } },
   };
   const send = vi.fn(async (_message: any) => {});
-  const env = { DB, captureReview:vi.fn(async () => ({shots:[],probe:{captureMethod:'browser-viewport-v1'}})), REVIEW_QUEUE: { send }, modelStore: { get: async () => ({ baseUrl: 'https://test.example/v1', model: 'fixture', protocol: 'openai', encryptedKey: 'fixture-only', enabled: true, updatedAt: '' }) } };
+  // These fixtures exercise the existing platform transport, not new members'
+  // default Agent execution (covered in local-review.test.ts).
+  const env = { DB, modelExecutor:'platform' as const, captureReview:vi.fn(async () => ({shots:[],probe:{captureMethod:'browser-viewport-v1'}})), REVIEW_QUEUE: { send }, modelStore: { get: async () => ({ baseUrl: 'https://test.example/v1', model: 'fixture', protocol: 'openai', encryptedKey: 'fixture-only', enabled: true, updatedAt: '' }) } };
   const payload = (title = 'Fixture') => ({ title, request_id: crypto.randomUUID(), html: '<html><canvas></canvas></html>', shots: [], probe: {} });
   return { sqlite, env, payload, send };
 }
