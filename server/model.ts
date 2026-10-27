@@ -156,9 +156,19 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           usage(data.usage || data.message?.usage);
           if (data.type === 'error' || data.error) {
             const code = String(data.error?.code || data.error?.type || '');
-            const busy = /rate_limit|overloaded/i.test(code);
             const detail = redact(String(data.error?.message || ''), config.apiKey);
-            throw new ModelHttpError((busy ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。' : '模型流式生成被接口中断：上游暂时不可用；本次请求结果未知，请稍后手动重试。') + (detail ? ` ${detail}` : ''), busy ? 429 : 502, undefined, code || 'UPSTREAM_STREAM_ERROR');
+            // Some compatible gateways return a 503 from the upstream inside
+            // an SSE event, even when the request asked for stream:false.
+            // Preserve that status so the outer retry policy can safely retry
+            // only before any model text has arrived.
+            const upstream503 = /(?:\b503\b|service[_ -]?unavailable|temporarily unavailable)/i.test(`${code} ${detail}`);
+            const busy = /rate_limit|overloaded|(?:\b429\b|too many requests)/i.test(`${code} ${detail}`);
+            const status = busy ? 429 : upstream503 ? 503 : 502;
+            throw new ModelHttpError((busy
+              ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。'
+              : upstream503
+                ? '模型网关上游暂时不可用（503），流式生成已被网关中断，正在等待重试。'
+                : '模型流式生成被接口中断：上游暂时不可用；本次请求结果未知，请稍后手动重试。') + (detail ? ` ${detail}` : ''), status, upstream503 ? 1000 : undefined, code || 'UPSTREAM_STREAM_ERROR');
           }
           if (!anthropic) {
             const choice = data.choices?.[0];
@@ -235,7 +245,8 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         catch (error) {
           clearTimeout(timeout);
           const pendingRequest = error instanceof ModelHttpError && error.upstreamStatus === 409 && /IDEMPOTENCY_(IN_PROGRESS|PENDING)|REQUEST_(IN_PROGRESS|PENDING)|INFLIGHT/i.test(error.code);
-          if (!(error instanceof ModelHttpError) || metrics.characters > 0 || metrics.thinkingCharacters > 0 || (!pendingRequest && error.upstreamStatus !== 429) || /quota|balance|credit|billing/i.test(error.code)) throw error;
+          const retryableTransport = error instanceof ModelHttpError && (error.upstreamStatus === 429 || error.upstreamStatus === 503);
+          if (!(error instanceof ModelHttpError) || metrics.characters > 0 || metrics.thinkingCharacters > 0 || (!pendingRequest && !retryableTransport) || /quota|balance|credit|billing/i.test(error.code)) throw error;
           const wait = Math.max(1000, error.retryMs ?? 15000 * 2 ** attempt);
           if (!pendingRequest) await abortable(throttle.cooldown(wait), controller.signal);
           if (attempt >= 3 || Date.now() + wait + 1000 >= deadline) throw error;

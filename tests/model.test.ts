@@ -182,6 +182,41 @@ describe('模型传输',()=>{
     ])).resolves.toBe('READY');
   });
 
+  it('短任务即使被网关改成 SSE，也能读取完整 Anthropic 响应',async()=>{
+    const fetchMock = vi.fn(async(_input:unknown,init?:RequestInit)=>{
+      const body=JSON.parse(String(init?.body));
+      expect(body.stream).toBe(false);
+      return new Response([
+        'event: message_start\n',
+        'data: {"type":"message_start"}\n\n',
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"READY"}}\n\n',
+        'data: {"type":"message_stop"}\n\n',
+      ].join(''),{headers:{'Content-Type':'text/event-stream'}});
+    });
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{stream:false})([
+      {role:'user',content:'test'},
+    ])).resolves.toBe('READY');
+  });
+
+  it('SSE 内的上游 503 会被识别并在没有正文时有限重试',async()=>{
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async()=>{
+      if (fetchMock.mock.calls.length === 1) return new Response(
+        'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Anthropic 渠道返回 503"}}\n\n',
+        {headers:{'Content-Type':'text/event-stream','Retry-After':'0'}},
+      );
+      return Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'});
+    });
+    vi.stubGlobal('fetch',fetchMock);
+    const result = modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{stream:false,totalTimeoutMs:30_000})([
+      {role:'user',content:'test'},
+    ]);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect(result).resolves.toBe('READY');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('DeepSeek流式读取思考与正文，只有报告正文返回给调用方',async()=>{
     const fetchMock=vi.fn(async(_input:unknown,init?:RequestInit)=>{
       expect(JSON.parse(String(init?.body))).toMatchObject({stream:true,max_tokens:24000,reasoning_effort:'low',response_format:{type:'json_object'}});

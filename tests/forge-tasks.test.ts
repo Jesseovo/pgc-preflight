@@ -133,11 +133,16 @@ describe('后台创作的持久任务',()=>{
     }
   });
 
-  it('SSE渠道503是未知中断，只记录一次原错误，不能按HTTP503自动复用请求',async()=>{
+  it('SSE渠道503在没有正文时按幂等键有限重试，恢复后完成任务',async()=>{
     const s=await setup();
-    const fetcher=vi.fn(async()=>new Response('event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Anthropic 渠道返回 503"}}\n\n',{headers:{'Content-Type':'text/event-stream'}}));
+    const fetcher=vi.fn(async(..._args: any[])=>fetcher.mock.calls.length === 1
+      ? new Response('event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Anthropic 渠道返回 503"}}\n\n',{headers:{'Content-Type':'text/event-stream'}})
+      : response('{"ok":true}'));
     vi.stubGlobal('fetch',fetcher);
-    await expect(complete(s.env,{}, {system:'s',user:'u',purpose:'preview',idempotencyKey:'stream-503'})).rejects.toThrow('503');
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    const result=complete(s.env,{}, {system:'s',user:'u',purpose:'preview',idempotencyKey:'stream-503'});
+    await expect(result).resolves.toBe('{"ok":true}');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect((fetcher.mock.calls[0]?.[1]?.headers as Record<string,string>)['Idempotency-Key'])
+      .toBe((fetcher.mock.calls[1]?.[1]?.headers as Record<string,string>)['Idempotency-Key']);
   });
 });
