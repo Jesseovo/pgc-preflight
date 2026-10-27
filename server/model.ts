@@ -28,10 +28,10 @@ function anthropicContent(content: unknown) {
   });
 }
 
-function anthropicRequest(messages: ChatMessage[], maxTokens: number) {
+function anthropicRequest(messages: ChatMessage[], maxTokens: number, stream: boolean) {
   const system = messages.filter(message => message.role === 'system').map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n\n');
   const converted = messages.filter(message => message.role !== 'system').map(message => ({ role: message.role === 'assistant' ? 'assistant' : 'user', content: anthropicContent(message.content) }));
-  return { ...(system ? { system } : {}), messages: converted, max_tokens: maxTokens, stream: true };
+  return { ...(system ? { system } : {}), messages: converted, max_tokens: maxTokens, stream };
 }
 
 function anthropicText(data: any) {
@@ -83,10 +83,12 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
     ? `模型接口限流（429）${raw ? `：${raw}` : '，请求过多，请等待后重试。'}`
     : response.status === 409
       ? `模型网关请求冲突（409）${raw ? `：${raw}` : '，这次请求未完成，请稍后重试。'}${code ? ` [${code}]` : ''}`
+    : response.status === 503
+      ? `模型网关上游暂时不可用（503）${raw ? `：${raw}` : '，请稍后重试。'}${code ? ` [${code}]` : ''}`
     : `模型接口返回 ${response.status}${raw ? `：${raw}` : '。请检查模型配置、额度和图片输入支持。'}${code ? ` [${code}]` : ''}`, response.status, wait, code);
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string; stream?: boolean } = {}): ModelTransport {
   const throttle = createModelThrottle(options.DB, config);
   return async messages => {
     const inferred = inferenceOptions(config, options.purpose, options.maxTokens);
@@ -95,6 +97,10 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
     const effort = config.effort && config.effort !== 'auto' ? config.effort : options.outputEffort || options.reasoningEffort || inferred.effort;
     const anthropic = config.protocol === 'anthropic';
     const deepseek = !anthropic && new URL(config.baseUrl).hostname === 'api.deepseek.com';
+    // Riffle's Anthropic stream relay is intermittently unavailable. Short
+    // tasks are safer as one bounded JSON response; long artifacts retain
+    // streaming so their heartbeat and character progress remain visible.
+    const stream = anthropic ? options.stream !== false : deepseek;
     const controller = new AbortController();
     const started = Date.now();
     const metrics: ModelMetrics = {elapsedMs:0,firstTextMs:null,characters:0,thinkingCharacters:0,inputTokens:null,outputTokens:null,reasoningTokens:null,finishReason:'',maxTokens,effort,status:'error',error:''};
@@ -112,13 +118,13 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       if (options.onWait) await abortable(Promise.resolve(options.onWait(0, 'pace')), controller.signal);
       touch();
       const headers: Record<string, string> = anthropic
-        ? {'Content-Type':'application/json','Accept':'text/event-stream','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
+        ? {'Content-Type':'application/json','Accept':stream ? 'text/event-stream' : 'application/json','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
         : {'Content-Type':'application/json', ...(deepseek ? { Accept: 'text/event-stream' } : {}), Authorization:`Bearer ${config.apiKey}`};
       if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
       if (options.onStart) await abortable(options.onStart(), controller.signal);
       const response = await abortable(fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST', headers,
-        body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens), ...(inferred.capability.kind === 'adaptive' ? {thinking:{type:'adaptive'},output_config:{effort}} : {}) } : {
+        body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens, stream), ...(inferred.capability.kind === 'adaptive' ? {thinking:{type:'adaptive'},output_config:{effort}} : {}) } : {
           model:config.model,messages,max_tokens:maxTokens,stream:deepseek,
           ...(deepseek && options.json ? { response_format: { type: 'json_object' } } : {}),
           ...(deepseek && inferred.capability.kind === 'deepseek' ? { thinking:{type:'enabled'}, reasoning_effort:effort, stream_options:{include_usage:true} } : {}),
@@ -152,7 +158,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
             const code = String(data.error?.code || data.error?.type || '');
             const busy = /rate_limit|overloaded/i.test(code);
             const detail = redact(String(data.error?.message || ''), config.apiKey);
-            throw new ModelHttpError((busy ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。' : '模型流式生成被接口中断，请重试。') + (detail ? ` ${detail}` : ''), busy ? 429 : 502, undefined, code);
+            throw new ModelHttpError((busy ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。' : '模型流式生成被接口中断：上游暂时不可用；本次请求结果未知，请稍后手动重试。') + (detail ? ` ${detail}` : ''), busy ? 429 : 502, undefined, code || 'UPSTREAM_STREAM_ERROR');
           }
           if (!anthropic) {
             const choice = data.choices?.[0];

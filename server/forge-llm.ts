@@ -90,6 +90,10 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const transport = modelTransport({ ...active.profile, apiKey }, {
         DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
         json: Boolean(req.schema), purpose:req.purpose, outputEffort:req.outputEffort,
+        // Riffle's Anthropic stream relay can fail with an upstream 503 before
+        // any text arrives. Keep streaming only for long artifacts that need
+        // live heartbeats; bounded admin generations use one JSON response.
+        stream: req.purpose === 'game' || req.purpose === 'assets',
         onStart: req.onStart,
         onProgress: req.onProgress,
         onActivity: req.onWait ? (phase, characters) => req.onWait!(phase === 'thinking' ? '模型正在思考，连接正常，尚未输出正文…' : `模型正在输出，已接收 ${characters.toLocaleString('en-US')} 个字符…`) : undefined,
