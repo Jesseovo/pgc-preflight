@@ -867,27 +867,18 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
   const stage = (message: string) => run(env, "UPDATE topics SET product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", message, now(), id, requestId);
   return withTopicLease(env, [id], 'product_status', async () => {
   try {
-    let topic = await getTopic(env, id);
+    const topic = await getTopic(env, id);
     if (topic.product_html?.trim()) return { id, status: 'done' };
     const model = activeModelProfile(await env.modelStore.get(), 'create');
     if (model?.id !== 'opus' || !/^claude-opus-5-5$/i.test(model.profile.model)) throw new HttpError(409, "创作模型已切换，任务已停止；请将创作模型切回 Claude Opus 5.5 后重试。");
     const cfg = await getSettings(env);
-    if (!topic.brief_md?.trim()) {
-      await stage('Opus 正在生成制作简报…');
-      const md = await complete(env, cfg, {
-        system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }), user: briefUser(topic),
-        maxTokens: 8000, timeoutMs: 300000, deadline, idempotencyKey: `pgc-product-brief-${requestId}`, purpose: 'create', requiredProfile: 'opus', maxAttempts: 1, outputEffort: 'low',
-        onWait: message => stage(message || 'Opus 正在生成制作简报…'),
-      });
-      if (!String(md).trim()) throw new Error('模型没有返回制作简报。');
-      await run(env, "UPDATE topics SET brief_md = ?, brief_status = '', brief_error = '', updated_at = ? WHERE id = ? AND product_request_id = ?", cfg.template + String(md).trim() + '\n', now(), id, requestId);
-      topic = await getTopic(env, id);
-    }
+    // Expanded topics already contain the playable core. A full production
+    // brief could exhaust the model before any HTML is made; keep it optional.
     await stage('Opus 正在编写完整 HTML 游戏…');
     const text = await withTopicLease(env, [id], 'product_status', () => complete(env, cfg, {
       system: GAME_SYSTEM,
       user: gameUser(topic, composeBrief(topic), topic.assets_html),
-      maxTokens: 16000,
+      maxTokens: 32768,
       timeoutMs: 300000,
       deadline, idempotencyKey: `pgc-game-${requestId}`, requiredProfile: 'opus', outputFormat: 'html',
       purpose: 'create', maxAttempts: 1, outputEffort: 'low',
@@ -898,7 +889,9 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
     await run(env, "UPDATE topics SET product_html = ?, product_status = '', product_error = '', status = 'made', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", html, now(), id, requestId);
     return { id, status: 'done' };
   } catch (error) {
-    const reason = /模型响应超时/.test(String(error?.message)) ? 'Opus 未能在制作时限内返回完整游戏，本次未保存成品；请稍后重试。' : String(error?.message || error);
+    const message = String(error?.message || error);
+    const reason = /模型响应超时/.test(message) ? 'Opus 未能在制作时限内返回完整游戏，本次未保存成品；请稍后重试。'
+      : /长度上限/.test(message) ? 'Opus 达到本次游戏生成的输出额度，未返回完整 HTML；未保存成品，也未自动重复制作。可点击重试制作。' : message;
     await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", reason.slice(0, 500), now(), id, requestId).catch(() => {});
     throw error;
   }

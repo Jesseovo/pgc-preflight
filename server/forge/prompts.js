@@ -196,7 +196,9 @@ export function gameUser(topic, brief, assetHtml) {
   const match = assets.match(/<script\b[^>]*\bid\s*=\s*(["'])game-assets\1[^>]*>([\s\S]*?)<\/script>/i);
   const assetSource = match?.[2]?.slice(0, 100000) || '';
   const d = topic.data || {};
-  const core = d.core_loop ? JSON.stringify({title:d.title,concept:d.logline,core_loop:String(d.core_loop).slice(0,1000),controls:String(d.controls || '').slice(0,600),art_direction:String(d.art_direction || '').slice(0,700),palette:d.palette,notes:topic.note || ''}) : gameBrief(brief);
+  const core = d.core_loop || !String(brief || '').trim()
+    ? JSON.stringify({title:d.title,concept:d.logline,core_loop:String(d.core_loop || '').slice(0,1000),controls:String(d.controls || topic.gesture || '').slice(0,600),art_direction:String(d.art_direction || topic.medium || '').slice(0,700),palette:d.palette,notes:topic.note || ''})
+    : gameBrief(brief);
   return `Make a small mobile game named ${d.title || 'Untitled'}.\nDesign reference:\n${core}${assetSource ? `\nExisting asset library (use its GAME_ASSETS drawing functions where applicable):\n${assetSource}` : ''}\nDeliver the complete playable HTML first version, under 220 lines excluding the asset library. Preserve the core mechanic, defer later expansion. No explanation.`;
 }
 

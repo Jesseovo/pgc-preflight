@@ -35,4 +35,10 @@ describe('Opus 游戏成品', () => {
     expect(compact).toContain('Hold and release');expect(compact).toContain('Hush then jump');expect(compact).toContain('Paper shadows');
     expect(compact).not.toContain('large table');expect(brief).toContain('large table');
   });
+  it('没有简报时保留选题概念、手势和美术媒介作为制作输入', () => {
+    const prompt = gameUser({data:{title:'Misprint',logline:'Pull a printing press lever.'},gesture:'Drag',medium:'Two-color Riso'}, '', '');
+    expect(prompt).toContain('Pull a printing press lever.');
+    expect(prompt).toContain('Drag');
+    expect(prompt).toContain('Two-color Riso');
+  });
 });

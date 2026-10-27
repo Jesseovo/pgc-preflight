@@ -49,6 +49,18 @@ describe('模型传输',()=>{
     expect(value.items[0].title).toBe('A {B}');
   });
 
+  it('Opus 制作的 32k 预算不会被传输层截成 24k，其他模型仍保留原上限',async()=>{
+    const budgets:number[]=[];
+    vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init?:RequestInit)=>{
+      budgets.push(JSON.parse(String(init?.body)).max_tokens);
+      return Response.json({content:[{type:'text',text:'READY'}],choices:[{message:{content:'READY'}}]});
+    }));
+    await modelTransport({...config,protocol:'anthropic',model:'claude-opus-5-5'},{maxTokens:32768})([]);
+    await modelTransport(config,{maxTokens:32768})([]);
+    await modelTransport({...config,protocol:'anthropic',model:'claude-opus-5-5'},{maxTokens:24000})([]);
+    expect(budgets).toEqual([32768,24000,24000]);
+  });
+
   it('修复尾随逗号时保留字符串里的逗号、括号和转义引号',()=>{
     const copy = 'Use ,} or ,] and "quoted" text';
     const response = `结果：{"items":[{"title":${JSON.stringify(copy)},},]} 完成。`;

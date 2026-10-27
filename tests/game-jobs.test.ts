@@ -67,18 +67,23 @@ describe('Opus 制作任务与成品接口', () => {
     expect((await forgeApi(requestAsMember,env,['topics','9','game'],memberStore)).status).toBe(403);
   });
 
-  it('后台先补简报再制作，重复消费不会再次调用模型', async () => {
+  it('没有简报也直接制作游戏，不隐式生成长简报；重复消费不再调用模型', async () => {
     const { env, request, row, send } = await setup();
-    const fetcher = vi.fn().mockResolvedValueOnce(Response.json({ content: [{ type: 'text', text: '## F. Tiny Garden\nTap to collect lights.' }], stop_reason: 'end_turn' }))
-      .mockResolvedValueOnce(Response.json({ content: [{ type: 'text', text: html }], stop_reason: 'end_turn' }));
+    const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.system).toContain('HTML Canvas games');
+      expect(JSON.stringify(body.messages)).toContain('Tiny Garden');
+      expect(JSON.stringify(body.messages)).toContain('A test game');
+      return Response.json({ content: [{ type: 'text', text: html }], stop_reason: 'end_turn' });
+    });
     vi.stubGlobal('fetch', fetcher);
     await request('POST', ['topics', '9', 'game']);
     const job = send.mock.calls[0][0];
     await processForgeJob(env, job);
     expect(row()).toMatchObject({ status: 'made', product_status: '', product_html: html });
-    expect(row().brief_md).toContain('Tiny Garden');
+    expect(row().brief_md).toBeNull();
     await processForgeJob(env, job);
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenCalledTimes(1);
     for (const call of fetcher.mock.calls) expect(JSON.parse(String((call[1] as RequestInit).body)).output_config).toEqual({effort:'low'});
     const list = await (await request('GET', ['products'])).json();
     expect(list[0]).toMatchObject({ id: 9, has_product: 1 });
@@ -120,7 +125,7 @@ describe('Opus 制作任务与成品接口', () => {
     const { sqlite, env, request, row, send } = await setup();
     sqlite.exec("UPDATE topics SET brief_md = 'Existing brief'");
     const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      expect(JSON.parse(String(init?.body)).max_tokens).toBe(16000);
+      expect(JSON.parse(String(init?.body)).max_tokens).toBe(32768);
       expect(JSON.parse(String(init?.body)).output_config).toEqual({effort:'low'});
       expect(JSON.parse(String(init?.body)).thinking).toEqual({type:'adaptive'});
       return Response.json({ content: [{ type: 'text', text: html }], stop_reason: 'max_tokens' });
@@ -130,6 +135,7 @@ describe('Opus 制作任务与成品接口', () => {
     await expect(processForgeJob(env, send.mock.calls[0][0])).rejects.toThrow('长度上限');
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(row()).toMatchObject({ product_status: 'error', product_html: null });
+    expect(row().product_error).toContain('游戏生成的输出额度');
   });
 
   it('已生成成品可以安全预览并单独读取源码', async () => {

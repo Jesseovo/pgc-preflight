@@ -62,7 +62,10 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
 export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onProgress?: (characters: number) => Promise<void>; json?: boolean; reasoningEffort?: 'low'; outputEffort?: 'low' } = {}): ModelTransport {
   const throttle = createModelThrottle(options.DB, config);
   return async messages => {
-    const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), 24000);
+    // Opus game requests need room for adaptive thinking and the HTML together.
+    // Other models and existing 24k review requests keep their original limits.
+    const limit = config.protocol === 'anthropic' && config.model === 'claude-opus-5-5' ? 32768 : 24000;
+    const maxTokens = Math.min(Math.max(options.maxTokens || 2200, 256), limit);
     const anthropic = config.protocol === 'anthropic';
     const deepseek = !anthropic && new URL(config.baseUrl).hostname === 'api.deepseek.com';
     const controller = new AbortController();
