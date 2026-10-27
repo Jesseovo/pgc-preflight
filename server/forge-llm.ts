@@ -1,6 +1,6 @@
 import { activeModelProfile, decryptKey } from './settings';
 import type { ModelConfig, ModelPurpose } from './settings';
-import { modelTransport, ModelOutputError, ModelHttpError } from './model';
+import { modelTransport, ModelOutputError } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
 import { inferenceOptions } from '../src/model-options';
 
@@ -87,13 +87,20 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const attemptMessages = retryHint ? [...messages, { role: 'user', content: retryHint }] : messages;
       const idempotencyKey = await keyedRequestId(req.idempotencyKey, attemptMessages);
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
+      const stream = req.purpose === 'game' || req.purpose === 'assets';
+      const remaining = Math.max(1, deadline - Date.now());
       const transport = modelTransport({ ...active.profile, apiKey }, {
-        DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
+        DB: env.DB, maxTokens,
+        // A non-streaming request has no activity until the entire artifact
+        // is ready. It must use the durable task deadline, not the 5-minute
+        // idle timer intended for streams that send keep-alives.
+        timeoutMs: env.generation && !stream ? remaining : req.timeoutMs || 90000,
+        totalTimeoutMs: remaining, idempotencyKey: attemptKey,
         json: Boolean(req.schema), purpose:req.purpose, outputEffort:req.outputEffort,
         // Riffle's Anthropic stream relay can fail with an upstream 503 before
         // any text arrives. Keep streaming only for long artifacts that need
         // live heartbeats; bounded admin generations use one JSON response.
-        stream: req.purpose === 'game' || req.purpose === 'assets',
+        stream,
         onStart: req.onStart,
         onProgress: req.onProgress,
         onActivity: req.onWait ? (phase, characters) => req.onWait!(phase === 'thinking' ? '模型正在思考，连接正常，尚未输出正文…' : `模型正在输出，已接收 ${characters.toLocaleString('en-US')} 个字符…`) : undefined,
@@ -102,7 +109,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
           await env.DB.prepare('INSERT INTO model_runs (id,profile_id,model,purpose,status,effort,max_tokens,input_tokens,output_tokens,reasoning_tokens,first_text_ms,elapsed_ms,characters,finish_reason,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
             .bind(crypto.randomUUID(),active.id,active.profile.model,req.purpose || 'create',metrics.status,metrics.effort,metrics.maxTokens,metrics.inputTokens,metrics.outputTokens,metrics.reasoningTokens,metrics.firstTextMs,metrics.elapsedMs,metrics.characters,metrics.finishReason,metrics.error,new Date().toISOString()).run();
         },
-        onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
+        onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'unavailable' ? '模型上游暂时繁忙，正在等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
       try {
         const text = await transport(attemptMessages);
@@ -116,10 +123,9 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = !env.generation && /模型返回的不是合法 JSON/.test(message);
         const outputFailure = !env.generation && error instanceof ModelOutputError && error.kind !== 'incomplete';
-        // HTTP 429 and explicitly pending 409 requests are retried by transport.
-        // A second retry loop would multiply requests and hit the key again.
-        const busy = error instanceof ModelHttpError && error.upstreamStatus === 503;
-        if (attempt + 1 >= attempts || deadline - Date.now() < 30000 || (!parseFailure && !outputFailure && !busy)) throw error;
+        // All HTTP retry decisions belong to transport. A second retry loop
+        // would multiply 503 calls and replay interrupted paid generations.
+        if (attempt + 1 >= attempts || deadline - Date.now() < 30000 || (!parseFailure && !outputFailure)) throw error;
         if (parseFailure || outputFailure) {
           freshRequest = true;
           retryHint = req.outputFormat === 'html'

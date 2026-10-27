@@ -199,17 +199,32 @@ describe('模型传输',()=>{
     ])).resolves.toBe('READY');
   });
 
-  it('SSE 内的上游 503 会被识别并在没有正文时有限重试',async()=>{
-    vi.useFakeTimers();
+  it.each(['', 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\n'])('SSE 内的上游 503 不重放已开始的生成，包括同一数据块中的正文',async(prefix)=>{
+    const onMetrics = vi.fn();
     const fetchMock = vi.fn(async()=>{
-      if (fetchMock.mock.calls.length === 1) return new Response(
-        'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Anthropic 渠道返回 503"}}\n\n',
+      return new Response(
+        prefix + 'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Anthropic 渠道返回 503"}}\n\n',
         {headers:{'Content-Type':'text/event-stream','Retry-After':'0'}},
       );
+    });
+    vi.stubGlobal('fetch',fetchMock);
+    const result = modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{stream:false,totalTimeoutMs:30_000,onMetrics})([
+      {role:'user',content:'test'},
+    ]);
+    await expect(result).rejects.toMatchObject({upstreamStatus:503,retryable:false});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onMetrics).toHaveBeenCalledWith(expect.objectContaining({characters:prefix ? 7 : 0,status:'error'}));
+  });
+
+  it('明确拒绝的 HTTP 503 使用原幂等键退避，恢复后交付结果',async()=>{
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async(_url:unknown,init?:RequestInit)=>{
+      expect((init?.headers as Record<string,string>)['Idempotency-Key']).toBe('same-request');
+      if (fetchMock.mock.calls.length === 1) return Response.json({error:{code:'service_unavailable',message:'temporarily unavailable'}},{status:503});
       return Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'});
     });
     vi.stubGlobal('fetch',fetchMock);
-    const result = modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{stream:false,totalTimeoutMs:30_000})([
+    const result = modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{stream:false,totalTimeoutMs:30_000,idempotencyKey:'same-request'})([
       {role:'user',content:'test'},
     ]);
     await vi.advanceTimersByTimeAsync(15_000);
@@ -217,19 +232,11 @@ describe('模型传输',()=>{
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('HTTP 502 包装的 UPSTREAM_STREAM_ERROR 会按上游 503 重试',async()=>{
-    vi.useFakeTimers();
-    const fetchMock = vi.fn(async()=>{
-      if (fetchMock.mock.calls.length === 1) return Response.json({error:{code:'UPSTREAM_STREAM_ERROR',message:'Anthropic 渠道返回 503'}},{status:502});
-      return Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'});
-    });
+  it.each([502,503])('HTTP %i 包装的 UPSTREAM_STREAM_ERROR 明确结果未知，不触发 409 重放',async(status)=>{
+    const fetchMock=vi.fn(async()=>Response.json({error:{code:'UPSTREAM_STREAM_ERROR',message:'Anthropic 渠道返回 503'}},{status}));
     vi.stubGlobal('fetch',fetchMock);
-    const result = modelTransport({baseUrl:'https://riffle.example',model:'claude-opus-5-5',protocol:'anthropic',apiKey:'test-only-api-key'},{stream:false,totalTimeoutMs:30_000})([
-      {role:'user',content:'test'},
-    ]);
-    await vi.advanceTimersByTimeAsync(15_000);
-    await expect(result).resolves.toBe('READY');
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(modelTransport({...config,protocol:'anthropic'},{idempotencyKey:'interrupted'})([])).rejects.toMatchObject({upstreamStatus:503,retryable:false});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('DeepSeek流式读取思考与正文，只有报告正文返回给调用方',async()=>{

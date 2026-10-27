@@ -133,16 +133,40 @@ describe('后台创作的持久任务',()=>{
     }
   });
 
-  it('SSE渠道503在没有正文时按幂等键有限重试，恢复后完成任务',async()=>{
+  it('SSE渠道503明确结束任务，complete 不再重放结果未知的请求',async()=>{
     const s=await setup();
     const fetcher=vi.fn(async(..._args: any[])=>fetcher.mock.calls.length === 1
       ? new Response('event: error\ndata: {"type":"error","error":{"type":"api_error","message":"Anthropic 渠道返回 503"}}\n\n',{headers:{'Content-Type':'text/event-stream'}})
       : response('{"ok":true}'));
     vi.stubGlobal('fetch',fetcher);
     const result=complete(s.env,{}, {system:'s',user:'u',purpose:'preview',idempotencyKey:'stream-503'});
-    await expect(result).resolves.toBe('{"ok":true}');
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    expect((fetcher.mock.calls[0]?.[1]?.headers as Record<string,string>)['Idempotency-Key'])
-      .toBe((fetcher.mock.calls[1]?.[1]?.headers as Record<string,string>)['Idempotency-Key']);
+    await expect(result).rejects.toThrow('本次结果未知');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('非流式简报超过五分钟仍可完成，不误触流式空闲超时',async()=>{
+    const s=await setup();vi.useFakeTimers();
+    const row=await enqueueForgeTask(s.env,{type:'brief',id:9});
+    const fetcher=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+      expect(JSON.parse(String(init?.body)).stream).toBe(false);
+      await new Promise(resolve=>setTimeout(resolve,360000));
+      return response('## F. 游戏设计\n慢速但完整的简报');
+    });vi.stubGlobal('fetch',fetcher);
+    const result=executeForgeTask(s.env,row.id);
+    await vi.waitFor(()=>expect(fetcher).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(360000);await result;
+    expect(s.task(row.id).status).toBe('done');expect(s.row().brief_md).toContain('慢速但完整');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('非流式调用即使永不回应，也在总期限内结束并保存可重试错误',async()=>{
+    const s=await setup();vi.useFakeTimers();
+    const row=await enqueueForgeTask(s.env,{type:'brief',id:9});
+    const fetcher=vi.fn(()=>new Promise<Response>(()=>{}));vi.stubGlobal('fetch',fetcher);
+    const result=executeForgeTask(s.env,row.id);
+    await vi.waitFor(()=>expect(fetcher).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(12*60000+100);await result;
+    expect(s.task(row.id)).toMatchObject({status:'error',error:expect.stringContaining('超时')});
+    expect(s.row().brief_status).toBe('error');expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

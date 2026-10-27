@@ -39,7 +39,7 @@ function anthropicText(data: any) {
 }
 
 export class ModelHttpError extends Error {
-  constructor(message: string, public upstreamStatus: number, public retryMs?: number, public code = '') { super(message); }
+  constructor(message: string, public upstreamStatus: number, public retryMs?: number, public code = '', public retryable = upstreamStatus === 429 || upstreamStatus === 503) { super(message); }
 }
 export class ModelOutputError extends Error {
   constructor(message: string, public kind: 'empty' | 'truncated' | 'incomplete' | 'format') { super(message); }
@@ -79,19 +79,23 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
   const code = String(detail?.error?.code || detail?.error?.type || '');
   const raw = redact(String(detail?.error?.message || ''), apiKey);
   const wait = retryAfterMs(response.headers.get('retry-after'));
-  // Riffle sometimes wraps an Anthropic 503 in an HTTP 502 envelope. It is
-  // retryable only when the body explicitly identifies the upstream failure;
-  // unrelated 502 responses remain non-retryable because their outcome is
-  // ambiguous.
-  const wrapped503 = response.status === 502 && /(?:UPSTREAM_STREAM_ERROR|\b503\b|service[_ -]?unavailable|temporarily unavailable)/i.test(`${code} ${raw}`);
+  // A failed stream may already have consumed tokens upstream. In production
+  // Riffle turns a replay of UPSTREAM_STREAM_ERROR into
+  // REQUEST_OUTCOME_UNCERTAIN, even if its message mentions 503. Preserve the
+  // useful status for diagnostics without treating it as a rejected request.
+  const streamFailure = code === 'UPSTREAM_STREAM_ERROR';
+  const wrapped503 = response.status === 502 && /(?:\b503\b|service[_ -]?unavailable|temporarily unavailable)/i.test(raw);
   const status = wrapped503 ? 503 : response.status;
   return new ModelHttpError(response.status === 429
     ? `模型接口限流（429）${raw ? `：${raw}` : '，请求过多，请等待后重试。'}`
     : response.status === 409
       ? `模型网关请求冲突（409）${raw ? `：${raw}` : '，这次请求未完成，请稍后重试。'}${code ? ` [${code}]` : ''}`
+    : streamFailure
+      ? `模型上游在生成中断开，本次结果未知，请手动重试${raw ? `：${raw}` : '。'} [${code}]`
     : status === 503
       ? `模型网关上游暂时不可用（503）${raw ? `：${raw}` : '，请稍后重试。'}${code ? ` [${code}]` : ''}`
-    : `模型接口返回 ${response.status}${raw ? `：${raw}` : '。请检查模型配置、额度和图片输入支持。'}${code ? ` [${code}]` : ''}`, status, wait, code);
+    : `模型接口返回 ${response.status}${raw ? `：${raw}` : '。请检查模型配置、额度和图片输入支持。'}${code ? ` [${code}]` : ''}`, status, wait, code,
+    !streamFailure && !wrapped503 && (response.status === 429 || response.status === 503));
 }
 
 export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string; stream?: boolean } = {}): ModelTransport {
@@ -163,24 +167,24 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           if (data.type === 'error' || data.error) {
             const code = String(data.error?.code || data.error?.type || '');
             const detail = redact(String(data.error?.message || ''), config.apiKey);
-            // Some compatible gateways return a 503 from the upstream inside
-            // an SSE event, even when the request asked for stream:false.
-            // Preserve that status so the outer retry policy can safely retry
-            // only before any model text has arrived.
+            // HTTP 200 plus an error event is an interrupted generation, not
+            // a rejected HTTP request. No automatic replay, even if the
+            // gateway never forwarded its upstream thinking or text.
             const upstream503 = /(?:\b503\b|service[_ -]?unavailable|temporarily unavailable)/i.test(`${code} ${detail}`);
             const busy = /rate_limit|overloaded|(?:\b429\b|too many requests)/i.test(`${code} ${detail}`);
             const status = busy ? 429 : upstream503 ? 503 : 502;
             throw new ModelHttpError((busy
-              ? '模型接口限流（429），流式生成已被网关中断，正在等待重试。'
+              ? '模型接口限流（429），生成连接已中断，请手动重试。'
               : upstream503
-                ? '模型网关上游暂时不可用（503），流式生成已被网关中断，正在等待重试。'
-                : '模型流式生成被接口中断：上游暂时不可用；本次请求结果未知，请稍后手动重试。') + (detail ? ` ${detail}` : ''), status, upstream503 ? 1000 : undefined, code || 'UPSTREAM_STREAM_ERROR');
+                ? '模型网关上游暂时不可用（503），生成连接已中断，本次结果未知，请手动重试。'
+                : '模型流式生成被接口中断：上游暂时不可用；本次请求结果未知，请稍后手动重试。') + (detail ? ` ${detail}` : ''), status, undefined, code || 'UPSTREAM_STREAM_ERROR', false);
           }
           if (!anthropic) {
             const choice = data.choices?.[0];
             if (choice?.finish_reason) metrics.finishReason = choice.finish_reason;
             if (choice?.finish_reason === 'length') truncated = true;
             if (typeof choice?.delta?.content === 'string') content += choice.delta.content;
+            metrics.characters = content.length;
             if (choice?.delta?.reasoning_content) { thinking = true; metrics.thinkingCharacters += choice.delta.reasoning_content.length; }
             return Boolean(choice?.delta?.content || choice?.delta?.reasoning_content);
           }
@@ -189,6 +193,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           if (data.type === 'message_delta' && data.delta?.stop_reason === 'max_tokens') truncated = true;
           if (data.type !== 'content_block_delta') return false;
           if (data.delta?.type === 'text_delta') content += String(data.delta.text || '');
+          metrics.characters = content.length;
           if (data.delta?.type === 'thinking_delta') { thinking = true; metrics.thinkingCharacters += String(data.delta.thinking || '').length; }
           return ['text_delta','thinking_delta','signature_delta'].includes(data.delta?.type);
         };
@@ -206,6 +211,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
             while ((newline = buffer.indexOf('\n')) >= 0) {
               const line = buffer.slice(0, newline).replace(/\r$/, ''); buffer = buffer.slice(newline + 1);
               if (event(line)) touch();
+              if (ended) { buffer = ''; break; }
             }
             metrics.characters = content.length;
             if (content.length && metrics.firstTextMs === null) metrics.firstTextMs = Date.now() - started;
@@ -246,17 +252,22 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       return content;
     };
     try {
-      for (let attempt = 0; ; attempt++) {
+      let retries = 0;
+      for (;;) {
         try { const result = await once(); metrics.status = 'ok'; return result; }
         catch (error) {
           clearTimeout(timeout);
-          const pendingRequest = error instanceof ModelHttpError && error.upstreamStatus === 409 && /IDEMPOTENCY_(IN_PROGRESS|PENDING)|REQUEST_(IN_PROGRESS|PENDING)|INFLIGHT/i.test(error.code);
-          const retryableTransport = error instanceof ModelHttpError && (error.upstreamStatus === 429 || error.upstreamStatus === 503);
+          const pendingRequest = Boolean(options.idempotencyKey) && error instanceof ModelHttpError && error.upstreamStatus === 409 && /^(?:IDEMPOTENCY_(?:IN_PROGRESS|PENDING)|REQUEST_(?:IN_PROGRESS|PENDING)|INFLIGHT)$/i.test(error.code);
+          const retryableTransport = error instanceof ModelHttpError && error.retryable;
           if (!(error instanceof ModelHttpError) || metrics.characters > 0 || metrics.thinkingCharacters > 0 || (!pendingRequest && !retryableTransport) || /quota|balance|credit|billing/i.test(error.code)) throw error;
-          const wait = Math.max(1000, error.retryMs ?? 15000 * 2 ** attempt);
+          // Pending polls only retrieve the original request. Let a slow Opus
+          // finish within the task deadline rather than failing after four
+          // polls. Rejected HTTP calls still have at most three retries.
+          const wait = Math.max(1000, error.retryMs ?? (pendingRequest ? 15000 : 15000 * 2 ** retries));
           if (!pendingRequest) await abortable(throttle.cooldown(wait), controller.signal);
-          if (attempt >= 3 || Date.now() + wait + 1000 >= deadline) throw error;
-          if (options.onWait) await abortable(Promise.resolve(options.onWait(wait, pendingRequest ? 'pending' : 'rate_limit')), controller.signal);
+          if ((!pendingRequest && retries >= 3) || Date.now() + wait + 1000 >= deadline) throw error;
+          if (!pendingRequest) retries++;
+          if (options.onWait) await abortable(Promise.resolve(options.onWait(wait, pendingRequest ? 'pending' : error.upstreamStatus === 503 ? 'unavailable' : 'rate_limit')), controller.signal);
           await pauseModel(wait, controller.signal);
         }
       }

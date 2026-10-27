@@ -105,6 +105,52 @@ describe('模型限流与恢复', () => {
     expect(waiting).toHaveBeenCalledWith(12000, 'pending');
   });
 
+  it('同一请求慢于四次轮询时继续等原结果，仍遵守总期限', async () => {
+    vi.useFakeTimers();
+    const fetchMock=vi.fn(async(_url:unknown,init?:RequestInit)=>{
+      expect((init?.headers as any)['Idempotency-Key']).toBe('slow-request');
+      return fetchMock.mock.calls.length<=6
+        ? Response.json({error:{code:'REQUEST_IN_PROGRESS',message:'still processing'}},{status:409,headers:{'Retry-After':'15'}})
+        : Response.json({content:[{type:'text',text:'READY'}]});
+    });
+    vi.stubGlobal('fetch',fetchMock);
+    const result=modelTransport(config,{idempotencyKey:'slow-request',totalTimeoutMs:120000})([]);
+    await vi.advanceTimersByTimeAsync(90000);
+    await expect(result).resolves.toBe('READY');
+    expect(fetchMock).toHaveBeenCalledTimes(7);
+  });
+
+  it.each(['REQUEST_OUTCOME_UNCERTAIN','KEY_BUDGET_RESERVED','UNKNOWN_REQUEST_PENDING'])('冲突 %s 不被当作可恢复排队',async(code)=>{
+    const fetchMock=vi.fn(async()=>Response.json({error:{code,message:'cannot replay'}},{status:409}));
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(modelTransport(config,{idempotencyKey:'uncertain-request'})([])).rejects.toMatchObject({code});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('503 只在传输层最多重试三次，不在 complete 外层叠加',async()=>{
+    vi.useFakeTimers();
+    const fetchMock=vi.fn(async()=>Response.json({error:{code:'service_unavailable',message:'busy'}},{status:503,headers:{'Retry-After':'1'}}));
+    vi.stubGlobal('fetch',fetchMock);
+    const encryptedKey=await encryptKey(config.apiKey,'fixture-secret');
+    const result=complete({SETTINGS_KEY:'fixture-secret',modelStore:{get:async()=>({...config,encryptedKey,enabled:true})}}, {}, {system:'test',user:'test',idempotencyKey:'same-request'});
+    const check=expect(result).rejects.toThrow('503');
+    await vi.waitFor(()=>expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5000);await check;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('没有幂等键的 409 不重发；待处理请求到期后结束等待',async()=>{
+    vi.useFakeTimers();
+    const fetchMock=vi.fn(async()=>Response.json({error:{code:'REQUEST_IN_PROGRESS'}},{status:409,headers:{'Retry-After':'10'}}));
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(modelTransport(config)([])).rejects.toMatchObject({upstreamStatus:409});
+    expect(fetchMock).toHaveBeenCalledTimes(1);fetchMock.mockClear();
+    const result=modelTransport(config,{idempotencyKey:'pending-request',totalTimeoutMs:25000})([]);
+    const check=expect(result).rejects.toMatchObject({upstreamStatus:409});
+    await vi.advanceTimersByTimeAsync(25000);await check;
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it('流式错误和被截断的正文不能作为成功内容返回', async () => {
     const stream = (tail: string) => new Response(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}\n\ndata: ${tail}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
     vi.stubGlobal('fetch', vi.fn(async () => stream('{"type":"error","error":{"type":"api_error"}}')));

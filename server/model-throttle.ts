@@ -1,7 +1,7 @@
 import type { ModelRuntime } from './settings';
 
 export interface ModelThrottleDatabase { prepare(sql: string): { bind(...values: unknown[]): { first(): Promise<any>; run(): Promise<any> } } }
-export type ModelWait = (milliseconds: number, reason: 'pace' | 'rate_limit' | 'pending') => Promise<void> | void;
+export type ModelWait = (milliseconds: number, reason: 'pace' | 'rate_limit' | 'pending' | 'unavailable') => Promise<void> | void;
 export function pauseModel(ms: number, signal?: AbortSignal) {
   return new Promise<void>((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return; }
