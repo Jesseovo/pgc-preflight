@@ -47,43 +47,45 @@ describe('模型按用途分配',()=>{
     expect(get()?.profiles?.deepseek?.vision).toBe(false);
     expect(publicConfig(get()).profiles.opus.vision).toBe(true);
   });
-  it('同一模型的多把 Key 独立保存，逐环节覆盖和继承均发送正确的 Key',async()=>{
+  it('同一模型的多把 Key 独立保存，审核和其他功能各用所选 Key，并清理旧细分设置',async()=>{
     const {store,get}=await twoProfiles();
     const saveExtra=(id:string,key='extra-fixture-key')=>saveConfig({profile:id,name:'Additional model',protocol:'anthropic',baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',apiKey:key},store,SECRET);
     await saveExtra('studio-key');
     const encrypted=get()!.profiles!['studio-key']!.encryptedKey;
     await saveExtra('studio-key','');
     expect(get()!.profiles!['studio-key']!.encryptedKey).toBe(encrypted);
-    await saveRoutes({review:'opus',create:'opus',review_verify:'studio-key',game:'studio-key',brief:'studio-key'},store);
+    await store.set({...get()!,routes:{review:'opus',create:'opus',review_verify:'opus',game:'studio-key',brief:'studio-key'}});
+    await saveRoutes({review:'studio-key',create:'opus'},store);
+    expect(get()!.routes).toEqual({review:'studio-key',create:'opus'});
     const fetcher=vi.fn(async()=>Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'}));
     vi.stubGlobal('fetch',fetcher);
     for(const purpose of MODEL_PURPOSES) {
       await expect(complete({modelStore:store,SETTINGS_KEY:SECRET},{},{system:'s',user:'test',purpose})).resolves.toBe('READY');
       const headers=new Headers((fetcher.mock.calls.at(-1) as any)[1].headers);
-      expect(headers.get('x-api-key')).toBe(['review_verify','game','brief'].includes(purpose)?'extra-fixture-key':'opus-key');
+      expect(headers.get('x-api-key')).toBe(['review','review_verify'].includes(purpose)?'extra-fixture-key':'opus-key');
     }
     const view=publicConfig(get());
     expect(view.profiles['studio-key']).toMatchObject({name:'Additional model',hasKey:true});
     expect(JSON.stringify(view)).not.toMatch(/extra-fixture-key|encryptedKey/);
-    await saveRoutes({game:'',review_verify:''},store);
+    await saveRoutes({review:''},store);
     expect(activeModelProfile(get(),'game')?.id).toBe('opus');
-    expect(activeModelProfile(get(),'review_verify')?.id).toBe('opus');
-    expect(activeModelProfile(get(),'brief')?.id).toBe('studio-key');
+    expect(activeModelProfile(get(),'review_verify')?.id).toBe('deepseek');
+    expect(activeModelProfile(get(),'brief')?.id).toBe('opus');
   });
   it('分配和默认切换原子保存，禁止删除使用中配置或选择停用模型',async()=>{
     const {store,get}=await twoProfiles();
-    await saveRoutes({brief:'opus',activeProfile:'opus'},store);
+    await saveRoutes({create:'opus',activeProfile:'opus'},store);
     await expect(deleteProfile('opus',store)).rejects.toThrow('正在被使用');
     await saveRoutes({activeProfile:'deepseek'},store);
     await expect(deleteProfile('opus',store)).rejects.toThrow('正在被使用');
-    await saveRoutes({brief:''},store);
+    await saveRoutes({create:''},store);
     await deleteProfile('opus',store);
     expect(get()?.profiles?.opus).toBeUndefined();
     const before=get();
-    await expect(saveRoutes({review:'deepseek',game:'missing',activeProfile:'missing'},store)).rejects.toThrow();
+    await expect(saveRoutes({review:'deepseek',create:'missing',activeProfile:'missing'},store)).rejects.toThrow();
     expect(get()).toBe(before);
     await saveConfig({profile:'disabled-model',baseUrl:'https://test.example',model:'text',apiKey:'fixture',enabled:false},store,SECRET);
-    await expect(saveRoutes({game:'disabled-model'},store)).rejects.toThrow('启用');
+    await expect(saveRoutes({create:'disabled-model'},store)).rejects.toThrow('启用');
     for(const profile of ['__proto__','constructor','Bad ID']) await expect(saveConfig({profile,baseUrl:'https://test.example',model:'text',apiKey:'fixture'},store,SECRET)).rejects.toThrow('标识');
   });
 });

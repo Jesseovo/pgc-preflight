@@ -112,10 +112,10 @@ describe('Opus 制作任务与成品接口', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('制作使用独立环节模型，停用模型或非候选游戏不能制作', async () => {
+  it('制作用其他功能的模型，停用模型或非候选游戏不能制作', async () => {
     const game = await setup();
     await saveConfig({profile:'game-writer',baseUrl:'https://writer.example/v1',model:'game-model',apiKey:'game-only-key'},game.env.modelStore,secrets.SETTINGS_KEY);
-    await saveRoutes({game:'game-writer'},game.env.modelStore);
+    await saveRoutes({create:'game-writer'},game.env.modelStore);
     const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
       expect(url).toBe('https://writer.example/v1/chat/completions');
       expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer game-only-key');

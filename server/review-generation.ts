@@ -5,7 +5,7 @@ import { reviewReportErrors } from './review-report';
 type Environment = Parameters<typeof complete>[0];
 type Request = Pick<Parameters<typeof complete>[2], 'system' | 'user' | 'maxTokens' | 'idempotencyKey' | 'onWait'>;
 
-// Both stages use the same evidence, with independently configurable models. Only the model may revise
+// Both stages use the same evidence and the AI review model. Only the model may revise
 // its scores; a failed verification must never publish the unchecked draft.
 export async function generateReview(env: Environment, cfg: Record<string, string>, request: Request) {
   const deadline = Date.now() + 12 * 60 * 1000;

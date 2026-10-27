@@ -738,7 +738,7 @@ async function startGameJob(env: ForgeEnv, id: number) {
   if (!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
   const model = activeModelProfile(await env.modelStore.get(), 'game');
   if (!model?.profile.enabled || !model.profile.encryptedKey) {
-    throw new HttpError(409, "请先在管理员模型配置中启用并分配游戏制作模型。");
+    throw new HttpError(409, "请先在管理员模型配置中为其他功能选择已启用的模型。");
   }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
   const requestId = crypto.randomUUID();
@@ -874,7 +874,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
     const topic = await getTopic(env, id);
     if (topic.product_html?.trim()) return { id, status: 'done' };
     const model = activeModelProfile(await env.modelStore.get(), 'game');
-    if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "游戏制作模型未启用，请在管理页配置后重试。");
+    if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "其他功能使用的模型未启用，请在管理页配置后重试。");
     const cfg = await getSettings(env);
     // Expanded topics already contain the playable core. A full production
     // brief could exhaust the model before any HTML is made; keep it optional.

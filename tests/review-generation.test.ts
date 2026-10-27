@@ -39,16 +39,16 @@ describe('模型评分依据复核', () => {
     expect(complete).toHaveBeenCalledTimes(2);
   });
 
-  it('不同审核模型各自使用输出预算，限流反馈保留复核阶段', async () => {
+  it('初评与复核使用同一审核模型及输出预算，忽略旧细分设置，限流反馈保留复核阶段', async () => {
     const profile = { baseUrl: 'https://fixture.example', protocol: 'openai' as const, encryptedKey: 'fixture', enabled: true, updatedAt: '' };
-    const separate = { SETTINGS_KEY: 'fixture', modelStore: { get: async () => ({ ...profile, model: 'vision-model', activeProfile: 'vision', profiles: { vision: { ...profile, model: 'vision-model' }, text: { ...profile, model: 'deepseek-chat' } }, routes: { review: 'vision', review_verify: 'text' } }) } };
+    const separate = { SETTINGS_KEY: 'fixture', modelStore: { get: async () => ({ ...profile, model: 'vision-model', activeProfile: 'vision', profiles: { vision: { ...profile, model: 'vision-model' }, text: { ...profile, model: 'deepseek-chat' } }, routes: { review: 'text', review_verify: 'vision' } }) } };
     const onWait = vi.fn(async () => {});
     vi.mocked(complete).mockResolvedValueOnce({ aes: 2, ease: 2, play: 2 }).mockImplementationOnce(async (_env, _cfg, req) => {
       await req.onWait?.('模型接口限流，正在等待恢复');
       return { aes: 2, ease: 2, play: 3 };
     });
     await generateReview(separate, {}, { system: 's', user: 'evidence', maxTokens: 16000, onWait });
-    expect(vi.mocked(complete).mock.calls.map(call => call[2].maxTokens)).toEqual([16000, 24000]);
+    expect(vi.mocked(complete).mock.calls.map(call => call[2].maxTokens)).toEqual([24000, 24000]);
     expect(onWait).toHaveBeenLastCalledWith(expect.stringMatching(/复核评分依据.*限流/));
   });
 

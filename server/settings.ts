@@ -2,9 +2,9 @@ export type ModelProtocol = 'openai' | 'anthropic';
 export type ModelProfileId = string;
 // `vision: false` marks a text-only model: review then sends no screenshots.
 export interface StoredModelProfile { name?: string; baseUrl: string; model: string; protocol: ModelProtocol; encryptedKey: string; enabled: boolean; updatedAt: string; vision?: boolean }
-// What a model call is for. Each purpose can be routed to its own profile;
-// an unrouted purpose follows the active profile.
+// Stages keep their own budgets and progress, but share just two model groups.
 export const MODEL_PURPOSES = ['review', 'review_verify', 'create', 'expand', 'brief', 'assets', 'preview', 'game', 'tags', 'vocab'] as const;
+const MODEL_GROUPS = ['review', 'create'] as const;
 export type ModelPurpose = typeof MODEL_PURPOSES[number];
 export type ModelRoutes = Partial<Record<ModelPurpose, ModelProfileId>>;
 // The top-level fields keep old rows and callers compatible. New rows also
@@ -73,7 +73,8 @@ export function modelProfiles(config: ModelConfig | null): Partial<Record<ModelP
 
 export function activeModelProfile(config: ModelConfig | null, purpose?: ModelPurpose): { id: ModelProfileId; profile: StoredModelProfile } | null {
   const profiles = modelProfiles(config);
-  const routed = purpose ? config?.routes?.[purpose] || (purpose === 'review_verify' ? config?.routes?.review : purpose === 'review' ? undefined : config?.routes?.create) : undefined;
+  const group = purpose === 'review' || purpose === 'review_verify' ? 'review' : 'create';
+  const routed = purpose ? config?.routes?.[group] : undefined;
   if (routed && profiles[routed]) return { id: routed, profile: profiles[routed]! };
   const preferred = config?.activeProfile && profiles[config.activeProfile] ? config.activeProfile : Object.keys(profiles)[0];
   const profile = profiles[preferred];
@@ -91,8 +92,8 @@ export async function saveRoutes(body: unknown, store: ConfigStore): Promise<Mod
   const raw = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
   const previous = await store.get();
   const profiles = modelProfiles(previous);
-  const routes: ModelRoutes = { ...previous?.routes };
-  for (const purpose of MODEL_PURPOSES) {
+  const routes: ModelRoutes = Object.fromEntries(MODEL_GROUPS.filter(group => previous?.routes?.[group]).map(group => [group, previous!.routes![group]]));
+  for (const purpose of MODEL_GROUPS) {
     const value = raw[purpose];
     if (!Object.hasOwn(raw, purpose)) continue;
     if (value === '' || value == null) { delete routes[purpose]; continue; }
@@ -147,7 +148,7 @@ export async function deleteProfile(value: unknown, store: ConfigStore): Promise
   const previous = await store.get();
   const profiles = modelProfiles(previous);
   if (!profiles[id]) throw new Error('模型配置不存在。');
-  if (activeModelProfile(previous)?.id === id || Object.values(previous?.routes || {}).includes(id)) throw new Error('该模型正在被使用，请先更换默认模型和环节分配。');
+  if ([activeModelProfile(previous)?.id, ...MODEL_GROUPS.map(group => activeModelProfile(previous, group)?.id)].includes(id)) throw new Error('该模型正在被使用，请先更换 AI 审核和其他功能的模型选择。');
   delete profiles[id];
   const config = configWithProfiles(profiles, previous!.activeProfile || Object.keys(profiles)[0], previous?.routes);
   await store.set(config);
@@ -160,7 +161,7 @@ export function publicConfig(config: ModelConfig | null) {
     const p = profiles[id];
     return [id, p ? { name: p.name || PROFILE_DEFAULTS[id]?.name || p.model, baseUrl: p.baseUrl, model: p.model, protocol: p.protocol || 'openai', enabled: p.enabled, vision: p.vision !== false, hasKey: !!p.encryptedKey, updatedAt: p.updatedAt } : { ...PROFILE_DEFAULTS[id], enabled: true, vision: true, hasKey: false, updatedAt: '' }];
   }));
-  const routes = Object.fromEntries(MODEL_PURPOSES.map(purpose => [purpose, config?.routes?.[purpose] || '']));
+  const routes = Object.fromEntries(MODEL_GROUPS.map(group => [group, config?.routes?.[group] || '']));
   const effective = Object.fromEntries(MODEL_PURPOSES.map(purpose => [purpose, activeModelProfile(config, purpose)?.id || '']));
   return { baseUrl: active?.profile.baseUrl || '', model: active?.profile.model || '', protocol: active?.profile.protocol || 'openai', enabled: active?.profile.enabled ?? true, hasKey: !!active?.profile.encryptedKey, updatedAt: active?.profile.updatedAt || '', activeProfile: active?.id || 'deepseek', profiles: publicProfiles, routes, effective };
 }

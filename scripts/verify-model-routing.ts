@@ -4,7 +4,7 @@ import {readFile,mkdir} from 'node:fs/promises';
 import {resolve,sep} from 'node:path';
 import {launchLocalBrowser} from '../server/local-browser';
 import {adminApi} from '../server/admin-api';
-import {saveConfig,saveRoutes,decryptKey} from '../server/settings';
+import {saveConfig,saveRoutes,decryptKey,activeModelProfile,MODEL_PURPOSES} from '../server/settings';
 import type {ModelConfig,ConfigStore} from '../server/settings';
 import type {MemberStore} from '../server/members';
 
@@ -51,10 +51,12 @@ try {
   const id=Object.keys(config!.profiles!).find(id=>id.startsWith('model-'))!;assert(id);
   assert.equal(await decryptKey(config!.profiles![id]!.encryptedKey,secrets.SETTINGS_KEY),'fixture-studio-secret');
   assert.equal(await page.$eval('#api-key',e=>(e as HTMLInputElement).value),'');
-  await page.select('[data-route="review_verify"]',id);await page.select('[data-route="game"]',id);await page.select('[data-route="brief"]','opus');
+  assert.equal(await page.$$eval('[data-route]',nodes=>nodes.length),2,'Only AI review and other functions can be selected');
+  await page.select('[data-route="review"]',id);await page.select('[data-route="create"]','opus');
   await page.type('#api-key','unsaved-fixture-key');
   await click('#save-routes');await page.waitForFunction('document.querySelector("#routes-message").textContent.includes("已保存")');
-  assert.equal(config!.routes!.game,id);assert.equal(config!.routes!.review_verify,id);assert.equal(config!.routes!.review,'deepseek');
+  assert.deepEqual(config!.routes,{review:id,create:'opus'});
+  for(const purpose of MODEL_PURPOSES) assert.equal(activeModelProfile(config,purpose)?.id,purpose==='review'||purpose==='review_verify'?id:'opus');
   assert.equal(await page.$eval('#api-key',e=>(e as HTMLInputElement).value),'unsaved-fixture-key','Saving routes preserves unsaved editor input');
   assert.equal(await decryptKey(config!.profiles![id]!.encryptedKey,secrets.SETTINGS_KEY),'fixture-studio-secret');
   await page.reload();await page.waitForSelector('#tab-model');await page.click('#tab-model');
@@ -68,9 +70,9 @@ try {
   assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'),'Mobile configuration must not overflow');
   await page.screenshot({path:'artifacts/models-mobile.png',fullPage:true});
   await click('#delete-model');await page.waitForFunction('document.querySelector("#config-message").textContent.includes("正在被使用")');assert(config!.profiles![id]);
-  await page.select('[data-route="game"]','');await page.select('[data-route="review_verify"]','');await click('#save-routes');await page.waitForFunction('document.querySelector("#routes-message").textContent.includes("已保存")');
+  await page.select('[data-route="review"]','deepseek');await click('#save-routes');await page.waitForFunction('document.querySelector("#routes-message").textContent.includes("已保存")');
   await click('#delete-model');await page.waitForFunction('document.querySelector("#config-message").textContent.includes("已删除")');assert(!config!.profiles![id]);
   assert.deepEqual(errors,[]);
-  console.log('PASS 真实登录、添加独立 Key、环节分配、刷新持久化、空 Key 保留、未保存输入保留、在用删除保护、解除分配后删除、桌面与手机布局。');
+  console.log('PASS 真实登录、添加独立 Key、仅两组模型选择、各环节正确继承、刷新持久化、空 Key 保留、未保存输入保留、在用删除保护、解除分配后删除、桌面与手机布局。');
 } catch(error) { await debugPage.screenshot({path:'artifacts/model-routing-failure.png',fullPage:true});throw error;
 } finally {await browser.close();await new Promise<void>(r=>server.close(()=>r()));}
