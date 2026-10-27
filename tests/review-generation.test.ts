@@ -7,6 +7,12 @@ afterEach(() => { vi.resetAllMocks(); vi.useRealTimers(); });
 const env = { SETTINGS_KEY: 'fixture', modelStore: { get: async () => null } };
 
 describe('模型评分依据复核', () => {
+  it('采集耗时计入整个队列时限，两轮评分不能把总时限重新延长',async()=>{
+    const deadline=Date.now()+8*60*1000;
+    vi.mocked(complete).mockResolvedValue({aes:2,ease:2,play:2});
+    await generateReview(env,{}, {system:'s',user:'evidence',deadline});
+    expect(vi.mocked(complete).mock.calls.map(c=>c[2].deadline)).toEqual([deadline,deadline]);
+  });
   it('原始证据与草稿交给复核模型，最终采用模型复核结果并展示当前阶段', async () => {
     const draft = { aes: 1, ease: 1, play: 1, issues: ['未经证实的遮挡'] };
     const final = { aes: 2, ease: 3, play: 2, issues: [] };

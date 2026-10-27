@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
+import { reviewDay,reviewUsage,reviewActivity } from '../server/review-usage';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, purgeReviewInputs, updateReviewProgress } from '../server/review-jobs';
 
 const databases: DatabaseSync[] = [];
@@ -9,7 +10,8 @@ function setup() {
   const sqlite = new DatabaseSync(':memory:'); databases.push(sqlite);
   sqlite.exec(readFileSync('migrations/0003_forge.sql', 'utf8'));
   sqlite.exec(readFileSync('migrations/0006_review_jobs.sql', 'utf8'));
-  sqlite.exec('CREATE TABLE members (id TEXT PRIMARY KEY, enabled INTEGER, can_review INTEGER); INSERT INTO members VALUES (\'a\', 1, 1), (\'b\', 1, 1)');
+  sqlite.exec(`CREATE TABLE members (id TEXT PRIMARY KEY, enabled INTEGER, can_review INTEGER,username TEXT,display_name TEXT,created_at TEXT); INSERT INTO members VALUES ('a', 1, 1,'a','甲','now'), ('b', 1, 1,'b','乙','now')`);
+  sqlite.exec(readFileSync('migrations/0014_review_capacity.sql','utf8'));
   const DB = {
     prepare(sql: string) {
       return { bind(...params: any[]) {
@@ -25,12 +27,61 @@ function setup() {
     async batch(statements: any[]) { sqlite.exec('BEGIN'); try { const results = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return results; } catch (error) { sqlite.exec('ROLLBACK'); throw error; } },
   };
   const send = vi.fn(async (_message: any) => {});
-  const env = { DB, REVIEW_QUEUE: { send }, modelStore: { get: async () => ({ baseUrl: 'https://test.example/v1', model: 'fixture', protocol: 'openai', encryptedKey: 'fixture-only', enabled: true, updatedAt: '' }) } };
+  const env = { DB, captureReview:vi.fn(async () => ({shots:[],probe:{captureMethod:'browser-viewport-v1'}})), REVIEW_QUEUE: { send }, modelStore: { get: async () => ({ baseUrl: 'https://test.example/v1', model: 'fixture', protocol: 'openai', encryptedKey: 'fixture-only', enabled: true, updatedAt: '' }) } };
   const payload = (title = 'Fixture') => ({ title, request_id: crypto.randomUUID(), html: '<html><canvas></canvas></html>', shots: [], probe: {} });
   return { sqlite, env, payload, send };
 }
 
 describe('后台并发审核的传输与隔离', () => {
+  it('并行提交原子预扣每日额度；重复 ID 不重复扣，调额立即生效', async()=>{
+    const {env,payload,sqlite,send}=setup();
+    sqlite.exec("UPDATE members SET daily_review_limit=2 WHERE id='a'");
+    const inputs=Array.from({length:5},()=>payload());
+    const results=await Promise.allSettled(inputs.map(input=>enqueueReview(env,input,'a')));
+    expect(results.filter(r=>r.status==='fulfilled')).toHaveLength(2);
+    expect(results.filter(r=>r.status==='rejected')).toHaveLength(3);
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(await reviewUsage(env.DB,'a')).toMatchObject({limit:2,used:2,remaining:0});
+    const accepted=results.findIndex(r=>r.status==='fulfilled');
+    await enqueueReview(env,inputs[accepted],'a');
+    expect(await reviewUsage(env.DB,'a')).toMatchObject({used:2});
+    sqlite.exec("UPDATE members SET daily_review_limit=3 WHERE id='a'");
+    await enqueueReview(env,payload(),'a');
+    expect(await reviewUsage(env.DB,'a')).toMatchObject({limit:3,used:3,remaining:0});
+  });
+  it('后台采集失败退次；模型调用后失败仍计一次，初评和复核不重复计次',async()=>{
+    const {env,payload,sqlite}=setup();
+    const captureFailed=await enqueueReview(env,payload(),'a');
+    env.captureReview.mockRejectedValueOnce(new Error('fixture-capture-error'));
+    const evaluate=vi.fn();
+    await processReviewJob(env,captureFailed.id,evaluate);
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(await reviewUsage(env.DB,'a')).toMatchObject({used:0,remaining:50});
+    const failed=await enqueueReview(env,payload(),'a');
+    await processReviewJob(env,failed.id,async()=>{
+      sqlite.prepare('UPDATE review_jobs SET model_started_at=? WHERE id=?').run(new Date().toISOString(),failed.id);
+      await updateReviewProgress(env,failed.id,'模型正在复核评分依据');
+      throw new Error('fixture-model-error');
+    });
+    expect(await reviewUsage(env.DB,'a')).toMatchObject({used:1,remaining:49});
+    expect(await getReviewJob(env,failed.id,'a')).toMatchObject({status:'error',stage:'verify',quota_charged:1});
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_jobs').get()).toMatchObject({n:2});
+  });
+  it('北京时间零点重置；管理员不占成员额度；记录包含失败和完成的游戏',async()=>{
+    expect(reviewDay(Date.parse('2026-10-27T15:59:59Z'))).toBe('2026-10-27');
+    expect(reviewDay(Date.parse('2026-10-27T16:00:00Z'))).toBe('2026-10-28');
+    const {env,payload,sqlite}=setup();
+    sqlite.exec("UPDATE members SET daily_review_limit=1 WHERE id='a'");
+    const yesterday=await enqueueReview(env,payload('yesterday'),'a');
+    sqlite.prepare('UPDATE review_jobs SET usage_day=? WHERE id=?').run('2000-01-01',yesterday.id);
+    const current=await enqueueReview(env,{...payload('today'),filename:'today.html'},'a');
+    await processReviewJob(env,current.id,async()=>{throw new Error('capture completed, fixture error');});
+    await enqueueReview(env,payload('admin test'),'admin');
+    expect(await reviewUsage(env.DB,'admin')).toMatchObject({limit:null,remaining:null});
+    const activity=await reviewActivity(env.DB,new URLSearchParams());
+    expect(activity.total).toBe(1);
+    expect(activity.records[0]).toMatchObject({title:'today',filename:'today.html',status:'error',quota_charged:0,display_name:'甲'});
+  });
   it('审核模型停用时拒绝入队，不留下任务或临时输入', async () => {
     const { env, payload, sqlite, send } = setup();
     const profile = await env.modelStore.get();
@@ -101,7 +152,7 @@ describe('后台并发审核的传输与隔离', () => {
     await expect(enqueueReview(env, payload(), 'a')).rejects.toMatchObject({ status: 503 });
     expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_jobs').get()).toMatchObject({ n: 0 });
     expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_inputs').get()).toMatchObject({ n: 0 });
-    for (let i = 0; i < 20; i++) await enqueueReview(env, payload(), 'a');
+    for (let i = 0; i < 50; i++) await enqueueReview(env, payload(), 'a');
     await expect(enqueueReview(env, payload(), 'a')).rejects.toMatchObject({ status: 429 });
   });
 });

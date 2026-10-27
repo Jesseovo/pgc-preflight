@@ -307,3 +307,4 @@
   .rv-stage-steps { gap: 4px; }
   .rv-stage-steps li { font-size: 9px; }
 }
+.rv-quota { font-size:11px; color:var(--rv-sage); line-height:1.8; max-width:100%; }

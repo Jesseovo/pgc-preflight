@@ -6,6 +6,16 @@ afterEach(()=>{vi.unstubAllGlobals();vi.useRealTimers();});
 
 describe('模型传输',()=>{
   const config={baseUrl:'https://provider.example',model:'vision-model',apiKey:'test-only-api-key'};
+  it('模型开始记录在实际请求前完成；记录失败时不发起收费请求',async()=>{
+    const order:string[]=[];
+    const fetchMock=vi.fn(async()=>{order.push('fetch');return Response.json({choices:[{message:{content:'READY'}}]});});
+    vi.stubGlobal('fetch',fetchMock);
+    await modelTransport(config,{onStart:async()=>{order.push('charge');}})([]);
+    expect(order).toEqual(['charge','fetch']);
+    fetchMock.mockClear();
+    await expect(modelTransport(config,{onStart:async()=>{throw new Error('fixture-ledger-unavailable');}})([])).rejects.toThrow('fixture-ledger-unavailable');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 
   it('兼容边缘运行时，读取正常的模型回复',async()=>{
     const fetchMock=vi.fn(async(_input:unknown,init?:RequestInit)=>{

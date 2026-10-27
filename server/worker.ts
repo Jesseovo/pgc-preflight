@@ -13,12 +13,21 @@ import {guardCheckPage,guardForgePage,guardReviewPage} from './page-access';
 import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
 import {purgeReviewInputs} from './review-jobs';
 import {captureReview} from './review-probe';
+import {acquireBrowser} from './browser-capacity';
 
 interface QueueMessage<T> { body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
 interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+function captureFor(env:Env){return async (html:string,onWait?:(message:string)=>Promise<void>)=>{
+  let browser;
+  try{
+    browser=await acquireBrowser(env.DB,()=>puppeteer.limits(env.BROWSER),()=>puppeteer.launch(env.BROWSER),onWait);
+    await onWait?.('正在采集三种手机比例的真实游戏画面…');
+    return await captureReview(browser as unknown as Browser,html);
+  }finally{await browser?.close().catch(()=>{});}
+};}
 
 export default {
   async fetch(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {
@@ -36,14 +45,7 @@ export default {
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
       return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE,REVIEW_QUEUE:env.REVIEW_QUEUE,
-        captureReview: async html => {
-          let browser;
-          try { browser = await puppeteer.launch(env.BROWSER); return await captureReview(browser as unknown as Browser, html); }
-          catch (error) {
-            if (/429|quota|concurrent|too many/i.test(String(error))) throw Object.assign(new Error('浏览器采集服务繁忙，请稍后重试；本次没有评分。'), { status: 429 });
-            throw error;
-          } finally { await browser?.close().catch(() => {}); }
-        },
+        captureReview: captureFor(env),
       },route,members,ctx);
     }
     if (url.pathname === '/api/health') {const config=await store.get();return json({ ok:true,configured:!!config?.enabled&&!!config?.encryptedKey,engine:'vision-model',version:'0.2.0',maxFileMB:8,maxBatch:20 });}
@@ -53,6 +55,7 @@ export default {
       if (!request.headers.get('Content-Type')?.includes('application/json')) return json({ error: '请求需要使用 JSON 格式。' }, 415);
       const user=await identity(request.headers.get('Cookie'),members,env);
       if(!user)return json({error:'请先使用管理员开通的账号登录。'},401);
+      if(user.role!=='admin')return json({error:'请在审核工作台提交游戏，系统会自动核算每日次数。'},403);
       if(!user.canReview)return json({error:'当前账号未开通检查权限，请联系管理员。'},403);
       const rate = await env.CHECK_RATE_LIMIT.limit({ key: `check:${user.id}` });
       if (!rate.success) return json({ error: '检查请求较多，请稍等一分钟再重试。' }, 429);
@@ -94,7 +97,7 @@ export default {
       .bind(new Date().toISOString(), new Date(Date.now() - 15 * 60 * 1000).toISOString()).run();
   },
   async queue(batch: QueueBatch<ForgeJob>, env: Env): Promise<void> {
-    const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB) };
+    const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB),captureReview:captureFor(env) };
     for (const message of batch.messages) {
       try {
         await processForgeJob(forgeEnv, message.body);

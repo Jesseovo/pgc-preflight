@@ -10,6 +10,15 @@ const secrets={ADMIN_PASSWORD:'test-only-admin',SETTINGS_KEY:'test-only-secret'}
 function memoryStore():MemberStore{const all:Member[]=[];return{list:async()=>all,byId:async id=>all.find(m=>m.id===id)||null,byUsername:async username=>all.find(m=>m.username===username)||null,save:async member=>{const i=all.findIndex(m=>m.id===member.id);if(i<0)all.push(member);else all[i]=member;}};}
 const config:ConfigStore={get:async()=>null,set:async()=>{}};
 describe('成员账号与权限',()=>{
+  it('默认每天50次，调额保留会话；0暂停新审核且拒绝非法额度',async()=>{
+    const store=memoryStore();const member=await createMember({username:'quota01',password:'test-only-password'},store);
+    expect(publicMember(member).dailyReviewLimit).toBe(50);
+    const token=await memberLogin(member.username,'test-only-password',store,secrets.SETTINGS_KEY);
+    await updateMember(member.id,{dailyReviewLimit:0},store);
+    expect(await identity(`pgc_member=${token}`,store,secrets)).toMatchObject({role:'member'});
+    expect(member.dailyReviewLimit).toBe(0);
+    for(const value of [-1,1.2,'50',10001])await expect(updateMember(member.id,{dailyReviewLimit:value},store)).rejects.toThrow('每日审核次数');
+  });
   it('开通账号后可登录，公开数据不包含密码摘要或盐',async()=>{
     const store=memoryStore();const member=await createMember({username:'Creator01',displayName:'测试创作者',password:'test-only-password'},store);
     expect(member.username).toBe('creator01');expect(member.passwordHash).not.toContain('test-only-password');

@@ -1,7 +1,7 @@
 import {authorized} from './settings';
 import type {AppSecrets} from './settings';
 
-export interface Member {id:string;username:string;displayName:string;passwordHash:string;passwordSalt:string;enabled:boolean;canReview:boolean;sessionVersion:number;createdAt:string;updatedAt:string}
+export interface Member {id:string;username:string;displayName:string;passwordHash:string;passwordSalt:string;enabled:boolean;canReview:boolean;dailyReviewLimit?:number;sessionVersion:number;createdAt:string;updatedAt:string}
 export interface MemberStore {list():Promise<Member[]>;byUsername(username:string):Promise<Member|null>;byId(id:string):Promise<Member|null>;save(member:Member):Promise<void>}
 export interface Identity {id:string;username:string;displayName:string;role:'admin'|'member';canReview:boolean}
 const encoder=new TextEncoder();
@@ -23,15 +23,16 @@ export function validateAccount(value:unknown){
   const password=validatePassword(body.password);
   const displayName=typeof body.displayName==='string'?body.displayName.trim():body.username;
   if(!displayName||displayName.length>50)throw new Error('成员姓名需要 1–50 个字。');
-  return{username:body.username.toLowerCase(),displayName,password,canReview:body.canReview!==false};
+  return{username:body.username.toLowerCase(),displayName,password,canReview:body.canReview!==false,dailyReviewLimit:validateReviewLimit(body.dailyReviewLimit ?? 50)};
 }
+export function validateReviewLimit(value:unknown):number{if(!Number.isInteger(value)||Number(value)<0||Number(value)>10000)throw new Error('每日审核次数需要是 0–10000 的整数，0 表示暂停新审核。');return Number(value);}
 export function validatePassword(password:unknown):string{if(typeof password!=='string'||password.length<6||password.length>128)throw new Error('密码需要 6–128 位字符。');return password;}
 export async function createMember(value:unknown,store:MemberStore):Promise<Member>{
   const fields=validateAccount(value);
   if(await store.byUsername(fields.username))throw new Error('这个账号已经存在。');
   const credential=await hashPassword(fields.password);
   const now=new Date().toISOString();
-  const member:Member={id:crypto.randomUUID(),username:fields.username,displayName:fields.displayName,passwordHash:credential.hash,passwordSalt:credential.salt,enabled:true,canReview:fields.canReview,sessionVersion:1,createdAt:now,updatedAt:now};
+  const member:Member={id:crypto.randomUUID(),username:fields.username,displayName:fields.displayName,passwordHash:credential.hash,passwordSalt:credential.salt,enabled:true,canReview:fields.canReview,dailyReviewLimit:fields.dailyReviewLimit,sessionVersion:1,createdAt:now,updatedAt:now};
   await store.save(member);return member;
 }
 export async function updateMember(id:string,value:unknown,store:MemberStore):Promise<Member>{
@@ -40,7 +41,9 @@ export async function updateMember(id:string,value:unknown,store:MemberStore):Pr
   if(body.enabled!==undefined){if(typeof body.enabled!=='boolean')throw new Error('账号状态格式不正确。');member.enabled=body.enabled;}
   if(body.canReview!==undefined){if(typeof body.canReview!=='boolean')throw new Error('检查权限格式不正确。');member.canReview=body.canReview;}
   if(body.password!==undefined){const next=await hashPassword(validatePassword(body.password));member.passwordHash=next.hash;member.passwordSalt=next.salt;}
-  member.sessionVersion++;member.updatedAt=new Date().toISOString();await store.save(member);return member;
+  if(body.dailyReviewLimit!==undefined)member.dailyReviewLimit=validateReviewLimit(body.dailyReviewLimit);
+  if(body.enabled!==undefined||body.canReview!==undefined||body.password!==undefined)member.sessionVersion++;
+  member.updatedAt=new Date().toISOString();await store.save(member);return member;
 }
 export async function memberLogin(username:string,password:string,store:MemberStore,secret:string):Promise<string|null>{
   const member=await store.byUsername(username.toLowerCase());

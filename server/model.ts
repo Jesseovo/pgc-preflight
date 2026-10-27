@@ -86,7 +86,7 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
     : `模型接口返回 ${response.status}${raw ? `：${raw}` : '。请检查模型配置、额度和图片输入支持。'}${code ? ` [${code}]` : ''}`, response.status, wait, code);
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string } = {}): ModelTransport {
   const throttle = createModelThrottle(options.DB, config);
   return async messages => {
     const inferred = inferenceOptions(config, options.purpose, options.maxTokens);
@@ -115,6 +115,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         ? {'Content-Type':'application/json','Accept':'text/event-stream','x-api-key':config.apiKey,'anthropic-version':'2023-06-01'}
         : {'Content-Type':'application/json', ...(deepseek ? { Accept: 'text/event-stream' } : {}), Authorization:`Bearer ${config.apiKey}`};
       if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
+      if (options.onStart) await abortable(options.onStart(), controller.signal);
       const response = await abortable(fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST', headers,
         body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens), ...(inferred.capability.kind === 'adaptive' ? {thinking:{type:'adaptive'},output_config:{effort}} : {}) } : {

@@ -5,6 +5,7 @@ import { inferenceOptions } from '../src/model-options';
 import type { ModelThrottleDatabase } from './model-throttle';
 import {createMember,updateMember,publicMember} from './members';
 import type {MemberStore} from './members';
+import {reviewActivity} from './review-usage';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase):Promise<Response|null> {
   const url=new URL(request.url);
@@ -24,6 +25,10 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
     if(url.pathname==='/api/admin/logout'&&request.method==='POST')return json({ok:true},200,{'Set-Cookie':sessionCookie('',0)});
+    if(url.pathname==='/api/admin/review-activity'&&request.method==='GET'){
+      if(!DB)return json({error:'审核记录服务尚未就绪。'},503);
+      return json(await reviewActivity(DB,url.searchParams));
+    }
     if(url.pathname==='/api/admin/members'){
       if(request.method==='GET')return json({members:(await members.list()).map(publicMember)});
       if(request.method==='POST')return json(publicMember(await createMember(await smallJson(request),members)),201);

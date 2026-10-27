@@ -3,12 +3,12 @@ import { REVIEW_SCHEMA, REVIEW_VERIFICATION } from './forge/prompts.js';
 import { reviewReportErrors } from './review-report';
 
 type Environment = Parameters<typeof complete>[0];
-type Request = Pick<Parameters<typeof complete>[2], 'system' | 'user' | 'maxTokens' | 'idempotencyKey' | 'onWait'>;
+type Request = Pick<Parameters<typeof complete>[2], 'system' | 'user' | 'maxTokens' | 'idempotencyKey' | 'onWait' | 'onStart' | 'deadline'>;
 
 // Both stages use the same evidence and the AI review model. Only the model may revise
 // its scores; a failed verification must never publish the unchecked draft.
 export async function generateReview(env: Environment, cfg: Record<string, string>, request: Request) {
-  const deadline = Date.now() + 12 * 60 * 1000;
+  const deadline = Math.min(request.deadline ?? Infinity, Date.now() + 12 * 60 * 1000);
   let stage = '模型正在结合完整画面、源码与校准样本评分';
   const onWait = async (message: string) => request.onWait?.(message ? `${stage} · ${message}` : stage);
   const config = await env.modelStore.get();

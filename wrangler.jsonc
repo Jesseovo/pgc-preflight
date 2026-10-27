@@ -5,6 +5,7 @@
   "main": "server/worker.ts",
   "compatibility_date": "2026-10-23",
   "compatibility_flags": ["nodejs_compat"],
+  "limits": { "cpu_ms": 300000 },
   "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/forge", "/forge/*", "/review", "/review/*"], "not_found_handling": "single-page-application" },
   "browser": { "binding": "BROWSER" },
   "d1_databases": [{ "binding": "DB", "database_name": "pgc-preflight-db", "database_id": "0cd1de96-d7f1-413b-ab08-be461da99de0", "migrations_dir": "migrations" }],
@@ -15,7 +16,7 @@
   ],
   "queues": {
     "producers": [{ "binding": "FORGE_QUEUE", "queue": "pgc-forge-jobs" }, { "binding": "REVIEW_QUEUE", "queue": "pgc-review-jobs" }],
-    "consumers": [{ "queue": "pgc-forge-jobs", "max_batch_size": 1, "max_batch_timeout": 5, "max_retries": 3, "max_concurrency": 1 }, { "queue": "pgc-review-jobs", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 3, "max_concurrency": 3 }]
+    "consumers": [{ "queue": "pgc-forge-jobs", "max_batch_size": 1, "max_batch_timeout": 5, "max_retries": 3, "max_concurrency": 1 }, { "queue": "pgc-review-jobs", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 3, "max_concurrency": 20 }]
   },
   "routes": [{ "pattern": "pgc.ovoxin.top", "custom_domain": true }],
   "observability": { "enabled": true }

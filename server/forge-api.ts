@@ -8,6 +8,7 @@ import { activeModelProfile } from './settings';
 import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, updateReviewProgress } from './review-jobs';
 import { generateReview } from './review-generation';
+import { reviewUsage } from './review-usage';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
 import {
@@ -48,7 +49,7 @@ export interface ForgeEnv {
   modelStore: ConfigStore;
   FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
   REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
-  captureReview?: (html: string) => Promise<unknown>;
+  captureReview?: (html: string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
 }
 
 export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string } | { type: 'review'; id: string };
@@ -105,7 +106,9 @@ function attachment(content, type, topic, suffix) {
 
 async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
+  if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
   if (a === 'review' && b === 'probe' && !c && method === 'POST') {
+    if(ownerId!=='admin')throw new HttpError(403,'请使用后台审核队列，系统会自动采集画面并核算次数。');
     const input = await readReviewBody(request);
     if (!env.captureReview) throw new HttpError(503, '浏览器采集服务尚未启用。');
     return env.captureReview(input.html);
@@ -115,7 +118,7 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     if (method === 'GET' && c) return getReviewJob(env, c, ownerId);
     if (method === 'POST' && !c) {
       const input = await readReviewBody(request);
-      const job = await enqueueReview(env, { ...input, html: trimSource(input.html) }, ownerId);
+      const job = await enqueueReview(env, input, ownerId);
       return json(job, 202);
     }
     throw new HttpError(405, '审核任务不支持这个操作。');
@@ -188,10 +191,13 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
     case "POST topics/:id/assets": return startTopicJob(env, 'assets', id, ctx, new URL(request.url).searchParams.get('regenerate') === '1', assetsJob);
     case "POST topics/:id/game": return startGameJob(env, id);
-    case "POST review": return review(env, await body(request), ownerId);
+    case "POST review": throw new HttpError(410, '请使用后台审核队列提交游戏。');
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
-    case "DELETE reviews/:id": return deleteReview(env, id, ownerId);
+    case "DELETE reviews/:id": {
+      if(ownerId!=='admin')throw new HttpError(403,'审核报告由管理员管理，成员不能删除审核记录。');
+      return deleteReview(env, id, ownerId);
+    }
     case "GET settings": return getSettings(env);
     case "PUT settings": return putSettings(env, await body(request));
     case "GET export": return exportAll(env);
@@ -648,7 +654,7 @@ function trimSource(html, max = MAX_SOURCE) {
   return out;
 }
 
-async function review(env, { title, topic_id, html, probe, shots }, ownerId, jobId = null) {
+async function review(env, { title, topic_id, html, probe, shots, deadline }, ownerId, jobId = null) {
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
   const images = (Array.isArray(shots) ? shots : []).filter((s) => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data)).slice(0, 6);
   const [cfg, games] = await Promise.all([getSettings(env), all(env, "SELECT * FROM games ORDER BY id")]);
@@ -673,7 +679,11 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
     : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
   parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
+  // Count only jobs that actually reach the model stage. Captures and queue
+  // failures are refunded without erasing the administrator's audit record.
   const result = await generateReview(env, cfg, {
+    deadline,
+    onStart: jobId ? () => run(env,"UPDATE review_jobs SET model_started_at=COALESCE(model_started_at,?) WHERE id=? AND status='running'",now(),jobId) : undefined,
     system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),
     user: parts,
     maxTokens: 16000,

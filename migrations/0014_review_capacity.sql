@@ -1,0 +1,11 @@
+ALTER TABLE members ADD COLUMN daily_review_limit INTEGER NOT NULL DEFAULT 50;
+ALTER TABLE review_jobs ADD COLUMN stage TEXT NOT NULL DEFAULT 'review';
+ALTER TABLE review_jobs ADD COLUMN filename TEXT NOT NULL DEFAULT '';
+ALTER TABLE review_jobs ADD COLUMN usage_day TEXT;
+ALTER TABLE review_jobs ADD COLUMN quota_charged INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE review_jobs ADD COLUMN model_started_at TEXT;
+UPDATE review_jobs SET usage_day = date(created_at, '+8 hours');
+UPDATE review_jobs SET model_started_at=created_at WHERE status IN ('running','done','error');
+CREATE INDEX IF NOT EXISTS review_jobs_daily_usage ON review_jobs(owner_id, usage_day, quota_charged);
+CREATE INDEX IF NOT EXISTS review_jobs_day ON review_jobs(usage_day, created_at);
+CREATE TABLE IF NOT EXISTS browser_launch_gate (id TEXT PRIMARY KEY, lease TEXT NOT NULL, lease_until INTEGER NOT NULL, next_at INTEGER NOT NULL DEFAULT 0);

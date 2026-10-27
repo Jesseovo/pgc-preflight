@@ -4,7 +4,6 @@ const LIMIT = 20;
 const MAX_BYTES = 8 * 1024 * 1024;
 const jobs = [];
 let selected = '';
-let concurrency = 3;
 let started = false;
 let preparing = false;
 let adding = Promise.resolve();
@@ -20,9 +19,9 @@ const wakePolls = () => { for (const wake of pollWaiters) wake(); };
 document.addEventListener('visibilitychange', () => { if (!document.hidden) wakePolls(); });
 addEventListener('online', wakePolls);
 const labels = { staged: '待开始', waiting: '等待采集', probing: '采集画面', submitting: '提交中', queued: '等待模型', running: 'AI 评分中', done: '已完成', error: '未完成' };
-const stageLabel = job => job.status === 'running' ? /复核/.test(job.note || '') ? '评分复核' : '模型初评' : labels[job.status] || '正在处理';
+const stageLabel = job => ['queued','running'].includes(job.status) && job.stage === 'capture' ? (job.status === 'queued' ? '等待采集' : '采集画面') : job.status === 'running' ? job.stage === 'verify' || /复核/.test(job.note || '') ? '评分复核' : '模型初评' : labels[job.status] || '正在处理';
 const stageSteps = job => {
-  const step = job.status === 'done' ? 4 : job.status === 'running' ? /复核/.test(job.note || '') ? 3 : 2 : ['submitting','queued'].includes(job.status) ? 1 : job.status === 'probing' ? 0 : -1;
+  const step = job.status === 'done' ? 4 : job.stage === 'capture' ? 0 : job.status === 'running' ? /复核/.test(job.note || '') ? 3 : 2 : ['submitting','queued'].includes(job.status) ? 1 : -1;
   return `<ol class="rv-stage-steps" aria-label="审核流程">${['采集画面','等待模型','模型初评','评分复核','生成报告'].map((label,i) => `<li class="${i < step ? 'is-complete' : i === step ? 'is-current' : ''}" ${i === step ? 'aria-current="step"' : ''}><i>${i < step ? '✓' : i+1}</i><span>${label}</span></li>`).join('')}</ol>`;
 };
 const active = job => ['probing', 'submitting', 'queued', 'running'].includes(job.status);
@@ -95,6 +94,7 @@ async function pollJob(job) {
           job.result = await dependencies.api('GET', `reviews/${remote.result_id}`);
         }
         job.status = remote.status;
+        job.stage = remote.stage;
         job.error = remote.status === 'error' ? reviewError(remote.error) : remote.error;
         job.remoteFailed = remote.status === 'error';
         job.note = remote.status === 'running' ? remote.error || '模型正在结合画面、源码与校准样本评分' : '后台排队中，可继续添加游戏';
@@ -109,7 +109,7 @@ async function pollJob(job) {
         if (job.status === 'done') { job.progress?.update({label:`审核完成 · ${job.title}`}); job.progress?.done('审核报告已生成'); }
         if (job.status === 'error') failJobProgress(job);
         refresh();
-        if (['done', 'error'].includes(job.status)) break;
+        if (['done', 'error'].includes(job.status)) { void dependencies.updateUsage?.(); break; }
       } catch (error) {
         if (error.status === 404 && ++missing >= 3) {
           job.status = 'error'; job.error = '后台没有找到这次任务，请重试提交。'; job.remoteFailed = true; failJobProgress(job);
@@ -129,14 +129,15 @@ async function pollJob(job) {
 
 async function submit(job) {
   job.status = 'submitting';
-  job.note = '正在提交游戏源码和截图…';
+  job.note = '正在上传，随后由后台采集画面并审核…';
   job.requestId ||= crypto.randomUUID();
   refresh();
   try {
-    const result = await dependencies.api('POST', 'review/jobs', { ...job.prepared, html: job.html, title: job.title, topic_id: job.topicId || null, request_id: job.requestId });
+    const result = await dependencies.api('POST', 'review/jobs', { html: job.html, title: job.title, filename:job.filename, topic_id: job.topicId || null, request_id: job.requestId });
+    job.stage = result.stage;
     job.status = result.status === 'error' ? 'error' : 'queued';
     if (result.status === 'error') { job.error = result.error; job.remoteFailed = true; }
-    job.note = '后台已接收，等待模型评分';
+    job.note = '后台已接收，自动采集与审核；关闭页面后仍会继续';
     void pollJob(job);
   } catch (error) {
     // Check the idempotent job before offering retry if the enqueue response
@@ -149,6 +150,7 @@ async function submit(job) {
     } catch { job.status = 'error'; job.error = error.message; }
   }
   if (job.status === 'error') failJobProgress(job);
+  void dependencies.updateUsage?.();
   refresh();
 }
 
@@ -156,21 +158,12 @@ async function pump() {
   if (!started || preparing || !dependencies) return;
   preparing = true;
   try {
-    while (activeCount() < concurrency) {
+    while (jobs.some(item => item.status === 'waiting')) {
       const job = jobs.find(item => item.status === 'waiting');
       if (!job) break;
       job.startedAt ||= Date.now();
-      job.progress ||= startTask(`AI 审核 · ${job.title}`, {key:`review-${job.id}`,compact:true,detail:'准备采集游戏画面…',startedAt:job.startedAt});
+      job.progress ||= startTask(`AI 审核 · ${job.title}`, {key:`review-${job.id}`,compact:true,detail:'准备上传游戏…',startedAt:job.startedAt});
       try {
-        if (!job.prepared) {
-          job.status = 'probing';
-          refresh();
-          dependencies.setProbing(true);
-          const { probe, shots } = await dependencies.probeGame(job.html, dependencies.captureBox(), (message, value, total) => { job.note = message; job.captureProgress = {value,total}; refresh(); });
-          job.prepared = { probe, shots: shots.map(({ label, data }) => ({ label, data })) };
-        }
-        dependencies.setProbing(false);
-        dependencies.clearCapture();
         await submit(job);
       } catch (error) {
         job.status = 'error';
@@ -234,8 +227,8 @@ function addFiles(files) {
 
 export async function mountReviewWorkspace(options) {
   const { view, api, alive, topics, probeGame, setProbing, checksHtml, probeChecks, copyText, download, openModal } = options;
-  view.innerHTML = `<div class="review-page"><section class="review-intro"><div><div class="eyebrow"><span></span>PGC AI SIMULATION REVIEW</div><h1>下一款好游戏，准备出发<span>。</span></h1><p>拖入游戏，采集真实画面。初评与复核之后，再给出修改建议。</p><div class="review-intro-tags"><span>多文件拖放</span><i>·</i><span>3 路 AI 并发</span><i>·</i><span>双轮评分核对</span></div></div><img class="review-mascot" src="/artwork/pixel-cat.png" width="74" height="74" alt=""></section>
-    <section class="review-workspace"><div class="review-upload-panel"><div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>每批最多 20 个</b></div><div class="review-dropzone" id="rvDropzone"><div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div><h2>把游戏们，一起拖进来。</h2><p>支持拖到页面任意位置，也可以选择多个文件</p><button type="button" class="rr-button rr-button-dark" id="rvChoose">${svg('upload')}选择游戏文件</button><input type="file" id="rvFile" accept=".html,.htm,text/html" multiple hidden><div class="upload-meta"><span>.html / .htm</span><span>单个 ≤ 8 MB</span><span>支持多选</span></div></div><p class="rv-feedback" id="rvFeedback" role="status" aria-live="polite">文件只用于审核，评分完成后可在历史记录中查看报告。</p><div class="review-action-row"><label class="rv-concurrency">AI 并发<select id="rvConcurrency" aria-label="AI 审核并发数"><option value="1">1 路</option><option value="2">2 路</option><option value="3" selected>3 路</option></select></label>${topics.length ? `<label class="rv-topic">关联选题<select id="rvTopic"><option value="">不关联</option>${topics.map(t => `<option value="${t.id}">${esc(t.data.title)}</option>`).join('')}</select></label>` : ''}<button type="button" class="rr-button rr-button-dark" id="rvGo" disabled>开始审核 ${svg('arrow')}</button></div></div>
+  view.innerHTML = `<div class="review-page"><section class="review-intro"><div><div class="eyebrow"><span></span>PGC AI SIMULATION REVIEW</div><h1>下一款好游戏，准备出发<span>。</span></h1><p>拖入游戏，采集真实画面。初评与复核之后，再给出修改建议。</p><div class="review-intro-tags"><span>多文件拖放</span><i>·</i><span>后台并行审核</span><i>·</i><span>双轮评分核对</span></div></div><img class="review-mascot" src="/artwork/pixel-cat.png" width="74" height="74" alt=""></section>
+    <section class="review-workspace"><div class="review-upload-panel"><div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>每批最多 20 个</b></div><div class="review-dropzone" id="rvDropzone"><div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div><h2>把游戏们，一起拖进来。</h2><p>支持拖到页面任意位置，也可以选择多个文件</p><button type="button" class="rr-button rr-button-dark" id="rvChoose">${svg('upload')}选择游戏文件</button><input type="file" id="rvFile" accept=".html,.htm,text/html" multiple hidden><div class="upload-meta"><span>.html / .htm</span><span>单个 ≤ 8 MB</span><span>支持多选</span></div></div><p class="rv-feedback" id="rvFeedback" role="status" aria-live="polite">每个游戏计 1 次，含初评与复核。北京时间零点重置；模型调用前的平台失败退回次数。</p><div class="review-action-row"><span class="rv-quota" id="rvQuota" role="status">正在读取今日次数…</span>${topics.length ? `<label class="rv-topic">关联选题<select id="rvTopic"><option value="">不关联</option>${topics.map(t => `<option value="${t.id}">${esc(t.data.title)}</option>`).join('')}</select></label>` : ''}<button type="button" class="rr-button rr-button-dark" id="rvGo" disabled>开始审核 ${svg('arrow')}</button></div></div>
     <aside class="review-scope-panel"><div class="section-label"><span><i class="step-number">02</i>同一份审核标准</span></div><div class="rv-criteria">${[['01', '美学', '画面协调、风格表达、视觉反馈'], ['02', '易玩性', '规则理解、上手门槛、操作引导'], ['03', '可玩性', '机制趣味、挑战节奏、重玩动力']].map(([n, t, d]) => `<div><span>${n}</span><section><h3>${t}<small>3 分</small></h3><p>${d}</p></section></div>`).join('')}</div><div class="rv-threshold"><strong>7<span> / 9</span></strong><div><b>模拟通过线</b><p>2 + 2 + 2 = 6，仍需修改</p></div></div><p class="rv-scope-foot">沿用 Forge 真实审核校准样本<br>AI 模拟评分 · 人工最终确认</p></aside></section>
     <section class="rv-batch" id="rvBatch" hidden><div class="rv-batch-heading"><div><span class="rr-kicker">REVIEW QUEUE</span><h2>这一批，逐个变好。<span id="rvQueueCount"></span></h2></div><div class="rv-batch-actions"><span id="rvBatchStats" role="status" aria-live="polite"></span><button type="button" class="rr-button" id="rvRetryAll" disabled>重试失败</button><button type="button" class="rr-button" id="rvExportAll" disabled>导出报告</button><button type="button" class="rr-button" id="rvClear">清除已结束</button></div></div><div id="rvOverview" class="rv-overview"></div><div id="rvBatchMeter"></div><div class="rv-results-grid"><div class="rv-job-list" id="rvJobs" aria-label="审核任务"></div><div id="rvResult" class="rv-selected" aria-live="polite"></div></div></section>
     <section class="rv-capture" id="rvCapture" hidden><div class="rr-section-heading"><h3>采集游戏画面</h3><span id="rvCaptureTitle"></span></div><p>正在浏览器中采集三种手机比例的完整画面。已提交的 AI 审核会同时在后台进行。</p><div class="phones" id="rvPhones"></div></section>
@@ -302,8 +295,6 @@ export async function mountReviewWorkspace(options) {
   };
   $('#rvChoose').onclick = () => $('#rvFile').click();
   $('#rvFile').onchange = event => { const files = [...event.target.files]; event.target.value = ''; void addFiles(files); };
-  $('#rvConcurrency').value = String(concurrency);
-  $('#rvConcurrency').onchange = event => { concurrency = Number(event.target.value); void pump(); };
   $('#rvGo').onclick = () => { started = true; for (const job of jobs) if (job.status === 'staged') { job.status = 'waiting'; job.startedAt = Date.now(); } refresh(); void pump(); };
   $('#rvJobs').onclick = event => {
     const select = event.target.closest('[data-select]');
@@ -318,7 +309,7 @@ export async function mountReviewWorkspace(options) {
     const failed = jobs.filter(job => job.status === 'error');
     const retryable = failed.filter(job => job.html);
     retryable.forEach(retryJob);
-    dependencies.feedback(`已重新排队 ${retryable.length} 个任务。${failed.length > retryable.length ? `另有 ${failed.length-retryable.length} 个临时文件已清理，需要重新上传。` : '会复用已采集的画面。'}`);
+    dependencies.feedback(`已重新排队 ${retryable.length} 个任务，重新审核按新的一次计算。${failed.length > retryable.length ? `另有 ${failed.length-retryable.length} 个临时文件已清理，需要重新上传。` : ''}`);
   };
   $('#rvExportAll').onclick = () => {
     const reports = [...new Map(jobs.filter(job => job.result).map(job => [job.result.id ?? job.id,job.result])).values()];
@@ -357,13 +348,21 @@ export async function mountReviewWorkspace(options) {
   };
   $('#rvRefreshHistory').onclick = () => void history();
   dependencies.updateHistory = history;
+  dependencies.updateUsage = async () => {
+    try {
+      const usage=await api('GET','review/usage');
+      if(!current())return;
+      $('#rvQuota').textContent=usage.limit===null?'管理员审核 · 不限每日次数':`今日剩余 ${usage.remaining} / ${usage.limit} 次 · 已使用 ${usage.used} 次`;
+    } catch { if(current())$('#rvQuota').textContent='次数暂时无法读取，提交时以服务端额度为准'; }
+  };
   refresh();
+  void dependencies.updateUsage();
   void history();
   try {
     const remote = await withProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
     for (const item of remote) {
       if (!['queued', 'running', 'error'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
-      const job = { id: item.id, requestId: item.id, title: item.title, status: item.status, error:reviewError(item.error),remoteFailed:item.status==='error',note: '恢复后台审核任务' };
+      const job = { id: item.id, requestId: item.id, title: item.title, filename:item.filename, stage:item.stage, status: item.status, error:reviewError(item.error),remoteFailed:item.status==='error',note: '恢复后台审核任务' };
       job.startedAt = Date.parse(item.created_at) || Date.now();
       job.progress = startTask(`AI 审核 · ${job.title}`,{key:`review-${job.id}`,compact:true,detail:job.note,startedAt:job.startedAt});
       jobs.push(job); selected ||= job.id;

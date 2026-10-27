@@ -20,6 +20,7 @@ const server = createServer(async (request, response) => {
       let body = ''; for await (const chunk of request) body += chunk;
       return json(await captureReview(browser, JSON.parse(body).html));
     }
+    if(url.pathname==='/api/forge/review/usage')return json({limit:50,remaining:50-tasks.size,used:tasks.size});
     if (url.pathname === '/api/forge/reviews') return json([...reports.values()]);
     if (/^\/api\/forge\/reviews\/\d+$/.test(url.pathname)) return json(reports.get(Number(url.pathname.split('/').at(-1))));
     if (url.pathname === '/api/forge/review/jobs' && request.method === 'GET') return json([...tasks.values()]);
@@ -29,13 +30,14 @@ const server = createServer(async (request, response) => {
       if (tasks.has(input.request_id)) return json(tasks.get(input.request_id), 202);
       const job = { id: input.request_id, title: input.title, status: 'running', error: '', result_id: null };
       tasks.set(job.id, job); active++; peak = Math.max(peak, active);
-      setTimeout(() => {
+      setTimeout(async () => {
         active--;
         if (input.title === 'Retry me' && !failOnce.has(input.title)) { failOnce.add(input.title); job.status = 'error'; job.error = '合成模型超时，请重试'; }
         else {
-          const report = fixture(input.title);
+          const report:any = fixture(input.title);
           Object.assign(report.result, { score_reasons: { aes: '截图中视觉层级清楚，但反馈区分不足。', ease: '从源码推断触摸规则清楚，实际手感待确认。', play: '源码中挑战重复，长期节奏需要人工试玩确认。' }, uncertainties: ['未实际听音频，请人工确认背景音乐与音效。', '未完成完整试玩，请人工确认手感与长期节奏。'] });
-          report.probe = input.probe; report.shots = input.shots; reports.set(report.id, report); job.status = 'done'; job.result_id = report.id as any;
+          const evidence=input.title==='real-probe-fixture'?await captureReview(browser,input.html):{probe:{captureMethod:'fixture'},shots:[]};
+          report.probe = evidence.probe; report.shots = evidence.shots; reports.set(report.id, report); job.status = 'done'; job.result_id = report.id as any;
         }
       }, 1000);
       return json(job, 202);
@@ -90,14 +92,15 @@ try {
   assert.match(await page.$eval('#rvFeedback', el => el.textContent!), /wrong.txt/);
   await page.click('#rvGo');
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 3 && document.querySelectorAll(".rv-job-status.error").length === 1', { timeout: 20000 });
-  assert.equal(peak, 3, 'AI jobs must overlap, limited to 3');
+  assert.equal(peak, 4, 'All uploaded jobs enter the background queue without a browser-side model cap');
   await page.waitForSelector('.pgc-task[data-task-state="error"]');
   assert(await page.$('.pgc-task-toggle[aria-expanded="false"]'),'Review progress stays compact so batch actions remain reachable');
   assert.match(await page.$eval('.pgc-task[data-task-state="error"]', el => el.textContent!), /审核未完成.*重试审核/s);
   assert.equal(await page.$('.pgc-task[data-task-state="error"] [data-progress-since]'), null, 'Failed tasks must stop their elapsed clock');
   await page.click('#rvRetryAll');
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 4', { timeout: 12000 });
-  assert.equal(await page.evaluate('window.probeCount'), 4, 'Retry reuses collected evidence');
+  assert.equal(await page.evaluate('window.probeCount'), 0, 'All evidence is captured server-side; browser never probes or bypasses quota');
+  assert.match(await page.$eval('#rvQuota',el=>el.textContent!),/今日剩余/);
   await page.click('[data-select]');
   assert.match(await page.$eval('.rr-reasons', el => el.textContent!), /为什么是这个分数.*实际手感待确认/s);
   assert.match(await page.$eval('.rr-uncertainties', el => el.textContent!), /未实际听音频/);
@@ -126,7 +129,7 @@ try {
   await page.screenshot({ path: 'artifacts/review-mobile.png', fullPage: true });
   assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile layout must not overflow');
   assert.deepEqual(errors, []);
-  console.log('PASS 页面任意位置拖入多文件、无效格式提示、3 路并发、逐项失败重试、复用截图、复制修改指令、手机布局。');
+  console.log('PASS 页面任意位置拖入多文件、无效格式提示、后台并发、逐项失败重试、后台采集、复制修改指令、手机布局。');
 
   const recoveryId = crypto.randomUUID();
   tasks.set(recoveryId, { id: recoveryId, title: 'Recovered failure', status: 'error', error: '模型接口返回 409。请在管理页检查模型配置、额度和图片输入支持。', result_id: null, created_at: new Date(Date.now() - 900000).toISOString(), updated_at: new Date(Date.now() - 60000).toISOString() });
