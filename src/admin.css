@@ -235,3 +235,5 @@
   .model-editor input, .model-editor .field select, .model-routing select { font-size: 16px; }
   .model-editor-heading { align-items: start; }
 }
+
+.model-run-list{display:grid;gap:10px;color:var(--muted,#69756b);font-size:12px}.model-run{display:grid;gap:5px;padding:12px 0;border-bottom:1px solid #edf0ec;overflow-wrap:anywhere}.model-run b{color:#38483c;font-weight:550}.model-run span,.model-run small{line-height:1.7}

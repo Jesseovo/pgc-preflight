@@ -112,17 +112,17 @@ describe('Opus 制作任务与成品接口', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('制作用其他功能的模型，停用模型或非候选游戏不能制作', async () => {
+  it('其他功能切换模型后制作仍使用 Opus，停用 Opus 或非候选游戏不能制作', async () => {
     const game = await setup();
     await saveConfig({profile:'game-writer',baseUrl:'https://writer.example/v1',model:'game-model',apiKey:'game-only-key'},game.env.modelStore,secrets.SETTINGS_KEY);
     await saveRoutes({create:'game-writer'},game.env.modelStore);
     const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
-      expect(url).toBe('https://writer.example/v1/chat/completions');
-      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer game-only-key');
+      expect(url).toBe('https://fixture.example/v1/messages');
+      expect(new Headers(init?.headers).get('x-api-key')).toBe('test-only-key');
       const body=JSON.parse(String(init?.body));
-      expect(body.model).toBe('game-model');
-      expect(body).not.toHaveProperty('output_config');
-      return Response.json({choices:[{message:{content:html},finish_reason:'stop'}]});
+      expect(body.model).toBe('claude-opus-5-5');
+      expect(body.output_config).toEqual({effort:'low'});
+      return Response.json({content:[{type:'text',text:html}],stop_reason:'end_turn'});
     });
     vi.stubGlobal('fetch',fetcher);
     expect((await game.request('POST',['topics','9','game'])).status).toBe(200);
@@ -130,7 +130,11 @@ describe('Opus 制作任务与成品接口', () => {
     expect(game.row().product_html).toBe(html);
     const disabled=await setup();
     await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://fixture.example',model:'claude-opus-5-5',enabled:false},disabled.env.modelStore,secrets.SETTINGS_KEY);
-    expect((await disabled.request('POST',['topics','9','game'])).status).toBe(409);
+    await saveConfig({profile:'deepseek',baseUrl:'https://api.deepseek.com',model:'deepseek-flash',apiKey:'test-deepseek-key'},disabled.env.modelStore,secrets.SETTINGS_KEY);
+    await saveRoutes({activeProfile:'deepseek',create:'deepseek'},disabled.env.modelStore);
+    const denied = await disabled.request('POST',['topics','9','game']);
+    expect(denied.status).toBe(409);
+    expect((await denied.json()).error).toContain('Opus 5.5');
     expect(disabled.send).not.toHaveBeenCalled();
     const notCandidate = await setup({ status: 'new' });
     expect((await notCandidate.request('POST', ['topics', '9', 'game'])).status).toBe(409);

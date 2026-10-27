@@ -6,7 +6,7 @@ import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "
 import { complete, providerStatus, activeModel, routedModel, LLMError } from "./forge-llm";
 import { activeModelProfile } from './settings';
 import { identity } from './members';
-import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob } from './review-jobs';
+import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, updateReviewProgress } from './review-jobs';
 import { generateReview } from './review-generation';
 import type { MemberStore } from './members';
 import type { AppSecrets, ConfigStore } from './settings';
@@ -337,7 +337,7 @@ async function suggestVocab(env, { dim, n = 30 }) {
     purpose: 'vocab',
     user: suggestUser(dim, count, [...new Set(existing)]),
     schema: SUGGEST_SCHEMA,
-    maxTokens: 8000,
+    maxTokens: 12000,
   });
   const seen = new Set(existing.map(norm));
   const fresh = (out.words || []).filter((w) => w.word && !seen.has(norm(w.word)) && seen.add(norm(w.word)));
@@ -422,7 +422,7 @@ async function tagGames(env) {
   const vocab = await all(env, "SELECT dim, word FROM vocab WHERE enabled = 1 ORDER BY dim, id");
   const byDim = Object.fromEntries(DIMS.map((d) => [d, vocab.filter((v) => v.dim === d).map((v) => v.word)]));
   const cfg = await getSettings(env);
-  const out = await complete(env, cfg, { system: tagSystem(byDim), user: tagUser(games), schema: TAG_SCHEMA, maxTokens: 4000, purpose: 'tags' });
+  const out = await complete(env, cfg, { system: tagSystem(byDim), user: tagUser(games), schema: TAG_SCHEMA, maxTokens: 8000, purpose: 'tags' });
   const ids = new Set(games.map((g) => g.id));
   const stmts = (out.items || []).filter((t) => ids.has(t.id)).map((t) =>
     env.DB.prepare("UPDATE games SET subject = ?, medium = ?, gesture = ?, structure = ?, mood = ?, updated_at = ? WHERE id = ?")
@@ -557,16 +557,8 @@ async function expandBatch(env, ids) {
         purpose: 'expand',
         user: expandUser({ existing, combos: pending }),
         schema: EXPAND_SCHEMA,
-        // Keep Opus responses bounded. The schema has many fields, but a single
-        // topic normally fits comfortably below 4k output tokens; a larger
-        // budget makes the relay spend too long on reasoning and lets the
-        // browser give up before the Worker can return the result.
-        // Extended-thinking Opus responses can spend part of the output
-        // budget on reasoning. Give each Opus item enough room to finish the
-        // requested JSON instead of cutting it off mid-object.
-        maxTokens: slowModel
-          ? Math.min(24000, 7000 * pending.length)
-          : 2800 + 1200 * pending.length,
+        // Allow room for thinking as well as the completed topic JSON.
+        maxTokens: 16000,
         // Opus can spend more than 90 seconds reasoning before its first
         // useful chunk. Queue jobs are allowed to run longer than an HTTP
         // request, so keep the relay open long enough for the model stream to
@@ -613,7 +605,9 @@ async function preview(env, id) {
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   const cfg = await getSettings(env);
-  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 12000, idempotencyKey: `pgc-preview-${id}`, purpose: 'preview' });
+  // A retry may have different topic context or model settings. Reusing a
+  // completed key makes Riffle reject the request as IDEMPOTENCY_CONFLICT.
+  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 16000, idempotencyKey: `pgc-preview-${id}-${Date.now()}`, purpose: 'preview' });
   const svg = sanitizeSvg(text);
   await run(env, "UPDATE topics SET preview_svg = ?, updated_at = ? WHERE id = ?", svg, now(), id);
   return { id, svg };
@@ -684,7 +678,7 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
     user: parts,
     maxTokens: 16000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
-    onWait: jobId ? message => run(env, "UPDATE review_jobs SET error = ? WHERE id = ? AND status = 'running'", message, jobId) : undefined,
+    onWait: jobId ? message => updateReviewProgress(env, jobId, message) : undefined,
   });
   const score = result.aes + result.ease + result.play;
   result.verdict = consistentVerdict(result.verdict, score);
@@ -738,7 +732,7 @@ async function startGameJob(env: ForgeEnv, id: number) {
   if (!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
   const model = activeModelProfile(await env.modelStore.get(), 'game');
   if (!model?.profile.enabled || !model.profile.encryptedKey) {
-    throw new HttpError(409, "请先在管理员模型配置中为其他功能选择已启用的模型。");
+    throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
   }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
   const requestId = crypto.randomUUID();
@@ -819,7 +813,9 @@ export function composeBrief(t) {
 function designPart(md) {
   const text = String(md || '');
   const at = text.search(/^##\s*F[.．、\s]/m);
-  return (at >= 0 ? text.slice(at) : text).slice(0, 20000);
+  // Keep long production tables out of the asset prompt so adaptive
+  // thinking leaves room for the actual drawing library.
+  return (at >= 0 ? text.slice(at) : text).slice(0, 9000);
 }
 
 export function cleanAssetsHtml(text) {
@@ -849,9 +845,16 @@ async function assetsJob(env, id, t) {
       system: ASSETS_SYSTEM,
       purpose: 'assets',
       user: assetsUser(t, designPart(t.brief_md), t.preview_svg || ''),
-      // A 40–60KB HTML file is roughly 15k tokens.
-      maxTokens: 20000,
-      timeoutMs: slowModel ? 300000 : 180000,
+      // Thinking and HTML share this budget. Keep the artifact compact and
+      // make this a single paid attempt: a truncated asset pack is not safely
+      // repairable by replaying the whole request with a fresh key.
+      // Opus adaptive thinking and the asset library share this budget. The
+      // provider advertises a 64k output ceiling; use it once rather than
+      // paying for blind retries after a thinking-only truncation.
+      maxTokens: 64000,
+      timeoutMs: slowModel ? 600000 : 180000,
+      maxAttempts: 1,
+      outputEffort: 'low',
       idempotencyKey: `pgc-assets-${id}-${Date.now()}`,
       onWait: message => run(env, "UPDATE topics SET assets_error = ? WHERE id = ? AND assets_status = 'running'", message, id),
     }));
@@ -874,7 +877,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
     const topic = await getTopic(env, id);
     if (topic.product_html?.trim()) return { id, status: 'done' };
     const model = activeModelProfile(await env.modelStore.get(), 'game');
-    if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "其他功能使用的模型未启用，请在管理页配置后重试。");
+    if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
     const cfg = await getSettings(env);
     // Expanded topics already contain the playable core. A full production
     // brief could exhaust the model before any HTML is made; keep it optional.
@@ -885,7 +888,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
       maxTokens: 32768,
       timeoutMs: 300000,
       deadline, idempotencyKey: `pgc-game-${requestId}`, outputFormat: 'html',
-      purpose: 'game', maxAttempts: 1, outputEffort: 'low',
+      purpose: 'game', requiredProfile: 'opus', maxAttempts: 1, outputEffort: 'low',
       onWait: message => stage(message || '模型正在编写完整 HTML 游戏…'),
       onProgress: characters => stage(characters ? `模型正在编写游戏，已接收 ${characters.toLocaleString('en-US')} 个字符…` : '模型正在准备游戏代码…'),
     }));
@@ -910,10 +913,8 @@ async function briefJob(env, id, t) {
         system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
         purpose: 'brief',
         user: briefUser(t),
-        // The F template is intentionally structured and normally fits below
-        // 6k output tokens. A smaller cap keeps the relay responsive while the
-        // longer idle window accommodates Opus's streamed reasoning.
-        maxTokens: 8000,
+        // Reserve room for both thinking and the complete production brief.
+        maxTokens: 24000,
         timeoutMs: slowModel ? 300000 : 180000,
         idempotencyKey: `pgc-brief-${id}-${Date.now()}`,
         onWait: message => run(env, "UPDATE topics SET brief_error = ? WHERE id = ? AND brief_status = 'running'", message, id),

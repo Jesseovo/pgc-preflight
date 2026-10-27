@@ -139,7 +139,7 @@ ${topic.note ? "- 我的补充要求：" + topic.note : ""}`;
 
 // Asset pack: one self-contained HTML file that is both the art review sheet
 // and the drawing code the game copies verbatim.
-export const ASSETS_SYSTEM = `你是游戏美术总监兼图形程序员。根据选题和设计文档，为一款竖屏手机小游戏制作完整的美术资产包，交付一个自包含的 HTML 文件。
+export const ASSETS_SYSTEM = `你是游戏美术总监兼图形程序员。根据选题和设计文档，为一款竖屏手机小游戏制作一个紧凑、可直接复用的美术资产包，交付一个自包含的 HTML 文件。
 
 ${DIRECTION}
 
@@ -159,19 +159,16 @@ ${DIRECTION}
    - fx 的 draw 以 (o.x, o.y) 为中心，o.p 是 0 到 1 的进度。
    - 每个 draw 都用 ctx.save() / ctx.restore() 包住，不泄漏画布状态。
 4. 页面其余部分是给人看的资产总览：
-   - 最上面是一个 9:16 的"游戏画面合成"：用背景、主角、两三个敌人或障碍、HUD 拼出一张像真实截图的画面，并持续播放动画。这就是概念图。
-   - 下面是网格，每个资产一张卡片：名字、尺寸、状态，卡片里循环播放它的每个状态和动画帧。
-   - 再下面是配色色板和风格规范说明。
-   - 总览页的文字用中文；游戏里会出现的文字（UI 上的字）用英文。
-   - 页面在手机和电脑上都能看，不出现横向滚动。
+   - 顶部一张 9:16 合成画面，下面用简洁网格展示资产、色板和风格说明。
+   - 总览页文字用中文；游戏 UI 文字用英文；手机和电脑都不能横向滚动。
 
 【内容要求】
-- 覆盖设计文档里出现的所有视觉元素：主角、每一种敌人或障碍、拾取物、Boss、背景各层、HUD 元素（生命、分数、连击、暂停按钮、结算面板）、命中和击杀等特效。
+- 优先覆盖首版核心视觉：1 个主角、最多 2 种敌人或障碍、1 个拾取物、1 个主背景、核心 HUD 和命中/击杀特效。后期 Boss 或重复变体合并到相近资产，不要为罗列资产牺牲可运行代码。
 - 每个精灵至少有循环的待机动画；主角有受击状态；敌人有攻击前的预警状态；会出现的拾取物有闪光或呼吸。
 - 风格必须忠实于选题指定的美术媒介，像一张有设计感的海报，而不是程序员配色。主色不超过 6 个（另加中性色），元素和背景要有足够的明度差。
 - 造型精致：用路径、渐变和分层勾勒细节，不要只用纯色方块和圆形。
 - 性能：每帧可调用；不在 draw 里创建大量临时对象，不用 ctx.filter。
-- 文件控制在 60KB 以内。只输出 HTML 本身，不要解释，不要代码块标记。`;
+- 文件控制在 24KB 以内。先直接输出完整的 <!doctype html> 和可复制的 game-assets 脚本，再补极简资产总览页面；不要先写规划、解释或注释，不要代码块标记。只输出 HTML 本身。`;
 
 export function assetsUser(topic, design, styleSvg) {
   const d = topic.data || {};
@@ -183,7 +180,7 @@ export function assetsUser(topic, design, styleSvg) {
 ${topic.note ? "我的补充要求：" + topic.note + "\n" : ""}
 【设计文档（细纲）】
 ${design}
-${styleSvg ? `\n【已确认的风格样板图（SVG 源码，资产的造型和配色要与它一致）】\n${styleSvg.slice(0, 9000)}\n` : ""}`;
+${styleSvg ? `\n【已确认的风格样板图（SVG 源码，资产的造型和配色要与它一致）】\n${styleSvg.slice(0, 4000)}\n` : ""}`;
 }
 
 export const GAME_SYSTEM = `You write small, polished, self-contained HTML Canvas games. Output only complete HTML from <!doctype html> to </html>, no explanation or Markdown.

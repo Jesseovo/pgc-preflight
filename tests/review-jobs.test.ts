@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
-import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, purgeReviewInputs } from '../server/review-jobs';
+import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, purgeReviewInputs, updateReviewProgress } from '../server/review-jobs';
 
 const databases: DatabaseSync[] = [];
 afterEach(() => { databases.splice(0).forEach(db => db.close()); });
@@ -66,6 +66,13 @@ describe('后台并发审核的传输与隔离', () => {
     for (const task of tasks) expect(await getReviewJob(env, task.id, 'a')).toMatchObject({ status: 'done' });
     await processReviewJob(env, tasks[0].id, evaluate);
     expect(evaluate).toHaveBeenCalledTimes(3);
+  });
+  it('活动中的模型进度会刷新任务心跳，避免被 15 分钟中断检测误判', async () => {
+    const { env, payload, sqlite } = setup(); const task = await enqueueReview(env, payload(), 'a');
+    sqlite.prepare("UPDATE review_jobs SET status = 'running', updated_at = ? WHERE id = ?")
+      .run(new Date(Date.now() - 16 * 60 * 1000).toISOString(), task.id);
+    await updateReviewProgress(env, task.id, '模型正在思考，连接正常，尚未输出正文…');
+    expect(await getReviewJob(env, task.id, 'a')).toMatchObject({ status: 'running', error: '模型正在思考，连接正常，尚未输出正文…' });
   });
   it('输入按小块往返保持中文和 emoji，失败不捏造评分且清理输入', async () => {
     const { env, payload, sqlite } = setup(); const input = payload(); input.html = `<!--${'文'.repeat(119950)}🐈${'字'.repeat(130000)}-->`;

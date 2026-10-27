@@ -61,6 +61,20 @@ describe('模型传输',()=>{
     expect(budgets).toEqual([32768,24000,24000]);
   });
 
+  it('Opus 支持请求 64k，遵守已保存的思考强度和输出上限',async()=>{
+    const bodies:any[]=[];
+    vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init?:RequestInit)=>{
+      bodies.push(JSON.parse(String(init?.body)));
+      return Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'});
+    }));
+    const opus={...config,protocol:'anthropic' as const,model:'claude-opus-5-5',effort:'medium' as const};
+    await modelTransport(opus,{maxTokens:64000,outputEffort:'low'})([]);
+    await modelTransport(opus,{maxTokens:100000})([]);
+    await modelTransport({...opus,maxOutputTokens:16000},{maxTokens:64000})([]);
+    expect(bodies.map(b=>b.max_tokens)).toEqual([64000,64000,16000]);
+    expect(bodies[0]).toMatchObject({thinking:{type:'adaptive'},output_config:{effort:'medium'}});
+  });
+
   it('修复尾随逗号时保留字符串里的逗号、括号和转义引号',()=>{
     const copy = 'Use ,} or ,] and "quoted" text';
     const response = `结果：{"items":[{"title":${JSON.stringify(copy)},},]} 完成。`;
@@ -87,6 +101,45 @@ describe('模型传输',()=>{
     const check=expect(response).rejects.toThrow('模型响应超时');
     await vi.advanceTimersByTimeAsync(45_000);
     await check;
+  });
+
+  it('上游流读取永久挂起时，超时会直接退出并取消读取',async()=>{
+    vi.useFakeTimers();
+    const cancel=vi.fn(async()=>{});
+    const reader={read:vi.fn(()=>new Promise<ReadableStreamReadResult<Uint8Array>>(()=>{})),cancel,releaseLock:vi.fn()};
+    vi.stubGlobal('fetch',vi.fn(async()=>({
+      status:200,ok:true,headers:new Headers({'content-type':'text/event-stream'}),body:{getReader:()=>reader},
+    } as unknown as Response)));
+    const response=modelTransport(config,{timeoutMs:100,totalTimeoutMs:1000})([]);
+    const check=expect(response).rejects.toThrow('模型响应超时');
+    await vi.advanceTimersByTimeAsync(100);
+    await check;
+    expect(reader.cancel).toHaveBeenCalledTimes(1);
+    expect(reader.releaseLock).toHaveBeenCalledTimes(1);
+  });
+
+  it('上游建连永久挂起时，超时会返回错误并完成任务清理',async()=>{
+    vi.useFakeTimers();
+    const onMetrics=vi.fn(async()=>{});
+    vi.stubGlobal('fetch',vi.fn(()=>new Promise<Response>(()=>{})));
+    const response=modelTransport(config,{timeoutMs:100,totalTimeoutMs:1000,onMetrics})([]);
+    const check=expect(response).rejects.toThrow('模型响应超时');
+    await vi.advanceTimersByTimeAsync(100);
+    await check;
+    expect(onMetrics).toHaveBeenCalledWith(expect.objectContaining({status:'error',error:'模型响应超时'}));
+  });
+
+  it.each(['openai','anthropic'] as const)('%s 已收到结束标记但网关不断开时，立即返回正文',async(protocol)=>{
+    const cancel=vi.fn();
+    const payload=protocol==='anthropic'
+      ? 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"READY"}}\n\ndata: {"type":"message_stop"}\n\n'
+      : 'data: {"choices":[{"delta":{"content":"READY"}}]}\n\ndata: [DONE]\n\n';
+    vi.stubGlobal('fetch',vi.fn(async()=>new Response(new ReadableStream({
+      start(controller){controller.enqueue(new TextEncoder().encode(payload));},
+      cancel,
+    }),{headers:{'content-type':'text/event-stream'}})));
+    await expect(modelTransport({...config,protocol},{timeoutMs:100})([])).resolves.toBe('READY');
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it('读取 Anthropic 流式文本，并带上幂等键',async()=>{

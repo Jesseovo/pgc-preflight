@@ -58,15 +58,23 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
 }
 
 export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
+  await recoverInterruptedReviews(env, ownerId);
   const { results } = await env.DB.prepare('SELECT * FROM review_jobs WHERE owner_id = ? AND created_at > ? ORDER BY created_at DESC LIMIT 40')
     .bind(ownerId, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()).all();
   return (results || []).map(publicJob);
 }
 
+export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string) {
+  const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  await env.DB.prepare(`UPDATE review_jobs SET status = 'error', error = '后台审核已中断，未发布评分，请重新上传或重试。', updated_at = ? WHERE status = 'running' AND updated_at < ?${ownerId ? ' AND owner_id = ?' : ''}`)
+    .bind(stamp(),cutoff,...(ownerId ? [ownerId] : [])).run();
+  await env.DB.prepare("DELETE FROM review_inputs WHERE job_id IN (SELECT id FROM review_jobs WHERE status = 'error')").bind().run();
+}
+
 export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: string) {
   let row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
   if (!row) throw fail('审核任务不存在。', 404);
-  const stale = row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 20 * 60 * 1000
+  const stale = row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000
     || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > 3 * 60 * 60 * 1000;
   if (stale) {
     await env.DB.prepare("UPDATE review_jobs SET status = 'error', error = '后台任务已中断，请重试。', updated_at = ? WHERE id = ? AND updated_at = ?")
@@ -77,9 +85,18 @@ export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: strin
   return publicJob(row);
 }
 
+// Model activity updates the member-visible stage and also renews the job
+// heartbeat. A live stream that spends a long time thinking must not be
+// mistaken for an abandoned queue consumer by the 15-minute stale check.
+export async function updateReviewProgress(env: ReviewJobEnv, id: string, message: string) {
+  await env.DB.prepare("UPDATE review_jobs SET error = ?, updated_at = ? WHERE id = ? AND status = 'running'")
+    .bind(message, stamp(), id).run();
+}
+
 const deleteInput = (env: ReviewJobEnv, id: string) => env.DB.prepare('DELETE FROM review_inputs WHERE job_id = ?').bind(id).run();
 
 export async function purgeReviewInputs(env: { DB: any }) {
+  await recoverInterruptedReviews(env);
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   await env.DB.batch([
     env.DB.prepare('DELETE FROM review_inputs WHERE created_at < ?').bind(cutoff),
@@ -94,10 +111,14 @@ export async function processReviewJob(env: ReviewJobEnv, id: string, evaluate: 
     await deleteInput(env, id);
     return;
   }
+  if (row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000) {
+    await recoverInterruptedReviews(env);
+    return; // Unknown upstream state: never silently replay a paid request.
+  }
   const lease = crypto.randomUUID();
   const claim = await env.DB.prepare(`UPDATE review_jobs SET status = 'running', lease = ?, updated_at = ?
-    WHERE id = ? AND (status = 'queued' OR (status = 'running' AND updated_at < ?))`)
-    .bind(lease, stamp(), id, new Date(Date.now() - 13 * 60 * 1000).toISOString()).run();
+    WHERE id = ? AND status = 'queued'`)
+    .bind(lease, stamp(), id).run();
   if (!claim.meta.changes) throw fail('任务正在处理。', 409);
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   try {

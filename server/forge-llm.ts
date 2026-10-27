@@ -2,6 +2,7 @@ import { activeModelProfile, decryptKey } from './settings';
 import type { ModelConfig, ModelPurpose } from './settings';
 import { modelTransport, ModelOutputError } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
+import { inferenceOptions } from '../src/model-options';
 
 export class LLMError extends Error {
   status: number;
@@ -53,7 +54,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
 export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
-  if (req.requiredProfile && (active?.id !== req.requiredProfile || active.profile.model !== 'claude-opus-5-5')) throw new LLMError('制作任务要求 Claude Opus 5.5；创作模型已切换，请重新配置后重试。', 409);
+  if (req.requiredProfile && (!active || active.profile.protocol !== 'anthropic' || !/^claude-opus-5-5$/i.test(active.profile.model))) throw new LLMError('游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。', 409);
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError(req.purpose === 'review' ? '管理员尚未配置并启用审核模型。' : '管理员尚未配置并启用创作模型。', 503);
   if (active.profile.vision === false) req = { ...req, user: withoutImages(req.user) };
   let apiKey: string;
@@ -62,7 +63,8 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   try {
     const messages = toMessages(req.system, req.user, req.schema) as any;
     let retryHint = '';
-    let maxTokens = req.maxTokens;
+    const inference = inferenceOptions(active.profile, req.purpose, req.maxTokens);
+    let maxTokens = inference.maxTokens;
     let lastError: unknown;
     let freshRequest = false;
     // Only explicitly pending idempotent requests are retried by transport.
@@ -77,11 +79,16 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const attemptMessages = retryHint ? [...messages, { role: 'user', content: retryHint }] : messages;
       const idempotencyKey = await keyedRequestId(req.idempotencyKey, attemptMessages);
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
-      const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, {
+      const transport = modelTransport({ ...active.profile, apiKey }, {
         DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
-        json: Boolean(req.schema), reasoningEffort: req.purpose === 'review' || req.purpose === 'review_verify' ? 'low' : undefined,
+        json: Boolean(req.schema), purpose:req.purpose,
         onProgress: req.onProgress,
-        outputEffort: active.profile.protocol === 'anthropic' && /^claude-opus-5-5$/i.test(active.profile.model) ? req.outputEffort : undefined,
+        onActivity: req.onWait ? (phase, characters) => req.onWait!(phase === 'thinking' ? '模型正在思考，连接正常，尚未输出正文…' : `模型正在输出，已接收 ${characters.toLocaleString('en-US')} 个字符…`) : undefined,
+        onMetrics: async metrics => {
+          if (!env.DB) return;
+          await env.DB.prepare('INSERT INTO model_runs (id,profile_id,model,purpose,status,effort,max_tokens,input_tokens,output_tokens,reasoning_tokens,first_text_ms,elapsed_ms,characters,finish_reason,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+            .bind(crypto.randomUUID(),active.id,active.profile.model,req.purpose || 'create',metrics.status,metrics.effort,metrics.maxTokens,metrics.inputTokens,metrics.outputTokens,metrics.reasoningTokens,metrics.firstTextMs,metrics.elapsedMs,metrics.characters,metrics.finishReason,metrics.error,new Date().toISOString()).run();
+        },
         onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
       try {
@@ -106,7 +113,15 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
             ? `上次输出不完整：${message} 请重新输出完整自包含 HTML 游戏，缩减实现以适应输出预算，保留完整核心循环。只输出 HTML，不要 JSON、解释或 Markdown。`
             : req.schema ? `上次生成未能交付完整报告：${message} 请根据原始材料重新生成完整 JSON 对象，严格使用给定字段和类型，内容简洁，保留所有必需字段；不要输出思考过程、Markdown 或解释。不得编造分数或证据。`
               : `上次输出不完整：${message} 请按原始要求重新完整输出，内容简洁，不要改成 JSON。`;
-          if (error instanceof ModelOutputError && error.kind === 'truncated') maxTokens = Math.min(24000, (maxTokens || 2200) * 2);
+          if (error instanceof ModelOutputError && error.kind === 'truncated') {
+            // Review stages already receive their full 24k contract budget.
+            // Only a deliberately smaller direct call may grow once; never
+            // turn a production stage into an unbounded paid retry.
+            const reviewCap = req.purpose === 'review' || req.purpose === 'review_verify'
+              ? Math.min(24000, Math.max(req.maxTokens ?? inference.maxTokens, 1) * 2)
+              : maxTokens * 2;
+            maxTokens = Math.min(inference.capability.maxOutput, active.profile.maxOutputTokens || inference.capability.maxOutput, reviewCap);
+          }
           await req.onWait?.(`模型报告未完整生成，正在重新生成（${attempt + 2}/${attempts}）。`);
         } else await req.onWait?.('模型接口暂不可用，正在等待恢复。');
         await new Promise(resolve => setTimeout(resolve, parseFailure || outputFailure ? 1200 : 5000 * (attempt + 1)));

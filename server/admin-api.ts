@@ -1,6 +1,7 @@
 import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, saveRoutes, validateModelFields, decryptKey, deleteProfile, profileId } from './settings';
 import type { AppSecrets, ConfigStore } from './settings';
 import { modelTransport } from './model';
+import { inferenceOptions } from '../src/model-options';
 import type { ModelThrottleDatabase } from './model-throttle';
 import {createMember,updateMember,publicMember} from './members';
 import type {MemberStore} from './members';
@@ -42,6 +43,11 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       const body=await smallJson(request) as {profile?:unknown};
       return json(publicConfig(await deleteProfile(body.profile,store)));
     }
+    if(url.pathname==='/api/admin/runs'&&request.method==='GET'){
+      if (!DB) return json({runs:[]});
+      const result=await (DB.prepare('SELECT profile_id,model,purpose,status,effort,max_tokens,input_tokens,output_tokens,reasoning_tokens,first_text_ms,elapsed_ms,characters,finish_reason,error,created_at FROM model_runs ORDER BY created_at DESC LIMIT 30').bind() as any).all();
+      return json({runs:result.results || []});
+    }
     if(url.pathname==='/api/admin/test'&&request.method==='POST'){
       const raw=await smallJson(request) as Record<string, unknown>;
       const fields=validateModelFields(raw);
@@ -50,15 +56,16 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       if(!fields.apiKey&&savedProfile&&(fields.baseUrl!==savedProfile.baseUrl||fields.protocol!==(savedProfile.protocol||'openai')))return json({error:'更换接口地址或协议时，请重新填写 API Key。'},400);
       const apiKey=fields.apiKey||(savedProfile?.encryptedKey?await decryptKey(savedProfile.encryptedKey,secrets.SETTINGS_KEY):'');
       if(!apiKey)return json({error:'请先填写 API Key。'},400);
-      const transport=modelTransport({...fields,apiKey},{DB});
+      const inference=inferenceOptions(fields,'test');
+      const transport=modelTransport({...fields,effort:'auto',apiKey},{DB,maxTokens:inference.maxTokens,purpose:'test'});
       const started=Date.now();
       // Text first: a connection that works but cannot take images is still
       // usable for creation, or for review with screenshots turned off.
       const text=await transport([{role:'user',content:[{type:'text',text:'这是模型接口测试。请只回复 READY。'}]}]);
       const durationMs=Date.now()-started;
-      let vision=true,visionError='';
+      let vision:boolean|null=true,visionError='';
       try{await transport([{role:'user',content:[{type:'text',text:'这是图片输入测试。请只回复 READY。'},{type:'image_url',image_url:{url:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwBfPXCY1iiH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBVNChh70khwUAAAAASUVORK5CYII='}}]}]);}
-      catch(error){vision=false;visionError=(error instanceof Error?error.message:String(error)).slice(0,200);}
+      catch(error){visionError=(error instanceof Error?error.message:String(error)).slice(0,200);vision=/image.*(not supported|unsupported)|不支持.*图|invalid.*image|vision.*not supported/i.test(visionError)?false:null;}
       return json({ok:true,durationMs,message:text.slice(0,150),vision,visionError});
     }
     return json({error:'接口不存在。'},404);

@@ -44,6 +44,15 @@ try {
   await page.setViewport({width:1440,height:1050});await page.goto(origin+'/admin');await page.waitForSelector('#admin-password');
   await page.type('#admin-password',secrets.ADMIN_PASSWORD);await page.click('#login-form button[type="submit"]');await page.waitForSelector('#tab-model');await page.click('#tab-model');
   assert.equal(await page.$eval('#api-key',e=>(e as HTMLInputElement).value),'');
+  await page.click('[data-profile="opus"]');
+  await page.select('#model-effort','medium');
+  await page.$eval('#model-output-limit',e=>(e as HTMLInputElement).value='64000');
+  await page.click('#save-model');await page.waitForFunction('document.querySelector("#config-message").textContent.includes("已保存")');
+  assert.equal(config!.profiles!.opus!.effort,'medium');
+  assert.equal(config!.profiles!.opus!.maxOutputTokens,64000);
+  await page.select('#model-effort','auto');
+  await page.$eval('#model-output-limit',e=>(e as HTMLInputElement).value='0');
+  await page.click('#save-model');await page.waitForFunction('document.querySelector("#config-message").textContent.includes("已保存")');
   await page.click('#add-model');
   await page.type('#profile-name','Studio · independent key');
   await page.$eval('#model-name',e=>(e as HTMLInputElement).value='');await page.type('#model-name','studio-model');await page.type('#api-key','fixture-studio-secret');

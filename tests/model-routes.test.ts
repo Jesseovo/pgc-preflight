@@ -79,6 +79,8 @@ describe('模型按用途分配',()=>{
     await saveRoutes({activeProfile:'deepseek'},store);
     await expect(deleteProfile('opus',store)).rejects.toThrow('正在被使用');
     await saveRoutes({create:''},store);
+    await expect(deleteProfile('opus',store)).rejects.toThrow('游戏制作');
+    await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',enabled:false},store,SECRET);
     await deleteProfile('opus',store);
     expect(get()?.profiles?.opus).toBeUndefined();
     const before=get();
