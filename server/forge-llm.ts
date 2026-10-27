@@ -79,9 +79,9 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
       const transport = modelTransport({ baseUrl: active.profile.baseUrl, model: active.profile.model, protocol: active.profile.protocol || 'openai', apiKey }, {
         DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
-        json: Boolean(req.schema), reasoningEffort: req.purpose === 'review' ? 'low' : undefined,
+        json: Boolean(req.schema), reasoningEffort: req.purpose === 'review' || req.purpose === 'review_verify' ? 'low' : undefined,
         onProgress: req.onProgress,
-        outputEffort: req.outputEffort,
+        outputEffort: active.profile.protocol === 'anthropic' && /^claude-opus-5-5$/i.test(active.profile.model) ? req.outputEffort : undefined,
         onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
       try {

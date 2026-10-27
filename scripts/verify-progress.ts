@@ -44,8 +44,8 @@ const server = createServer(async (request, response) => {
       if (url.pathname.endsWith('/login')) { adminSignedIn = true; return json({ ok: true }); }
       if (!adminSignedIn) return json({ error: 'not signed in' }, 401);
       if (url.pathname.endsWith('/test')) { modelTest = true; await pause(2300); return json({ durationMs: 2300 }); }
-      const profile = { baseUrl: 'https://example.com/v1', model: 'test-vision', protocol: 'openai', enabled: true, hasKey: true, updatedAt: '' };
-      return json({ ...profile, activeProfile: 'deepseek', profiles: { deepseek: profile, opus: { ...profile, protocol: 'anthropic' } } });
+      const profile = { name: 'Synthetic model', baseUrl: 'https://example.com/v1', model: 'test-vision', protocol: 'openai', enabled: true, hasKey: true, updatedAt: '' };
+      return json({ ...profile, activeProfile: 'deepseek', profiles: { deepseek: profile, opus: { ...profile, protocol: 'anthropic' } }, routes: {}, effective: {} });
     }
     if (url.pathname === '/api/auth/login') { await pause(1800); return json({ error: '合成登录错误' }, 401); }
     if (url.pathname === '/api/auth/me') return json({ error: 'not signed in' }, 401);

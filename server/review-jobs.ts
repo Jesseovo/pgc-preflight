@@ -19,8 +19,11 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
     typeof shot?.data === 'string' && /^data:image\/(jpeg|png|webp);base64,/.test(shot.data)).slice(0, 6);
   if (shots.reduce((size: number, shot: any) => size + shot.data.length, 0) > 1500000) throw fail('截图总大小过大，请重新采集。', 413);
   if (JSON.stringify(payload.probe || {}).length > 150000) throw fail('运行记录过大，请精简游戏日志。', 413);
-  const active = activeModelProfile(await env.modelStore.get(), 'review');
-  if (!active?.profile.enabled || !active.profile.encryptedKey) throw fail('管理员尚未配置并启用审核模型。', 503);
+  const config = await env.modelStore.get();
+  for (const purpose of ['review', 'review_verify'] as const) {
+    const model = activeModelProfile(config, purpose);
+    if (!model?.profile.enabled || !model.profile.encryptedKey) throw fail(`管理员尚未配置并启用${purpose === 'review' ? '审核初评' : '评分复核'}模型。`, 503);
+  }
   const id = payload.request_id;
   if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw fail('审核请求标识无效，请重新提交。');
   const existing = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();

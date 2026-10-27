@@ -1,7 +1,8 @@
-import {describe,expect,it} from 'vitest';
-import {activeModelProfile,activateProfile,publicConfig,saveConfig,saveRoutes} from '../server/settings';
+import {afterEach,describe,expect,it,vi} from 'vitest';
+import {activeModelProfile,activateProfile,publicConfig,saveConfig,saveRoutes,deleteProfile,MODEL_PURPOSES} from '../server/settings';
 import type {ModelConfig,ConfigStore} from '../server/settings';
-import {withoutImages,routedModel} from '../server/forge-llm';
+import {withoutImages,routedModel,complete} from '../server/forge-llm';
+afterEach(()=>vi.unstubAllGlobals());
 
 const SECRET='test-only-encryption-key';
 async function twoProfiles(){
@@ -21,7 +22,7 @@ describe('模型按用途分配',()=>{
     expect(activeModelProfile(get(),'review')?.id).toBe('deepseek');
     expect(activeModelProfile(get(),'create')?.id).toBe('opus');
     expect(routedModel(get(),'create')).toBe('claude-opus-5-5');
-    expect(publicConfig(get()).effective).toEqual({review:'deepseek',create:'opus'});
+    expect(publicConfig(get()).effective).toEqual(Object.fromEntries(MODEL_PURPOSES.map(p=>[p,p==='review'||p==='review_verify'?'deepseek':'opus'])));
     expect(JSON.stringify(publicConfig(get()))).not.toMatch(/deepseek-key|opus-key/);
   });
   it('切换全局模型和重新保存配置都不会丢失用途分配',async()=>{
@@ -45,6 +46,45 @@ describe('模型按用途分配',()=>{
     const {get}=await twoProfiles();
     expect(get()?.profiles?.deepseek?.vision).toBe(false);
     expect(publicConfig(get()).profiles.opus.vision).toBe(true);
+  });
+  it('同一模型的多把 Key 独立保存，逐环节覆盖和继承均发送正确的 Key',async()=>{
+    const {store,get}=await twoProfiles();
+    const saveExtra=(id:string,key='extra-fixture-key')=>saveConfig({profile:id,name:'Additional model',protocol:'anthropic',baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',apiKey:key},store,SECRET);
+    await saveExtra('studio-key');
+    const encrypted=get()!.profiles!['studio-key']!.encryptedKey;
+    await saveExtra('studio-key','');
+    expect(get()!.profiles!['studio-key']!.encryptedKey).toBe(encrypted);
+    await saveRoutes({review:'opus',create:'opus',review_verify:'studio-key',game:'studio-key',brief:'studio-key'},store);
+    const fetcher=vi.fn(async()=>Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'}));
+    vi.stubGlobal('fetch',fetcher);
+    for(const purpose of MODEL_PURPOSES) {
+      await expect(complete({modelStore:store,SETTINGS_KEY:SECRET},{},{system:'s',user:'test',purpose})).resolves.toBe('READY');
+      const headers=new Headers((fetcher.mock.calls.at(-1) as any)[1].headers);
+      expect(headers.get('x-api-key')).toBe(['review_verify','game','brief'].includes(purpose)?'extra-fixture-key':'opus-key');
+    }
+    const view=publicConfig(get());
+    expect(view.profiles['studio-key']).toMatchObject({name:'Additional model',hasKey:true});
+    expect(JSON.stringify(view)).not.toMatch(/extra-fixture-key|encryptedKey/);
+    await saveRoutes({game:'',review_verify:''},store);
+    expect(activeModelProfile(get(),'game')?.id).toBe('opus');
+    expect(activeModelProfile(get(),'review_verify')?.id).toBe('opus');
+    expect(activeModelProfile(get(),'brief')?.id).toBe('studio-key');
+  });
+  it('分配和默认切换原子保存，禁止删除使用中配置或选择停用模型',async()=>{
+    const {store,get}=await twoProfiles();
+    await saveRoutes({brief:'opus',activeProfile:'opus'},store);
+    await expect(deleteProfile('opus',store)).rejects.toThrow('正在被使用');
+    await saveRoutes({activeProfile:'deepseek'},store);
+    await expect(deleteProfile('opus',store)).rejects.toThrow('正在被使用');
+    await saveRoutes({brief:''},store);
+    await deleteProfile('opus',store);
+    expect(get()?.profiles?.opus).toBeUndefined();
+    const before=get();
+    await expect(saveRoutes({review:'deepseek',game:'missing',activeProfile:'missing'},store)).rejects.toThrow();
+    expect(get()).toBe(before);
+    await saveConfig({profile:'disabled-model',baseUrl:'https://test.example',model:'text',apiKey:'fixture',enabled:false},store,SECRET);
+    await expect(saveRoutes({game:'disabled-model'},store)).rejects.toThrow('启用');
+    for(const profile of ['__proto__','constructor','Bad ID']) await expect(saveConfig({profile,baseUrl:'https://test.example',model:'text',apiKey:'fixture'},store,SECRET)).rejects.toThrow('标识');
   });
 });
 

@@ -1,4 +1,4 @@
-import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, saveRoutes, validateModelFields, decryptKey } from './settings';
+import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, saveRoutes, validateModelFields, decryptKey, deleteProfile, profileId } from './settings';
 import type { AppSecrets, ConfigStore } from './settings';
 import { modelTransport } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
@@ -38,12 +38,15 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json(publicConfig(await activateProfile(body.profile,store)));
     }
     if(url.pathname==='/api/admin/config/routes'&&request.method==='POST')return json(publicConfig(await saveRoutes(await smallJson(request),store)));
+    if(url.pathname==='/api/admin/config/profile'&&request.method==='DELETE'){
+      const body=await smallJson(request) as {profile?:unknown};
+      return json(publicConfig(await deleteProfile(body.profile,store)));
+    }
     if(url.pathname==='/api/admin/test'&&request.method==='POST'){
       const raw=await smallJson(request) as Record<string, unknown>;
       const fields=validateModelFields(raw);
       const previous=await store.get();
-      const profileId=raw.profile==='opus'?'opus':'deepseek';
-      const savedProfile=modelProfiles(previous)[profileId];
+      const savedProfile=modelProfiles(previous)[profileId(raw.profile ?? 'deepseek')];
       if(!fields.apiKey&&savedProfile&&(fields.baseUrl!==savedProfile.baseUrl||fields.protocol!==(savedProfile.protocol||'openai')))return json({error:'更换接口地址或协议时，请重新填写 API Key。'},400);
       const apiKey=fields.apiKey||(savedProfile?.encryptedKey?await decryptKey(savedProfile.encryptedKey,secrets.SETTINGS_KEY):'');
       if(!apiKey)return json({error:'请先填写 API Key。'},400);

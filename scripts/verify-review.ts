@@ -49,12 +49,12 @@ const server = createServer(async (request, response) => {
       html = html.replace('<script type="module" src="/forge/app.js"></script>', `<script type="module">
         import { mountReviewWorkspace } from '/forge/review-workspace.js';
         const api = async (method,path,data) => { const r=await fetch('/api/forge/'+path,{method,headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}); const out=await r.json(); if(!r.ok) throw Error(out.error); return out; };
-        window.copied=[]; window.probeCount=0;
+        window.copied=[]; window.downloaded=[]; window.probeCount=0;
         const probeGame = async (html,box,log) => {
           window.probeCount++; log('采集画面…'); await new Promise(r=>setTimeout(r,30));
           return {probe:{loaded:{},errors:[],layout:{},audio:{}}, shots:[]};
         };
-        await mountReviewWorkspace({view:document.querySelector('#view'),api,alive:()=>true,topics:[],probeGame,setProbing:()=>{},checksHtml:()=>'',probeChecks:()=>[],copyText:t=>window.copied.push(t),download:()=>{},openModal:()=>{}});
+        await mountReviewWorkspace({view:document.querySelector('#view'),api,alive:()=>true,topics:[],probeGame,setProbing:()=>{},checksHtml:()=>'',probeChecks:()=>[],copyText:t=>window.copied.push(t),download:(name,text)=>window.downloaded.push({name,text}),openModal:()=>{}});
         window.ready=true;
       </script>`);
       response.setHeader('Content-Type', 'text/html'); return response.end(html);
@@ -69,9 +69,10 @@ const server = createServer(async (request, response) => {
 await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 const origin = `http://127.0.0.1:${(server.address() as any).port}`;
 const browser = await launchLocalBrowser();
+let debugPage:any;
 await mkdir('artifacts', { recursive: true });
 try {
-  const page = await browser.newPage();
+  const page = await browser.newPage();debugPage=page;
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(String(error)));
   await page.setViewport({ width: 1440, height: 1000 });
@@ -91,9 +92,10 @@ try {
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 3 && document.querySelectorAll(".rv-job-status.error").length === 1', { timeout: 20000 });
   assert.equal(peak, 3, 'AI jobs must overlap, limited to 3');
   await page.waitForSelector('.pgc-task[data-task-state="error"]');
+  assert(await page.$('.pgc-task-toggle[aria-expanded="false"]'),'Review progress stays compact so batch actions remain reachable');
   assert.match(await page.$eval('.pgc-task[data-task-state="error"]', el => el.textContent!), /审核未完成.*重试审核/s);
   assert.equal(await page.$('.pgc-task[data-task-state="error"] [data-progress-since]'), null, 'Failed tasks must stop their elapsed clock');
-  await page.click('.pgc-task[data-task-state="error"] button');
+  await page.click('#rvRetryAll');
   await page.waitForFunction('document.querySelectorAll(".rv-job-status.done").length === 4', { timeout: 12000 });
   assert.equal(await page.evaluate('window.probeCount'), 4, 'Retry reuses collected evidence');
   await page.click('[data-select]');
@@ -101,6 +103,19 @@ try {
   assert.match(await page.$eval('.rr-uncertainties', el => el.textContent!), /未实际听音频/);
   await page.click('[data-copy-fix]');
   assert.match(String(await page.evaluate('window.copied[0]')), /每 15 秒/);
+  await page.click('#rvExportAll');
+  const exported=await page.evaluate('window.downloaded[0]') as {name:string;text:string};
+  assert.match(exported.name,/reviews-.*\.md$/);
+  for(const title of ['First game','Second game','Retry me','Fourth game'])assert(exported.text.includes(title));
+  await page.select('#rvHistoryFilter','pass');
+  assert.equal(await page.$$eval('[data-history]',items=>items.length),0);
+  await page.select('#rvHistoryFilter','revise');
+  await page.type('#rvHistorySearch','Second');
+  assert.equal(await page.$$eval('[data-history]',items=>items.length),1);
+  await page.$eval('#rvHistorySearch',el=>{(el as HTMLInputElement).value='';el.dispatchEvent(new Event('input',{bubbles:true}));});
+  await page.select('#rvHistoryFilter','all');
+  await page.click('[data-report-jump=".rr-issues"]');
+  await page.waitForFunction('document.querySelector(".rr-issues").getBoundingClientRect().top < innerHeight');
   await page.evaluate(() => scrollTo(0, 0));
   await page.screenshot({ path: 'artifacts/review-desktop.png', fullPage: true });
   await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
@@ -122,6 +137,7 @@ try {
   await recovery.waitForSelector(recoveredTask);
   assert.match(await recovery.$eval(recoveredTask, el => el.textContent!), /请求冲突（409）.*重新上传重试/s);
   assert.doesNotMatch(await recovery.$eval(recoveredTask, el => el.textContent!), /AI 评分中|检查模型配置/);
+  await recovery.click('.pgc-task-toggle[aria-expanded="false"]');
   const chooser = recovery.waitForFileChooser();
   await recovery.click(`${recoveredTask} button`);
   await (await chooser).cancel();
@@ -168,4 +184,5 @@ try {
   assert.deepEqual(runtimeErrors, []);
   assert.equal(latest.probe.captureMethod, 'browser-viewport-v1');
   console.log('PASS 真实上传入口 + 三种比例独立浏览器页面 + 4 张完整视口截图 + 后台报告。');
+} catch(error) { console.log(await debugPage.evaluate('({feedback:document.querySelector("#rvFeedback")?.textContent,statuses:[...document.querySelectorAll(".rv-job-status")].map(e=>e.textContent)})'));await debugPage.screenshot({path:'artifacts/review-verification-failure.png',fullPage:true});throw error;
 } finally { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve())); }

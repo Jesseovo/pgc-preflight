@@ -2,7 +2,7 @@
 .review-page { --rv-line: #e1e7e2; --rv-soft: #f6f8f4; --rv-sage: #53725e; --rv-muted: #7b857e; }
 .review-page button, .review-page select { touch-action: manipulation; }
 .review-page button:focus-visible, .review-page select:focus-visible, .review-page summary:focus-visible { outline: 2px solid #618269; outline-offset: 4px; }
-.review-page .review-intro { padding: 36px 0 28px; }
+.review-page .review-intro { padding: 24px 0 18px; }
 .review-page .review-intro h1 { font-size: clamp(26px, 3vw, 36px); letter-spacing: -1.3px; }
 .review-intro-tags { display: flex; gap: 10px; align-items: center; margin-top: 17px; color: var(--rv-sage); font-size: 11px; }
 .review-intro-tags i { font-style: normal; color: #b9c8bc; }
@@ -12,7 +12,7 @@
 .review-page .section-label { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 12px; }
 .review-page .section-label > span { display: flex; align-items: center; }
 .review-page .section-label > b { font-size: 10px; font-weight: 400; color: var(--rv-muted); }
-.review-page .review-dropzone { min-height: 250px; margin-top: 18px; border-color: #c1d1be; border-radius: 8px; transition: border-color 160ms ease-out, background-color 160ms ease-out; }
+.review-page .review-dropzone { min-height: 210px; margin-top: 18px; border-color: #c1d1be; border-radius: 8px; transition: border-color 160ms ease-out, background-color 160ms ease-out; }
 .review-page .review-dropzone.drag-over { outline: 3px solid #e2ecde; border-color: #628362; background-color: #eef5e9; transform: none; }
 .review-page .review-dropzone h2 { margin-top: 12px; font-size: 19px; }
 .review-page .review-dropzone > p { font-size: 11px; }
@@ -49,7 +49,7 @@
 .rv-batch-heading { display: flex; align-items: end; justify-content: space-between; gap: 15px; }
 .rv-batch-heading h2 { margin: 7px 0 0; font-size: 19px; font-weight: 600; letter-spacing: -.5px; }
 #rvQueueCount { display: inline-block; margin-left: 10px; color: #94a38e; font: 12px ui-monospace, monospace; }
-.rv-batch-actions { display: flex; gap: 12px; align-items: center; }
+.rv-batch-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 #rvBatchStats { font-size: 10px; color: var(--rv-muted); }
 .rv-batch-actions .rr-button { border: 0; padding: 6px 0; color: #6a7f6c; font-size: 10px; }
 .rv-batch-progress { height: 2px; margin: 17px 0 20px; background: #edf0e9; }
@@ -269,4 +269,41 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .review-page *, .review-page *::before, .review-page *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
+
+/* Compact batch controls and a visible path from capture to verified report. */
+.rv-overview { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); border: 1px solid var(--rv-line); border-radius: 8px; margin: 18px 0 14px; background: #fff; }
+.rv-overview > div { display: flex; gap: 10px; align-items: baseline; padding: 14px 18px; }
+.rv-overview > div + div { border-left: 1px solid var(--rv-line); }
+.rv-overview b { font-size: 23px; font-weight: 500; color: #526b58; font-variant-numeric: tabular-nums; }
+.rv-overview span { font-size: 11px; color: #79877c; }
+.rv-stage-steps { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; width: 100%; margin: 25px 0 10px; }
+.rv-stage-steps li { display: grid; justify-items: center; gap: 9px; font-size: 10px; color: #8b978c; }
+.rv-stage-steps i { display: grid; place-items: center; font: 11px ui-monospace,monospace; width: 26px; height: 26px; border: 1px solid #dce5d9; border-radius: 50%; background: #fff; }
+.rv-stage-steps .is-complete { color: #668267; }
+.rv-stage-steps .is-complete i { background: #edf4e9; }
+.rv-stage-steps .is-current { color: #3d6548; font-weight: 600; }
+.rv-stage-steps .is-current i { background: #55775b; color: #fff; border-color: #55775b; }
+.rr-report-nav { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 27px 22px; }
+.rr-report-nav button { background: #fff; border: 1px solid var(--rv-line); border-radius: 5px; padding: 8px 10px; color: #667b67; font: inherit; font-size: 11px; cursor: pointer; }
+.rr-report-nav b { font-weight: 500; font-size: 10px; margin-left: 4px; color: #86957f; }
+.review-report section { scroll-margin-top: 85px; }
+.rv-history-tools { display: flex; flex-wrap: wrap; align-items: end; gap: 14px; padding: 8px 0 15px; border-bottom: 1px solid var(--rv-line); }
+.rv-history-tools label { display: grid; gap: 7px; font-size: 10px; color: #768371; }
+.rv-history-tools label:first-child { flex: 1; min-width: 140px; }
+.rv-history-tools input, .rv-history-tools select { min-height: 38px; border: 1px solid #dfe6dc; border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12px; color: #50664f; background: #fff; min-width: 0; width: 100%; }
+.rv-history-tools > span { font-size: 10px; color: #8a9682; padding-bottom: 10px; }
+.review-page input:focus-visible, .rr-report-nav button:focus-visible { outline: 2px solid #618269; outline-offset: 3px; }
+@media (max-width: 700px) {
+  .rv-overview > div { display: grid; gap: 4px; padding: 12px 10px; }
+  .rv-overview b { font-size: 21px; }
+  .rv-overview span { font-size: 10px; }
+  #rvBatchStats { width: 100%; }
+  .rv-batch-actions { justify-content: start; gap: 16px; }
+  .rr-report-nav { padding: 0 17px 20px; gap: 6px; }
+  .rr-report-nav button { font-size: 10px; padding: 8px; }
+  .rv-history-tools input, .rv-history-tools select { font-size: 16px; }
+  .rv-history-tools > span { width: 100%; padding: 0; }
+  .rv-stage-steps { gap: 4px; }
+  .rv-stage-steps li { font-size: 9px; }
 }

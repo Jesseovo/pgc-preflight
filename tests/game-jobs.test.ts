@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import { forgeApi, processForgeJob } from '../server/forge-api';
-import { saveConfig } from '../server/settings';
+import { saveConfig, saveRoutes } from '../server/settings';
 import type { ConfigStore, ModelConfig } from '../server/settings';
 import type { MemberStore } from '../server/members';
 import { hashPassword, memberLogin } from '../server/members';
@@ -112,10 +112,26 @@ describe('Opus 制作任务与成品接口', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('只允许候选游戏和 Claude Opus 5.5 启动制作', async () => {
-    const wrongModel = await setup({ model: 'deepseek-flash' });
-    expect((await wrongModel.request('POST', ['topics', '9', 'game'])).status).toBe(409);
-    expect(wrongModel.send).not.toHaveBeenCalled();
+  it('制作使用独立环节模型，停用模型或非候选游戏不能制作', async () => {
+    const game = await setup();
+    await saveConfig({profile:'game-writer',baseUrl:'https://writer.example/v1',model:'game-model',apiKey:'game-only-key'},game.env.modelStore,secrets.SETTINGS_KEY);
+    await saveRoutes({game:'game-writer'},game.env.modelStore);
+    const fetcher=vi.fn(async(url:unknown,init?:RequestInit)=>{
+      expect(url).toBe('https://writer.example/v1/chat/completions');
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer game-only-key');
+      const body=JSON.parse(String(init?.body));
+      expect(body.model).toBe('game-model');
+      expect(body).not.toHaveProperty('output_config');
+      return Response.json({choices:[{message:{content:html},finish_reason:'stop'}]});
+    });
+    vi.stubGlobal('fetch',fetcher);
+    expect((await game.request('POST',['topics','9','game'])).status).toBe(200);
+    await processForgeJob(game.env,game.send.mock.calls[0][0]);
+    expect(game.row().product_html).toBe(html);
+    const disabled=await setup();
+    await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://fixture.example',model:'claude-opus-5-5',enabled:false},disabled.env.modelStore,secrets.SETTINGS_KEY);
+    expect((await disabled.request('POST',['topics','9','game'])).status).toBe(409);
+    expect(disabled.send).not.toHaveBeenCalled();
     const notCandidate = await setup({ status: 'new' });
     expect((await notCandidate.request('POST', ['topics', '9', 'game'])).status).toBe(409);
     expect(notCandidate.send).not.toHaveBeenCalled();

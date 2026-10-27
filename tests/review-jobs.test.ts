@@ -31,6 +31,15 @@ function setup() {
 }
 
 describe('后台并发审核的传输与隔离', () => {
+  it('复核模型停用时拒绝入队，不留下任务或临时输入', async () => {
+    const { env, payload, sqlite, send } = setup();
+    const profile = await env.modelStore.get();
+    env.modelStore.get = async () => ({ ...profile, activeProfile: 'initial', profiles: { initial: profile, verify: { ...profile, enabled: false } }, routes: { review: 'initial', review_verify: 'verify' } });
+    await expect(enqueueReview(env, payload(), 'a')).rejects.toMatchObject({ status: 503, message: '管理员尚未配置并启用评分复核模型。' });
+    expect(send).not.toHaveBeenCalled();
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_jobs').get()).toMatchObject({ n: 0 });
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_inputs').get()).toMatchObject({ n: 0 });
+  });
   it('任务重复提交只入队一次，并隔离其他成员的任务', async () => {
     const { env, payload, send } = setup(); const input = payload();
     const job = await enqueueReview(env, input, 'a');

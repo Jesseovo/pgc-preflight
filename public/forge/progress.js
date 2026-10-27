@@ -27,6 +27,7 @@ function createService() {
   const documents = new Map([[doc, null]]);
   let tray;
   let collapsed = host.matchMedia('(max-width: 640px)').matches;
+  let userToggled = false;
   const paint = () => {
     if (!tray) {
       tray = doc.createElement('aside'); tray.className = 'pgc-task-tray'; tray.setAttribute('aria-label', '任务进度');
@@ -34,7 +35,7 @@ function createService() {
       tray.addEventListener('click', event => {
         const button = event.target.closest('button');
         if (!button) return;
-        if (button.dataset.fold !== undefined) { collapsed = !collapsed; paint(); return; }
+        if (button.dataset.fold !== undefined) { userToggled = true; collapsed = !collapsed; paint(); return; }
         const task = tasks.get(button.dataset.task);
         if (button.dataset.dismiss !== undefined) { tasks.delete(task?.id); paint(); }
         else task?.action?.();
@@ -66,6 +67,7 @@ function createService() {
   return {
     register(document) { documents.set(document, document.defaultView?.frameElement || null); },
     start(label, options = {}) {
+      if (options.compact && !userToggled) collapsed = true;
       const task = { id: host.crypto.randomUUID(), key: options.key || '', label, detail: '请求已发出，请稍候。', status: 'running', startedAt: Date.now(), views: new Set(), ...options };
       const handle = {
         update(patch) { Object.assign(task, patch); paint(); },

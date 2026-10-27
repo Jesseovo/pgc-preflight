@@ -334,6 +334,7 @@ async function suggestVocab(env, { dim, n = 30 }) {
   const { positives } = exampleSets(games);
   const out = await complete(env, cfg, {
     system: suggestSystem({ redlines: cfg.redlines, positives }),
+    purpose: 'vocab',
     user: suggestUser(dim, count, [...new Set(existing)]),
     schema: SUGGEST_SCHEMA,
     maxTokens: 8000,
@@ -421,7 +422,7 @@ async function tagGames(env) {
   const vocab = await all(env, "SELECT dim, word FROM vocab WHERE enabled = 1 ORDER BY dim, id");
   const byDim = Object.fromEntries(DIMS.map((d) => [d, vocab.filter((v) => v.dim === d).map((v) => v.word)]));
   const cfg = await getSettings(env);
-  const out = await complete(env, cfg, { system: tagSystem(byDim), user: tagUser(games), schema: TAG_SCHEMA, maxTokens: 4000 });
+  const out = await complete(env, cfg, { system: tagSystem(byDim), user: tagUser(games), schema: TAG_SCHEMA, maxTokens: 4000, purpose: 'tags' });
   const ids = new Set(games.map((g) => g.id));
   const stmts = (out.items || []).filter((t) => ids.has(t.id)).map((t) =>
     env.DB.prepare("UPDATE games SET subject = ?, medium = ?, gesture = ?, structure = ?, mood = ?, updated_at = ? WHERE id = ?")
@@ -539,7 +540,7 @@ async function expandBatch(env, ids) {
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
-  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'create'));
+  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'expand'));
   const [cfg, games, prior] = await Promise.all([
     getSettings(env),
     all(env, "SELECT * FROM games ORDER BY id"),
@@ -553,6 +554,7 @@ async function expandBatch(env, ids) {
   try {
     out = await withTopicLease(env, pending.map((topic) => topic.id), 'expand_status', () => complete(env, cfg, {
         system: expandSystem({ redlines: cfg.redlines, positives, negatives }),
+        purpose: 'expand',
         user: expandUser({ existing, combos: pending }),
         schema: EXPAND_SCHEMA,
         // Keep Opus responses bounded. The schema has many fields, but a single
@@ -611,7 +613,7 @@ async function preview(env, id) {
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   const cfg = await getSettings(env);
-  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 12000, idempotencyKey: `pgc-preview-${id}` });
+  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 12000, idempotencyKey: `pgc-preview-${id}`, purpose: 'preview' });
   const svg = sanitizeSvg(text);
   await run(env, "UPDATE topics SET preview_svg = ?, updated_at = ? WHERE id = ?", svg, now(), id);
   return { id, svg };
@@ -671,7 +673,8 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   const parts = [];
   for (const s of images) parts.push({ type: "text", text: `截图：${s.label}` }, { type: "image", data: s.data });
   // Keep the source bounded; thinking and report tokens share an output budget.
-  const smallModel = /deepseek/i.test(routedModel(await env.modelStore.get(), 'review'));
+  const reviewConfig = await env.modelStore.get();
+  const smallModel = ['review', 'review_verify'].some(purpose => /deepseek/i.test(routedModel(reviewConfig, purpose)));
   const captureNote = probe?.captureMethod === 'browser-viewport-v1'
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
     : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
@@ -679,7 +682,7 @@ async function review(env, { title, topic_id, html, probe, shots }, ownerId, job
   const result = await generateReview(env, cfg, {
     system: reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),
     user: parts,
-    maxTokens: smallModel ? 24000 : 16000,
+    maxTokens: 16000,
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
     onWait: jobId ? message => run(env, "UPDATE review_jobs SET error = ? WHERE id = ? AND status = 'running'", message, jobId) : undefined,
   });
@@ -733,9 +736,9 @@ async function startGameJob(env: ForgeEnv, id: number) {
   const topic = await getTopic(env, id);
   if (topic.product_html?.trim()) return { id, status: 'done', has_product: true };
   if (!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
-  const model = activeModelProfile(await env.modelStore.get(), 'create');
-  if (model?.id !== 'opus' || !/^claude-opus-5-5$/i.test(model.profile.model) || !model.profile.enabled || !model.profile.encryptedKey) {
-    throw new HttpError(409, "创作模型当前没有路由到 Claude Opus 5.5。请先在管理员的模型配置中切换创作模型，再开始制作。");
+  const model = activeModelProfile(await env.modelStore.get(), 'game');
+  if (!model?.profile.enabled || !model.profile.encryptedKey) {
+    throw new HttpError(409, "请先在管理员模型配置中启用并分配游戏制作模型。");
   }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
   const requestId = crypto.randomUUID();
@@ -840,10 +843,11 @@ export function cleanAssetsHtml(text) {
 
 async function assetsJob(env, id, t) {
   const cfg = await getSettings(env);
-  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'create'));
+  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'assets'));
   try {
     const text = await withTopicLease(env, [id], 'assets_status', () => complete(env, cfg, {
       system: ASSETS_SYSTEM,
+      purpose: 'assets',
       user: assetsUser(t, designPart(t.brief_md), t.preview_svg || ''),
       // A 40–60KB HTML file is roughly 15k tokens.
       maxTokens: 20000,
@@ -869,29 +873,29 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
   try {
     const topic = await getTopic(env, id);
     if (topic.product_html?.trim()) return { id, status: 'done' };
-    const model = activeModelProfile(await env.modelStore.get(), 'create');
-    if (model?.id !== 'opus' || !/^claude-opus-5-5$/i.test(model.profile.model)) throw new HttpError(409, "创作模型已切换，任务已停止；请将创作模型切回 Claude Opus 5.5 后重试。");
+    const model = activeModelProfile(await env.modelStore.get(), 'game');
+    if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "游戏制作模型未启用，请在管理页配置后重试。");
     const cfg = await getSettings(env);
     // Expanded topics already contain the playable core. A full production
     // brief could exhaust the model before any HTML is made; keep it optional.
-    await stage('Opus 正在编写完整 HTML 游戏…');
+    await stage('模型正在编写完整 HTML 游戏…');
     const text = await withTopicLease(env, [id], 'product_status', () => complete(env, cfg, {
       system: GAME_SYSTEM,
       user: gameUser(topic, composeBrief(topic), topic.assets_html),
       maxTokens: 32768,
       timeoutMs: 300000,
-      deadline, idempotencyKey: `pgc-game-${requestId}`, requiredProfile: 'opus', outputFormat: 'html',
-      purpose: 'create', maxAttempts: 1, outputEffort: 'low',
-      onWait: message => stage(message || 'Opus 正在编写完整 HTML 游戏…'),
-      onProgress: characters => stage(characters ? `Opus 正在编写游戏，已接收 ${characters.toLocaleString('en-US')} 个字符…` : 'Opus 正在准备游戏代码…'),
+      deadline, idempotencyKey: `pgc-game-${requestId}`, outputFormat: 'html',
+      purpose: 'game', maxAttempts: 1, outputEffort: 'low',
+      onWait: message => stage(message || '模型正在编写完整 HTML 游戏…'),
+      onProgress: characters => stage(characters ? `模型正在编写游戏，已接收 ${characters.toLocaleString('en-US')} 个字符…` : '模型正在准备游戏代码…'),
     }));
     const html = cleanGameHtml(text);
     await run(env, "UPDATE topics SET product_html = ?, product_status = '', product_error = '', status = 'made', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", html, now(), id, requestId);
     return { id, status: 'done' };
   } catch (error) {
     const message = String(error?.message || error);
-    const reason = /模型响应超时/.test(message) ? 'Opus 未能在制作时限内返回完整游戏，本次未保存成品；请稍后重试。'
-      : /长度上限/.test(message) ? 'Opus 达到本次游戏生成的输出额度，未返回完整 HTML；未保存成品，也未自动重复制作。可点击重试制作。' : message;
+    const reason = /模型响应超时/.test(message) ? '模型未能在制作时限内返回完整游戏，本次未保存成品；请稍后重试。'
+      : /长度上限/.test(message) ? '模型达到本次游戏生成的输出额度，未返回完整 HTML；未保存成品，也未自动重复制作。可点击重试制作。' : message;
     await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", reason.slice(0, 500), now(), id, requestId).catch(() => {});
     throw error;
   }
@@ -900,10 +904,11 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
 
 async function briefJob(env, id, t) {
   const cfg = await getSettings(env);
-  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'create'));
+  const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'brief'));
   try {
     const md = await withTopicLease(env, [id], 'brief_status', () => complete(env, cfg, {
         system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
+        purpose: 'brief',
         user: briefUser(t),
         // The F template is intentionally structured and normally fits below
         // 6k output tokens. A smaller cap keeps the relay responsive while the
