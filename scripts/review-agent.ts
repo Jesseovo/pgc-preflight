@@ -40,7 +40,7 @@ async function readCredential(){
   try{const saved=JSON.parse(await readFile(credentialPath,'utf8'));return JSON.parse(saved.encoding==='dpapi'?await dpapi(saved.data,true):saved.data);}catch(e){if((e as any).code==='ENOENT')return null;throw new Error('无法读取本机账号授权，请重新配对。');}
 }
 async function api(action:string,body:any={}):Promise<any>{
-  if(!token)throw new Error('尚未授权。请在审核页生成配对码，让智能助手执行 pair；无需安装助手。');
+  if(!token)throw new Error('尚未授权。请在审核页生成配对码，让智能助手执行 pair。');
   for(let attempt=0;;attempt++){
     try{
       const res=await fetch(`${origin}/api/review-device/${action}`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(45000)});
@@ -154,7 +154,7 @@ try{
       print({event:'paired',deviceId:paired.deviceId,expiresAt:paired.expiresAt});
     }else{
       if(!token)token=(await readCredential())?.token||'';
-      if(!token)throw new Error('尚未授权。请在网页生成配对码后执行 pair，无需下载安装助手。');
+      if(!token)throw new Error('尚未授权。请在网页生成配对码后执行 pair。');
       if(['review','capture'].includes(command)){
         for(const name of await readdir(join(dataDir,'outbox'))){const path=join(dataDir,'outbox',name);if(name.endsWith('.bin')&&Date.now()-(await stat(path)).mtimeMs>86400000)await unlink(path);}
         heartbeat=setInterval(()=>{void api('heartbeat',{version:'agent-capture-v1',freeMemoryMB:Math.floor(freemem()/1048576),job:current}).catch(()=>{});},20000);

@@ -75,4 +75,5 @@
 - 生产 tail 109 事件均 `ok`；两次审核 alarm CPU 2028/997ms、耗时 56582/49878ms，无 CPU 异常，脱敏证据为 `artifacts/agent-live-runtime-evidence.json`。仅实测两任务重叠；50 是接纳上限，不能宣称实测 50 并发或无限并发。
 - Free DO 仍受每日 100,000 请求、13,000 GB-s、D1 与模型供应商额度限制；本机采集避开 Browser Run 日分钟和会话获取限制，模型 API 费用仍按供应商计费。
 - 验证脚本：`scripts/verify-agent.ts` 使用实际 bundle、DPAPI、两款本机游戏、四次脚本模型调用、报告/清理/幂等/额度；`scripts/verify-review.ts` 验证多文件/全页拖放、并行提交、重试、报告和移动端；`scripts/verify-review-capacity.ts` 验证额度与记录；`scripts/verify-review-evidence.ts` 验证 DOM/多 Canvas/可信触摸/网络隔离；`scripts/verify-model-routing.ts` 验证两组模型与 Key 配置；`scripts/verify-products.ts` 验证制作幂等/刷新/重试/沙箱/下载；`scripts/verify-progress.ts` 验证等待反馈和恢复。合成响应不证明真实模型准确率。最新发布的变更需相称回归与线上验证，不能只凭本地测试判上线成功。
+- 文档与权限隔离修复 `13a8af9` 已部署为 Worker `39699ca1-db45-4679-bf9a-8e9241e8242b`：真实浏览器确认说明为 UTF-8；成员只加载审核模块，管理脚本/接口拒绝成员与设备访问，跨成员任务操作拒绝；管理员真实登录与内嵌工作台正常。验证未发模型调用，临时成员和任务已清理；脱敏证据为 `artifacts/agent-scope-live-evidence.json`。
 - 限制来源：https://developers.cloudflare.com/durable-objects/platform/limits/ 、https://developers.cloudflare.com/durable-objects/platform/pricing/ 、https://developers.cloudflare.com/browser-run/limits/ 。合成探针脱敏证据为 ignored 的 `artifacts/free-review-capacity-evidence.json`。
