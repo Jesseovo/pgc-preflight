@@ -18,6 +18,7 @@ import {
   reviewSystem, GAME_SYSTEM, gameUser,
 } from "./forge/prompts.js";
 import { cleanGameHtml } from './game-generation';
+import {enqueueForgeTask, recoverForgeTasks, readForgeTask, publicForgeTask, type ForgeRunnerBinding} from './forge-tasks';
 
 const TEXT_DEFAULTS = { redlines: DEFAULT_REDLINES, template: DEFAULT_TEMPLATE, template_f: DEFAULT_TEMPLATE_F };
 // Model credentials and model selection belong to /admin. Forge only stores
@@ -49,12 +50,14 @@ export interface ForgeEnv {
   SETTINGS_KEY: string;
   modelStore: ConfigStore;
   FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
+  FORGE_RUNNER?: ForgeRunnerBinding;
+  generation?: {id:string; deadline:number; onStart():Promise<void>; onWait(message:string):Promise<void>};
   REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
   captureReview?: (html: string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
   reviewExecutor?: 'device';
 }
 
-export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string } | { type: 'review'; id: string };
+export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string } | { type: 'review'; id: string } | {type:'preview';id:number} | {type:'suggest';dim:string;n:number} | {type:'tag'};
 
 // Per-topic background jobs share one claim/lease/recovery path.
 type TopicJobKind = 'brief' | 'assets';
@@ -108,6 +111,15 @@ function attachment(content, type, topic, suffix) {
 
 async function dispatch(method, route, request, env, ownerId, ctx) {
   const [a, b, c] = route;
+  if(a==='generation-jobs'&&method==='GET'){
+    if(b){
+      const row=await readForgeTask(env,b);
+      if(!row)throw new HttpError(404,'生成任务不存在。');
+      return publicForgeTask(row);
+    }
+    await recoverForgeTasks(env);
+    return (await all(env,"SELECT * FROM forge_tasks WHERE status IN ('queued','running') OR updated_at > ? ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString())).map(publicForgeTask);
+  }
   if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
   if(a==='review'&&b==='worker-status'&&!c&&method==='GET')return deviceStatus(env.DB,ownerId);
   if (a === 'review' && b === 'probe' && !c && method === 'POST') {
@@ -132,7 +144,11 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "POST seed": return seed(env);
     case "GET vocab": return listVocab(env);
     case "POST vocab": return addVocab(env, await body(request));
-    case "POST suggest": return suggestVocab(env, await body(request));
+    case "POST suggest": {
+      const data=await body(request);
+      if(!['subject','medium'].includes(data.dim))throw new HttpError(400,'只支持补充题材和美术媒介');
+      return env.FORGE_RUNNER ? startSimpleTask(env,{type:'suggest',dim:data.dim,n:Math.min(Math.max(Number(data.n)||30,5),60)}) : suggestVocab(env,data);
+    }
     case "PATCH vocab/:id": return patchRow(env, "vocab", id, await body(request), ["word", "note", "base", "enabled"]);
     case "DELETE vocab/:id": return deleteRow(env, "vocab", id);
     case "GET games": return all(env, "SELECT * FROM games ORDER BY id DESC");
@@ -140,12 +156,13 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "PATCH games/:id": return patchRow(env, "games", id, await body(request), GAME_FIELDS);
     case "DELETE games/:id": return deleteRow(env, "games", id);
     case "POST import": return importWorks(env, await body(request));
-    case "POST tag": return tagGames(env);
+    case "POST tag": return env.FORGE_RUNNER ? startSimpleTask(env,{type:'tag'}) : tagGames(env);
     case "POST draw": return draw(env, await body(request));
     case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
     case "GET products": return listProducts(env);
     case "GET topics/:id": {
+      if(env.FORGE_RUNNER)await recoverForgeTasks(env,id);
       const topic = await getTopic(env, id);
       return { ...topic, brief_export: composeBrief(topic) };
     }
@@ -165,6 +182,7 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
       return json({ id, html: topic.product_html });
     }
     case "GET topics/:id/game": {
+      if(env.FORGE_RUNNER)await recoverForgeTasks(env,id);
       let topic = await getTopic(env, id);
       const interrupted = topic.product_status === 'running' && Date.now() - Date.parse(topic.updated_at) > 15 * 60 * 1000;
       const expired = topic.product_status === 'queued' && Date.now() - Date.parse(topic.updated_at) > 24 * 60 * 60 * 1000;
@@ -190,7 +208,11 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
       return attachment(topic.product_html, 'text/html; charset=utf-8', topic, 'game.html');
     }
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
-    case "POST topics/:id/preview": return preview(env, id);
+    case "POST topics/:id/preview": {
+      const topic=await getTopic(env,id);
+      if(!topic.data.title)throw new HttpError(409,'这个选题还没扩写');
+      return env.FORGE_RUNNER ? startSimpleTask(env,{type:'preview',id}) : preview(env,id);
+    }
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
     case "POST topics/:id/assets": return startTopicJob(env, 'assets', id, ctx, new URL(request.url).searchParams.get('regenerate') === '1', assetsJob);
     case "POST topics/:id/game": return startGameJob(env, id);
@@ -206,6 +228,13 @@ async function dispatch(method, route, request, env, ownerId, ctx) {
     case "GET export": return exportAll(env);
     default: throw new HttpError(404, `没有这个接口：${method} /api/${route.join("/")}`);
   }
+}
+
+async function startSimpleTask(env,job){
+  const active=activeModelProfile(await env.modelStore.get(),'create');
+  if(!active?.profile.enabled||!active.profile.encryptedKey)throw new HttpError(503,'管理员尚未配置并启用创作模型。');
+  const row=await enqueueForgeTask(env,job);
+  return {pending:true,jobId:row.id};
 }
 
 // ---------- settings ----------
@@ -452,7 +481,7 @@ async function listTopics(env, params) {
   const limit = Math.min(Number(params.get("limit")) || 100, 500);
   const marks = statuses.map(() => "?").join(",");
   const rows = await all(env, `SELECT id, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
-      preview_svg IS NOT NULL AS has_preview, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
+      preview_svg IS NOT NULL AS has_preview, expand_status, expand_error, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
       assets_html IS NOT NULL AS has_assets, assets_status, assets_error,
       product_html IS NOT NULL AS has_product, product_status, product_error
     FROM topics WHERE status IN (${marks}) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses, limit);
@@ -517,6 +546,7 @@ async function draw(env, { n, locks = {} } = {}) {
 
 async function expand(env, { ids }, ctx) {
   if (!Array.isArray(ids) || !ids.length) throw new HttpError(400, "缺少 ids");
+  if(ids.length>40||ids.some(id=>!Number.isSafeInteger(id)||id<=0))throw new HttpError(400,'每批最多 40 个有效选题。');
   const marks = ids.map(() => "?").join(",");
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   if (!topics.length) throw new HttpError(404, "选题不存在");
@@ -525,6 +555,10 @@ async function expand(env, { ids }, ctx) {
   // saved result instead of generating it a second time.
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
+  if(env.FORGE_RUNNER){
+    for(const topic of pending)await enqueueForgeTask(env,{type:'expand',ids:[topic.id]});
+    return {pending:true,topics:(await all(env,`SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`,...ids)).map(hydrate)};
+  }
   if (env.FORGE_QUEUE || ctx?.waitUntil) {
     const claimed = [];
     const staleBefore = staleJobBefore();
@@ -566,6 +600,12 @@ async function expandBatch(env, ids) {
         purpose: 'expand',
         user: expandUser({ existing, combos: pending }),
         schema: EXPAND_SCHEMA,
+        validate:value=>{
+          if(!Array.isArray(value?.items)||value.items.length!==pending.length)return ['items 必须覆盖全部选题'];
+          const indices=value.items.map(item=>item.idx);
+          if(new Set(indices).size!==pending.length||indices.some(i=>!Number.isInteger(i)||i<0||i>=pending.length))return ['选题 idx 缺失、重复或超出范围'];
+          return value.items.some(item=>!item.title?.trim()||!item.core_loop?.trim()||!item.controls?.trim()||!item.art_direction?.trim()||[item.aes,item.ease,item.play].some(score=>!Number.isInteger(score)||score<1||score>3)) ? ['选题内容或评分字段不完整'] : [];
+        },
         // Allow room for thinking as well as the completed topic JSON.
         maxTokens: 16000,
         // Opus can spend more than 90 seconds reasoning before its first
@@ -580,7 +620,7 @@ async function expandBatch(env, ids) {
     // Riffle returns 409 when another tab is already processing the same
     // idempotent request. Wait for that request to persist its result instead
     // of surfacing a false failure or starting a duplicate model call.
-    if (/返回 409|409/.test(String(error?.message || error))) {
+    if (!env.generation && /返回 409|409/.test(String(error?.message || error))) {
       const recovered = await waitForExpanded(env, ids, 130000);
       if (recovered) return recovered;
     }
@@ -751,6 +791,10 @@ async function startGameJob(env: ForgeEnv, id: number) {
   if (!model?.profile.enabled || !model.profile.encryptedKey) {
     throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
   }
+  if(env.FORGE_RUNNER){
+    const task=await enqueueForgeTask(env,{type:'game',id,requestId:crypto.randomUUID()});
+    return {id,status:'pending',taskId:task.id};
+  }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
   const requestId = crypto.randomUUID();
   const claim = await run(env, "UPDATE topics SET product_status = 'queued', product_error = '等待后台制作队列…', product_request_id = ?, updated_at = ? WHERE id = ? AND product_status IN ('', 'error')", requestId, now(), id);
@@ -770,6 +814,11 @@ async function startTopicJob(env, kind: TopicJobKind, id, ctx, regenerate, job: 
   const t = await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   if (kind === 'assets' && !t.brief_md?.trim()) throw new HttpError(409, "先生成简报（细纲），资产要按它来做。");
+  if(env.FORGE_RUNNER){
+    if(!regenerate&&t[k.status]!=='running'&&t[k.output]?.trim())return {id,[kind]:t[k.output]};
+    const task=await enqueueForgeTask(env,{type:kind,id});
+    return {id,status:'pending',taskId:task.id};
+  }
   // A previous request may have completed after the browser lost its
   // connection. Return the persisted result instead of generating it again.
   const staleBefore = staleJobBefore();
@@ -792,6 +841,9 @@ function markTopicJobError(env, kind: TopicJobKind, id, error, onlyIfRunning = f
 }
 
 export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
+  if(job.type==='preview')return preview(env,job.id);
+  if(job.type==='suggest')return suggestVocab(env,job);
+  if(job.type==='tag')return tagGames(env);
   if (job.type === 'review') return processReviewJob(env, job.id, (payload, ownerId, jobId) => review(env, payload, ownerId, jobId));
   if (job.type === 'game') return produceGame(env, job.id, job.requestId);
   if (job.type === 'expand') {
@@ -931,7 +983,7 @@ async function briefJob(env, id, t) {
         purpose: 'brief',
         user: briefUser(t),
         // Reserve room for both thinking and the complete production brief.
-        maxTokens: 24000,
+        maxTokens: slowModel ? 64000 : 24000,
         timeoutMs: slowModel ? 300000 : 180000,
         idempotencyKey: `pgc-brief-${id}-${Date.now()}`,
         onWait: message => run(env, "UPDATE topics SET brief_error = ? WHERE id = ? AND brief_status = 'running'", message, id),

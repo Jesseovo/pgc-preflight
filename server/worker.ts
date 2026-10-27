@@ -15,11 +15,13 @@ import {purgeReviewInputs} from './review-jobs';
 import {captureReview} from './review-probe';
 import {acquireBrowser} from './browser-capacity';
 import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
+import {enqueueForgeTask,recoverForgeTasks,type ForgeRunnerBinding} from './forge-tasks';
 export {ReviewRunner} from './review-runner';
+export {ForgeRunner} from './forge-runner';
 
-interface QueueMessage<T> { body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
+interface QueueMessage<T> { id: string; body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
-interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
+interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 function captureFor(env:Env){return async (html:string,onWait?:(message:string)=>Promise<void>)=>{
@@ -63,7 +65,7 @@ const app = {
     if(url.pathname.startsWith('/api/forge/')){
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
-      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_QUEUE:env.FORGE_QUEUE,REVIEW_QUEUE:env.REVIEW_QUEUE,
+      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,
         reviewExecutor:'device',
       },route,members,ctx);
     }
@@ -138,15 +140,29 @@ const app = {
       return;
     }
     await purgeReviewInputs(env);
+    await recoverForgeTasks({...env,modelStore:configStore(env.DB)});
+    await env.DB.prepare("DELETE FROM forge_tasks WHERE status IN ('done','error') AND updated_at < ?").bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ?")
       .bind(new Date().toISOString(), new Date(Date.now() - 15 * 60 * 1000).toISOString()).run();
   },
   async queue(batch: QueueBatch<ForgeJob>, env: Env): Promise<void> {
-    const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB),captureReview:captureFor(env) };
+    const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB),FORGE_RUNNER:env.FORGE_RUNNER,captureReview:captureFor(env) };
     for (const message of batch.messages) {
       try {
-        await processForgeJob(forgeEnv, message.body);
+        // Old queued creation messages only dispatch alarms. Never run long
+        // model streams (or replay them) in an ordinary Free Queue consumer.
+        if(message.body.type==='review')await processForgeJob(forgeEnv,message.body);
+        else {
+          const jobs:ForgeJob[]=message.body.type==='expand' ? message.body.ids.map(id=>({type:'expand',ids:[id]})) : [message.body];
+          for(const job of jobs){
+            // Queue re-delivery must keep the ID even after a task finishes.
+            const digest=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(`${message.id}:${JSON.stringify(job)}`)));
+            const hex=Array.from(digest.slice(0,16),b=>b.toString(16).padStart(2,'0')).join('');
+            const taskId=`${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+            await enqueueForgeTask(forgeEnv,job,taskId);
+          }
+        }
         message.ack();
       } catch {
         if ((message.attempts || 1) >= 3) message.ack();

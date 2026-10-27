@@ -1,6 +1,6 @@
 import { activeModelProfile, decryptKey } from './settings';
 import type { ModelConfig, ModelPurpose } from './settings';
-import { modelTransport, ModelOutputError } from './model';
+import { modelTransport, ModelOutputError, ModelHttpError } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
 import { inferenceOptions } from '../src/model-options';
 
@@ -51,11 +51,19 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (req.requiredProfile && (!active || active.profile.protocol !== 'anthropic' || !/^claude-opus-5-5$/i.test(active.profile.model))) throw new LLMError('游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。', 409);
   if (!active?.profile.enabled || !active.profile.encryptedKey) throw new LLMError(req.purpose === 'review' ? '管理员尚未配置并启用审核模型。' : '管理员尚未配置并启用创作模型。', 503);
+  if(env.generation){
+    const original=req, task=env.generation;
+    req={...req,idempotencyKey:`pgc-create-${task.id}`,deadline:Math.min(req.deadline??Infinity,task.deadline),maxAttempts:req.maxAttempts??3,
+      timeoutMs:Math.max(req.timeoutMs||90000,/opus|claude/i.test(active.profile.model)?300000:180000),
+      onStart:async()=>{await task.onStart();await original.onStart?.();},
+      onWait:async(message)=>{await task.onWait(message);await original.onWait?.(message);},
+    };
+  }
   if (active.profile.vision === false) req = { ...req, user: withoutImages(req.user) };
   let apiKey: string;
   try { apiKey = await decryptKey(active.profile.encryptedKey, env.SETTINGS_KEY); }
@@ -81,7 +89,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
       const transport = modelTransport({ ...active.profile, apiKey }, {
         DB: env.DB, maxTokens, timeoutMs: req.timeoutMs || 90000, totalTimeoutMs: Math.max(1, deadline - Date.now()), idempotencyKey: attemptKey,
-        json: Boolean(req.schema), purpose:req.purpose,
+        json: Boolean(req.schema), purpose:req.purpose, outputEffort:req.outputEffort,
         onStart: req.onStart,
         onProgress: req.onProgress,
         onActivity: req.onWait ? (phase, characters) => req.onWait!(phase === 'thinking' ? '模型正在思考，连接正常，尚未输出正文…' : `模型正在输出，已接收 ${characters.toLocaleString('en-US')} 个字符…`) : undefined,
@@ -102,11 +110,11 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       } catch (error) {
         lastError = error;
         const message = String(error instanceof Error ? error.message : error);
-        const parseFailure = /模型返回的不是合法 JSON/.test(message);
-        const outputFailure = error instanceof ModelOutputError && error.kind !== 'incomplete';
+        const parseFailure = !env.generation && /模型返回的不是合法 JSON/.test(message);
+        const outputFailure = !env.generation && error instanceof ModelOutputError && error.kind !== 'incomplete';
         // HTTP 429 and explicitly pending 409 requests are retried by transport.
         // A second retry loop would multiply requests and hit the key again.
-        const busy = /返回 503/.test(message);
+        const busy = error instanceof ModelHttpError && error.upstreamStatus === 503;
         if (attempt + 1 >= attempts || deadline - Date.now() < 30000 || (!parseFailure && !outputFailure && !busy)) throw error;
         if (parseFailure || outputFailure) {
           freshRequest = true;

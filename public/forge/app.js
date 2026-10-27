@@ -31,8 +31,8 @@ function toast(msg, ms = 2600) {
   toast.timer = setTimeout(() => (t.hidden = true), ms);
 }
 
-async function api(method, path, data) {
-  const options = path === 'review/jobs' && method === 'POST' ? { signal: AbortSignal.timeout(60000) } : {};
+async function rawApi(method, path, data) {
+  const options = {signal:AbortSignal.timeout(path === 'review/jobs' && method === 'POST' ? 60000 : 30000)};
   const res = await fetch("/api/forge/" + path, {
     ...options,
     method,
@@ -51,6 +51,44 @@ async function api(method, path, data) {
     throw error;
   }
   return out;
+}
+
+async function api(method,path,data,progress) {
+  const out=await rawApi(method,path,data);
+  return out?.pending && out.jobId ? observeGeneration({id:out.jobId},progress) : out;
+}
+const generationPolls=new Map();
+const GENERATION_LABELS={preview:'生成样板图',suggest:'补充词库',tag:'自动打标签'};
+function observeGeneration(row,provided) {
+  if(generationPolls.has(row.id))return generationPolls.get(row.id);
+  const task=provided||startTask(GENERATION_LABELS[row.kind]||'后台生成',{key:`generation-${row.id}`,retain:true,detail:row.detail||'等待后台执行…'});
+  const promise=(async()=>{
+    const deadline=Date.now()+16*60000;
+    try{
+      while(Date.now()<deadline){
+        let saved;
+        try{saved=await rawApi('GET',`generation-jobs/${row.id}`);}
+        catch(error){
+          if(error.status===401||error.status===403||error.status===404)throw error;
+          task.update({detail:'正在重新连接，后台生成继续运行…'});
+          await new Promise(resolve=>setTimeout(resolve,3500));continue;
+        }
+        if(saved.status==='error')throw new Error(saved.error||'生成未完成，请手动重试。');
+        if(saved.status==='done'){
+          if(!provided){
+            const show=saved.kind==='preview'?async()=>{const t=await api('GET',`topics/${saved.result.id}`);showPreview(t,saved.result.svg);}:undefined;
+            task.done('已完成',show);
+          }
+          return saved.result;
+        }
+        task.update({detail:saved.detail||'等待模型输出…'});
+        await new Promise(resolve=>setTimeout(resolve,3500));
+      }
+      throw new Error('后台任务尚未结束，请稍后刷新查看。');
+    }catch(error){if(!provided)task.fail(error.message);throw error;}
+    finally{generationPolls.delete(row.id);}
+  })();
+  generationPolls.set(row.id,promise);return promise;
 }
 
 async function guard(btn, fn, label) {
@@ -227,7 +265,7 @@ function bindCards(root, list, rerender) {
         if (t.has_preview) svg = (await api("GET", `topics/${id}`)).preview_svg;
         else {
           progress.update({detail:"模型正在绘制风格样板，返回后会展示图片。"});
-          svg = (await api("POST", `topics/${id}/preview`)).svg;
+          svg = (await api("POST", `topics/${id}/preview`,undefined,progress)).svg;
           t.has_preview = 1;
           toast("样板图好了");
           rerender();
@@ -318,23 +356,14 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
     if (!/超时|timeout|409|5\d\d|网络|failed to fetch|fetch failed|network/i.test(String(error?.message || error))) throw error;
     update("提交响应中断，正在向后台确认任务状态…");
   }
-  let reclaimed = false;
   const failed = `${job.noun}生成失败`;
-  for (let attempt = 0; attempt < 210; attempt++) {
+  for (let attempt = 0; attempt < 260; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
     try {
       const saved = await api("GET", `topics/${id}`);
       if (saved?.[job.status] === 'error') throw new Error(`${failed}：${saved[job.error] || "请重试或切换模型。"}`);
       if (job.output(saved) && saved[job.status] !== 'running') return job.read(saved);
       update(saved?.[job.error] || `后台排队或生成中，正在等待完整${job.noun}返回。`);
-      // A waitUntil task can be cut off by the edge while the model gateway is
-      // still working. Re-submit once after the lease expires so the server
-      // can reclaim the stale job instead of polling forever.
-      if (!reclaimed && attempt >= 28 && saved?.[job.status] === 'running') {
-        reclaimed = true;
-        update("正在确认后台任务并恢复等待…");
-        await api("POST", `topics/${id}/${kind}`);
-      }
     } catch (error) {
       if (error instanceof Error && error.message.startsWith(failed)) throw error;
       update("暂时无法读取进度，正在重新连接；后台任务会继续运行。");
@@ -351,7 +380,7 @@ function showPreview(t, svg) {
   $("#dlSvg").onclick = () => download(`${t.data.title}.svg`, svg, "image/svg+xml");
   $("#regenSvg").onclick = (e) => guard(e.target, async (progress) => {
     progress.update({label:"重新生成样板图",detail:"模型正在绘制新的风格样板…"});
-    const r = await api("POST", `topics/${t.id}/preview`);
+    const r = await api("POST", `topics/${t.id}/preview`,undefined,progress);
     showPreview(t, r.svg);
   });
 }
@@ -421,6 +450,7 @@ async function renderDraw(alive) {
     paintDrawn();
   });
   bindCards($("#cards"), () => state.drawn, paintDrawn);
+  for(const t of state.drawn)if(t.expand_status==='error')t._error=t.expand_error||'扩写未完成，请重试。';
   paintDrawn();
   paintLowStock();
   const stuck = state.drawn.filter((t) => t.status === "drawn" && !t._inflight && !t._error).map((t) => t.id);
@@ -450,11 +480,11 @@ function paintLowStock() {
   if (left >= need) return (box.innerHTML = "");
   box.innerHTML = `<p class="small bad">还没用过的题材只剩 ${left} 个（每个题材只会被抽一次）。
     <button class="ghost small" id="suggestBtn">让 AI 补充 30 个题材</button></p>`;
-  $("#suggestBtn").onclick = (e) => guard(e.target, () => suggestWords("subject"));
+  $("#suggestBtn").onclick = (e) => guard(e.target, progress => suggestWords("subject",progress));
 }
 
-async function suggestWords(dim) {
-  const r = await api("POST", "suggest", { dim, n: 30 });
+async function suggestWords(dim,progress) {
+  const r = await api("POST", "suggest", { dim, n: 30 },progress);
   state.vocab = null;
   await refreshStatus();
   toast(`新增 ${r.added} 个：${r.words.slice(0, 8).join("、")}${r.added > 8 ? "…" : ""}`, 6000);
@@ -478,9 +508,7 @@ const pendingExpandIds = new Set();
 async function expandIds(ids) {
   const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
   if (!unique.length) return;
-  // Queue consumers serialize the actual model calls. Submit every batch up
-  // front so a 12-topic draw is queued as 12 small jobs instead of waiting for
-  // one browser request to finish before the next one can even start.
+  // Submit small background tasks; the shared gateway throttle paces starts.
   const slowModel = /opus|claude/i.test(String(state.info?.model || ""));
   const size = slowModel ? 1 : Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
   const chunks = [];
@@ -762,7 +790,7 @@ async function renderVocab(alive) {
         <td><button class="ghost bad small" data-del>删</button></td></tr>`;
     }).join("")}</tbody></table></div>`;
   view.querySelectorAll("button[data-dim]").forEach((b) => (b.onclick = () => { state.vocabDim = b.dataset.dim; render(); }));
-  if ($("#suggestBtn")) $("#suggestBtn").onclick = (e) => guard(e.target, () => suggestWords(dim));
+  if ($("#suggestBtn")) $("#suggestBtn").onclick = (e) => guard(e.target, progress => suggestWords(dim,progress));
   $("#addVocab").onsubmit = (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -888,7 +916,7 @@ async function renderGames(alive) {
     let left = untagged;
     progress.update({label:"AI 自动打标签",total:untagged,value:0,detail:`剩余 ${left} 个`});
     while (left > 0) {
-      const r = await api("POST", "tag");
+      const r = await api("POST", "tag",undefined,progress);
       if (!r.tagged && r.remaining > 0) throw new Error(`仍有 ${r.remaining} 个未完成，请重试。`);
       left = r.remaining;
       progress.update({value:untagged-left,detail:`已完成 ${untagged-left} 个，剩余 ${left} 个`});
@@ -973,6 +1001,9 @@ async function boot() {
     if (!memberOnly) {
       await refreshStatus();
       state.settings = await api("GET", "settings");
+      void rawApi('GET','generation-jobs').then(rows=>{
+        for(const row of rows)if(['queued','running'].includes(row.status)&&GENERATION_LABELS[row.kind])void observeGeneration(row).catch(()=>{});
+      }).catch(()=>{});
     }
     render();
   } catch (e) {
