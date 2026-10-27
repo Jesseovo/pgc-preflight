@@ -9,12 +9,12 @@ document.body.classList.add('auth-page');
 document.querySelector('#app')!.innerHTML = `
   <header class="header"><div class="header-inner">
     <a class="brand" href="/"><img src="/favicon.svg" alt="" width="32" height="32"/><span>PGC <b>Preflight</b></span></a>
-    <span class="header-caption">A little check. A better game.</span>
+    <span class="header-caption">多一次检查，少一点遗漏。</span>
   </div></header>
   <main class="auth-main">
     <section class="auth-sheet" aria-labelledby="welcome-title">
-      <div class="sheet-label"><span class="pixel-mark"></span>CREATOR'S LITTLE CORNER<span class="sheet-tag">MEMBERS ONLY</span></div>
-      <div class="auth-welcome"><div class="welcome-heading"><h1 id="welcome-title">Hi there, creator<span>.</span></h1>${catWalk}</div><p>好游戏，准备出发。登录后开始你的游戏基础体检。</p><div class="auth-bottom"><span>Making good games. Keeping it playful.</span>${quietCorner}</div></div>
+      <div class="sheet-label"><span class="pixel-mark"></span>创作者的小天地<span class="sheet-tag">成员专属</span></div>
+      <div class="auth-welcome"><div class="welcome-heading"><h1 id="welcome-title">你好，创作者<span>.</span></h1>${catWalk}</div><p>好游戏，准备出发。登录后开始你的游戏基础体检。</p><div class="auth-bottom"><span>认真做游戏，也不忘好玩。</span>${quietCorner}</div></div>
       <section class="login-card member-login-card" aria-labelledby="login-title">
         <div class="login-card-heading"><div class="login-symbol">${icon('gamepad-2')}</div><div><h2 id="login-title">欢迎回来</h2><p>登录你的团队账号</p></div></div>
         <form id="member-login" class="auth-form">
@@ -26,7 +26,7 @@ document.querySelector('#app')!.innerHTML = `
         <div class="login-foot">${icon('user-round-check')}没有账号？联系管理员开通。</div>
       </section>
     </section>
-    <footer><span>PGC Preflight <span class="footer-separator">/</span> For your next good game</span><span>模型检查，人工终审</span></footer>
+    <footer><span>PGC Preflight <span class="footer-separator">/</span> 为你的下一款好游戏</span><span>模型检查，人工终审</span></footer>
   </main>`;
 createIcons({ icons, attrs: { 'stroke-width': 1.7 } });
 

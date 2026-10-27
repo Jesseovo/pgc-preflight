@@ -40,7 +40,7 @@ async function readCredential(){
   try{const saved=JSON.parse(await readFile(credentialPath,'utf8'));return JSON.parse(saved.encoding==='dpapi'?await dpapi(saved.data,true):saved.data);}catch(e){if((e as any).code==='ENOENT')return null;throw new Error('无法读取本机账号授权，请重新配对。');}
 }
 async function api(action:string,body:any={}):Promise<any>{
-  if(!token)throw new Error('尚未授权。请在审核页生成配对码，让 Agent 执行 pair；无需安装助手。');
+  if(!token)throw new Error('尚未授权。请在审核页生成配对码，让智能助手执行 pair；无需安装助手。');
   for(let attempt=0;;attempt++){
     try{
       const res=await fetch(`${origin}/api/review-device/${action}`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(45000)});
@@ -137,7 +137,7 @@ try{
     if(['pair','submit','review','capture'].includes(command)){
       lockPath=join(dataDir,'capture.lock');
       let old:any;try{old=JSON.parse(await readFile(lockPath,'utf8'));}catch{}
-      if(old){try{process.kill(old.pid,0);throw new Error('此设备已有 Agent 操作运行，请等待该命令结束。');}catch(e){if((e as any).code!=='ESRCH')throw e;await unlink(lockPath);}}
+      if(old){try{process.kill(old.pid,0);throw new Error('此设备已有智能助手操作运行，请等待该命令结束。');}catch(e){if((e as any).code!=='ESRCH')throw e;await unlink(lockPath);}}
       const lock=await open(lockPath,'wx',0o600);lockOwned=true;
       try{await lock.writeFile(JSON.stringify({pid:process.pid}));}finally{await lock.close();}
     }
@@ -169,7 +169,7 @@ try{
         if(errors.length)throw new Error(errors.join('\n'));
       }else if(command==='jobs')print(await api('jobs'));
       else if(['status','report','wait','capture'].includes(command)){
-        if(args.length!==1||!uuid(args[0]))throw new Error('请提供一个 job UUID。');
+        if(args.length!==1||!uuid(args[0]))throw new Error('请提供一个任务编号（UUID）。');
         const id=args[0];
         if(command==='wait')await waitFor([id]);
         else if(command==='capture'){await capture(id);if(alsoWait)await waitFor([id]);}

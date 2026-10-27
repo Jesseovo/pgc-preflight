@@ -34,6 +34,26 @@ function setup(){
   return {sqlite,DB,env,device,call,submit,claim,evidence,schedule};
 }
 describe('成员本机采集与云端审核',()=>{
+  it('设备只允许明确列出的审核操作，嵌套路径不能借末尾名称绕过',async()=>{
+    const s=setup();await s.device('a');
+    for(const action of ['config','topics','settings','admin/jobs','nested/pair','nested/report','jobs/']){
+      expect((await s.call(action)).status,action).toBe(403);
+    }
+    expect((await s.call('jobs')).status).toBe(200);
+  });
+  it('他人任务不能查看、领取、续租、上传证据、标记失败或读取报告',async()=>{
+    const s=setup();await s.device('a');await s.device('b');
+    const b=await s.submit('b'),job=await s.claim('b');
+    expect((await s.call('job',{id:b.id})).status).toBe(404);
+    expect((await s.call('report',{id:b.id})).status).toBe(404);
+    expect(await (await s.call('claim',{id:b.id,claimId:crypto.randomUUID()})).json()).toBe(null);
+    for(const action of ['evidence','fail'])expect((await s.call(action,s.evidence(job))).status).toBe(409);
+    s.sqlite.prepare("UPDATE review_jobs SET updated_at='unchanged' WHERE id=?").run(b.id);
+    expect((await s.call('heartbeat',{job:{id:b.id,lease:job.lease}})).status).toBe(200);
+    expect(s.sqlite.prepare('SELECT updated_at FROM review_jobs WHERE id=?').get(b.id)).toMatchObject({updated_at:'unchanged'});
+    expect(s.schedule).not.toHaveBeenCalled();
+    expect(JSON.stringify(await (await s.call('jobs')).json())).not.toContain(b.id);
+  });
   it('网页授权需要本人有效会话与同源请求；指定领取不会取走另一项任务',async()=>{
     const s=setup();
     const password=await hashPassword('fixture-password');

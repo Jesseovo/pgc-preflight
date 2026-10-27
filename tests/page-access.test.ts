@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { guardCheckPage, guardForgePage, guardReviewPage } from '../server/page-access';
+import { guardCheckPage, guardForgePage, guardReviewPage, guardPrivateAsset, guardDeviceScope } from '../server/page-access';
 import { createMember, memberLogin, updateMember } from '../server/members';
 import type { Member, MemberStore } from '../server/members';
 import { login } from '../server/settings';
@@ -50,5 +50,30 @@ describe('检查台的登录前置', () => {
     expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
     expect(await guardForgePage(page('/forge', `pgc_admin=${adminToken}`), store, secrets)).toBe(null);
     expect((await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
+  });
+  it('成员和未登录用户不能读取管理脚本，管理员可读，审核共享资源不受影响', async () => {
+    const store = memoryStore();
+    await createMember({ username: 'creator03', password: 'test-only-password' }, store);
+    const memberToken = await memberLogin('creator03', 'test-only-password', store, secrets.SETTINGS_KEY);
+    const adminToken = await login(secrets.ADMIN_PASSWORD, secrets);
+    for (const path of ['/forge/app.js', '/forge/review-sheet.js', '/forge/%61pp.js', '/assets/admin-abc123.js', '/assets/%61dmin-abc123.js', '/assets/admin-abc123.js.map']) {
+      for (const cookie of ['', `pgc_member=${memberToken}`]) {
+        const response = await guardPrivateAsset(page(path, cookie), store, secrets);
+        expect(response?.status, path).toBe(403);
+        expect(response?.headers.get('Cache-Control')).toContain('no-store');
+      }
+      expect(await guardPrivateAsset(page(path, `pgc_admin=${adminToken}`), store, secrets)).toBe(null);
+    }
+    for (const path of ['/forge/member-review.js', '/forge/review-workspace.js', '/forge/review-capture.js', '/forge/style.css', '/forge/progress.js', '/assets/login-abc123.js']) {
+      expect(await guardPrivateAsset(page(path), store, secrets)).toBe(null);
+    }
+  });
+  it('设备凭据即使附带管理员会话也只能调用审核设备接口', () => {
+    for (const path of ['/api/admin/config', '/api/forge/topics', '/api/forge/settings', '/api/auth/me', '/api/check']) {
+      const request = new Request(`https://pgc.example${path}`, { headers: { Authorization: `Bearer ${'a'.repeat(64)}`, Cookie: 'pgc_admin=unrelated' } });
+      expect(guardDeviceScope(request)?.status, path).toBe(403);
+    }
+    expect(guardDeviceScope(new Request('https://pgc.example/api/review-device/jobs', { headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }))).toBe(null);
+    expect(guardDeviceScope(page('/api/admin/config'))).toBe(null);
   });
 });

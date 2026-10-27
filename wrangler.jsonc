@@ -7,7 +7,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": { "bindings": [{ "name": "CONTROL_PLANE", "class_name": "ReviewControlPlane" }, { "name": "REVIEW_RUNNER", "class_name": "ReviewRunner" }] },
   "migrations": [{ "tag": "v1-review-control", "new_sqlite_classes": ["ReviewControlPlane", "ReviewRunner"] }],
-  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/forge", "/forge/*", "/review", "/review/*"], "not_found_handling": "single-page-application" },
+  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/agent.md", "/admin", "/admin/", "/assets/*", "/forge", "/forge/*", "/review", "/review.html", "/review/*"], "not_found_handling": "single-page-application" },
   "browser": { "binding": "BROWSER" },
   "d1_databases": [{ "binding": "DB", "database_name": "pgc-preflight-db", "database_id": "0cd1de96-d7f1-413b-ab08-be461da99de0", "migrations_dir": "migrations" }],
   "triggers": { "crons": ["17 * * * *"] },

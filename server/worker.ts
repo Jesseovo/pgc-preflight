@@ -9,7 +9,7 @@ import {configStore,memberStore} from './storage';
 import type {Database} from './storage';
 import {authApi} from './auth-api';
 import {identity} from './members';
-import {guardCheckPage,guardForgePage,guardReviewPage} from './page-access';
+import {guardCheckPage,guardForgePage,guardReviewPage,guardPrivateAsset,guardDeviceScope,isPrivateAsset} from './page-access';
 import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
 import {purgeReviewInputs} from './review-jobs';
 import {captureReview} from './review-probe';
@@ -34,6 +34,8 @@ function captureFor(env:Env){return async (html:string,onWait?:(message:string)=
 const app = {
   async fetch(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {
     const url = new URL(request.url);
+    const deviceBoundary=guardDeviceScope(request);
+    if(deviceBoundary)return deviceBoundary;
     // The ordinary Free Worker only routes API traffic. JSON processing and
     // control-plane work use the free SQLite Durable Object CPU allowance.
     if(url.pathname.startsWith('/api/')&&(env as any).CONTROL_PLANE){
@@ -94,8 +96,24 @@ const app = {
       } finally { await browser?.close().catch(() => {}); }
     }
     if (url.pathname.startsWith('/api/')) return json({ error: '接口不存在。' }, 404);
+    if(url.pathname==='/agent.md'){
+      const response=await env.ASSETS.fetch(request),headers=new Headers(response.headers);
+      headers.set('Content-Type','text/plain; charset=utf-8');headers.set('X-Content-Type-Options','nosniff');
+      headers.set('Cache-Control','no-cache');
+      return new Response(response.body,{status:response.status,headers});
+    }
     const redirect = await guardForgePage(request, members, env) || await guardReviewPage(request, members, env) || await guardCheckPage(request, members, env);
     if (redirect) return redirect;
+    const privateAsset=await guardPrivateAsset(request,members,env);
+    if(privateAsset)return privateAsset;
+    if(['/admin','/admin/'].includes(url.pathname)){
+      const user=await identity(request.headers.get('Cookie'),members,env);
+      if(user?.role!=='admin'){
+        const response=await env.ASSETS.fetch(new Request(new URL('/admin-login',url),request));
+        const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
+        return new Response(response.body,{status:response.status,headers});
+      }
+    }
     if (url.pathname === '/forge') return env.ASSETS.fetch(new Request(new URL('/forge/index.html', url), request));
     // Cloudflare Assets clean URLs redirect a direct `/review.html` fetch to
     // `/review`. Read the canonical asset path here so a member visiting `/`
@@ -105,7 +123,12 @@ const app = {
       const user = await identity(request.headers.get('Cookie'), members, env);
       if (user?.role === 'member') return env.ASSETS.fetch(new Request(new URL('/review', url), request));
     }
-    return env.ASSETS.fetch(request);
+    const response=await env.ASSETS.fetch(request);
+    if(isPrivateAsset(request)||['/admin','/admin/'].includes(url.pathname)){
+      const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
+      return new Response(response.body,{status:response.status,headers});
+    }
+    return response;
   },
   async scheduled(_event: unknown, env: Env): Promise<void> {
     if((env as any).CONTROL_PLANE){

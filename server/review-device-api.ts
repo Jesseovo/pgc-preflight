@@ -7,6 +7,7 @@ import {enqueueReview,getReviewJob,listReviewJobs} from './review-jobs';
 const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
 type Env={DB:any;SETTINGS_KEY:string;ADMIN_PASSWORD:string;modelStore:{get():Promise<any>};REVIEW_RUNNER?:any};
 const validId=(value:any)=>typeof value==='string'&&/^[a-f0-9-]{36}$/.test(value);
+const reviewActions=new Set(['submit','jobs','job','report','heartbeat','claim','evidence','fail']);
 async function version(env:Env,owner:string){
   if(owner==='admin')return digest(env.ADMIN_PASSWORD);
   const row=await env.DB.prepare('SELECT enabled,can_review,session_version FROM members WHERE id=?').bind(owner).first();
@@ -14,7 +15,7 @@ async function version(env:Env,owner:string){
 }
 async function authenticate(request:Request,env:Env){
   const token=request.headers.get('Authorization')?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
-  if(!token)throw problem('请先在网页授权 Agent。',401);
+  if(!token)throw problem('请先在网页授权智能助手。',401);
   const device=await env.DB.prepare('SELECT * FROM review_devices WHERE token_hash=? AND revoked=0 AND expires_at>?').bind(await digest(token),stamp()).first();
   if(!device||await version(env,device.owner_id)!==device.session_version)throw problem('设备配对已过期或账号权限已变更，请重新配对。',401);
   return device;
@@ -66,7 +67,9 @@ export async function reviewDeviceWeb(request:Request,env:Env){
 export async function reviewDeviceApi(request:Request,env:Env){
   try{
     if(request.method!=='POST')throw problem('请使用 POST。',405);
-    const b=await readBody(request),action=new URL(request.url).pathname.split('/').pop(),DB=env.DB;
+    const action=new URL(request.url).pathname.slice('/api/review-device/'.length),DB=env.DB;
+    if(action!=='pair'&&!reviewActions.has(action))throw problem('此接入仅开放本人 AI 审核操作。',403);
+    const b=await readBody(request);
     if(action==='pair'){
       if(!validId(b.deviceId)||!/^[a-f0-9]{64}$/.test(b.token)||!/^[a-f0-9]{40}$/.test(b.code))throw problem('配对信息不正确。');
       const hash=await digest(b.code),tokenHash=await digest(b.token);
@@ -146,7 +149,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
       }
       const stub=env.REVIEW_RUNNER.get(env.REVIEW_RUNNER.idFromName(row.id));
       const response=await stub.fetch(new Request('https://internal/schedule',{method:'POST',body:row.id}));
-      if(!response.ok)throw problem('证据已保存，云端调度暂不可用；Agent 将使用同一证据重新连接。',503);
+      if(!response.ok)throw problem('证据已保存，云端调度暂不可用；智能助手将使用同一证据重新连接。',503);
       return json({ok:true,status:'review'});
     }
     if(action==='fail'){
@@ -154,5 +157,5 @@ export async function reviewDeviceApi(request:Request,env:Env){
       await failDeviceReview(DB,row.id,String(b.message||'本机截图未完成，请重试。'));return json({ok:true});
     }
     throw problem('接口不存在。',404);
-  }catch(error){return json({error:(error as Error).message||'Agent 请求失败。'},(error as any).status||500);}
+  }catch(error){return json({error:(error as Error).message||'智能助手请求失败。'},(error as any).status||500);}
 }

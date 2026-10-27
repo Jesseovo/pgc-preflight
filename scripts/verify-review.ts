@@ -48,7 +48,7 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === '/test') {
       let html = await readFile('public/review.html', 'utf8');
-      html = html.replace('<script type="module" src="/forge/app.js"></script>', `<script type="module">
+      html = html.replace('<script type="module" src="/forge/member-review.js"></script>', `<script type="module">
         import { mountReviewWorkspace } from '/forge/review-workspace.js';
         const api = async (method,path,data) => { const r=await fetch('/api/forge/'+path,{method,headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}); const out=await r.json(); if(!r.ok) throw Error(out.error); return out; };
         window.copied=[]; window.downloaded=[]; window.probeCount=0;
