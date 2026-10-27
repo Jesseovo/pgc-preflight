@@ -67,6 +67,8 @@ function renderGames(data) {
   const total = Number(data.total) || 0;
   const heroCount = $('#hero-count');
   if (heroCount) heroCount.textContent = total.toLocaleString('zh-CN');
+  const heroLabel = $('#hero-label');
+  if (heroLabel) heroLabel.textContent = state.query ? '款结果匹配' : state.manage ? '款作品可管理' : '款作品已收录';
   state.page = Number(data.page) || state.page;
   const pageSize = Number(data.pageSize) || 12;
   $('#result-count').innerHTML = `${state.query ? `“${escape(state.query)}” · ` : state.manage ? '管理全部作品 · ' : '全部作品 · '}<strong>${total}</strong> 款游戏`;
