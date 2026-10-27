@@ -837,7 +837,7 @@ async function renderGames(alive) {
   const filtered = games.filter((g) =>
     (!f.source || g.source === f.source) && (!f.status || g.status === f.status) &&
     (!f.q || (g.title + g.descr + g.feedback + DIMS.map((d) => g[d]).join("")).toLowerCase().includes(f.q.toLowerCase())));
-  view.innerHTML = `<details class="box section" open><summary><b>导入个人作品历史表格</b>（.xlsx）</summary>
+  view.innerHTML = `<details class="box section"><summary><b>导入个人作品历史表格</b>（.xlsx）</summary>
       <p class="small muted">总审核导出的「版本审核记录」表格：每行一条初审或终审记录。同名游戏会合并更新分数和意见，保留已有的简介和标签。组员姓名只在这台电脑上用来区分"我的"和"他人"，不会上传。</p>
       <div class="locks">
         <label class="field">表格文件<input type="file" id="sheetFile" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></label>

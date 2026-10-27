@@ -390,7 +390,7 @@
 .workspace-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 8px 0 18px; }
 .workspace-stat { min-width: 0; padding: 14px 16px; border: 1px solid #e2e9e3; border-radius: 7px; background: #fbfcfb; }
 .workspace-stat span, .workspace-stat small { display: block; color: #7c8981; font-size: 11px; }
-.workspace-stat strong { display: block; margin: 7px 0 3px; color: #294334; font-size: 24px; font-weight: 600; letter-spacing: -.4px; }
+.workspace-stat strong { display: block; margin: 7px 0 3px; color: #294334; font-size: 24px; font-weight: 600; letter-spacing: 0; }
 .workspace-stat small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #workspace-records { display: grid; gap: 10px; }
 .admin-workspace .management-section.workspace-block { padding: 0; margin: 0; overflow: hidden; }
