@@ -179,8 +179,10 @@
 .rr-lightbox { display: block; max-width: 100%; max-height: 73svh; object-fit: contain; margin: auto; }
 .review-page .review-history { box-shadow: none; border-color: var(--rv-line); border-radius: 10px; padding: 22px 24px; margin-top: 32px; }
 .review-history .rr-section-heading h2 { font-size: 16px; font-weight: 500; letter-spacing: -.3px; margin: 6px 0 12px; }
-.rv-history-item { display: flex; align-items: center; gap: 14px; width: 100%; padding: 15px 0; border: 0; border-bottom: 1px solid #edf0e8; background: transparent; color: inherit; cursor: pointer; text-align: left; }
-.rv-history-item:last-child { border-bottom: 0; }
+.rv-history-row { display: flex; align-items: center; border-bottom: 1px solid #edf0e8; }
+.rv-history-row:last-child { border-bottom: 0; }
+.rv-history-item { display: flex; align-items: center; gap: 14px; flex: 1; min-width: 0; padding: 15px 0; border: 0; background: transparent; color: inherit; cursor: pointer; text-align: left; }
+.rv-history-remove { flex: none; width: 32px; height: 32px; border: 0; background: transparent; color: #8d9b87; cursor: pointer; font-size: 18px; }
 .rv-history-mark { display: grid; place-items: center; width: 28px; height: 30px; color: #a9b599; background: #f7f9f1; border-radius: 4px; flex-shrink: 0; }
 .rv-history-mark svg { width: 14px; height: 14px; }
 .rv-history-mark.is-pass { background: #eff5e9; color: #82a368; }

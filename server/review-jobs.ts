@@ -88,7 +88,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
 
 export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
   await recoverInterruptedReviews(env, ownerId);
-  const { results } = await env.DB.prepare("SELECT * FROM review_jobs WHERE owner_id = ? AND (created_at > ? OR (model_executor='agent' AND status IN ('queued','running'))) ORDER BY created_at DESC LIMIT 100")
+  const { results } = await env.DB.prepare("SELECT * FROM review_jobs WHERE owner_id = ? AND owner_hidden = 0 AND (created_at > ? OR (model_executor='agent' AND status IN ('queued','running'))) ORDER BY created_at DESC LIMIT 100")
     .bind(ownerId, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()).all();
   return (results || []).map(publicJob);
 }
@@ -103,7 +103,7 @@ export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string)
 
 export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: string) {
   await recoverDeviceReviews(env.DB);
-  let row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
+  let row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ? AND owner_hidden=0').bind(id, ownerId).first();
   if (!row) throw fail('审核任务不存在。', 404);
   const stale = row.model_executor!=='agent' && (row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000
     || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > (row.executor==='device'?24:3) * 60 * 60 * 1000);

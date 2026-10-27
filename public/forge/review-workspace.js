@@ -293,7 +293,7 @@ export async function mountReviewWorkspace(options) {
     $('#rvExportAll').disabled = !jobs.some(job => job.result);
     $('#rvOverview').innerHTML = [['已完成',done],['进行中',activeCount()],['待处理',jobs.length-done-errors-activeCount()],['未完成',errors]].map(([label,count]) => `<div><b>${count}</b><span>${label}</span></div>`).join('');
     if (!jobs.some(job => job.id === selected)) selected = jobs[0]?.id || '';
-    $('#rvJobs').innerHTML = jobs.map(job => `<article class="rv-job ${job.id === selected ? 'is-selected' : ''}" data-job="${job.id}"><button type="button" class="rv-job-select" data-select="${job.id}" aria-pressed="${job.id === selected}"><span class="rv-file-icon">${svg(job.status === 'done' ? 'check' : 'file')}</span><span class="rv-job-info"><b>${esc(job.title)}</b><small>${esc(job.filename || '后台任务')}${job.bytes ? ` · ${size(job.bytes)}` : ''}</small><span class="rv-job-status ${active(job) ? 'is-active' : job.status}">${active(job) ? '<i class="rv-spinner"></i>' : '<i></i>'}${stageLabel(job)}${job.result ? ` · ${job.result.score}/9` : ''}</span>${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</span></button>${job.status === 'staged' ? `<button type="button" class="rv-job-remove" data-remove="${job.id}" aria-label="移除 ${esc(job.title)}">×</button>` : ''}${allowUpload && job.status === 'error' ? `<button type="button" class="rv-job-retry" data-retry="${job.id}">${svg('retry')}重试</button>` : ''}</article>`).join('');
+    $('#rvJobs').innerHTML = jobs.map(job => `<article class="rv-job ${job.id === selected ? 'is-selected' : ''}" data-job="${job.id}"><button type="button" class="rv-job-select" data-select="${job.id}" aria-pressed="${job.id === selected}"><span class="rv-file-icon">${svg(job.status === 'done' ? 'check' : 'file')}</span><span class="rv-job-info"><b>${esc(job.title)}</b><small>${esc(job.filename || '后台任务')}${job.bytes ? ` · ${size(job.bytes)}` : ''}</small><span class="rv-job-status ${active(job) ? 'is-active' : job.status}">${active(job) ? '<i class="rv-spinner"></i>' : '<i></i>'}${stageLabel(job)}${job.result ? ` · ${job.result.score}/9` : ''}</span>${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</span></button>${['staged','done','error'].includes(job.status) ? `<button type="button" class="rv-job-remove" data-remove="${job.id}" aria-label="移除 ${esc(job.title)}" title="移除任务">×</button>` : ''}${allowUpload && job.status === 'error' ? `<button type="button" class="rv-job-retry" data-retry="${job.id}">${svg('retry')}重试</button>` : ''}</article>`).join('');
     const job = jobs.find(item => item.id === selected) || jobs[0];
     if (!job) { $('#rvResult').innerHTML = ''; renderedId = ''; renderedResult = null; return; }
     selected = job.id;
@@ -308,15 +308,32 @@ export async function mountReviewWorkspace(options) {
   if(allowUpload)$('#rvChoose').onclick = () => $('#rvFile').click();
   if(allowUpload)$('#rvFile').onchange = event => { const files = [...event.target.files]; event.target.value = ''; void addFiles(files); };
   if(allowUpload)$('#rvGo').onclick = () => { started = true; for (const job of jobs) if (job.status === 'staged') { job.status = 'waiting'; job.startedAt = Date.now(); } refresh(); void pump(); };
-  $('#rvJobs').onclick = event => {
+  const removeJob = async job => {
+    if (!job) return;
+    if (job.requestId) {
+      try { await api('DELETE', `review/jobs/${job.requestId}`); }
+      catch (error) { if (error.status !== 404 || job.status !== 'error') throw error; }
+    }
+    job.progress?.dismiss();
+    const index = jobs.indexOf(job);
+    if (index >= 0) jobs.splice(index, 1);
+    refresh();
+  };
+  $('#rvJobs').onclick = async event => {
     const select = event.target.closest('[data-select]');
     if (select) { selected = select.dataset.select; refresh(); }
     const remove = event.target.closest('[data-remove]');
-    if (remove) { const index = jobs.findIndex(job => job.id === remove.dataset.remove && job.status === 'staged'); if (index >= 0) jobs.splice(index, 1); refresh(); }
+    if (remove) { remove.disabled = true; try { await removeJob(jobs.find(job => job.id === remove.dataset.remove)); } catch (error) { dependencies.feedback(`移除失败：${error.message}`, true); remove.disabled = false; } }
     const retry = event.target.closest('[data-retry]');
     if (retry) retryJob(jobs.find(item => item.id === retry.dataset.retry));
   };
-  $('#rvClear').onclick = () => { for (let i = jobs.length - 1; i >= 0; i--) if (['done', 'error'].includes(jobs[i].status)) { jobs[i].progress?.dismiss(); jobs.splice(i, 1); } refresh(); };
+  $('#rvClear').onclick = async () => {
+    const button = $('#rvClear'); button.disabled = true;
+    const results = await Promise.allSettled(jobs.filter(job => ['done','error'].includes(job.status)).map(removeJob));
+    const failed = results.filter(result => result.status === 'rejected');
+    if (failed.length) dependencies.feedback(`${failed.length} 个任务移除失败，请重试。`, true);
+    refresh();
+  };
   if(allowUpload)$('#rvRetryAll').onclick = () => {
     const failed = jobs.filter(job => job.status === 'error');
     const retryable = failed.filter(job => job.html);
@@ -334,7 +351,7 @@ export async function mountReviewWorkspace(options) {
     const filter = $('#rvHistoryFilter').value;
     const list = historyItems.filter(report => String(report.title).toLocaleLowerCase().includes(query) && (filter === 'all' || (filter === 'pass' ? report.score >= 7 : report.score < 7)));
     $('#rvHistoryCount').textContent = `${list.length} / ${historyItems.length} 份报告`;
-    $('#rvHistory').innerHTML = list.length ? list.map(report => `<button type="button" class="rv-history-item" data-history="${report.id}"><span class="rv-history-mark ${report.score >= 7 ? 'is-pass' : ''}">${svg(report.score >= 7 ? 'check' : 'file')}</span><b>${esc(report.title)}</b><span class="rv-history-score">${esc(report.score)}<small>/9</small></span><span class="rr-verdict ${report.score >= 7 ? 'is-pass' : 'is-revise'}">${report.score >= 7 ? '模拟通过' : '建议修改'}</span><time>${esc(date(report.created_at))}</time><span>↗</span></button>`).join('') : `<p class="rr-empty-note">${historyItems.length ? '没有匹配的报告，试试其他名称或结果。' : '还没有历史报告。连接自己的 Agent，审核第一款本地游戏。'}</p>`;
+    $('#rvHistory').innerHTML = list.length ? list.map(report => `<div class="rv-history-row"><button type="button" class="rv-history-item" data-history="${report.id}"><span class="rv-history-mark ${report.score >= 7 ? 'is-pass' : ''}">${svg(report.score >= 7 ? 'check' : 'file')}</span><b>${esc(report.title)}</b><span class="rv-history-score">${esc(report.score)}<small>/9</small></span><span class="rr-verdict ${report.score >= 7 ? 'is-pass' : 'is-revise'}">${report.score >= 7 ? '模拟通过' : '建议修改'}</span><time>${esc(date(report.created_at))}</time><span>↗</span></button>${!allowUpload ? `<button type="button" class="rv-history-remove" data-delete-history="${report.id}" aria-label="删除 ${esc(report.title)} 的审核记录" title="删除审核记录">×</button>` : ''}</div>`).join('') : `<p class="rr-empty-note">${historyItems.length ? '没有匹配的报告，试试其他名称或结果。' : '还没有历史报告。连接自己的 Agent，审核第一款本地游戏。'}</p>`;
   };
   $('#rvHistorySearch').oninput = renderHistory;
   $('#rvHistoryFilter').onchange = renderHistory;
@@ -346,6 +363,18 @@ export async function mountReviewWorkspace(options) {
     } catch (error) { if (current()) $('#rvHistory').textContent = `记录暂时无法读取：${error.message}`; }
   };
   $('#rvHistory').onclick = async event => {
+    const remove = event.target.closest('[data-delete-history]');
+    if (remove) {
+      if (!confirm('从你的审核记录中移除这份报告？管理员仍可查看原始记录。')) return;
+      remove.disabled = true;
+      try {
+        await api('DELETE', `reviews/${remove.dataset.deleteHistory}`);
+        historyItems = historyItems.filter(report => String(report.id) !== remove.dataset.deleteHistory);
+        for (let i = jobs.length - 1; i >= 0; i--) if (String(jobs[i].result?.id) === remove.dataset.deleteHistory) { jobs[i].progress?.dismiss(); jobs.splice(i, 1); }
+        renderHistory(); refresh();
+      } catch (error) { dependencies.feedback(`删除失败：${error.message}`, true); remove.disabled = false; }
+      return;
+    }
     const button = event.target.closest('[data-history]');
     if (!button) return;
     button.disabled = true;

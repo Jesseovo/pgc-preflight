@@ -39,7 +39,9 @@ export async function forgeApi(request: Request, env: ForgeEnv, route: string[],
     const reviewOnly = route[0] === 'review' || route[0] === 'reviews';
     if (user.role !== 'admin' && !user.star && !reviewOnly) return json({ error: '成员账号只开放 AI 模拟审核。' }, 403);
     if (user.role !== 'admin' && reviewOnly && !user.canReview) return json({ error: '当前账号未开通 AI 模拟审核权限，请联系管理员。' }, 403);
-    if(user.role==='member' && request.method!=='GET' && reviewOnly) return json({error:'成员仅通过自己的 Agent 提交审核。'},403);
+    const hideReview = request.method === 'DELETE' && ((route[0] === 'reviews' && route.length === 2 && /^\d+$/.test(route[1])) || (route[0] === 'review' && route[1] === 'jobs' && route.length === 3));
+    if (hideReview && request.headers.get('Origin') !== new URL(request.url).origin) return json({error:'请求来源不匹配。'},403);
+    if(user.role==='member' && request.method!=='GET' && reviewOnly && !hideReview) return json({error:'成员仅通过自己的 Agent 提交审核。'},403);
     const a=route[0];
     if(user.role==='admin' && request.method!=='GET' && ['draw','expand','suggest','tag','import'].includes(a))return json({error:'超级管理员仅管理平台，请使用 Star 成员账号创作。'},403);
     if(user.role==='admin' && request.method==='POST' && a==='topics')return json({error:'超级管理员仅管理内容，请使用 Star 成员账号生成。'},403);
@@ -172,6 +174,13 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
   if (a === 'review' && b === 'jobs') {
     if (method === 'GET' && !c) return listReviewJobs(env, ownerId);
     if (method === 'GET' && c) return getReviewJob(env, c, ownerId);
+    if (method === 'DELETE' && c && route.length === 3) {
+      const row = await first(env, 'SELECT status FROM review_jobs WHERE id=? AND owner_id=?', c, ownerId);
+      if (!row) throw new HttpError(404, '审核任务不存在。');
+      if (!['done', 'error'].includes(row.status)) throw new HttpError(409, '进行中的任务不能移除。');
+      await run(env, "UPDATE review_jobs SET owner_hidden=1 WHERE id=? AND owner_id=? AND status IN ('done','error')", c, ownerId);
+      return {ok:true};
+    }
     if (method === 'POST' && !c) {
       if(ownerId!=='admin')throw new HttpError(403,'成员仅通过 Agent 提交审核。');
       const input = await readReviewBody(request);
@@ -263,7 +272,6 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
     case "DELETE reviews/:id": {
-      if(ownerId!=='admin')throw new HttpError(403,'审核报告由管理员管理，成员不能删除审核记录。');
       return deleteReview(env, id, ownerId);
     }
     case "GET settings": return getSettings(env);
@@ -349,7 +357,7 @@ async function exportAll(env) {
   const [vocab, games, topics, settings, reviews] = await Promise.all([
     all(env, "SELECT * FROM vocab"), ownedGames(env),
     all(env, "SELECT * FROM topics WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'), all(env, "SELECT id AS key, value, updated_at FROM settings WHERE id IN ('redlines','template','template_f','draw_size','expand_batch')"),
-    all(env, "SELECT id, title, topic_id, score, result, probe, created_at FROM reviews WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'),
+    all(env, "SELECT id, title, topic_id, score, result, probe, created_at FROM reviews WHERE (?='admin' OR (owner_id=? AND owner_hidden=0))",env.ownerId||'admin',env.ownerId||'admin'),
   ]);
   return { exported_at: now(), vocab, games, topics, settings, reviews };
 }
@@ -377,7 +385,12 @@ async function deleteReview(env, id, ownerId) {
   if (ownerId === 'admin') {
     await run(env, "DELETE FROM reviews WHERE id = ?", id);
   } else {
-    await run(env, "DELETE FROM reviews WHERE id = ? AND owner_id = ?", id, ownerId);
+    const report = await first(env, 'SELECT id, job_id FROM reviews WHERE id=? AND owner_id=?', id, ownerId);
+    if (!report) throw new HttpError(404, '审核记录不存在');
+    await env.DB.batch([
+      env.DB.prepare('UPDATE reviews SET owner_hidden=1 WHERE id=? AND owner_id=?').bind(id,ownerId),
+      env.DB.prepare("UPDATE review_jobs SET owner_hidden=1 WHERE id=? AND owner_id=? AND status IN ('done','error')").bind(report.job_id,ownerId),
+    ]);
   }
   return { ok: true };
 }
@@ -814,14 +827,14 @@ async function listReviews(env, ownerId) {
   const isAdmin = ownerId === 'admin';
   const rows = isAdmin
     ? await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews ORDER BY id DESC LIMIT 100")
-    : await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? ORDER BY id DESC LIMIT 100", ownerId);
+    : await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? AND owner_hidden=0 ORDER BY id DESC LIMIT 100", ownerId);
   return rows;
 }
 
 async function getReview(env, id, ownerId = 'admin') {
   const r = ownerId === 'admin'
     ? await first(env, "SELECT * FROM reviews WHERE id = ?", id)
-    : await first(env, "SELECT * FROM reviews WHERE id = ? AND owner_id = ?", id, ownerId);
+    : await first(env, "SELECT * FROM reviews WHERE id = ? AND owner_id = ? AND owner_hidden=0", id, ownerId);
   if (!r) throw new HttpError(404, "审核记录不存在");
   return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots) };
 }

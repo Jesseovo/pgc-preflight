@@ -32,6 +32,32 @@ async function setup(){
 }
 
 describe('Star 工作区迁移与所有权',()=>{
+  it('成员仅能移除本人已结束任务和报告，管理员记录、额度及请求编号保留',async()=>{
+    const s=await setup(), now=new Date().toISOString(), id=crypto.randomUUID(), active=crypto.randomUUID(), failed=crypto.randomUUID();
+    s.sqlite.prepare("INSERT INTO review_jobs(id,owner_id,title,status,created_at,updated_at,quota_charged) VALUES(?,'a','failed','error',?,?,1),(?,'a','running','running',?,?,0),(?,'a','failed only','error',?,?,0)").run(id,now,now,active,now,now,failed,now,now);
+    const report=s.review('a','A report'), other=s.review('b','B report');
+    s.sqlite.prepare('UPDATE reviews SET job_id=? WHERE id=?').run(id,report);
+    expect((await s.request('b','DELETE',`review/jobs/${id}`)).status).toBe(404);
+    expect((await s.request('a','DELETE',`review/jobs/${active}`)).status).toBe(409);
+    expect((await s.request('a','DELETE',`review/jobs/${failed}`)).status).toBe(200);
+    expect((await s.request('a','DELETE',`review/jobs/${failed}`)).status).toBe(200);
+    expect((await s.request('a','DELETE',`reviews/${other}`)).status).toBe(404);
+    expect((await s.request('a','DELETE',`reviews/${report}`,undefined,{Origin:'https://other.test'})).status).toBe(403);
+    expect((await s.request('a','DELETE',`reviews/${report}`,undefined,{Authorization:'Bearer invalid'})).status).toBe(403);
+    expect((await s.request('a','DELETE',`reviews/${report}`)).status).toBe(200);
+    expect((await s.request('a','DELETE',`reviews/${report}`)).status).toBe(200);
+    expect(await (await s.request('a','GET','reviews')).json()).toEqual([]);
+    expect((await s.request('a','GET',`reviews/${report}`)).status).toBe(404);
+    expect((await s.request('a','GET',`review/jobs/${id}`)).status).toBe(404);
+    expect(await (await s.request('a','GET','review/jobs')).json()).toEqual([expect.objectContaining({id:active})]);
+    expect((await s.request('admin','GET',`reviews/${report}`)).status).toBe(200);
+    expect(s.sqlite.prepare('SELECT owner_hidden,quota_charged FROM review_jobs WHERE id=?').get(id)).toMatchObject({owner_hidden:1,quota_charged:1});
+    expect(s.sqlite.prepare('SELECT owner_hidden FROM reviews WHERE id=?').get(report)).toMatchObject({owner_hidden:1});
+    expect((await s.request('a','POST','review/jobs',{html:'x'})).status).toBe(403);
+    expect((await s.request('a','GET','export')).status).toBe(200);
+    expect(JSON.stringify(await (await s.request('a','GET','export')).json())).not.toContain('A report');
+  });
+
   it('真实旧库迁移保留管理员作品、各类产物和稳定编号；外部作品编号按 owner 唯一',()=>{
     const{sqlite}=database(true);
     sqlite.prepare("INSERT INTO games(id,ext_id,title,subject) VALUES(41,'external-1','Legacy game',' Old Subject ')").run();
