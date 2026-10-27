@@ -3,6 +3,7 @@ import {createServer} from 'node:http';
 import {DatabaseSync} from 'node:sqlite';
 import {readFile,readdir,mkdir,writeFile,rm,mkdtemp} from 'node:fs/promises';
 import {resolve,join} from 'node:path';
+import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {reviewDeviceApi} from '../server/review-device-api';
 import {digest} from '../server/review-device-state';
@@ -36,17 +37,23 @@ const origin=`http://127.0.0.1:${(server.address() as any).port}`;
 env={DB,SETTINGS_KEY:'fixture-secret',ADMIN_PASSWORD:'fixture-admin',modelStore:{get:async()=>{throw new Error('Local review must not read platform model configuration');}},REVIEW_RUNNER:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{throw new Error('Local review must not schedule platform execution');}})}};
 await mkdir('artifacts',{recursive:true});
 const root=await mkdtemp(resolve('artifacts/agent-verify-'));
-const cli=async(args:string[],extra:Record<string,string>={})=>new Promise<any[]>((done,reject)=>{
-  const child=spawn(process.execPath,[resolve('public/agent/review-agent.mjs'),...args],{env:{...process.env,PGC_ORIGIN:origin,PGC_AGENT_DATA:join(root,'account'),...extra},windowsHide:true,stdio:['ignore','pipe','pipe']});
+const cli=async(args:string[],extra:Record<string,string>={},stdin='')=>new Promise<any[]>((done,reject)=>{
+  const child=spawn(process.execPath,[resolve('public/agent/review-agent.mjs'),...args],{env:{...process.env,PGC_ORIGIN:origin,PGC_AGENT_DATA:join(root,'account'),...extra},windowsHide:true,stdio:['pipe','pipe','pipe']});
   let stdout='',stderr='';child.stdout.on('data',b=>stdout+=b);child.stderr.on('data',b=>stderr+=b);
   child.on('error',reject);child.on('close',code=>code===0?done(stdout.trim().split('\n').filter(Boolean).map(s=>JSON.parse(s))):reject(new Error(`CLI failed ${code}: ${stderr}\n${stdout}`)));
+  child.stdin.on('error',()=>{});child.stdin.end(stdin);
 });
 try{
   const code='a'.repeat(40);sqlite.prepare('INSERT INTO review_pairings VALUES(?,?,?, ?,NULL)').run(await digest(code),'fixture','1',new Date(Date.now()+300000).toISOString());
-  assert.equal((await cli(['pair'],{PGC_PAIR_CODE:code}))[0].event,'paired');
+  assert.equal((await cli(['pair'],{},code))[0].event,'paired');
   const credential=await readFile(join(root,'account','credential.json'),'utf8');if(process.platform==='win32')assert.match(credential,/dpapi/);
   const a=join(root,'a.html'),b=join(root,'b.html');
   for(const path of [a,b])await writeFile(path,'<!doctype html><html><title>AGENT_FIXTURE</title><meta name="viewport" content="width=device-width,initial-scale=1"><body style="margin:0;background:#d7e7d9"><h1>AGENT_FIXTURE</h1><button onclick="this.textContent=\'touched\'">Start</button><canvas width="360" height="200"></canvas><script>const c=document.querySelector("canvas").getContext("2d");c.fillStyle="#55795d";c.fillRect(30,30,140,100);</script></body></html>');
+  const humanPath=join(root,'human.json'),source='https://creator-hub-7mi.pages.dev';
+  const human={workId:'fixture-work',versionId:'fixture-version',score:null,feedback:null,updatedAt:'2026-10-27T08:00:00.000Z',source,status:'pending',phase:null,matchedBy:'published-record',uploadedContentHash:createHash('sha256').update(await readFile(a)).digest('hex')};
+  await writeFile(humanPath,JSON.stringify(human));
+  const submitted=await cli(['submit',a,'--human-review',humanPath]);
+  assert.equal(submitted.find(e=>e.event==='human-review').human_review.status,'pending');
   const result=await cli(['review',a,b,'--out',join(root,'reports')]);
   const ids=result.filter(e=>e.event==='submitted').map(e=>e.job.id);assert.equal(ids.length,2);
   const materials=result.filter(e=>e.event==='material');assert.equal(materials.length,2);
@@ -69,6 +76,14 @@ try{
   assert.equal(calls,0);assert.equal((await reviewUsage(DB,'fixture')).used,0);
   const rerun=await cli(['review',a,'--out',join(root,'reports')]);assert.equal(rerun.find(e=>e.event==='submitted').job.id,ids[0]);assert.equal(calls,0);
   assert.equal((await cli(['report',ids[1]]))[0].report.probe.evidenceOrigin,'member-device');
+  const aiResult=sqlite.prepare('SELECT result FROM reviews WHERE job_id=?').get(ids[0])!.result;
+  await writeFile(humanPath,JSON.stringify({...human,status:'reviewed',phase:'final',score:0,feedback:'合成真人反馈；仅验证回填。',updatedAt:'2026-10-27T09:00:00.000Z'}));
+  await cli(['human-review',ids[0],'--json',humanPath]);
+  await cli(['human-review',ids[0],'--json',humanPath]);
+  const updated=(await cli(['report',ids[0]]))[0].report;
+  assert.equal(updated.human_review.score,0);assert.equal(updated.human_review.phase,'final');
+  assert.equal(sqlite.prepare('SELECT COUNT(*) n FROM review_human_reviews').get()!.n,2);
+  assert.equal(sqlite.prepare('SELECT result FROM reviews WHERE job_id=?').get(ids[0])!.result,aiResult);
   assert.equal(sqlite.prepare('SELECT COUNT(*) n FROM review_inputs').get()!.n,0);assert.equal(sqlite.prepare('SELECT COUNT(*) n FROM review_evidence').get()!.n,0);
-  console.log('PASS Agent bundle → DPAPI pair → 2 local games → 8 real viewport images → local draft/verification protocol → immutable JSON reports; zero platform calls/quota; no daemon/installer. Scripted judgments only.');
+  console.log('PASS Agent bundle → stdin/DPAPI pair → 2 local games → 8 real viewport images → local draft/verification → queued and completed human-feedback sync/idempotency → immutable AI reports; zero platform calls/quota. Scripted judgments only.');
 }finally{await new Promise<void>(r=>server.close(()=>r()));sqlite.close();const target=resolve(root),parent=resolve('artifacts');assert.ok(target.startsWith(parent+'\\')||target.startsWith(parent+'/'));assert.ok(target.split(/[\\/]/).at(-1)?.startsWith('agent-verify-'));await rm(target,{recursive:true,force:true});}

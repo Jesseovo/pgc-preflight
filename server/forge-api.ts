@@ -19,6 +19,7 @@ import {
 } from "./forge/prompts.js";
 import {createAgentTask,publicCreatorTask,validateAgentTask} from './forge-agent-api';
 import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnapshot} from './forge-workspace';
+import {currentHumanReview,withHumanReviews} from './human-review';
 import { cleanGameHtml } from './game-generation';
 import {enqueueForgeTask, recoverForgeTasks, readForgeTask, publicForgeTask, type ForgeRunnerBinding} from './forge-tasks';
 
@@ -357,9 +358,9 @@ async function exportAll(env) {
   const [vocab, games, topics, settings, reviews] = await Promise.all([
     all(env, "SELECT * FROM vocab"), ownedGames(env),
     all(env, "SELECT * FROM topics WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'), all(env, "SELECT id AS key, value, updated_at FROM settings WHERE id IN ('redlines','template','template_f','draw_size','expand_batch')"),
-    all(env, "SELECT id, title, topic_id, score, result, probe, created_at FROM reviews WHERE (?='admin' OR (owner_id=? AND owner_hidden=0))",env.ownerId||'admin',env.ownerId||'admin'),
+    all(env, "SELECT id, owner_id, job_id, title, topic_id, score, result, probe, created_at FROM reviews WHERE (?='admin' OR (owner_id=? AND owner_hidden=0))",env.ownerId||'admin',env.ownerId||'admin'),
   ]);
-  return { exported_at: now(), vocab, games, topics, settings, reviews };
+  return { exported_at: now(), vocab, games, topics, settings, reviews: await withHumanReviews(env.DB, reviews) };
 }
 
 // ---------- generic rows ----------
@@ -826,9 +827,9 @@ export function sameGame(a, b) {
 async function listReviews(env, ownerId) {
   const isAdmin = ownerId === 'admin';
   const rows = isAdmin
-    ? await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews ORDER BY id DESC LIMIT 100")
-    : await all(env, "SELECT id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? AND owner_hidden=0 ORDER BY id DESC LIMIT 100", ownerId);
-  return rows;
+    ? await all(env, "SELECT id,owner_id,job_id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews ORDER BY id DESC LIMIT 100")
+    : await all(env, "SELECT id,owner_id,job_id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? AND owner_hidden=0 ORDER BY id DESC LIMIT 100", ownerId);
+  return withHumanReviews(env.DB,rows);
 }
 
 async function getReview(env, id, ownerId = 'admin') {
@@ -836,7 +837,7 @@ async function getReview(env, id, ownerId = 'admin') {
     ? await first(env, "SELECT * FROM reviews WHERE id = ?", id)
     : await first(env, "SELECT * FROM reviews WHERE id = ? AND owner_id = ? AND owner_hidden=0", id, ownerId);
   if (!r) throw new HttpError(404, "审核记录不存在");
-  return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots) };
+  return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots),human_review:await currentHumanReview(env.DB,r.job_id,r.owner_id) };
 }
 
 function brief(env, id, ctx, regenerate = false) {

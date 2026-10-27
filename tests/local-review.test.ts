@@ -11,12 +11,16 @@ import {reviewDeviceApi} from '../server/review-device-api';
 import {canonicalJson,digest,recoverDeviceReviews} from '../server/review-device-state';
 import {enqueueReview,getReviewJob,processReviewJob,purgeReviewInputs} from '../server/review-jobs';
 import {executeDeviceReview,ReviewRunner} from '../server/review-runner';
-import {reviewUsage} from '../server/review-usage';
+import {reviewUsage,reviewActivity,reviewDay} from '../server/review-usage';
+import {dispatch} from '../server/forge-api';
+import {adminWorkspaceApi} from '../server/admin-workspace-api';
+import {login} from '../server/settings';
 import {REVIEW_SCHEMA,REVIEW_VERIFICATION} from '../server/forge/prompts.js';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.restoreAllMocks();});
 const report=()=>({aes:2,ease:2,play:3,score_reasons:{aes:'frame-0 可见清晰配色',ease:'frame-1 可见操作提示',play:'源码推断核心循环，尚未完成完整试玩'},uncertainties:['真实手感需人工试玩'],verdict:'模拟通过',reviewer_comment:'合成审核意见',strengths:['画面层级清楚'],issues:[],fix_prompt:'依据已观察到的证据修改'});
+const human=(job:any,overrides:any={})=>({id:job.id,...(job.lease?{lease:job.lease}:{}),requestId:crypto.randomUUID(),workId:'external-work',versionId:'external-version:2',score:0,feedback:'真人终审意见',updatedAt:'2026-10-27T10:00:00.000Z',source:'https://creator-hub-7mi.pages.dev',status:'reviewed',phase:'final',matchedBy:'user-confirmed',...overrides});
 async function setup(){
   const sqlite=new DatabaseSync(':memory:');databases.push(sqlite);
   for(const file of readdirSync('migrations').filter(n=>n.endsWith('.sql')).sort())sqlite.exec(readFileSync(`migrations/${file}`,'utf8'));
@@ -46,6 +50,87 @@ async function setup(){
 }
 
 describe('成员 Agent 本地模型审核协议',()=>{
+  it('真人回填允许未领取任务的本人设备，上传内容按原 HTML 字节验证，领取后绑定原设备和租约',async()=>{
+    const s=await setup(),queued=await s.submit(),hash=s.sqlite.prepare('SELECT input_hash FROM review_jobs WHERE id=?').get(queued.id)?.input_hash;
+    expect(hash).toBe(await digest('<html><title>ORIGINAL_GAME</title><canvas></canvas></html>'));
+    const first=human(queued,{uploadedContentHash:hash});
+    expect((await s.call('human-review',{...first,uploadedContentHash:'0'.repeat(64)})).status).toBe(409);
+    const saved=await s.ok('human-review',first,'a2');
+    expect(saved.human_review).toMatchObject({score:0,workId:'external-work',phase:'final'});
+    expect((await s.ok('jobs')).find((j:any)=>j.id===queued.id)).toMatchObject({human_status:'reviewed',human_score:0,human_review:saved.human_review});
+    const job=await s.claim(queued.id),newer=human(job,{updatedAt:'2026-10-27T11:00:00.000Z',score:8.5});
+    expect((await s.call('human-review',newer,'a2')).status).toBe(409);
+    expect((await s.call('human-review',{...newer,lease:undefined})).status).toBe(409);
+    expect((await s.ok('human-review',newer)).human_review.score).toBe(8.5);
+    expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();expect(s.send).not.toHaveBeenCalled();
+  });
+  it('真人审核回填与任务、账号和设备权限隔离，网页Cookie或注入归属字段不能扩大权限',async()=>{
+    const s=await setup(),job=await s.ready(),body=human(job);
+    expect((await s.call('human-review',body,'b')).status).toBe(404);
+    expect((await s.call('human-review',body,'a2')).status).toBe(409);
+    expect((await s.call('human-review',{...body,owner_id:'b'})).status).toBe(400);
+    s.sqlite.prepare('UPDATE review_devices SET revoked=1 WHERE id=?').run(s.devices.a);
+    expect((await s.call('human-review',body)).status).toBe(401);
+    s.sqlite.prepare('UPDATE review_devices SET revoked=0 WHERE id=?').run(s.devices.a);
+    s.sqlite.exec("UPDATE members SET can_review=0 WHERE id='a'");expect((await s.call('human-review',body)).status).toBe(401);
+    s.sqlite.exec("UPDATE members SET can_review=1 WHERE id='a'");
+    await s.ok('fail',{...job,message:'fixture failed'});expect((await s.call('human-review',body)).status).toBe(409);
+    expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_human_reviews').get()).toMatchObject({n:0});
+  });
+  it('真人记录严格校验外部ID、来源、阶段、时间、空分与状态组合，不依作品同名自动匹配',async()=>{
+    const s=await setup(),job=await s.submit(),base=human(job);
+    for(const change of [{workId:1},{workId:'../other'},{versionId:null},{source:'https://elsewhere.test'},{score:-1},{score:10},{score:'8'},{updatedAt:'2026-02-30T10:00:00.000Z'},{updatedAt:'2026-10-27'},{status:'approved'},{phase:'other'},{matchedBy:'title'},{feedback:'x'.repeat(20001)},{score:null,feedback:'  '},{status:'pending',phase:'final'},{status:'pending',phase:null,score:null,workId:null,versionId:null},{status:'unavailable',phase:null,score:2},{uploadedContentHash:'INVALID'},{lease:{}}]){
+      const response=await s.call('human-review',{...base,...change});expect(response.status,JSON.stringify(change).slice(0,200)).toBe(400);
+    }
+    const unlinked=human(job,{workId:null,versionId:null,score:null,feedback:'用户尚未确认作品版本',status:'unlinked',phase:null,matchedBy:null});
+    expect((await s.ok('human-review',unlinked)).human_review).toMatchObject({status:'unlinked',workId:null,versionId:null,score:null});
+    const pending=human(job,{status:'pending',phase:null,score:null,feedback:null,updatedAt:'2026-10-27T11:00:00.000Z'});
+    expect((await s.ok('human-review',pending)).human_review.status).toBe('pending');
+    const rejected=human(job,{score:null,feedback:'直接驳回，无评分',updatedAt:'2026-10-27T12:00:00.000Z'});
+    expect((await s.ok('human-review',rejected)).human_review).toMatchObject({score:null,feedback:'直接驳回，无评分',phase:'final'});
+    expect(s.sqlite.prepare('SELECT COUNT(*) n FROM topics').get()).toMatchObject({n:0});
+  });
+  it('真人回填并发和响应丢失重传幂等，同请求变更内容或同任务换作品版本被拒绝',async()=>{
+    const s=await setup(),job=await s.ready(),body=human(job),repeated=await Promise.all(Array.from({length:5},()=>s.ok('human-review',body)));
+    expect(new Set(repeated.map(v=>v.human_review.id)).size).toBe(1);
+    expect(await s.ok('human-review',Object.fromEntries(Object.entries(body).reverse()))).toEqual(repeated[0]);
+    for(const change of [{score:1},{feedback:'替换意见'},{phase:'preliminary'},{workId:'other-work'},{versionId:'other-version'}])expect((await s.call('human-review',{...body,...change})).status).toBe(409);
+    expect((await s.call('human-review',human(job,{workId:'other-work'}))).status).toBe(409);
+    expect((await s.call('human-review',human(job,{versionId:'other-version'}))).status).toBe(409);
+    expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_human_reviews').get()).toMatchObject({n:1});
+    const second=await s.submit(),a=human(second),b=human(second,{workId:'different-confirmed-work'}),race=await Promise.all([s.call('human-review',a),s.call('human-review',b)]);
+    expect(race.map(r=>r.status).sort()).toEqual([200,409]);
+    const requestRace=await s.submit(),same=human(requestRace),different={...same,feedback:'other valid callback'},results=await Promise.all([s.call('human-review',same),s.call('human-review',different)]);
+    expect(results.map(r=>r.status).sort()).toEqual([200,409]);
+  });
+  it('迟到回填、预审和查询失败保留历史且不覆盖已有终审，同版本较新终审可更新展示',async()=>{
+    const s=await setup(),job=await s.submit(),final=await s.ok('human-review',human(job,{score:7}));
+    for(const change of [{updatedAt:'2026-10-27T09:00:00.000Z',score:9},{updatedAt:'2026-10-27T11:00:00.000Z',phase:'preliminary',score:8},{updatedAt:'2026-10-27T12:00:00.000Z',status:'unavailable',phase:null,score:null,feedback:'无法查询'},{updatedAt:'2026-10-27T13:00:00.000Z',workId:null,versionId:null,matchedBy:null,status:'unlinked',phase:null,score:null}]){
+      await s.ok('human-review',human(job,change));expect((await s.ok('job',{id:job.id})).human_review).toEqual(final.human_review);
+    }
+    const fresh=await s.ok('human-review',human(job,{score:8.5,updatedAt:'2026-10-27T14:00:00.000Z'}));
+    expect((await s.ok('job',{id:job.id})).human_review).toEqual(fresh.human_review);
+    expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_human_reviews').get()).toMatchObject({n:6});
+    expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_human_reviews WHERE is_current=1').get()).toMatchObject({n:1});
+  });
+  it('已完成任务回填不改变AI报告，成员报告、管理员报告、工作台和活动都读取独立真人关联',async()=>{
+    const s=await setup(),job=await s.ready();await s.ok('complete',await s.verified(job));
+    const before=s.sqlite.prepare('SELECT * FROM reviews WHERE job_id=?').get(job.id) as any,hash=s.sqlite.prepare('SELECT input_hash FROM review_jobs WHERE id=?').get(job.id)?.input_hash;
+    const saved=await s.ok('human-review',human(job,{uploadedContentHash:hash}));
+    expect(s.sqlite.prepare('SELECT * FROM reviews WHERE job_id=?').get(job.id)).toEqual(before);
+    expect((await s.ok('report',{id:job.id})).human_review).toEqual(saved.human_review);
+    const request=new Request('https://fixture.test/api/forge/reviews');
+    for(const owner of ['a','admin']){
+      const list=await dispatch('GET',['reviews'],request,s.env,owner),detail=await dispatch('GET',['reviews',String(before.id)],request,s.env,owner);
+      expect(list.find((r:any)=>r.id===before.id)).toMatchObject({score:7,human_score:0,human_review:saved.human_review});expect(detail.human_review).toEqual(saved.human_review);
+    }
+    expect(await dispatch('GET',['reviews'],request,s.env,'b')).toEqual([]);
+    await expect(dispatch('GET',['reviews',String(before.id)],request,s.env,'b')).rejects.toMatchObject({status:404});
+    expect((await reviewActivity(s.DB,new URLSearchParams({date:reviewDay()}))).records.find((r:any)=>r.id===job.id)).toMatchObject({score:7,human_score:0,human_review:saved.human_review});
+    const cookie=`pgc_admin=${await login(s.env.ADMIN_PASSWORD,s.env)}`,response=await adminWorkspaceApi(new Request('https://fixture.test/api/admin/workspace',{headers:{Cookie:cookie}}),s.env),workspace=await response!.json() as any;
+    expect(response!.status).toBe(200);expect(workspace.reviews.find((r:any)=>r.id===before.id).human_review).toEqual(saved.human_review);expect(workspace.reviewJobs.find((r:any)=>r.id===job.id).human_review).toEqual(saved.human_review);
+    expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();
+  });
   it('无平台配置和每日模型次数也可提交，默认零扣次，不接受设备切到平台执行且无50任务上限',async()=>{
     const s=await setup(),fetch=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('No network model requests'));
     const first=await s.submit();await s.submit('a',first.id);

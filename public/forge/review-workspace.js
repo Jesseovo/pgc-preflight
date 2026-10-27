@@ -55,11 +55,31 @@ const svg = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
 
 const reportOrigin = report => /import|manual-admin/.test(report.model_executor || '') ? '管理员导入' : report.model_executor === 'agent' ? '成员本机 Agent' : report.model_executor === 'platform' ? '平台模型（管理员上传）' : !report.model_executor && report.probe?.modelExecutor === 'agent' ? '成员本机 Agent' : '历史报告（未记录执行来源）';
 const reportEvidence = report => report.probe?.evidenceOrigin === 'member-device' ? '成员本机采集' : report.probe?.evidenceOrigin || '未单独记录';
+const HUMAN_REVIEW_LABELS = { reviewed: '已审核', pending: '暂未审核', unavailable: '真人审核查询暂不可用', unlinked: '未关联真人审核作品' };
+const humanReviewTitle = review => review?.phase === 'preliminary' ? '组长预审' : review?.phase === 'final' ? '真人终审' : '真人审核';
+const humanReview = report => {
+  const review = report.human_review;
+  if (!review || typeof review !== 'object') return null;
+  const score = review.score == null || review.score === '' ? '' : String(review.score);
+  const feedback = String(review.feedback ?? '').trim();
+  const status = Object.hasOwn(HUMAN_REVIEW_LABELS, review.status) ? review.status : score || feedback ? 'reviewed' : review.workId ? 'pending' : 'unlinked';
+  return { ...review, score, feedback, status };
+};
+const humanReviewFields = review => [['关联作品', review.workId], ['投稿版本', review.versionId], ['更新时间', review.updatedAt], ['审核来源（Agent 同步）', review.source]].filter(([, value]) => value != null && value !== '');
+const humanReviewText = report => {
+  const review = humanReview(report);
+  if (!review) return '暂无真人审核或未关联作品。';
+  return [`审核阶段：${humanReviewTitle(review)}`, HUMAN_REVIEW_LABELS[review.status], ...(review.score ? [`${humanReviewTitle(review)}评分：${review.score}/9`] : review.status === 'reviewed' ? [`${humanReviewTitle(review)}评分：未提供`] : []), ...humanReviewFields(review).map(([label, value]) => `${label}：${value}`), ...(review.status === 'reviewed' || review.feedback ? [`审核意见：${review.feedback || '暂无真人审核意见。'}`] : [])].join('\n');
+};
+const humanReviewHtml = report => {
+  const review = humanReview(report);
+  return `<section class="rr-human-review" aria-label="真人审核"><div class="rr-section-heading"><h3>${humanReviewTitle(review)}</h3>${review?.score ? `<strong class="rr-human-score">${humanReviewTitle(review)}评分 ${esc(review.score)} / 9</strong>` : ''}</div>${review ? `<p class="rr-human-state">${HUMAN_REVIEW_LABELS[review.status]}${review.status === 'reviewed' && !review.score ? ' · 未提供评分' : ''}</p><dl>${humanReviewFields(review).map(([label, value]) => `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl>${review.status === 'reviewed' || review.feedback ? `<p class="rr-human-feedback">${esc(review.feedback || '暂无真人审核意见。')}</p>` : ''}` : '<p class="rr-human-empty">暂无真人审核或未关联作品。</p>'}</section>`;
+};
 export function reportText(report) {
   const x = report.result || {};
   const reasons = [['aes', '美学'], ['ease', '易玩性'], ['play', '可玩性']].map(([key, label]) => `- ${label}：${x.score_reasons?.[key] || '旧报告未单独记录评分依据'}`).join('\n');
   const uncertainties = Array.isArray(x.uncertainties) ? x.uncertainties.map(text => `- ${text}`).join('\n') || '- 模型未额外列出待确认项' : '- 旧报告未单独记录待确认项';
-  return `# ${report.title} · AI 模拟审核\n\n执行来源：${reportOrigin(report)}${report.model ? ` · 模型 ${report.model}` : ''}\n证据来源：${reportEvidence(report)}${report.agent_id ? ` · Agent ${report.agent_id}` : ''}${report.evidence_hash ? `\n证据哈希：${report.evidence_hash}` : ''}\n\n总分 ${report.score}/9 · ${x.verdict || ''}\n美学 ${x.aes}/3 · 易玩性 ${x.ease}/3 · 可玩性 ${x.play}/3\n\n${x.reviewer_comment || ''}\n\n## 评分依据\n${reasons}\n\n## 待人工确认\n${uncertainties}\n\n## 亮点\n${arr(x.strengths).map(t => `- ${t}`).join('\n')}\n\n## 优先修改\n${arr(x.issues).map((i, n) => `${n + 1}. [${i.severity}] ${i.area}：${i.problem}\n   证据：${i.evidence}\n   建议：${i.fix}`).join('\n\n')}\n\n## 交给智能助手修改\n${x.fix_prompt || ''}\n\n这是基于有限证据的 AI 模拟评分，最终结果由人工确认。\n`;
+  return `# ${report.title} · AI 模拟审核\n\n执行来源：${reportOrigin(report)}${report.model ? ` · 模型 ${report.model}` : ''}\n证据来源：${reportEvidence(report)}${report.agent_id ? ` · Agent ${report.agent_id}` : ''}${report.evidence_hash ? `\n证据哈希：${report.evidence_hash}` : ''}\n\n总分 ${report.score}/9 · ${x.verdict || ''}\n美学 ${x.aes}/3 · 易玩性 ${x.ease}/3 · 可玩性 ${x.play}/3\n\n${x.reviewer_comment || ''}\n\n## 真人审核\n${humanReviewText(report)}\n\n## 评分依据\n${reasons}\n\n## 待人工确认\n${uncertainties}\n\n## 亮点\n${arr(x.strengths).map(t => `- ${t}`).join('\n')}\n\n## 优先修改\n${arr(x.issues).map((i, n) => `${n + 1}. [${i.severity}] ${i.area}：${i.problem}\n   证据：${i.evidence}\n   建议：${i.fix}`).join('\n\n')}\n\n## 交给智能助手修改\n${x.fix_prompt || ''}\n\n这是基于有限证据的 AI 模拟评分，最终结果由人工确认。\n`;
 }
 
 export function reviewHtml(report) {
@@ -71,6 +91,7 @@ export function reviewHtml(report) {
     <header class="rr-header"><div><span class="rr-kicker">AI 模拟审核报告</span><h2>${esc(report.title)}</h2><div class="rr-meta"><span class="rr-verdict ${passed ? 'is-pass' : 'is-revise'}">${svg(passed ? 'check' : 'retry')}${passed ? '模拟通过' : '建议修改'}</span><time>${esc(date(report.created_at))}</time></div></div><div class="rr-total"><strong>${esc(report.score)}</strong><span>/ 9</span><small>通过线 7 分</small></div></header>
     <p class="rr-legacy-note">执行来源：${esc(reportOrigin(report))}${report.model ? ` · 模型 ${esc(report.model)}` : ''}<br>证据来源：${esc(reportEvidence(report))}${report.agent_id ? ` · Agent ${esc(report.agent_id)}` : ''}${report.evidence_hash ? `<br>证据哈希：${esc(report.evidence_hash)}` : ''}</p><div class="rr-scores">${[['aes', '美学', '视觉与风格'], ['ease', '易玩性', '规则与操作'], ['play', '可玩性', '机制与挑战']].map(([k, title, caption], index) => `<section><span class="rr-score-label"><i>0${index + 1}</i>${title}</span><div class="rr-score-value"><b>${esc(x[k])}<small> / 3</small></b><span class="rr-segments" aria-hidden="true">${[1, 2, 3].map(n => `<i class="${n <= Number(x[k]) ? 'filled' : ''}"></i>`).join('')}</span></div><p>${caption}</p></section>`).join('')}</div>
     <section class="rr-comment"><span>${svg('sparkle')}审核意见</span><p>${esc(x.reviewer_comment)}</p>${x.verdict ? `<small>模型结论 · ${esc(x.verdict)}</small>` : ''}</section>
+    ${humanReviewHtml(report)}
     <nav class="rr-report-nav" aria-label="报告内容"><button type="button" data-report-jump=".rr-reasons">评分依据</button><button type="button" data-report-jump=".rr-issues">修改建议 <b>${issues.length}</b></button><button type="button" data-report-jump=".rr-agent">智能助手指令 ↗</button>${shots.length ? '<button type="button" data-report-jump=".rr-evidence">画面证据</button>' : ''}</nav>
     ${x.score_reasons ? `<section class="rr-reasons"><h3>为什么是这个分数</h3><dl>${[['aes', '美学'], ['ease', '易玩性'], ['play', '可玩性']].map(([key, label]) => `<div><dt>${label}<b>${esc(x[key])} / 3</b></dt><dd>${esc(x.score_reasons[key])}</dd></div>`).join('')}</dl></section>` : '<p class="rr-legacy-note">旧报告未单独记录评分依据，可让自己的 Agent 重新审核获取新版报告。</p>'}
     ${arr(x.uncertainties).length ? `<section class="rr-uncertainties"><h3>待人工确认</h3><ul>${x.uncertainties.map(text => `<li>${esc(text)}</li>`).join('')}</ul></section>` : ''}
@@ -383,6 +404,7 @@ export async function mountReviewWorkspace(options) {
       if (!current()) return;
       let job = jobs.find(item => item.result?.id === report.id);
       if (!job) { job = { id: `history-${report.id}`, title: report.title, result: report, status: 'done' }; jobs.push(job); }
+      else { job.result = report; job.title = report.title; }
       selected = job.id; refresh();
       $('#rvBatch').scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
     } catch (error) { dependencies.feedback(error.message, true); } finally { button.disabled = false; }
@@ -391,7 +413,7 @@ export async function mountReviewWorkspace(options) {
   dependencies.updateHistory = history;
   dependencies.updateUsage = async () => {if(current())$('#rvQuota').textContent='审核由自己的 Agent 与模型执行';};
   $('#rvQuota').insertAdjacentHTML('afterend','<span id="rvWorkerStatus" class="rv-quota" role="status">正在读取智能助手授权状态…</span>');
-  $('#rvDropzone').closest('.review-upload-panel').insertAdjacentHTML('beforeend',`<details class="rv-device" open><summary>智能助手接入</summary><div class="rv-agent-prompt"><b>复制给智能助手</b><p id="rvAgentText">请阅读 ${location.origin}/agent.md，连接我的审核账号，使用你自己的模型采集并审核指定的本地 HTML 游戏，完成初评和同模型复核后提交中文报告。</p><button class="rr-button" id="rvCopyAgent">复制接入指令</button></div><div class="rv-device-actions"><button class="rr-button" id="rvPair">生成一次性配对码</button><a class="rr-button" href="/agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p>首次使用需授权，配对码 5 分钟内有效。</p><div id="rvPairCode" role="status"></div><div id="rvDevices"></div></details>`);
+  $('#rvDropzone').closest('.review-upload-panel').insertAdjacentHTML('beforeend',`<details class="rv-device" open><summary>智能助手接入</summary><div class="rv-agent-prompt"><b>复制给智能助手</b><p id="rvAgentText">请阅读 ${location.origin}/agent.md，连接我的审核账号。首次连接时请让我生成一次性配对码并直接在本对话中询问我，收到后由你自行完成配对，不要让我打开命令窗口。使用你自己的模型采集并审核指定的本地 HTML 游戏，完成初评和同模型复核后提交中文报告。提交游戏时，使用你已有的 creator-hub 授权查询本人准确作品和投稿版本的真人分数与意见；没有结果时照常完成 AI 审核，有结果后再回填。</p><button class="rr-button" id="rvCopyAgent">复制接入指令</button></div><div class="rv-device-actions"><button class="rr-button" id="rvPair">生成一次性配对码</button><a class="rr-button" href="/agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p>首次使用需授权，配对码 5 分钟内有效。</p><div id="rvPairCode" role="status"></div><div id="rvDevices"></div></details>`);
   $('#rvPair').onclick=async()=>{
     const button=$('#rvPair');button.disabled=true;
     try{const value=await withProgress('生成本机配对码',()=>api('POST','review/device/pairing',{}));if(!current())return;$('#rvPairCode').innerHTML=`<label>配对码 · 5 分钟内一次有效<input type="text" readonly value="${esc(value.code)}" aria-label="配对码"></label><button class="rr-button" id="rvCopyCode">复制配对码</button>`;$('#rvCopyCode').onclick=()=>copyText(value.code);setTimeout(()=>{if(current())$('#rvPairCode').replaceChildren();},300000);}

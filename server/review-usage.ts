@@ -1,3 +1,4 @@
+import {withHumanReviews} from './human-review';
 // Metadata only: the quota and administrator ledger never retain game source.
 export const reviewDay = (time = Date.now()) => new Date(time + 8 * 3600000).toISOString().slice(0, 10);
 export async function reviewUsage(DB:any, ownerId:string) {
@@ -20,5 +21,5 @@ export async function reviewActivity(DB:any, params:URLSearchParams) {
     DB.prepare(`SELECT COUNT(*) AS n FROM review_jobs j WHERE ${where}`).bind(...args).first(),
     DB.prepare("SELECT m.id,m.username,m.display_name,m.daily_review_limit,COUNT(j.id) AS submitted,COALESCE(SUM(j.quota_charged),0) AS used,COALESCE(SUM(j.status='done'),0) AS completed,COALESCE(SUM(j.status='error'),0) AS failed,COALESCE(SUM(j.status IN ('queued','running')),0) AS active FROM members m LEFT JOIN review_jobs j ON j.owner_id=m.id AND j.usage_day=? GROUP BY m.id ORDER BY m.created_at DESC").bind(day).all(),
   ]);
-  return {day,timeZone:'Asia/Shanghai',page,pageSize:size,total:Number(total?.n||0),records:rows.results||[],members:summary.results||[]};
+  return {day,timeZone:'Asia/Shanghai',page,pageSize:size,total:Number(total?.n||0),records:await withHumanReviews(DB,rows.results||[],true),members:summary.results||[]};
 }

@@ -2,6 +2,8 @@
 import { activeModelProfile } from './settings';
 import { reviewDay, reviewUsage } from './review-usage';
 import { recoverDeviceReviews } from './review-device-state';
+import {digest} from './review-device-state';
+import {withHumanReviews} from './human-review';
 
 type ReviewJob = { type: 'review'; id: string };
 export interface ReviewJobEnv {
@@ -14,7 +16,7 @@ export interface ReviewJobEnv {
 }
 const stamp = () => new Date().toISOString();
 const fail = (message: string, status = 400) => Object.assign(new Error(message), { status });
-const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model });
+const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, human_review=null }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
   const local = env.modelExecutor !== 'platform';
@@ -32,7 +34,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   const id = payload.request_id;
   if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw fail('审核请求标识无效，请重新提交。');
   const existing = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
-  if (existing) return publicJob(existing);
+  if (existing) return publicJob((await withHumanReviews(env.DB,[existing],true))[0]);
   if(payload.topic_id!==undefined&&payload.topic_id!==null){
     if(!Number.isInteger(payload.topic_id)||payload.topic_id<1)throw fail('选题编号无效。');
     const topic=await env.DB.prepare('SELECT owner_id FROM topics WHERE id=?').bind(payload.topic_id).first();
@@ -40,23 +42,24 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   }
   const title = String(payload.title || '未命名').slice(0, 120);
   const filename = String(payload.filename || '').slice(0, 200);
+  const inputHash=await digest(payload.html);
   const now = stamp();
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
-  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged)
-    SELECT ?,?,?,?,'capture',?,?,?,'device',0,'agent',0 WHERE
+  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash)
+    SELECT ?,?,?,?,'capture',?,?,?,'device',0,'agent',0,? WHERE
     (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))`)
-    .bind(id,ownerId,title,filename,day,now,now,ownerId,ownerId).run()
-    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor)
-    SELECT ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform' WHERE
+    .bind(id,ownerId,title,filename,day,now,now,inputHash,ownerId,ownerId).run()
+    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash)
+    SELECT ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',? WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
-    .bind(id, ownerId, title, filename, day, now, now,env.reviewExecutor||'cloud', ownerId, ownerId, ownerId, ownerId, day).run();
+    .bind(id, ownerId, title, filename, day, now, now,env.reviewExecutor||'cloud',inputHash, ownerId, ownerId, ownerId, ownerId, day).run();
   if (!inserted.meta.changes) {
     const duplicate = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
-    if (duplicate) return publicJob(duplicate);
+    if (duplicate) return publicJob((await withHumanReviews(env.DB,[duplicate],true))[0]);
     if(ownerId !== 'admin'){
       const member=await env.DB.prepare('SELECT enabled,can_review FROM members WHERE id=?').bind(ownerId).first();
       if(!member?.enabled||!member.can_review)throw fail('当前账号已停用或审核权限已撤销。',403);
@@ -90,7 +93,7 @@ export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
   await recoverInterruptedReviews(env, ownerId);
   const { results } = await env.DB.prepare("SELECT * FROM review_jobs WHERE owner_id = ? AND owner_hidden = 0 AND (created_at > ? OR (model_executor='agent' AND status IN ('queued','running'))) ORDER BY created_at DESC LIMIT 100")
     .bind(ownerId, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()).all();
-  return (results || []).map(publicJob);
+  return (await withHumanReviews(env.DB,results||[],true)).map(publicJob);
 }
 
 export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string) {
@@ -113,7 +116,7 @@ export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: strin
     row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
     if (row.status === 'error') await deleteInput(env, id);
   }
-  return publicJob(row);
+  return publicJob((await withHumanReviews(env.DB,[row],true))[0]);
 }
 
 // Model activity updates the member-visible stage and also renews the job

@@ -5,6 +5,7 @@ import {publicSettings} from './forge-workspace';
 import {publicCreatorTask} from './forge-agent-api';
 import {reviewReportErrors} from './review-report';
 import {enqueueReview} from './review-jobs';
+import {withHumanReviews} from './human-review';
 
 const paths=new Set(['/api/admin/workspace','/api/admin/public-data','/api/admin/review-upload','/api/admin/review-import']);
 const json=(v:any,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
@@ -31,9 +32,9 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
         all(DB,"SELECT id,owner_id,name,revoked,expires_at,last_seen,'creation' AS scope FROM forge_agents WHERE (?='' OR owner_id=?) UNION ALL SELECT id,owner_id,name,revoked,expires_at,last_seen,'review' AS scope FROM review_devices WHERE (?='' OR owner_id=?)",owner,owner,owner,owner),
         all(DB,"SELECT * FROM vocab_suggestions WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200",owner,owner),store.list(),
         all(DB,"SELECT id,owner_id,title,filename,status,stage,error,result_id,model_executor,quota_charged,created_at,updated_at FROM review_jobs WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200",owner,owner),
-        all(DB,"SELECT id,owner_id,title,score,model_executor,agent_id,model,created_at FROM reviews WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 200",owner,owner),
+        all(DB,"SELECT id,owner_id,job_id,title,score,model_executor,agent_id,model,created_at FROM reviews WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 200",owner,owner),
       ]);
-      return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,tasks:tasks.map(publicCreatorTask),agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),reviewJobs,reviews});
+      return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,tasks:tasks.map(publicCreatorTask),agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),reviewJobs:await withHumanReviews(DB,reviewJobs,true),reviews:await withHumanReviews(DB,reviews)});
     }
     if(url.pathname.endsWith('/public-data')){
       if(request.method==='GET')return json({settings:await publicSettings(DB),vocab:await all(DB,'SELECT * FROM vocab ORDER BY dim,id'),games:await all(DB,'SELECT * FROM games WHERE is_public=1 ORDER BY id')});

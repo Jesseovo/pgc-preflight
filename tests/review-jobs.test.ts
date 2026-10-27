@@ -16,6 +16,7 @@ function setup() {
   sqlite.exec(readFileSync('migrations/0018_review_material_snapshot.sql','utf8'));
   sqlite.exec("ALTER TABLE review_jobs ADD COLUMN model_executor TEXT NOT NULL DEFAULT 'platform'; ALTER TABLE review_jobs ADD COLUMN local_model TEXT;");
   sqlite.exec(readFileSync('migrations/0019_review_visibility.sql','utf8'));
+  sqlite.exec(readFileSync('migrations/0020_human_review.sql','utf8'));
   const DB = {
     prepare(sql: string) {
       return { bind(...params: any[]) {
