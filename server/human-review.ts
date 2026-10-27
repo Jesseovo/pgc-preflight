@@ -1,9 +1,10 @@
 import {canonicalJson,digest,problem,readReviewInput,stamp} from './review-device-state';
+import {autoPublishGalleryGame} from './gallery';
 
 const source='https://creator-hub-7mi.pages.dev';
 const uuid=(v:unknown)=>typeof v==='string'&&/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(v);
 const externalId=(v:unknown)=>v===null||typeof v==='string'&&/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(v);
-const fields=new Set(['id','requestId','workId','versionId','score','feedback','updatedAt','source','status','phase','matchedBy','uploadedContentHash','lease']);
+const fields=new Set(['id','requestId','workId','versionId','score','feedback','updatedAt','source','status','phase','matchedBy','uploadedContentHash','lease','decision']);
 
 function validate(b:any){
   if(!b||typeof b!=='object'||Array.isArray(b)||Object.keys(b).some(k=>!fields.has(k)))throw problem('真人审核包含不支持的字段。');
@@ -18,12 +19,14 @@ function validate(b:any){
   if(b.status==='reviewed'&&(!b.workId||!b.phase||!b.matchedBy||b.score===null&&!b.feedback?.trim()))throw problem('已审核记录需要作品、版本、匹配依据、阶段和评分或意见。');
   if(b.status==='pending'&&(!b.workId||!b.matchedBy))throw problem('待审核记录需要作品、版本和匹配依据。');
   if(b.status!=='reviewed'&&(b.phase!==null||b.score!==null))throw problem('未审核记录不能带审核阶段或评分。');
+  if(b.decision!==undefined&&b.decision!==null&&!['approved','rejected'].includes(b.decision))throw problem('真人终审结论不正确。');
+  if(b.decision!==undefined&&b.decision!==null&&(b.status!=='reviewed'||b.phase!=='final'))throw problem('只有真人终审可带通过或拒绝结论。');
   if(b.uploadedContentHash!==undefined&&(typeof b.uploadedContentHash!=='string'||!/^[a-f0-9]{64}$/.test(b.uploadedContentHash)))throw problem('上传内容哈希必须为 SHA-256。');
-  return {workId:b.workId,versionId:b.versionId,score:b.score,feedback:b.feedback,updatedAt:b.updatedAt,source:b.source,status:b.status,phase:b.phase,matchedBy:b.matchedBy,...(b.uploadedContentHash!==undefined?{uploadedContentHash:b.uploadedContentHash}:{})};
+  return {workId:b.workId,versionId:b.versionId,score:b.score,feedback:b.feedback,updatedAt:b.updatedAt,source:b.source,status:b.status,phase:b.phase,matchedBy:b.matchedBy,...(b.uploadedContentHash!==undefined?{uploadedContentHash:b.uploadedContentHash}:{}),...(b.decision!==undefined?{decision:b.decision}:{})};
 }
 
 export function publicHumanReview(r:any){
-  return r?{id:r.id,jobId:r.job_id,requestId:r.request_id,workId:r.work_id,versionId:r.version_id,score:r.score,feedback:r.feedback,updatedAt:r.source_updated_at,source:r.source,status:r.status,phase:r.phase,matchedBy:r.matched_by,uploadedContentHash:r.uploaded_content_hash,createdAt:r.created_at}:null;
+  return r?{id:r.id,jobId:r.job_id,requestId:r.request_id,workId:r.work_id,versionId:r.version_id,score:r.score,feedback:r.feedback,updatedAt:r.source_updated_at,source:r.source,status:r.status,phase:r.phase,decision:r.decision??null,matchedBy:r.matched_by,uploadedContentHash:r.uploaded_content_hash,createdAt:r.created_at}:null;
 }
 export async function currentHumanReview(DB:any,jobId:string,ownerId:string){
   return publicHumanReview(await DB.prepare('SELECT * FROM review_human_reviews WHERE job_id=? AND owner_id=? AND is_current=1').bind(jobId,ownerId).first());
@@ -48,7 +51,7 @@ export async function saveHumanReview(DB:any,device:any,b:any){
   const hasLease=!!(job.worker_id||job.lease);
   if(hasLease&&(job.worker_id!==device.id||job.lease!==b.lease)||!hasLease&&job.status!=='queued')throw problem('仅原任务设备可回填，请使用原租约。',409);
   const old=await DB.prepare('SELECT * FROM review_human_reviews WHERE job_id=? AND request_id=? AND owner_id=?').bind(job.id,b.requestId,device.owner_id).first();
-  if(old){if(old.payload_hash!==hash)throw problem('同一真人审核请求不能更换内容。',409);return {ok:true,human_review:publicHumanReview(old)};}
+  if(old){if(old.payload_hash!==hash)throw problem('同一真人审核请求不能更换内容。',409);return savedResult(DB,device,b,old);}
   if(payload.uploadedContentHash){
     let inputHash=job.input_hash;
     if(!inputHash){
@@ -62,12 +65,12 @@ export async function saveHumanReview(DB:any,device:any,b:any){
   await DB.batch([
     // Recheck status, lease and immutable external IDs inside the insert, so a
     // concurrent claim or association cannot race the authorization above.
-    DB.prepare(`INSERT OR IGNORE INTO review_human_reviews(job_id,owner_id,device_id,request_id,payload_hash,work_id,version_id,score,feedback,source_updated_at,source,status,phase,matched_by,uploaded_content_hash,display_rank,created_at)
-      SELECT id,owner_id,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM review_jobs j
+    DB.prepare(`INSERT OR IGNORE INTO review_human_reviews(job_id,owner_id,device_id,request_id,payload_hash,work_id,version_id,score,feedback,source_updated_at,source,status,phase,matched_by,uploaded_content_hash,display_rank,created_at,decision)
+      SELECT id,owner_id,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM review_jobs j
       WHERE id=? AND owner_id=? AND executor='device' AND owner_hidden=0 AND status IN ('queued','running','done')
       AND ((status='queued' AND worker_id IS NULL AND lease IS NULL) OR (worker_id=? AND lease=?))
       AND NOT EXISTS(SELECT 1 FROM review_human_reviews h WHERE h.job_id=j.id AND h.work_id IS NOT NULL AND ? IS NOT NULL AND (h.work_id<>? OR h.version_id<>?))`)
-      .bind(device.id,b.requestId,hash,payload.workId,payload.versionId,payload.score,payload.feedback,payload.updatedAt,payload.source,payload.status,payload.phase,payload.matchedBy,payload.uploadedContentHash??null,rank,now,job.id,device.owner_id,device.id,b.lease??null,payload.workId,payload.workId,payload.versionId),
+      .bind(device.id,b.requestId,hash,payload.workId,payload.versionId,payload.score,payload.feedback,payload.updatedAt,payload.source,payload.status,payload.phase,payload.matchedBy,payload.uploadedContentHash??null,rank,now,payload.decision??null,job.id,device.owner_id,device.id,b.lease??null,payload.workId,payload.workId,payload.versionId),
     // Newer observations may advance the displayed status, but a delayed
     // callback or preliminary/failed lookup cannot replace a final decision.
     DB.prepare(`UPDATE review_human_reviews AS current SET is_current=0 WHERE job_id=? AND is_current=1 AND EXISTS(
@@ -80,5 +83,19 @@ export async function saveHumanReview(DB:any,device:any,b:any){
   const saved=await DB.prepare('SELECT * FROM review_human_reviews WHERE job_id=? AND request_id=? AND owner_id=?').bind(job.id,b.requestId,device.owner_id).first();
   if(!saved)throw problem('任务租约或作品关联已改变，请保持原作品和版本。',409);
   if(saved.payload_hash!==hash)throw problem('同一真人审核请求不能更换内容。',409);
-  return {ok:true,human_review:publicHumanReview(saved)};
+  return savedResult(DB,device,b,saved);
+}
+
+async function savedResult(DB:any,device:any,b:any,saved:any){
+  const result:any={ok:true,human_review:publicHumanReview(saved)};
+  try{Object.assign(result,await autoPublishGalleryGame(DB,device,b.id,b.lease));}
+  catch(error){
+    // The human record is already durable; failure to copy the approved file
+    // must not make a client replay it with another request identifier.
+    if((error as any).status>=400&&(error as any).status<500)return result;
+    const current=await DB.prepare(`SELECT h.decision FROM review_human_reviews h WHERE h.job_id=? AND h.owner_id=? AND h.is_current=1 AND h.status='reviewed' AND h.phase='final'
+      AND h.id=(SELECT latest.id FROM review_human_reviews latest WHERE latest.owner_id=h.owner_id AND latest.work_id=h.work_id AND latest.version_id=h.version_id AND latest.status='reviewed' AND latest.phase='final' ORDER BY latest.source_updated_at DESC,latest.id DESC LIMIT 1)`).bind(b.id,device.owner_id).first();
+    if(current?.decision==='approved')Object.assign(result,{gallery_pending:true,gallery_message:'真人终审已保存；广场文件尚未保存，可用 gallery 命令上传本地原版重试。'});
+  }
+  return result;
 }

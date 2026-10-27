@@ -4,7 +4,7 @@
 
 ## 复制给智能助手
 
-> 请阅读 https://pgc.ovoxin.top/agent.md，连接我的审核账号。首次连接时请让我在审核页生成一次性配对码，并直接在本对话中询问我；收到后由你自己完成配对，不要让我打开命令窗口。审核指定的本地 HTML 游戏，使用你自己的模型完成初评和相同模型复核，把最终中文报告提交到平台。提交游戏时，使用你已有的真人审核站授权查询对应本人作品和版本的真人分数与意见；没有结果时照常完成 AI 审核，有结果后再回填。
+> 请阅读 https://pgc.ovoxin.top/agent.md，连接我的审核账号。首次连接时请让我在审核页生成一次性配对码，并直接在本对话中询问我；收到后由你自己完成配对，不要让我打开命令窗口。审核指定的本地 HTML 游戏，使用你自己的模型完成初评和相同模型复核，把最终中文报告提交到平台。提交游戏时，使用你已有的真人审核站授权查询对应本人作品和版本的真人分数、意见与终审结论；没有结果时照常完成 AI 审核，有结果后再回填。真人终审明确通过的同版游戏进入仅登录成员可见的游戏广场。
 
 ## 执行范围
 
@@ -98,6 +98,7 @@ node review-agent.mjs complete JOB_UUID --json /absolute/path/verified.json --ou
   "versionId": "本次文件对应的投稿版本编号",
   "status": "reviewed",
   "phase": "final",
+  "decision": "approved",
   "score": 7,
   "feedback": "查询所得真人意见原文",
   "updatedAt": "2026-10-27T08:00:00.000Z",
@@ -107,6 +108,8 @@ node review-agent.mjs complete JOB_UUID --json /absolute/path/verified.json --ou
 ```
 
 以上仅为结构示例，必须填入查询所得数据。`score` 为 0–9 的数字或 `null`，0 是有效分数。`phase` 为终审 `final` 或组长预审 `preliminary`；`reviewed` 至少需要分数或非空意见。`matchedBy` 为已保存部署/投稿记录 `published-record` 或用户明确确认 `user-confirmed`。作品与版本编号必须成对提供，使用接口返回的安全 ASCII 编号（最多 200 字符）。
+
+`decision` 是可选的终审结论，仅 `status: reviewed`、`phase: final` 时可填 `approved`（终审通过）或 `rejected`（终审未通过），未知时为 `null` 或省略。读取准确投稿版本的终审 `decision`，不能根据分数、AI 结论或组长预审 `preapproved` 推断通过。旧请求缺少该字段时仍可原样重试；新查到的结论使用新请求编号，不能给原幂等请求补字段。
 
 无结果但已确认关联时使用 `status: pending`；无法关联用 `unlinked`；查询失败用 `unavailable`。后三种状态的 `score`、`phase` 均为 `null`；无法关联时 `workId`、`versionId`、`matchedBy` 也为 `null`，原因可放入 `feedback`。`updatedAt` 使用 UTC 毫秒 ISO 时间，已有结果使用来源的审核更新时间，无结果使用本次查询时间。
 
@@ -118,6 +121,21 @@ node review-agent.mjs human-review JOB_UUID --json /absolute/path/human-review.j
 ```
 
 `submit` 和 `review` 的 `--human-review` 只支持单文件，在提交游戏后独立回填。回填暂时失败时工具输出 `human_review_pending`、原任务编号及重试命令，继续 AI 审核；使用原任务重试回填，不重新提交游戏。任务领取前可由本人设备回填；领取后及完成后仅原领取设备携原租约继续，工具会使用私有缓存里的租约。
+
+## 游戏广场
+
+https://pgc.ovoxin.top/square 仅供平台已登录账号浏览试玩，普通成员、Star 成员和管理员均可进入，不要求审核权限。真人终审明确 `approved` 的游戏，随回填自动保留通过版本的 HTML 并进入广场；AI 分数、预审或未明确终审结论均不能使游戏入场。广场展示游戏标题、作者、真人分数与通过时间；私人审核意见、任务材料和设备凭据不会共享。游戏在禁网络、无同源权限的隔离窗口运行，依赖外部资源的内容不能在广场加载。
+
+原 AI 审核完成后会清理临时源码。工具仅保存原文件路径和哈希，收到通过结论后会尝试读取该文件补齐广场内容，不额外缓存源码。文件被移动、删除或修改时，真人回填仍成功，工具输出 `gallery_pending`。使用原设备提供当时投稿的原版文件恢复：
+
+```sh
+node review-agent.mjs human-review JOB_UUID --json /absolute/path/human-review.json --game /absolute/path/original-game.html
+node review-agent.mjs gallery JOB_UUID --game /absolute/path/original-game.html
+```
+
+只需任选一种恢复方式，不要重新创建 AI 审核。服务端校验原上传内容的 UTF-8 SHA-256 和原任务租约；修改后的文件不能替换通过版。相同作品与投稿版本只产生一项广场内容，重复提交不会重复发布；同版更换文件会被拒绝。较新的真人终审拒绝会使该版不可见，管理员可手动下架与恢复，恢复仍须符合终审通过条件。
+
+通过版 HTML 是广场保留的共享文件，不随 AI 审核临时材料清理。其他未通过版本仍按原规则清理。平台只保存 Agent 从既有授权读取的结论及其声明，不独立登录真人站核验；在用户授权的当前会话查询并回填后广场才会更新，没有常驻同步。旧 Agent 应重新阅读本文并更新工具后回填终审 `decision`，历史分数不会自动推断通过。
 
 ## 恢复与查询
 
@@ -131,7 +149,7 @@ node review-agent.mjs report JOB_UUID --out /absolute/path/reports
 
 `submit` 只提交文件，之后用 `capture` 采集；`review` 可接收多个 HTML 路径。重复执行相同内容会复用持久请求编号；明确开始新审核时，为单文件指定新的 `--request-id UUID`。`wait` 遇到本地任务会返回下一步操作，不会等待云端执行。
 
-工具使用加密 outbox 保存待传证据和报告请求，连接失败可重跑原命令。证据、初稿和已发布报告不可替换；相同内容重传返回原结果，修改内容需要新任务。断线后用原配对设备继续，不能把本地任务交给平台模型；24 小时未活动的任务会清理临时材料并明确过期。成功或失败立即清理服务端源码及临时证据分片，报告保留既有截图。请在取回报告后删除不再需要的本地临时材料。
+工具使用加密 outbox 保存待传证据和报告请求，连接失败可重跑原命令。证据、初稿和已发布报告不可替换；相同内容重传返回原结果，修改内容需要新任务。断线后用原配对设备继续，不能把本地任务交给平台模型；24 小时未活动的任务会清理临时材料并明确过期。成功或失败立即清理服务端临时源码及证据分片，报告保留既有截图，已入广场的通过版独立保留。请在取回报告后删除不再需要的本地临时材料，并保留需要后续入场的投稿原文件。
 
 ## 直接 HTTP 协议
 
@@ -148,7 +166,8 @@ node review-agent.mjs report JOB_UUID --out /absolute/path/reports
 | `material` | `{id, lease}`；返回统一 `system`、`user`、`schema`、`verification`、`evidenceHash`、`stage`；初稿后另含 `draftHash`、`model` 及初稿 |
 | `draft` | `{id, lease, model, evidenceHash, report}`；验证并锁定初稿，返回 `draftHash`，阶段变为 `verify` |
 | `complete` | `{id, lease, model, evidenceHash, report, verification: {confirmed:true, model, evidenceHash, draftHash}}`；完成后返回报告 `result_id` 和不可变 `resultHash` |
-| `human-review` | `{id, requestId: UUID, workId, versionId, status, phase, score, feedback, updatedAt, source, matchedBy, uploadedContentHash?, lease?}`；字段约定见上节，领取后须原设备与租约，完成后仍可追加；不修改 AI 报告、不调用平台模型或扣次 |
+| `human-review` | `{id, requestId: UUID, workId, versionId, status, phase, decision?, score, feedback, updatedAt, source, matchedBy, uploadedContentHash?, lease?}`；字段约定见上节，领取后须原设备与租约，完成后仍可追加；通过版自动入广场，缺文件返回 `gallery_pending`；不修改 AI 报告、不调用平台模型或扣次 |
+| `gallery` | `{id, requestId: UUID, html, lease?}`；为当前真人终审通过版补交原始 HTML（最多 8 MB），严格核对任务输入哈希与作品版本；领取后须原设备和租约；重复请求幂等，不调用模型、不扣次 |
 | `report` | `{id}`；只返回本人已完成报告 |
 | `fail` | `{id, lease, message}`；本地审核无法完成时明确失败，清理临时材料，不能发布初稿 |
 

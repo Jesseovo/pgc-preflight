@@ -106,7 +106,7 @@ describe('真人审核回填CLI',()=>{
     const s=await fixture();
     try{
       const id=crypto.randomUUID();
-      for(const invalid of [null,[],{...human(),source:'https://elsewhere.test'},{...human(),workId:'../other'},{...human(),score:10},{...human(),status:'pending'},{...human(),updatedAt:'2026-10-27'}]){
+      for(const invalid of [null,[],{...human(),source:'https://elsewhere.test'},{...human(),workId:'../other'},{...human(),score:10},{...human(),status:'pending'},{...human(),updatedAt:'2026-10-27'},{...human(),decision:'preapproved'},{...human(),decision:'approved',phase:'preliminary'}]){
         const path=await s.json('invalid',invalid),before=s.requests.length,result=await s.run(['human-review',id,'--json',path],true);expect(result.code).toBe(1);expect(s.requests).toHaveLength(before);
       }
       const path=await s.json('valid',human()),game=join(s.directory,'game.html');await writeFile(game,'<html/>');
@@ -114,6 +114,42 @@ describe('真人审核回填CLI',()=>{
       const submitted=await s.direct('submit',{html:'<html/>',request_id:id});
       const unlinked=await s.json('unlinked',{workId:null,versionId:null,score:null,feedback:null,phase:null,matchedBy:null,updatedAt:'2026-10-27T12:00:00.000Z',source,status:'unlinked'});
       const result=await s.run(['human-review',submitted.id,'--json',unlinked]);expect(result.code).toBe(0);expect(s.requests.at(-1)!.body).toMatchObject({id:submitted.id,status:'unlinked',workId:null,versionId:null});
+    }finally{await s.close();}
+  },30000);
+  it('完成后终审通过自动补原文件入广场，重复不增条目且改文件不能顶替',async()=>{
+    const s=await fixture();
+    try{
+      const game=join(s.directory,'approved.html'),html='<html><body>Approved version fixture</body></html>';
+      await writeFile(game,html);
+      const submitted=await s.run(['submit',game]),id=submitted.values.find(value=>value.event==='submitted').job.id;
+      const job=await s.evidence(id);await s.complete(job);
+      await mkdir(join(s.privateDir,'claims'),{recursive:true});await writeFile(join(s.privateDir,'claims',`${id}.json`),JSON.stringify({claimId:job.lease}));
+      const path=await s.json('approved',{...human(),decision:'approved'});
+      const result=await s.run(['human-review',id,'--json',path]);
+      expect(result.values.find(value=>value.event==='human-review').human_review.decision).toBe('approved');
+      expect(result.values.find(value=>value.event==='gallery')).toBeTruthy();
+      expect(s.requests.filter(value=>value.action==='gallery').at(-1)!.body).toMatchObject({id,html,lease:job.lease});
+      await s.run(['human-review',id,'--json',path]);await s.run(['gallery',id,'--game',game]);
+      expect(s.sqlite.prepare('SELECT count(*) n FROM gallery_games').get()).toMatchObject({n:1});
+      const before=s.requests.length;await writeFile(game,html+'<!-- modified -->');
+      const changed=await s.run(['gallery',id,'--game',game],true);
+      expect(changed.code).toBe(1);expect(changed.stderr).toContain('文件已修改');expect(s.requests).toHaveLength(before);
+      expect(s.sqlite.prepare('SELECT count(*) n FROM review_inputs').get()).toMatchObject({n:0});
+      expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();
+    }finally{await s.close();}
+  },30000);
+  it('找不到原文件时保留已成功人审回填，可用原版显式恢复',async()=>{
+    const s=await fixture();
+    try{
+      const html='<html>Source restored fixture</html>',id=crypto.randomUUID();
+      await s.direct('submit',{html,request_id:id});const job=await s.evidence(id);await s.complete(job);
+      await mkdir(join(s.privateDir,'claims'),{recursive:true});await writeFile(join(s.privateDir,'claims',`${id}.json`),JSON.stringify({claimId:job.lease}));
+      const path=await s.json('approved',{...human(),decision:'approved'}),result=await s.run(['human-review',id,'--json',path]);
+      expect(result.code).toBe(0);expect(result.values.find(value=>value.event==='gallery_pending')).toMatchObject({jobId:id});
+      expect(s.sqlite.prepare('SELECT decision FROM review_human_reviews WHERE job_id=? AND is_current=1').get(id)).toMatchObject({decision:'approved'});
+      const restored=join(s.directory,'restored.html');await writeFile(restored,html);
+      await s.run(['gallery',id,'--game',restored]);
+      expect(s.sqlite.prepare('SELECT count(*) n FROM gallery_games').get()).toMatchObject({n:1});
     }finally{await s.close();}
   },30000);
 });

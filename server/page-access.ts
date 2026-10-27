@@ -58,3 +58,15 @@ export async function guardReviewPage(request: Request, members: MemberStore, se
   if (user?.role === 'admin') return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
   return new Response(null, { status: 302, headers: { Location: '/login', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
 }
+
+// The square is shared by every enabled, signed-in account, independently of
+// creation/review permissions. Gate all document aliases before serving assets.
+export async function guardSquarePage(request: Request, members: MemberStore, secrets: AppSecrets): Promise<Response | null> {
+  let pathname:string;
+  try { pathname = decodeURIComponent(new URL(request.url).pathname); } catch { return null; }
+  if (!['/square', '/square/', '/square.html', '/square/index.html'].includes(pathname)) return null;
+  const headers = { 'Cache-Control': 'private, no-store', Vary: 'Cookie' };
+  if (request.headers.has('Authorization')) return new Response('请使用网页登录游戏广场。', { status: 403, headers });
+  const user = await identity(request.headers.get('Cookie'), members, secrets);
+  return user ? null : new Response(null, { status: 302, headers: { ...headers, Location: '/login' } });
+}

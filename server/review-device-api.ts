@@ -7,11 +7,12 @@ import {prepareReview} from './forge-api';
 import {REVIEW_SCHEMA,REVIEW_VERIFICATION} from './forge/prompts.js';
 import {reviewReportErrors} from './review-report';
 import {currentHumanReview,saveHumanReview} from './human-review';
+import {publishGalleryGame} from './gallery';
 
 const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
 type Env={DB:any;SETTINGS_KEY:string;ADMIN_PASSWORD:string;modelStore:{get():Promise<any>};REVIEW_RUNNER?:any};
 const validId=(value:any)=>typeof value==='string'&&/^[a-f0-9-]{36}$/.test(value);
-const reviewActions=new Set(['submit','jobs','job','report','heartbeat','claim','evidence','material','draft','complete','fail','human-review']);
+const reviewActions=new Set(['submit','jobs','job','report','heartbeat','claim','evidence','material','draft','complete','fail','human-review','gallery']);
 const localModel=(value:unknown)=>{if(typeof value!=='string'||!value.trim()||value.length>200)throw problem('请填写实际执行初评与复核的本地模型标识。');return value.trim();};
 function validatedReport(value:any){
   const report=structuredClone(value),errors=reviewReportErrors(report);
@@ -110,6 +111,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
     if(action==='jobs')return json(await listReviewJobs(env,device.owner_id));
     if(action==='job')return json(await getReviewJob(env,String(b.id||''),device.owner_id));
     if(action==='human-review')return json(await saveHumanReview(DB,device,b));
+    if(action==='gallery')return json(await publishGalleryGame(DB,device,b));
     if(action==='report'){
       const job=await getReviewJob(env,String(b.id||''),device.owner_id);
       if(job.status!=='done'||!job.result_id)throw problem('审核尚未完成，请先查询进度。',409);

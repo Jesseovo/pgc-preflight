@@ -9,13 +9,14 @@ import {configStore,memberStore} from './storage';
 import type {Database} from './storage';
 import {authApi} from './auth-api';
 import {identity} from './members';
-import {guardCheckPage,guardForgePage,guardReviewPage,guardPrivateAsset,guardDeviceScope,isPrivateAsset} from './page-access';
+import {guardCheckPage,guardForgePage,guardReviewPage,guardSquarePage,guardPrivateAsset,guardDeviceScope,isPrivateAsset} from './page-access';
 import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
 import {purgeReviewInputs} from './review-jobs';
 import {captureReview} from './review-probe';
 import {acquireBrowser} from './browser-capacity';
 import {forgeAgentApi,forgeAgentWeb} from './forge-agent-api';
 import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
+import {galleryApi} from './gallery';
 import {enqueueForgeTask,recoverForgeTasks,type ForgeRunnerBinding} from './forge-tasks';
 export {ReviewRunner} from './review-runner';
 export {ForgeRunner} from './forge-runner';
@@ -46,6 +47,7 @@ const app = {
       return binding.get(binding.idFromName('review-control-v1')).fetch(request);
     }
     const store=configStore(env.DB),members=memberStore(env.DB);
+    if(url.pathname.startsWith('/api/square/'))return (await galleryApi(request,env)) || json({error:'接口不存在。'},404);
     if(url.pathname.startsWith('/api/forge-agent/')){
       if(url.pathname.endsWith('/pair')){const rate=await env.CHECK_RATE_LIMIT.limit({key:`forge-pair:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'配对操作较多，请稍后重试。'},429);}
       return forgeAgentApi(request,{...env,modelStore:store});
@@ -110,10 +112,16 @@ const app = {
       headers.set('Cache-Control','no-cache');
       return new Response(response.body,{status:response.status,headers});
     }
-    const redirect = await guardForgePage(request, members, env) || await guardReviewPage(request, members, env) || await guardCheckPage(request, members, env);
+    const redirect = await guardSquarePage(request, members, env) || await guardForgePage(request, members, env) || await guardReviewPage(request, members, env) || await guardCheckPage(request, members, env);
     if (redirect) return redirect;
     const privateAsset=await guardPrivateAsset(request,members,env);
     if(privateAsset)return privateAsset;
+    if(['/square','/square/','/square.html','/square/index.html'].includes(decodeURIComponent(url.pathname))){
+      if(url.pathname!=='/square')return new Response(null,{status:302,headers:{Location:'/square','Cache-Control':'private, no-store',Vary:'Cookie'}});
+      const response=await env.ASSETS.fetch(new Request(new URL('/square',url),request));
+      const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
+      return new Response(response.body,{status:response.status,headers});
+    }
     if(['/admin','/admin/'].includes(url.pathname)){
       const user=await identity(request.headers.get('Cookie'),members,env);
       if(user?.role!=='admin'){

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { guardCheckPage, guardForgePage, guardReviewPage, guardPrivateAsset, guardDeviceScope } from '../server/page-access';
+import { guardCheckPage, guardForgePage, guardReviewPage, guardSquarePage, guardPrivateAsset, guardDeviceScope } from '../server/page-access';
 import { createMember, memberLogin, updateMember } from '../server/members';
 import type { Member, MemberStore } from '../server/members';
 import { login } from '../server/settings';
@@ -92,5 +92,24 @@ describe('检查台的登录前置', () => {
     expect(guardDeviceScope(new Request('https://pgc.example/api/review-device/jobs', { headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }))).toBe(null);
     expect(guardDeviceScope(new Request('https://pgc.example/api/forge-agent/jobs', { headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }))).toBe(null);
     expect(guardDeviceScope(page('/api/admin/config'))).toBe(null);
+  });
+  it('广场全部文档别名要求登录，所有启用账号可进入，不依赖审核或Star权限', async () => {
+    const store=memoryStore();
+    const member=await createMember({username:'squareviewer',password:'test-only-password',canReview:false},store);
+    const cookie=`pgc_member=${await memberLogin(member.username,'test-only-password',store,secrets.SETTINGS_KEY)}`;
+    const adminCookie=`pgc_admin=${await login(secrets.ADMIN_PASSWORD,secrets)}`;
+    for(const path of ['/square','/square/','/square.html','/square/index.html','/%73quare']){
+      const anonymous=await guardSquarePage(page(path),store,secrets);
+      expect(anonymous?.status,path).toBe(302);expect(anonymous?.headers.get('Location')).toBe('/login');expect(anonymous?.headers.get('Cache-Control')).toContain('no-store');
+      expect(await guardSquarePage(page(path,cookie),store,secrets)).toBe(null);
+      expect(await guardSquarePage(page(path,adminCookie),store,secrets)).toBe(null);
+      const mixed=new Request(`https://pgc.example${path}`,{headers:{Cookie:adminCookie,Authorization:'Bearer device-only'}});
+      expect((await guardSquarePage(mixed,store,secrets))?.status).toBe(403);
+    }
+    await updateMember(member.id,{star:true},store);
+    expect(await guardSquarePage(page('/square',cookie),store,secrets)).toBe(null);
+    await updateMember(member.id,{enabled:false},store);
+    expect((await guardSquarePage(page('/square',cookie),store,secrets))?.headers.get('Location')).toBe('/login');
+    expect(await guardSquarePage(page('/square/app.js'),store,secrets)).toBe(null);
   });
 });

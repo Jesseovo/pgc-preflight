@@ -7,7 +7,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": { "bindings": [{ "name": "CONTROL_PLANE", "class_name": "ReviewControlPlane" }, { "name": "REVIEW_RUNNER", "class_name": "ReviewRunner" }, { "name": "FORGE_RUNNER", "class_name": "ForgeRunner" }] },
   "migrations": [{ "tag": "v1-review-control", "new_sqlite_classes": ["ReviewControlPlane", "ReviewRunner"] }, { "tag": "v2-forge-runner", "new_sqlite_classes": ["ForgeRunner"] }],
-  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/agent.md", "/forge-agent.md", "/admin", "/admin/", "/assets/*", "/forge", "/forge/*", "/review", "/review.html", "/review/*"], "not_found_handling": "single-page-application" },
+  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/agent.md", "/forge-agent.md", "/admin", "/admin/", "/assets/*", "/forge", "/forge/*", "/review", "/review.html", "/review/*", "/square", "/square.html", "/square/*"], "not_found_handling": "single-page-application" },
   "browser": { "binding": "BROWSER" },
   "d1_databases": [{ "binding": "DB", "database_name": "pgc-preflight-db", "database_id": "0cd1de96-d7f1-413b-ab08-be461da99de0", "migrations_dir": "migrations" }],
   "triggers": { "crons": ["17 * * * *"] },

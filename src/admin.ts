@@ -12,7 +12,7 @@ type AdminTab='members'|'forge'|'activity'|'public'|'upload'|'model';
 let adminTab:AdminTab='members';
 const $=<T extends Element=HTMLElement>(selector:string)=>document.querySelector<T>(selector)!;
 const iconsReady=()=>createIcons({icons,attrs:{'stroke-width':1.7}});
-app.innerHTML=`<header class="header admin-header"><div class="header-inner"><a class="brand" href="/admin"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>OverFlow</b></span></a><div class="header-actions"><span class="back-link">${icon('shield-check')}超级管理员</span></div></div></header><main class="admin-main"><div id="admin-content"><div class="admin-loading">${progressHtml({label:"正在读取管理配置",detail:"正在确认登录状态…"})}</div></div><footer><span>PGC OverFlow / 管理后台</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
+app.innerHTML=`<header class="header admin-header"><div class="header-inner"><a class="brand" href="/admin"><img src="/favicon.svg" alt="" width="34" height="34"/><span>PGC <b>OverFlow</b></span></a><div class="header-actions"><a class="back-link" href="/square">${icon('gamepad-2')}游戏广场</a><span class="back-link">${icon('shield-check')}超级管理员</span></div></div></header><main class="admin-main"><div id="admin-content"><div class="admin-loading">${progressHtml({label:"正在读取管理配置",detail:"正在确认登录状态…"})}</div></div><footer><span>PGC OverFlow / 管理后台</span><span>接口密钥仅保存在服务端 ${icon('lock-keyhole')}</span></footer></main>`;
 iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){

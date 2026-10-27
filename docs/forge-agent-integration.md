@@ -82,3 +82,5 @@ node forge-agent.mjs job TASK_UUID
 ## 审核与真人反馈
 
 创作和审核分开授权。用户要求 AI 审核成品时，阅读最新版 https://pgc.ovoxin.top/agent.md，使用独立审核工具完成本地初评、复核及回传。提交游戏时，用你已经接入的 https://creator-hub-7mi.pages.dev/ 创作授权查询本人对应作品及准确投稿版本的真人分数和意见，并按审核协议关联；之后有新反馈时为原任务追加回填。使用原部署和投稿记录确认 `workId`、版本及文件，不按同名猜测，也不上传真人站令牌。暂无审核或暂时无法查询不阻断 AI 审核；当前会话结束后不会后台自动查询。
+
+同时读取准确投稿版本的终审 `decision`，只有明确 `approved` 时才按审核协议填 `phase: final`、`decision: approved`。通过版本将进入 https://pgc.ovoxin.top/square，供所有已登录成员隔离试玩。预审、分数阈值或 AI 通过不算真人终审通过。完成审核后收到通过结论时，审核工具会用已保存的原文件路径补传同版 HTML；输出 `gallery_pending` 时，使用审核工具的 `gallery JOB_UUID --game /absolute/path/original-game.html` 恢复，不重新审核。保留对应投稿的原文件，不能拿修改后的新版顶替；更新工具及协议无需重新配对有效设备。
