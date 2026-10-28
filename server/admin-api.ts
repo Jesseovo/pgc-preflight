@@ -7,6 +7,7 @@ import {createMember,updateMember,publicMember} from './members';
 import type {MemberStore} from './members';
 import {adminWorkspaceApi} from './admin-workspace-api';
 import {reviewActivity} from './review-usage';
+import {modelQuota} from './model-quota';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
@@ -42,6 +43,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       if(request.method==='GET')return json(publicConfig(await store.get()));
       if(request.method==='PUT')return json(publicConfig(await saveConfig(await smallJson(request),store,secrets.SETTINGS_KEY)));
     }
+    if(url.pathname==='/api/admin/quota'&&request.method==='GET')return json(await modelQuota(store,secrets.SETTINGS_KEY,url.searchParams.get('profile')));
     if(url.pathname==='/api/admin/config/active'&&request.method==='POST'){
       const body=await smallJson(request) as {profile?:unknown};
       return json(publicConfig(await activateProfile(body.profile,store)));

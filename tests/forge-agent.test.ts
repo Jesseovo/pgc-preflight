@@ -216,7 +216,7 @@ describe('成员个人 Agent 的权限、租约与结果版本',()=>{
     s.sqlite.prepare("INSERT INTO settings(id,value,updated_at) VALUES('model',?,?)").run(JSON.stringify({model:'PRIVATE_MODEL_METADATA',apiKey:'PRIVATE_MODEL_KEY',baseUrl:'https://private-model.invalid'}),new Date().toISOString());
     for(const path of ['state','settings','export']){
       const response=await page(s,path);expect(response.status).toBe(200);const text=await response.text();expect(text).not.toMatch(/PRIVATE_MODEL|private-model\.invalid|INTERNAL_PRIVATE_SECRET/);
-      if(path==='state')expect(JSON.parse(text)).toMatchObject({executor:'agent',model:'（未配置）',providers:{openai:false}});
+      if(path==='state')expect(JSON.parse(text)).toMatchObject({executor:'platform',model:'平台创作模型',providers:{openai:false}});
       if(path==='settings')expect(Object.keys(JSON.parse(text)).sort()).toEqual(['draw_size','expand_batch','redlines','template','template_f']);
     }
     expect(s.env.modelStore.get).not.toHaveBeenCalled();expect(s.fetcher).not.toHaveBeenCalled();

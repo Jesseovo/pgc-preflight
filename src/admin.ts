@@ -17,7 +17,7 @@ app.innerHTML=`<header class="header admin-header"><div class="header-inner"><a 
 iconsReady();
 
 async function api(path:string,method='GET',body?:unknown){
-  const label=path.startsWith('workspace')?'读取团队内容与任务':path==='public-data'?(method==='GET'?'读取公共资料':'保存公共资料'):path==='review-upload'?'提交管理员游戏审核':path==='review-import'?'导入管理员审核报告':path==='test'?'测试模型连接与图片输入':path==='login'?'管理员登录':path==='logout'?'退出登录':path==='config/active'?'切换全局模型':path==='config/routes'?'保存模型用途':path==='config/profile'?'删除模型配置':path==='config'?(method==='GET'?'读取模型配置':'保存模型配置'):path.startsWith('review-activity')?'读取成员审核记录':path==='members'?(method==='GET'?'读取成员列表':'开通成员账号'):'更新成员权限与账号';
+  const label=path.startsWith('quota?')?'查询 Opus Key 余额':path.startsWith('workspace')?'读取团队内容与任务':path==='public-data'?(method==='GET'?'读取公共资料':'保存公共资料'):path==='review-upload'?'提交管理员游戏审核':path==='review-import'?'导入管理员审核报告':path==='test'?'测试模型连接与图片输入':path==='login'?'管理员登录':path==='logout'?'退出登录':path==='config/active'?'切换全局模型':path==='config/routes'?'保存模型用途':path==='config/profile'?'删除模型配置':path==='config'?(method==='GET'?'读取模型配置':'保存模型配置'):path.startsWith('review-activity')?'读取成员审核记录':path==='members'?(method==='GET'?'读取成员列表':'开通成员账号'):'更新成员权限与账号';
   return withProgress(label, async progress => {
   const response=await fetch(`/api/admin/${path}`,{method,headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined});
   const data=await response.json();

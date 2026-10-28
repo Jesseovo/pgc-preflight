@@ -19,7 +19,7 @@ import {
   reviewSystem, GAME_SYSTEM, gameUser,
 } from "./forge/prompts.js";
 import {createAgentTask,publicCreatorTask,validateAgentTask} from './forge-agent-api';
-import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnapshot} from './forge-workspace';
+import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnapshot,prepareArtifact} from './forge-workspace';
 import {currentHumanReview,withHumanReviews} from './human-review';
 import { cleanGameHtml } from './game-generation';
 import {enqueueForgeTask, recoverForgeTasks, readForgeTask, publicForgeTask, type ForgeRunnerBinding} from './forge-tasks';
@@ -38,6 +38,7 @@ export async function forgeApi(request: Request, env: ForgeEnv, route: string[],
     if(request.headers.has('Authorization'))return json({error:'设备凭据不能访问网页接口。'},403);
     const user = await identity(request.headers.get('Cookie'), members, env);
     if (!user) return json({ error: '请先登录。' }, 401);
+    if(request.method!=='GET' && request.headers.get('Origin')!==new URL(request.url).origin)return json({error:'请求来源不匹配。'},403);
     const reviewOnly = route[0] === 'review' || route[0] === 'reviews';
     if (user.role !== 'admin' && !user.star && !reviewOnly) return json({ error: '成员账号只开放 AI 模拟审核。' }, 403);
     if (user.role !== 'admin' && reviewOnly && !user.canReview) return json({ error: '当前账号未开通 AI 模拟审核权限，请联系管理员。' }, 403);
@@ -115,7 +116,8 @@ async function visibleGames(env){return all(env,`SELECT * FROM games WHERE owner
 
 async function persistGenerated(env,id,kind,content){
   const topic=await getTopic(env,id),snapshot=env.generationSnapshot||await inputSnapshot(env.DB,topic.owner_id,{type:kind,...(kind==='expand'?{ids:[id]}:{id})});
-  return saveArtifact(env.DB,{owner:topic.owner_id,topicId:id,kind,content,revision:snapshot.revision,policyRevision:snapshot.policy_revision,heads:snapshot.heads,executor:'platform',taskId:env.generation?.id});
+  const model=activeModelProfile(await env.modelStore.get(),kind)?.profile.model;
+  return saveArtifact(env.DB,{owner:topic.owner_id,topicId:id,kind,content,revision:snapshot.revision,policyRevision:snapshot.policy_revision,heads:snapshot.heads,executor:'platform',taskId:env.generation?.id,model});
 }
 
 async function runBatch(env, statements) {
@@ -147,7 +149,9 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     return saveArtifact(env.DB,{owner:topic.owner_id,topicId:topic.id,kind:v.kind,content:v.content,revision:topic.content_revision,policyRevision:v.policy_revision,heads:JSON.parse(v.input_versions||'{}'),executor:'restore',restoredFrom:v.id,force:true});
   }
   if(env.memberMode && method==='POST' && a==='draw'){const data=await body(request);return reserveDraw(env.DB,ownerId,{...data,request_id:data.request_id||crypto.randomUUID()});}
-  if(env.memberMode && method==='POST' && (['expand','suggest','tag'].includes(a)||(a==='topics'&&['preview','brief','assets','game'].includes(c)))){
+  // Public vocabulary suggestions and personal tagging retain the Agent path.
+  if(env.memberMode && method==='POST' && (a==='expand'||(a==='topics'&&['brief','preview','assets','game'].includes(c))) && !env.FORGE_RUNNER)throw new HttpError(503,'后台创作服务尚未就绪，请稍后重试。');
+  if(env.memberMode && method==='POST' && ['suggest','tag'].includes(a)){
     const data=await body(request).catch(()=>({}));
     const jobs=a==='expand'?(Array.isArray(data.ids)?[...new Set(data.ids)]:[]).map(id=>({type:'expand',ids:[id]})):[a==='topics'?{type:c,id:Number(b)}:a==='suggest'?{type:'suggest',dim:data.dim,n:Math.min(60,Math.max(5,Number(data.n)||30))}:{type:'tag'}];
     if(!jobs.length||jobs.length>40)throw new HttpError(400,'每批 1–40 个任务。');
@@ -239,8 +243,8 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
       let topic = await getTopic(env, id);
       const interrupted = topic.product_status === 'running' && Date.now() - Date.parse(topic.updated_at) > 15 * 60 * 1000;
       const expired = topic.product_status === 'queued' && Date.now() - Date.parse(topic.updated_at) > 24 * 60 * 60 * 1000;
-      const agentTask=await first(env,"SELECT id FROM forge_tasks WHERE owner_id=? AND executor='agent' AND scope=? AND status IN ('queued','running')",topic.owner_id,`${topic.owner_id}:game:${id}`);
-      if (!agentTask && (interrupted || expired)) {
+      const activeTask=await first(env,"SELECT id FROM forge_tasks WHERE owner_id=? AND kind='game' AND scope IN (?,?) AND status IN ('queued','running')",topic.owner_id,`${topic.owner_id}:game:${id}`,`game:${id}`);
+      if (!activeTask && (interrupted || expired)) {
         await run(env, "UPDATE topics SET product_status = 'error', product_error = '制作任务已中断或过期，请重新制作。', updated_at = ? WHERE id = ? AND updated_at = ?", now(), id, topic.updated_at);
         topic = await getTopic(env, id);
       }
@@ -321,15 +325,16 @@ async function getState(env) {
   ]);
   const s = await getSettings(env);
   const model = env.memberMode?null:await env.modelStore.get();
+  const active=activeModelProfile(model,'create'),game=activeModelProfile(model,'game');
   return {
-    executor:env.memberMode?'agent':'platform',
+    executor:'platform',
     games: games.n,
     vocab: vocab.n,
     fresh_subjects: fresh.n,
     topics: Object.fromEntries(topics.map((r) => [r.status, r.n])),
-    providers: { anthropic: false, anthropic_compat: false, openai: Boolean(model?.enabled && model?.encryptedKey) },
+    providers: { anthropic: false, anthropic_compat: false, openai: Boolean(active?.profile.enabled && active.profile.encryptedKey) },
     provider: 'openai',
-    model: model?.model || "（未配置）",
+    model: env.memberMode?'平台创作模型':active?.profile.model || "（未配置）",gameModel:env.memberMode?'claude-opus-5-5':game?.profile.model||'',
   };
 }
 
@@ -609,6 +614,7 @@ async function draw(env, { n, locks = {} } = {}) {
 async function expand(env, { ids }, ctx) {
   if (!Array.isArray(ids) || !ids.length) throw new HttpError(400, "缺少 ids");
   if(ids.length>40||ids.some(id=>!Number.isSafeInteger(id)||id<=0))throw new HttpError(400,'每批最多 40 个有效选题。');
+  if(env.memberMode)for(const id of ids)await getTopic(env,id);
   const marks = ids.map(() => "?").join(",");
   const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
   if (!topics.length) throw new HttpError(404, "选题不存在");
@@ -642,14 +648,14 @@ async function expand(env, { ids }, ctx) {
 
 async function expandBatch(env, ids) {
   const marks = ids.map(() => "?").join(",");
-  const topics = (await all(env, `SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`, ...ids)).map(hydrate);
+  const topics = env.generationSnapshot?.topic?[env.generationSnapshot.topic]:(await all(env, `SELECT * FROM topics WHERE id IN (${marks}) AND (?='admin' OR owner_id=?) ORDER BY id`, ...ids,env.ownerId||'admin',env.ownerId||'admin')).map(hydrate);
   const pending = topics.filter((topic) => !topic.data?.title);
   if (!pending.length) return topics;
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'expand'));
-  const [cfg, games, prior] = await Promise.all([
+  const [cfg, games, prior] = env.generationSnapshot ? [env.generationSnapshot.cfg,env.generationSnapshot.games,env.generationSnapshot.prior] : await Promise.all([
     getSettings(env),
     visibleGames(env),
-    all(env, "SELECT data, subject FROM topics WHERE status IN ('new', 'liked', 'made') ORDER BY id"),
+    all(env, "SELECT data, subject FROM topics WHERE owner_id=? AND status IN ('new', 'liked', 'made') ORDER BY id",env.ownerId||'admin'),
   ]);
   const { positives, negatives } = exampleSets(games);
   const existing = games.map((g) => `- ${g.title}｜${g.descr}｜${g.gesture}`)
@@ -712,7 +718,7 @@ async function waitForExpanded(env, ids, maxWaitMs) {
 }
 
 async function preview(env, id) {
-  const t = await getTopic(env, id);
+  const t = env.generationSnapshot?.topic || await getTopic(env, id);
   if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
   const cfg = await getSettings(env);
   // A retry may have different topic context or model settings. Reusing a
@@ -847,7 +853,7 @@ async function startGameJob(env: ForgeEnv, id: number) {
   }
   if(env.FORGE_RUNNER){
     const task=await enqueueForgeTask(env,{type:'game',id,requestId:crypto.randomUUID()});
-    return {id,status:'pending',taskId:task.id};
+    return {id,pending:true,status:'pending',taskId:task.id,jobId:task.id,executor:task.executor};
   }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
   const requestId = crypto.randomUUID();
@@ -871,7 +877,7 @@ async function startTopicJob(env, kind: TopicJobKind, id, ctx, regenerate, job: 
   if(env.FORGE_RUNNER){
     if(!regenerate&&t[k.status]!=='running'&&t[k.output]?.trim())return {id,[kind]:t[k.output]};
     const task=await enqueueForgeTask(env,{type:kind,id});
-    return {id,status:'pending',taskId:task.id};
+    return {id,pending:true,status:'pending',taskId:task.id,jobId:task.id,executor:task.executor};
   }
   // A previous request may have completed after the browser lost its
   // connection. Return the persisted result instead of generating it again.
@@ -908,7 +914,7 @@ export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
     }
   }
   const run_ = job.type === 'assets' ? assetsJob : briefJob;
-  try { return await run_(env, job.id, await getTopic(env, job.id)); }
+  try { return await run_(env, job.id, env.generationSnapshot?.topic || await getTopic(env, job.id)); }
   catch (error) {
     await markTopicJobError(env, job.type, job.id, error, true);
     throw error;
@@ -961,7 +967,7 @@ export function cleanAssetsHtml(text) {
 }
 
 async function assetsJob(env, id, t) {
-  const cfg = await getSettings(env);
+  const cfg = env.generationSnapshot?.cfg || await getSettings(env);
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'assets'));
   try {
     const text = await withTopicLease(env, [id], 'assets_status', () => complete(env, cfg, {
@@ -997,7 +1003,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
   const stage = (message: string) => run(env, "UPDATE topics SET product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'running'", message, now(), id, requestId);
   return withTopicLease(env, [id], 'product_status', async () => {
   try {
-    const topic = await getTopic(env, id);
+    const topic = env.generationSnapshot?.topic || await getTopic(env, id);
     if (topic.product_html?.trim()) return { id, status: 'done' };
     const model = activeModelProfile(await env.modelStore.get(), 'game');
     if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
@@ -1015,7 +1021,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
       onWait: message => stage(message || '模型正在编写完整 HTML 游戏…'),
       onProgress: characters => stage(characters ? `模型正在编写游戏，已接收 ${characters.toLocaleString('en-US')} 个字符…` : '模型正在准备游戏代码…'),
     }));
-    const html = cleanGameHtml(text);
+    const html = await prepareArtifact('game',text,{topic});
     await persistGenerated(env,id,'game',html);
     return { id, status: 'done' };
   } catch (error) {
@@ -1029,7 +1035,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
 }
 
 async function briefJob(env, id, t) {
-  const cfg = await getSettings(env);
+  const cfg = env.generationSnapshot?.cfg || await getSettings(env);
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'brief'));
   try {
     const md = await withTopicLease(env, [id], 'brief_status', () => complete(env, cfg, {

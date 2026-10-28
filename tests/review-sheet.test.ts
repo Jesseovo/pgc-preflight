@@ -104,7 +104,7 @@ describe('作品库导入合并',()=>{
       {id:'sheet-c',title:'Gamma',desc:'',status:'preapproved',source:'peer',match:'title',versions:[{r:1,ps:'3/3/2'}]},
     ];
     const token=await memberLogin('creator','fixture-password',members,secrets.SETTINGS_KEY);
-    const res=await forgeApi(new Request('https://pgc.example/api/forge/import',{method:'POST',headers:{Cookie:`pgc_member=${token}`,'content-type':'application/json'},body:JSON.stringify({works})}),
+    const res=await forgeApi(new Request('https://pgc.example/api/forge/import',{method:'POST',headers:{Origin:'https://pgc.example',Cookie:`pgc_member=${token}`,'content-type':'application/json'},body:JSON.stringify({works})}),
       {...secrets,modelStore:{get:async()=>null,set:async()=>{}},DB} as any,['import'],members);
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({inserted:1,updated:2});

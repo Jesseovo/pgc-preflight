@@ -14,11 +14,14 @@ let config:ModelConfig|null=null;
 const store:ConfigStore={get:async()=>config,set:async v=>{config=v;}};
 const members:MemberStore={list:async()=>[],byId:async()=>null,byUsername:async()=>null,save:async()=>{}};
 await saveConfig({profile:'deepseek',baseUrl:'https://fixture.example/v1',model:'deepseek-chat',apiKey:'fixture-deepseek'},store,secrets.SETTINGS_KEY);
-await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://fixture.example',model:'claude-opus-5-5',apiKey:'fixture-opus'},store,secrets.SETTINGS_KEY);
+await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',apiKey:'fixture-opus'},store,secrets.SETTINGS_KEY);
 await saveRoutes({review:'deepseek',create:'opus'},store);
 const server=createServer(async(req,res)=>{
   const url=new URL(req.url!,'http://localhost');
   try {
+    if(url.pathname==='/api/admin/quota'){
+      res.setHeader('Content-Type','application/json');res.end(JSON.stringify({currency:'CNY',available:90,total:{limit:1000,used:100,remaining:900},daily:{limit:100,used:10,remaining:90,resetAt:'2026-10-29T16:00:00Z'},reservations:{amount:0,requests:0},requestsPerMinute:10,queriedAt:new Date().toISOString()}));return;
+    }
     if(url.pathname.startsWith('/api/admin/')) {
       let body='';for await(const chunk of req)body+=chunk;
       const request=new Request(`http://${req.headers.host}${req.url}`,{method:req.method,headers:req.headers as Record<string,string>,body:['GET','HEAD'].includes(req.method!)?undefined:body});
@@ -43,6 +46,19 @@ try {
   const click=async(selector:string)=>{await page.locator(selector).click();};
   await page.setViewport({width:1440,height:1050});await page.goto(origin+'/admin');await page.waitForSelector('#admin-password');
   await page.type('#admin-password',secrets.ADMIN_PASSWORD);await page.click('#login-form button[type="submit"]');await page.waitForSelector('#tab-model');await page.click('#tab-model');
+  await page.waitForFunction('document.querySelector("[data-model-row=opus] .provider-balance").textContent.includes("900.00")');
+  assert.equal(await page.$eval('.model-library',el=>(el as HTMLElement).hidden),true,'Editor starts collapsed');
+  await page.click('[data-model-row="opus"] [data-use="review"]');
+  await page.waitForFunction('document.querySelector("#switch-message").textContent.includes("审核已切换")');
+  assert.equal(activeModelProfile(config,'review')?.id,'opus');
+  await page.click('[data-model-row="deepseek"] [data-use="create"]');
+  await page.waitForFunction('document.querySelector("#switch-message").textContent.includes("创作已切换")');
+  assert.equal(activeModelProfile(config,'create')?.id,'deepseek');assert.equal(activeModelProfile(config,'game')?.id,'opus');
+  await page.screenshot({path:'artifacts/model-switch-desktop.png',fullPage:true});
+  await page.setViewport({width:390,height:844});
+  assert(await page.evaluate('document.documentElement.scrollWidth<=innerWidth+1'));
+  await page.screenshot({path:'artifacts/model-switch-mobile.png',fullPage:true});
+  await page.setViewport({width:1440,height:1050});
   assert.equal(await page.$eval('#api-key',e=>(e as HTMLInputElement).value),'');
   await page.click('[data-profile="opus"]');
   await page.select('#model-effort','medium');

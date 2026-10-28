@@ -12,7 +12,7 @@ async function setup() {
   const admin=await login(env.ADMIN_PASSWORD,env);
   const adminCookie=`pgc_admin=${admin}`;
   const token = await memberLogin(account.username, 'fixture-password', members, env.SETTINGS_KEY);
-  const request = (body: unknown, cookie = `pgc_member=${token}`) => new Request('https://test.invalid/api/forge/review/probe', { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const request = (body: unknown, cookie = `pgc_member=${token}`) => new Request('https://test.invalid/api/forge/review/probe', { method: 'POST', headers: { Origin: 'https://test.invalid', Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   return { env, members, account, request, adminCookie };
 }
 describe('审核画面采集权限与上传边界', () => {
@@ -24,7 +24,7 @@ describe('审核画面采集权限与上传边界', () => {
     expect((await forgeApi(request({ html: '<html></html>' }), env, ['review','jobs'], members)).status).toBe(403);
     expect((await forgeApi(request({ result: {} }), env, ['review','manual'], members)).status).toBe(403);
     expect(env.captureReview).toHaveBeenCalledTimes(0);
-    const deletion=new Request('https://test.invalid/api/forge/reviews/1',{method:'DELETE',headers:request({}).headers});
+    const deletion=new Request('https://test.invalid/api/forge/reviews/1',{method:'DELETE',headers:{...Object.fromEntries(request({}).headers),Origin:'https://other.invalid'}});
     expect((await forgeApi(deletion,env,['reviews','1'],members)).status).toBe(403);
     expect((await forgeApi(request({}), env, ['expand'], members)).status).toBe(403);
     account.canReview = false;

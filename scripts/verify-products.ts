@@ -11,6 +11,8 @@ let requests = 0, statusReads = 0, offline = false;
 const server = createServer(async (request, response) => {
   const url = new URL(request.url!, 'http://localhost');
   const json = (data: unknown, status=200) => { response.writeHead(status, {'Content-Type':'application/json'}); response.end(JSON.stringify(data)); };
+  if(url.pathname==='/api/auth/me')return json({id:'fixture-star',role:'member',star:true,canReview:true,displayName:'合成成员'});
+  if(url.pathname==='/api/forge/generation-jobs')return json([]);
   if (url.pathname === '/api/forge/state') return json({games:1,vocab:5,fresh_subjects:10,providers:{openai:true},provider:'openai',model:'claude-opus-5-5'});
   if (url.pathname === '/api/forge/settings') return json({draw_size:2});
   if (url.pathname === '/api/forge/vocab') return json([]);

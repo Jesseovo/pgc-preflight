@@ -4,7 +4,9 @@ import {readFileSync,readdirSync} from 'node:fs';
 import {forgeApi,prepareReview} from '../server/forge-api';
 import {hashPassword,memberLogin,updateMember} from '../server/members';
 import {memberStore} from '../server/storage';
-import {login} from '../server/settings';
+import {login,encryptKey} from '../server/settings';
+import {executeForgeTask} from '../server/forge-runner';
+import {createAgentTask} from '../server/forge-agent-api';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{vi.unstubAllGlobals();databases.splice(0).forEach(db=>db.close());});
@@ -32,6 +34,55 @@ async function setup(){
 }
 
 describe('Star 工作区迁移与所有权',()=>{
+  it('Star 网页制作由平台 Opus 执行，重复提交与跨成员访问被隔离，成品保存版本',async()=>{
+    const s=await setup(),id=s.topic('a','A_LIVE_CREATION'),other=s.topic('b','B_PRIVATE_CREATION');
+    s.sqlite.prepare("UPDATE topics SET product_html=NULL,assets_html=NULL WHERE id=?").run(id);
+    const encryptedKey=await encryptKey('platform-test-key',s.env.SETTINGS_KEY);
+    s.env.modelStore.get.mockResolvedValue({profiles:{opus:{baseUrl:'https://fixture.example',model:'claude-opus-5-5',encryptedKey,enabled:true,protocol:'anthropic'}},activeProfile:'opus'});
+    expect((await s.request('plain','POST',`topics/${id}/game`)).status).toBe(403);
+    expect((await s.request('admin','POST',`topics/${id}/game`)).status).toBe(403);
+    expect((await s.request('a','POST',`topics/${other}/game`)).status).toBe(404);
+    expect((await s.request('a','POST',`topics/${id}/game`,undefined,{Origin:'https://attacker.test'})).status).toBe(403);
+    const first=await (await s.request('a','POST',`topics/${id}/game`)).json() as any;
+    const repeat=await (await s.request('a','POST',`topics/${id}/game`)).json() as any;
+    expect(first.taskId).toBe(repeat.taskId);expect(first).toMatchObject({executor:'platform',pending:true});
+    expect((await s.request('b','GET',`generation-jobs/${first.taskId}`)).status).toBe(404);
+    const html='<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><canvas></canvas><script>let score=0;document.onclick=()=>score++;</script></body></html>';
+    const fetcher=vi.fn(async(_url:any,init:any)=>{expect(JSON.parse(init.body).model).toBe('claude-opus-5-5');expect(init.body).not.toContain('B_PRIVATE');return Response.json({content:[{type:'text',text:html}],stop_reason:'end_turn'});});vi.stubGlobal('fetch',fetcher);
+    await executeForgeTask(s.env,first.taskId);await executeForgeTask(s.env,first.taskId);expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(s.sqlite.prepare('SELECT owner_id,executor,model,disposition FROM artifact_versions WHERE task_id=?').get(first.taskId)).toMatchObject({owner_id:'a',executor:'platform',model:'claude-opus-5-5',disposition:'current'});
+    expect((await s.request('a','GET','products')).status).toBe(200);
+    expect(await (await s.request('a','GET',`topics/${id}/product-file`)).text()).toBe(html);
+  });
+
+  it('平台与 Agent 在同一选题同一环节互斥，不会偷偷转换已有 Agent 任务',async()=>{
+    const s=await setup(),id=s.topic('a','A_AGENT_QUEUED');
+    s.sqlite.prepare('UPDATE topics SET product_html=NULL WHERE id=?').run(id);
+    const agent=await createAgentTask(s.env,'a',{type:'game',id});
+    s.env.modelStore.get.mockResolvedValue({profiles:{opus:{baseUrl:'https://fixture.example',model:'claude-opus-5-5',encryptedKey:'fixture',enabled:true,protocol:'anthropic'}},activeProfile:'opus'});
+    const result=await (await s.request('a','POST',`topics/${id}/game`)).json() as any;
+    expect(result.taskId).toBe(agent.id);expect(result.executor).toBe('agent');expect(s.dispatch).not.toHaveBeenCalled();
+    expect(s.sqlite.prepare('SELECT count(*) n FROM forge_tasks').get()).toMatchObject({n:1});
+  });
+
+  it('撤销 Star 或停用账号后，排队平台任务不再发起模型请求',async()=>{
+    for(const change of [{star:false},{enabled:false}]){
+      const s=await setup(),id=s.topic('a','A_REVOKED');
+      s.sqlite.prepare('UPDATE topics SET product_html=NULL WHERE id=?').run(id);
+      s.env.modelStore.get.mockResolvedValue({profiles:{opus:{baseUrl:'https://fixture.example',model:'claude-opus-5-5',encryptedKey:'fixture',enabled:true,protocol:'anthropic'}},activeProfile:'opus'});
+      const result=await (await s.request('a','POST',`topics/${id}/game`)).json() as any;
+      await updateMember('a',change,s.members);const fetcher=vi.fn();vi.stubGlobal('fetch',fetcher);
+      await executeForgeTask(s.env,result.taskId);expect(fetcher).not.toHaveBeenCalled();
+      expect(s.sqlite.prepare('SELECT status,model_started_at FROM forge_tasks WHERE id=?').get(result.taskId)).toMatchObject({status:'error',model_started_at:null});
+    }
+  });
+
+  it('批量扩写预先校验全部归属，不能读取或生成另一成员选题',async()=>{
+    const s=await setup(),id=s.topic('a','A_EXPAND'),other=s.topic('b','B_EXPAND');
+    s.sqlite.prepare("UPDATE topics SET data='{}' WHERE id IN (?,?)").run(id,other);
+    expect((await s.request('a','POST','expand',{ids:[id,other]})).status).toBe(404);
+    expect(s.dispatch).not.toHaveBeenCalled();expect(s.sqlite.prepare('SELECT count(*) n FROM forge_tasks').get()).toMatchObject({n:0});
+  });
   it('成员仅能移除本人已结束任务和报告，管理员记录、额度及请求编号保留',async()=>{
     const s=await setup(), now=new Date().toISOString(), id=crypto.randomUUID(), active=crypto.randomUUID(), failed=crypto.randomUUID();
     s.sqlite.prepare("INSERT INTO review_jobs(id,owner_id,title,status,created_at,updated_at,quota_charged) VALUES(?,'a','failed','error',?,?,1),(?,'a','running','running',?,?,0),(?,'a','failed only','error',?,?,0)").run(id,now,now,active,now,now,failed,now,now);

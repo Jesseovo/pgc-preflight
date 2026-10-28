@@ -1,6 +1,13 @@
 import {configStore} from './storage';
 import {processForgeJob, type ForgeEnv, type ForgeJob} from './forge-api';
 import {failForgeTask, FORGE_TASK_LIMIT_MS, type ForgeTask} from './forge-tasks';
+import {memberStore} from './storage';
+
+async function requireCreationAccess(env:ForgeEnv,owner:string){
+  if(owner==='admin')return; // historical platform tasks only
+  const member=await memberStore(env.DB).byId(owner);
+  if(!member?.enabled||!member.star)throw new Error('账号已停用或 Star 权限已撤销，本次未发起新的模型请求。');
+}
 
 export async function executeForgeTask(env: ForgeEnv, id: string) {
   const at = new Date().toISOString();
@@ -9,15 +16,19 @@ export async function executeForgeTask(env: ForgeEnv, id: string) {
   const update = (detail:string) => env.DB.prepare("UPDATE forge_tasks SET detail=?,updated_at=? WHERE id=? AND status='running'").bind(detail,new Date().toISOString(),id).run();
   const timer = setInterval(()=>{void env.DB.prepare("UPDATE forge_tasks SET updated_at=? WHERE id=? AND status='running'").bind(new Date().toISOString(),id).run().catch(()=>{});},30000);
   try {
+    await requireCreationAccess(env,row.owner_id||'admin');
     const job: ForgeJob = JSON.parse(row.payload);
-    const result = await processForgeJob({...env,ownerId:row.owner_id||'admin',generationSnapshot:row.input_snapshot?JSON.parse(row.input_snapshot):null,generation:{id,deadline:Date.now()+12*60000,
+    const config=await env.modelStore.get();
+    const result = await processForgeJob({...env,modelStore:{get:async()=>config,set:async()=>{throw new Error('任务模型快照不可修改。');}},ownerId:row.owner_id||'admin',generationSnapshot:row.input_snapshot?JSON.parse(row.input_snapshot):null,generation:{id,deadline:Date.now()+12*60000,
       onStart:async()=>{
+        await requireCreationAccess(env,row.owner_id||'admin');
         const result = await env.DB.prepare("UPDATE forge_tasks SET model_started_at=COALESCE(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(new Date().toISOString(),new Date().toISOString(),id).run();
         if (!result.meta.changes) throw new Error('生成任务已停止。');
       },onWait:async(message:string)=>{await update(message || '等待模型输出…');},
     }},job);
     // Artifact HTML and briefs live on topics, not in a second task copy.
-    const saved = ['preview','suggest','tag'].includes(job.type) ? result : {id:'id' in job ? job.id : undefined};
+    const version=await env.DB.prepare('SELECT id,topic_id,disposition FROM artifact_versions WHERE task_id=?').bind(id).first();
+    const saved = version?{id:version.topic_id,version_id:version.id,disposition:version.disposition}:['preview','suggest','tag'].includes(job.type) ? result : {id:'id' in job ? job.id : undefined};
     await env.DB.prepare("UPDATE forge_tasks SET status='done',result=?,detail='已完成',error='',updated_at=? WHERE id=? AND status='running'").bind(JSON.stringify(saved),new Date().toISOString(),id).run();
   } catch (error) {
     await failForgeTask(env,row,error instanceof Error ? error.message : '生成未完成，请手动重试。');

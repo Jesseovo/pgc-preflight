@@ -62,7 +62,7 @@ const generationPolls=new Map();
 const GENERATION_LABELS={preview:'生成样板图',suggest:'补充词库',tag:'自动打标签'};
 function observeGeneration(row,provided) {
   if(generationPolls.has(row.id))return generationPolls.get(row.id);
-  const task=provided||startTask(GENERATION_LABELS[row.kind]||'后台生成',{key:`generation-${row.id}`,retain:true,detail:row.detail||'等待本人的 Agent 接取…'});
+  const task=provided||startTask(GENERATION_LABELS[row.kind]||'后台生成',{key:`generation-${row.id}`,retain:true,detail:row.detail||'等待后台执行…'});
   const promise=(async()=>{
 
     try{
@@ -93,7 +93,7 @@ function observeGeneration(row,provided) {
           }
           return result;
         }
-        task.update({detail:saved.detail||'等待本人的 Agent 回传…'});
+        task.update({detail:saved.detail||(saved.executor==='agent'?'等待本人的 Agent 回传…':'等待模型输出…')});
         await new Promise(resolve=>setTimeout(resolve,3500));
       }
       throw new Error('后台任务尚未结束，请稍后刷新查看。');
@@ -197,7 +197,7 @@ function topicCard(t, mode) {
   if (t.status === "drawn") {
     return `<article class="card pending" data-id="${t.id}">
       <div class="art"><div class="title">…</div></div>
-      <div class="body">${chipsHtml(t)}<div class="small">${t._pendingVersion ? '扩写结果已保存为待确认版本，请在历史版本中核对并选择采用。' : t._error ? `<span class="bad">${esc(t._error)}</span>` : t.expand_status === 'running' || t._inflight ? progressHtml({label:"AI 扩写中",detail:t.expand_error || "等待本人的 Agent 接取或生成中…"}) : '选题已保存，可以交给自己的 Agent 扩写。'}</div></div>
+      <div class="body">${chipsHtml(t)}<div class="small">${t._pendingVersion ? '扩写结果已保存为待确认版本，请在历史版本中核对并选择采用。' : t._error ? `<span class="bad">${esc(t._error)}</span>` : t.expand_status === 'running' || t._inflight ? progressHtml({label:"AI 扩写中",detail:t.expand_error || "后台正在扩写选题…"}) : '选题已保存，可以开始扩写。'}</div></div>
       <div class="acts">${t._pendingVersion ? '' : t._error ? `<button class="ghost" data-act="retry">重试扩写</button>` : t.expand_status !== 'running' && !t._inflight ? `<button class="ghost" data-act="retry">开始扩写</button>` : ''}<button class="ghost" data-act="versions">历史版本</button></div>
     </article>`;
   }
@@ -222,9 +222,9 @@ function topicCard(t, mode) {
     <div class="body">
       ${chipsHtml(t)}
       <div>${esc(d.logline)}</div>
-      ${t.brief_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'制作简报',detail:'等待本人的 Agent，可查看进度。'})}</div>` : ''}
-      ${t.assets_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'生成资产',detail:'等待本人的 Agent，可查看进度。'})}</div>` : ''}
-      ${mode === 'picks' && ['queued', 'running'].includes(t.product_status) ? `<div class="pgc-inline-wait">${progressHtml({label:t.product_status === 'queued' ? '等待本人的 Agent' : 'Agent 正在制作游戏',detail:t.product_error || '直接使用选题资料生成单文件 HTML，可切到成品栏目查看任务。'})}</div>` : ''}
+      ${t.brief_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'制作简报',detail:'后台正在生成，可查看进度。'})}</div>` : ''}
+      ${t.assets_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'生成资产',detail:'后台正在生成，可查看进度。'})}</div>` : ''}
+      ${mode === 'picks' && ['queued', 'running'].includes(t.product_status) ? `<div class="pgc-inline-wait">${progressHtml({label:t.product_status === 'queued' ? '等待后台制作' : '正在制作游戏',detail:t.product_error || '直接使用选题资料生成单文件 HTML，可切到成品栏目查看任务。'})}</div>` : ''}
       ${mode === 'picks' && t.product_status === 'error' ? `<div class="small bad">${esc(t.product_error || '制作未完成，可重试。')}</div>` : ''}
       ${t.status === "dup" ? `<div class="small bad">与「${esc(d.dup_of)}」撞题</div>` : ""}
       <div class="kv"><b>新机制</b>${esc(d.twist)}</div>
@@ -276,7 +276,7 @@ function bindCards(root, list, rerender) {
         let svg;
         if (t.has_preview) svg = (await api("GET", `topics/${id}`)).preview_svg;
         else {
-          progress.update({detail:"等待本人的 Agent 绘制风格样板并回传。"});
+          progress.update({detail:"后台正在绘制风格样板…"});
           svg = (await api("POST", `topics/${id}/preview`,undefined,progress)).svg;
           t.has_preview = 1;
           toast("样板图好了");
@@ -326,7 +326,7 @@ const TOPIC_JOBS = {
 const jobRequests = new Map();
 function showJobProgress(kind, entry) {
   const job = TOPIC_JOBS[kind];
-  openModal(`${entry.topic.data.title} · ${job.label}`, `<p class="muted small">${job.noun}由本人的 Agent 生成。可以关闭窗口或切换栏目，右下角会保留任务进度。</p><div id="${kind}Progress" class="pgc-inline-wait"></div>`, entry);
+  openModal(`${entry.topic.data.title} · ${job.label}`, `<p class="muted small">${job.noun}由平台模型生成。可以关闭窗口或切换栏目，右下角会保留任务进度。</p><div id="${kind}Progress" class="pgc-inline-wait"></div>`, entry);
   entry.task.attach($(`#${kind}Progress`));
 }
 function generateTopicJob(kind, topic, repaint = () => {}, regenerate = false, { show = true, resume = false } = {}) {
@@ -335,7 +335,7 @@ function generateTopicJob(kind, topic, repaint = () => {}, regenerate = false, {
   const current = jobRequests.get(key);
   if (current?.pending) { showJobProgress(kind, current); return; }
   const entry = {topic, pending:true};
-  entry.task = startTask(`${job.label} · ${topic.data.title}`, {key, retain:true, detail:resume ? "已恢复后台任务，正在读取生成状态…" : "正在提交给本人的 Agent…", action:() => showJobProgress(kind, entry), actionLabel:"查看进度"});
+  entry.task = startTask(`${job.label} · ${topic.data.title}`, {key, retain:true, detail:resume ? "已恢复后台任务，正在读取生成状态…" : "正在提交后台任务…", action:() => showJobProgress(kind, entry), actionLabel:"查看进度"});
   if (current) current.task.dismiss();
   jobRequests.set(key, entry);
   topic[job.status] = 'running'; repaint(); if (show) showJobProgress(kind, entry);
@@ -367,7 +367,7 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
     const queued = await rawApi("POST", `topics/${id}/${kind}${regenerate ? '?regenerate=1' : ''}`);
     const started=queued?.jobId?await observeGeneration({id:queued.jobId},{update:state=>update(state.detail)}):queued;
     if (started?.[kind]) return started[kind];
-    update(`任务已保存，等待本人的 Agent 生成${job.noun}。可以继续使用工作台。`);
+    update(`任务已保存，后台正在生成${job.noun}。可以继续使用工作台。`);
   } catch (error) {
     if(error.versionPending)throw error;
     // The Worker writes the result before sending its response. If the relay
@@ -381,9 +381,9 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
     await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
     try {
       const saved = await api("GET", `topics/${id}`);
-      if (saved?.[job.status] === 'error') throw new Error(`${failed}：${saved[job.error] || "请检查自己的 Agent 后手动重试。"}`);
+      if (saved?.[job.status] === 'error') throw new Error(`${failed}：${saved[job.error] || "请查看错误原因后手动重试。"}`);
       if (job.output(saved) && saved[job.status] !== 'running') return job.read(saved);
-      update(saved?.[job.error] || `正在等待本人的 Agent 回传完整${job.noun}返回。`);
+      update(saved?.[job.error] || `模型正在生成完整${job.noun}…`);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith(failed)) throw error;
       update("暂时无法读取进度，正在重新连接；后台任务会继续运行。");
@@ -399,7 +399,7 @@ function showPreview(t, svg) {
     <button class="ghost" id="regenSvg">重新生成</button></div>`);
   $("#dlSvg").onclick = () => download(`${t.data.title}.svg`, svg, "image/svg+xml");
   $("#regenSvg").onclick = (e) => guard(e.target, async (progress) => {
-    progress.update({label:"重新生成样板图",detail:"等待本人的 Agent 绘制新样板…"});
+    progress.update({label:"重新生成样板图",detail:"后台正在绘制新样板…"});
     const r = await api("POST", `topics/${t.id}/preview`,undefined,progress);
     showPreview(t, r.svg);
   });
@@ -446,7 +446,7 @@ async function renderDraw(alive) {
         <button class="primary" id="drawBtn">抽一批</button></div>
       <p class="muted small">按历史审核分数加权随机组合五个维度，自动跳过做过的题材和重复组合，再交给 AI 扩写、打分、查重。想指定某个维度就在下面锁定。</p>
       <div class="locks">${DIMS.map((d) => `<label class="field">${DIM_LABEL[d]}<select data-lock="${d}"><option value="">随机</option>${opts(d)}</select></label>`).join("")}</div>
-      <label class="field personal-requirements">补充要求<textarea id="drawRequirements" rows="3" placeholder="如目标人群、画面风格、操作限制；将交给自己的 Agent"></textarea></label>
+      <label class="field personal-requirements">补充要求<textarea id="drawRequirements" rows="3" placeholder="如目标人群、画面风格、操作限制；用于平台生成"></textarea></label>
       <details class="custom-topic"><summary>使用自己的主题</summary><div class="row"><input id="customSubject" class="grow" maxlength="200" placeholder="输入主题，例如：午夜修补玩具"><button class="ghost" id="customDrawBtn">创建主题并扩写</button></div><p class="muted small">沿用上面的维度锁定与补充要求，创建一个个人选题。</p></details>
       <div class="progress" id="progress"></div>
       <div id="lowStock"></div>
@@ -527,7 +527,7 @@ const pendingExpandIds = new Set();
 async function expandIds(ids, {resume = false} = {}) {
   const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
   if (!unique.length) return;
-  // Submit small groups; the member's Agent controls execution concurrency.
+  // Submit small groups; durable tasks share the gateway start-rate limit.
   const size = Math.min(2, Math.max(1, Number(state.settings?.expand_batch) || 2));
   const chunks = [];
   for (let i = 0; i < unique.length; i += size) chunks.push(unique.slice(i, i + size));
@@ -567,7 +567,7 @@ async function expandIds(ids, {resume = false} = {}) {
     const status = remaining ? 'running' : failed ? 'error' : 'done';
     progress.update({value:done+pending+failed,detail,status});
     const p = $("#progress");
-    if (p) p.innerHTML = progressHtml({label:"Agent 选题扩写",value:done+pending+failed,total:unique.length,detail,status});
+    if (p) p.innerHTML = progressHtml({label:"AI 选题扩写",value:done+pending+failed,total:unique.length,detail,status});
     if (!remaining && !settled) {
       settled = true;
       if (failed) progress.fail(detail + "，可在对应卡片重试。");
@@ -600,7 +600,7 @@ async function expandIds(ids, {resume = false} = {}) {
       }
     }
   };
-  // Limit enqueue requests independently of the Agent's model concurrency.
+  // Limit enqueue requests independently of background model concurrency.
   const waitingChunks = chunks.slice();
   const submitWorker = async () => { while (waitingChunks.length) await submit(waitingChunks.shift()); };
   if(!resume)await Promise.all(Array.from({ length: Math.min(4, waitingChunks.length) }, submitWorker));
@@ -665,7 +665,7 @@ async function renderPicks(alive) {
   const list = await api("GET", "topics?status=liked,made&limit=200");
   if (!alive()) return;
   view.innerHTML = `<div class="row section"><h2 class="grow">候选选题</h2><span class="muted small">${list.length} 个</span></div>
-    <p class="muted small section">点击“开始制作”，任务会交给你自己的 Agent，使用它的模型制作单文件 HTML，并在“成品”栏目提供预览和下载。</p>
+    <p class="muted small section">点击“开始制作”，平台使用 Opus 5.5 生成可试玩的单文件游戏，完成后在“成品”栏目查看。</p>
     <div class="cards" id="pickCards"></div>`;
   const paint = () => {
     const shown = list.filter((t) => t.status === "liked" || t.status === "made");
@@ -680,12 +680,12 @@ async function renderProducts(alive) {
   if (!alive()) return;
   const products = list.filter(topic => topic.has_product || ['queued', 'running', 'error'].includes(topic.product_status));
   view.innerHTML = `<div class="row section"><h2 class="grow">成品</h2><span class="muted small">${products.length} 款</span></div>
-    <p class="muted small section">个人 Agent 生成的可试玩首版保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
+    <p class="muted small section">生成的可试玩首版保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
     <div class="cards" id="productCards"></div>`;
   const paint = () => {
     if (!alive()) return;
     const cards = products.map(topic => ['queued', 'running'].includes(topic.product_status)
-      ? `<article class="card pending" data-id="${topic.id}"><div class="art"><div class="title">${esc(topic.data?.title || '制作中')}</div></div><div class="body">${progressHtml({label:'等待 Agent 制作',detail:topic.product_error || '等待你的 Agent 接取或回传。页面关闭后可恢复查看任务。'})}</div><div class="acts"><button class="ghost" data-act="resumeProduct">查看进度</button></div></article>`
+      ? `<article class="card pending" data-id="${topic.id}"><div class="art"><div class="title">${esc(topic.data?.title || '制作中')}</div></div><div class="body">${progressHtml({label:'游戏制作中',detail:topic.product_error || '等待后台执行。页面关闭后可恢复查看任务。'})}</div><div class="acts"><button class="ghost" data-act="resumeProduct">查看进度</button></div></article>`
       : topic.product_status === 'error'
         ? `<article class="card" data-id="${topic.id}"><div class="art"><div class="title">${esc(topic.data?.title || '制作未完成')}</div></div><div class="body"><p class="bad">${esc(topic.product_error || '制作失败，可重试。')}</p></div><div class="acts"><button class="primary" data-act="retryProduct">重试制作</button></div></article>`
         : productCard(topic)).join('');
@@ -717,7 +717,7 @@ function bindProductCards(root, list, paint) {
 
 const productRequests = new Map();
 function productProgress(topic, entry) {
-  openModal(`${topic.data?.title || '游戏'} · AI 制作`, `<p class="muted small">先制作包含核心玩法和美术方向的可试玩首版，后期扩展留待迭代。任务已保存，等待本人的 Agent 接取与回传。可关闭此窗口或切换栏目，右下角会保留等待进度。</p><div id="productProgress" class="pgc-inline-wait"></div>`, entry);
+  openModal(`${topic.data?.title || '游戏'} · AI 制作`, `<p class="muted small">先制作包含核心玩法和美术方向的可试玩首版，后期扩展留待迭代。任务已保存，平台 Opus 会在后台完成制作。可关闭此窗口或切换栏目，右下角会保留任务进度。</p><div id="productProgress" class="pgc-inline-wait"></div>`, entry);
   entry.task.attach($('#productProgress'));
 }
 
@@ -763,7 +763,7 @@ async function requestProductJob(id, entry, resume = false) {
     const started=queued?.jobId?await observeGeneration({id:queued.jobId},entry.task):queued;
     if(started.html)return started.html;
     if (started.status === 'done' && started.has_product) return (await api('GET', `topics/${id}/product`)).html;
-    entry.task.update({detail:'任务已保存，等待你的 Agent 根据选题资料制作可试玩首版。'});
+    entry.task.update({detail:'后台已接收，Opus 将根据选题资料制作可试玩首版。'});
   } catch (error) {
     if(error.versionPending)throw error;
     if (error.status && error.status < 500) throw error;
@@ -776,7 +776,7 @@ async function requestProductJob(id, entry, resume = false) {
       Object.assign(entry.topic, saved);
       if (saved.product_status === 'error') throw Object.assign(new Error(saved.product_error || '制作失败，请重试。'), {terminal:true});
       if (saved.has_product && saved.product_status !== 'running') return (await api('GET', `topics/${id}/product`)).html;
-      entry.task.update({detail:saved.product_error || '你的 Agent 正在制作 HTML 游戏，等待回传完整版本。'});
+      entry.task.update({detail:saved.product_error || 'Opus 正在制作 HTML 游戏，等待完整版本…'});
       entry.repaint();
       if (!['queued', 'running'].includes(saved.product_status)) throw Object.assign(new Error('后台没有接收到制作任务，请重新开始制作。'), {terminal:true});
     } catch (error) {
@@ -792,7 +792,7 @@ async function showSavedProduct(topic) {
 }
 
 function showProduct(topic, html) {
-  openModal(`${topic.data?.title || '游戏'} · 成品`, `<p class="muted small">个人 Agent 制作的单文件游戏，在隔离环境中预览。外部网络连接已禁用。</p><div class="row" style="margin-bottom:10px"><button class="primary" id="downloadProduct">下载 HTML</button><button class="ghost" id="copyProductPrompt">复制 HTML</button></div><iframe class="product-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${esc(topic.data?.title || '游戏')}成品预览" src="/api/forge/topics/${topic.id}/product-preview"></iframe>`);
+  openModal(`${topic.data?.title || '游戏'} · 成品`, `<p class="muted small">单文件游戏，在隔离环境中预览。外部网络连接已禁用。</p><div class="row" style="margin-bottom:10px"><button class="primary" id="downloadProduct">下载 HTML</button><button class="ghost" id="copyProductPrompt">复制 HTML</button></div><iframe class="product-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${esc(topic.data?.title || '游戏')}成品预览" src="/api/forge/topics/${topic.id}/product-preview"></iframe>`);
   $('#downloadProduct').onclick = () => download(`${topic.data?.title || 'game'}.html`, html, 'text/html');
   $('#copyProductPrompt').onclick = () => copyText(html);
 }

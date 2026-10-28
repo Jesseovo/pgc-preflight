@@ -1,6 +1,6 @@
 # PGC 个人创作空间 · Agent 接入
 
-适用于超级管理员已授予 `star` 权限的成员。使用你自己的 Agent、模型与工具创作，平台只提供资料、保存进度与结果。模型 Key 不发送给平台，成员不能调用平台的模型 API。审核使用独立的 https://pgc.ovoxin.top/agent.md 和独立授权。
+适用于超级管理员已授予 `star` 权限的成员。使用你自己的 Agent、模型与工具创作，平台只提供资料、保存进度与结果。模型 Key 不发送给平台，此设备协议不能调用平台的模型 API。Star 网页另支持平台模型制作，两种任务来源独立，不互相代执行。审核使用独立的 https://pgc.ovoxin.top/agent.md 和独立授权。
 
 ## 接入与使用
 
@@ -19,7 +19,7 @@ node forge-agent.mjs jobs
 
 ## 发起和执行
 
-网页创建任务后，使用 `jobs` 查询并选择任务 UUID。Agent 也可以按用户要求抽题和创建任务：
+本协议只领取 executor=agent 的任务，不能领取网页提交的平台模型任务。使用 `jobs` 查询并选择 Agent 任务 UUID；Agent 可按用户要求抽题和创建任务：
 
 ```sh
 node forge-agent.mjs draw --json draw-request.json

@@ -129,7 +129,10 @@ describe('后台创作的持久任务',()=>{
       const saved=await (await s.request('GET',`generation-jobs/${queued.jobId}`)).json() as any;
       expect(saved.status).toBe('done');
       expect(JSON.stringify(saved)).not.toMatch(/test-only-key|encryptedKey|system/);
-      if(path.includes('preview'))expect(saved.result.svg).toContain('<svg');
+      if(path.includes('preview')){
+        expect(saved.result).toMatchObject({id:9,disposition:'current',version_id:expect.any(String)});
+        expect(s.sqlite.prepare('SELECT content FROM artifact_versions WHERE id=?').get(saved.result.version_id)).toMatchObject({content:expect.stringContaining('<svg')});
+      }
       if(path==='suggest')expect(saved.result).toMatchObject({added:1});
       if(path==='tag')expect(saved.result).toMatchObject({tagged:0,remaining:0});
     }
