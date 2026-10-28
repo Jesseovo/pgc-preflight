@@ -9,6 +9,7 @@ type ReviewJob = { type: 'review'; id: string };
 export interface ReviewJobEnv {
   DB: any;
   REVIEW_QUEUE?: { send(message: ReviewJob): Promise<void> };
+  REVIEW_RUNNER?: { idFromName(id:string):any; get(id:any):{fetch(request:Request):Promise<Response>} };
   modelStore: { get(): Promise<any> };
   captureReview?: (html:string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
   reviewExecutor?: 'device';
@@ -20,7 +21,7 @@ const publicJob = ({ id, title, filename, stage, status, error, result_id, creat
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
   const local = env.modelExecutor !== 'platform';
-  if (!local && !env.REVIEW_QUEUE && env.reviewExecutor!=='device') throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
+  if (!local && !env.REVIEW_QUEUE && !env.REVIEW_RUNNER && env.reviewExecutor!=='device') throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
   if (typeof payload?.html !== 'string' || !payload.html.trim()) throw fail('缺少游戏源码。');
   if (new TextEncoder().encode(payload.html).length > 8 * 1024 * 1024) throw fail('单个 HTML 不能超过 8 MB。', 413);
   if (!local && !env.captureReview && env.reviewExecutor!=='device') throw fail('后台画面采集服务尚未就绪。', 503);
@@ -34,7 +35,13 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   const id = payload.request_id;
   if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw fail('审核请求标识无效，请重新提交。');
   const existing = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
-  if (existing) return publicJob((await withHumanReviews(env.DB,[existing],true))[0]);
+  if (existing) {
+    if(!local && existing.model_executor==='platform' && existing.executor==='cloud' && existing.status==='queued' && existing.input_ready && existing.error?.startsWith('后台调度未确认')){
+      await scheduleCloudReview(env,id);
+      await env.DB.prepare("UPDATE review_jobs SET error='' WHERE id=? AND status='queued'").bind(id).run();
+    }
+    return publicJob((await withHumanReviews(env.DB,[existing],true))[0]);
+  }
   if(payload.topic_id!==undefined&&payload.topic_id!==null){
     if(!Number.isInteger(payload.topic_id)||payload.topic_id<1)throw fail('选题编号无效。');
     const topic=await env.DB.prepare('SELECT owner_id FROM topics WHERE id=?').bind(payload.topic_id).first();
@@ -80,13 +87,32 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
     }
     await env.DB.batch(chunks);
     await env.DB.prepare('UPDATE review_jobs SET input_ready=1 WHERE id=?').bind(id).run();
-    if(!local&&env.reviewExecutor!=='device')await env.REVIEW_QUEUE!.send({ type: 'review', id });
   } catch {
     await env.DB.prepare('DELETE FROM review_jobs WHERE id = ? AND status = ?').bind(id, 'queued').run();
     await deleteInput(env, id).catch(() => {});
     throw fail('审核任务提交失败，请重试。', 503);
   }
+  // Dispatch may have succeeded even when its response is lost. Preserve input
+  // and the original ID; a duplicate dispatch cannot claim the paid stage twice.
+  if(!local&&env.reviewExecutor!=='device'){
+    try{await scheduleCloudReview(env,id);}
+    catch{
+      await env.DB.prepare("UPDATE review_jobs SET error='后台调度未确认，已保留原任务与文件，请使用原编号重试。',updated_at=? WHERE id=? AND status='queued'").bind(stamp(),id).run();
+      throw fail(`后台调度未确认，任务 ${id} 已保留，请使用原编号重试。`,503);
+    }
+  }
   return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform' };
+}
+
+export async function scheduleCloudReview(env: Pick<ReviewJobEnv,'REVIEW_RUNNER'|'REVIEW_QUEUE'>, id:string) {
+  if(!env.REVIEW_RUNNER){await env.REVIEW_QUEUE!.send({type:'review',id});return;}
+  try {
+    const response=await env.REVIEW_RUNNER.get(env.REVIEW_RUNNER.idFromName(id)).fetch(new Request('https://internal/start',{method:'POST',body:id}));
+    if(!response.ok)throw fail('后台审核调度暂时不可用。',503);
+  }catch(error){
+    if(env.REVIEW_QUEUE){await env.REVIEW_QUEUE.send({type:'review',id});return;}
+    throw error;
+  }
 }
 
 export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {

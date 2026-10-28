@@ -153,13 +153,16 @@ describe('后台并发审核的传输与隔离', () => {
     expect(await getReviewJob(env, expired.id, 'b')).toMatchObject({ status: 'error' });
     expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_inputs').get()).toMatchObject({ n: 0 });
   });
-  it('后台提交数有上限，入队失败不留下悬空任务', async () => {
+  it('调度响应丢失保留原编号和输入以安全重试；后台提交数有上限', async () => {
     const { env, payload, sqlite, send } = setup();
+    const original=payload();
     send.mockRejectedValueOnce(new Error('fixture-queue-failure'));
-    await expect(enqueueReview(env, payload(), 'a')).rejects.toMatchObject({ status: 503 });
-    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_jobs').get()).toMatchObject({ n: 0 });
-    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_inputs').get()).toMatchObject({ n: 0 });
-    for (let i = 0; i < 50; i++) await enqueueReview(env, payload(), 'a');
+    await expect(enqueueReview(env, original, 'a')).rejects.toMatchObject({status:503,message:expect.stringContaining('后台调度未确认')});
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_jobs').get()).toMatchObject({ n: 1 });
+    expect(sqlite.prepare('SELECT COUNT(*) AS n FROM review_inputs').get()).toMatchObject({ n: 1 });
+    expect(await enqueueReview(env,original,'a')).toMatchObject({id:original.request_id,status:'queued'});
+    expect(send).toHaveBeenCalledTimes(2);
+    for (let i = 0; i < 49; i++) await enqueueReview(env, payload(), 'a');
     await expect(enqueueReview(env, payload(), 'a')).rejects.toMatchObject({ status: 429 });
   });
 });

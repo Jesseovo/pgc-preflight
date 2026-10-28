@@ -31,6 +31,7 @@ describe('模型评分依据复核', () => {
     expect(calls[1][2].user).toEqual([...user, expect.objectContaining({ text: expect.stringContaining(JSON.stringify(draft)) })]);
     expect(calls[1][2].system).toContain('原评分标准');
     expect(calls[1][2].system).toContain('评分依据复核阶段');
+    expect(calls[1][2].system).toBe(calls[0][2].system);
     expect(calls[0][2].purpose).toBe('review');
     expect(calls[1][2].purpose).toBe('review_verify');
     expect(calls[1][2].deadline).toBe(calls[0][2].deadline);

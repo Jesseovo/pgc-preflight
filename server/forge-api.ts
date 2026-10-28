@@ -3,6 +3,7 @@
 import { SEED_GAMES, SEED_VOCAB } from "./forge/seed.js";
 import { DEFAULT_SETTINGS, DEFAULT_REDLINES, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_F } from "./forge/defaults.js";
 import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "./forge/logic.js";
+import { reviewSource } from './review-source';
 import { complete, providerStatus, activeModel, routedModel, LLMError } from "./forge-llm";
 import { activeModelProfile } from './settings';
 import { identity } from './members';
@@ -749,14 +750,6 @@ async function readReviewBody(request) {
   return input;
 }
 
-// Long minified/base64 lines carry no reviewable logic and cost many tokens.
-function trimSource(html, max = MAX_SOURCE) {
-  const lines = String(html || "").split("\n").map((l) => (l.length > 3000 ? `/* [省略一行 ${l.length} 字符] */` : l));
-  let out = lines.join("\n");
-  if (out.length > max) out = out.slice(0, max) + `\n/* [源码过长，后面 ${out.length - max} 字符已省略] */`;
-  return out;
-}
-
 export async function prepareReview(env, { title, topic_id, html, probe, shots },ownerId=env.ownerId||'admin') {
   env={...env,ownerId};
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
@@ -782,7 +775,7 @@ export async function prepareReview(env, { title, topic_id, html, probe, shots }
   const captureNote = probe?.captureMethod === 'browser-viewport-v1'
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
     : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
-  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${trimSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
+  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${reviewSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
   return {system:reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),user:parts,maxTokens:16000,images};
 }
 

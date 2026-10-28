@@ -10,10 +10,9 @@ import type {Database} from './storage';
 import {authApi} from './auth-api';
 import {identity} from './members';
 import {guardCheckPage,guardForgePage,guardReviewPage,guardSquarePage,guardPrivateAsset,guardDeviceScope,isPrivateAsset} from './page-access';
-import {forgeApi, processForgeJob, type ForgeJob} from './forge-api';
-import {purgeReviewInputs} from './review-jobs';
-import {captureReview} from './review-probe';
-import {acquireBrowser} from './browser-capacity';
+import {forgeApi, type ForgeJob} from './forge-api';
+import {purgeReviewInputs,scheduleCloudReview} from './review-jobs';
+import {captureFor} from './cloud-review-capture';
 import {forgeAgentApi,forgeAgentWeb} from './forge-agent-api';
 import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
 import {galleryApi} from './gallery';
@@ -26,14 +25,6 @@ interface QueueBatch<T> { messages: QueueMessage<T>[] }
 interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
-function captureFor(env:Env){return async (html:string,onWait?:(message:string)=>Promise<void>)=>{
-  let browser;
-  try{
-    browser=await acquireBrowser(env.DB,()=>puppeteer.limits(env.BROWSER),()=>puppeteer.launch(env.BROWSER),onWait);
-    await onWait?.('正在采集三种手机比例的真实游戏画面…');
-    return await captureReview(browser as unknown as Browser,html);
-  }finally{await browser?.close().catch(()=>{});}
-};}
 
 const app = {
   async fetch(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {
@@ -168,7 +159,10 @@ const app = {
       try {
         // Old queued creation messages only dispatch alarms. Never run long
         // model streams (or replay them) in an ordinary Free Queue consumer.
-        if(message.body.type==='review')await processForgeJob(forgeEnv,message.body);
+        if(message.body.type==='review'){
+          const job=await env.DB.prepare('SELECT executor,model_executor,status FROM review_jobs WHERE id=?').bind(message.body.id).first() as any;
+          if(job?.executor==='cloud'&&job.model_executor==='platform'&&['queued','running'].includes(job.status))await scheduleCloudReview({...env,REVIEW_QUEUE:undefined} as any,message.body.id);
+        }
         else {
           const jobs:ForgeJob[]=message.body.type==='expand' ? message.body.ids.map(id=>({type:'expand',ids:[id]})) : [message.body];
           for(const job of jobs){

@@ -2,6 +2,7 @@ import {configStore} from './storage';
 import {prepareReview,consistentVerdict} from './forge-api';
 import {generateReview} from './review-generation';
 import {deviceOwnerAllowed,failDeviceReview,readReviewInput,stamp} from './review-device-state';
+import {cloudReviewAlarm} from './cloud-review-runner';
 
 // One alarm per game, with a 15-minute wall-clock limit and Free DO CPU
 // allowance. The alarm survives a closed member tab or disconnected device.
@@ -40,16 +41,17 @@ export class ReviewRunner{
   constructor(private state:any,private env:any){}
   async fetch(request:Request){
     const id=await request.text();if(!/^[a-f0-9-]{36}$/.test(id))return new Response('Invalid job', {status:400});
-    const row=await this.env.DB.prepare('SELECT status,evidence_ready,model_execution_started_at,model_executor FROM review_jobs WHERE id=?').bind(id).first();
+    const row=await this.env.DB.prepare('SELECT status,executor,evidence_ready,model_execution_started_at,model_executor FROM review_jobs WHERE id=?').bind(id).first();
     if(!row||row.model_executor!=='platform')return Response.json({error:'此任务由成员 Agent 执行。'},{status:409});
     // Persist only compatible platform work; local jobs never schedule alarms.
     await this.state.storage.put('jobId',id);
-    if(row?.status==='running'&&row.evidence_ready&&!row.model_execution_started_at&&!await this.state.storage.getAlarm())await this.state.storage.setAlarm(Date.now()+100);
+    if(!await this.state.storage.getAlarm() && (row.executor==='cloud'&&['queued','running'].includes(row.status) || row?.status==='running'&&row.evidence_ready&&!row.model_execution_started_at))await this.state.storage.setAlarm(Date.now()+100);
     return Response.json({ok:true});
   }
   async alarm(){
     const id=await this.state.storage.get('jobId');if(!id)return;
-    const row=await this.env.DB.prepare('SELECT status,model_execution_started_at,model_executor FROM review_jobs WHERE id=?').bind(id).first();
+    const row=await this.env.DB.prepare('SELECT status,executor,model_execution_started_at,model_executor FROM review_jobs WHERE id=?').bind(id).first();
+    if(row?.executor==='cloud'&&row.model_executor==='platform')return cloudReviewAlarm(this.state,{...this.env,modelStore:configStore(this.env.DB)},id);
     if(row?.status!=='running'||row.model_executor!=='platform'){await this.state.storage.deleteAlarm();await this.state.storage.deleteAll();return;}
     if(row.model_execution_started_at){
       await failDeviceReview(this.env.DB,id,'云端执行意外中断，模型请求状态未知；未发布评分，请手动重试。');

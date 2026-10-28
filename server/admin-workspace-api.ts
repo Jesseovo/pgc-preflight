@@ -4,7 +4,7 @@ import {digest,canonicalJson,problem,stamp} from './review-device-state';
 import {publicSettings} from './forge-workspace';
 import {publicCreatorTask} from './forge-agent-api';
 import {reviewReportErrors} from './review-report';
-import {enqueueReview} from './review-jobs';
+import {enqueueReview,recoverInterruptedReviews} from './review-jobs';
 import {withHumanReviews} from './human-review';
 
 const paths=new Set(['/api/admin/workspace','/api/admin/public-data','/api/admin/review-upload','/api/admin/review-import']);
@@ -25,6 +25,7 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
     if(request.method!=='GET'&&request.headers.get('Origin')!==url.origin)throw problem('请求来源不匹配。',403);
     if(url.pathname.endsWith('/workspace')&&request.method==='GET'){
       const owner=url.searchParams.get('owner')||'';
+      await recoverInterruptedReviews(env,owner||undefined);
       const [topics,games,tasks,agents,suggestions,members,reviewJobs,reviews]=await Promise.all([
         all(DB,"SELECT id,owner_id,subject,status,data,score,origin,requirements,content_revision,created_at,updated_at,brief_md IS NOT NULL AS has_brief,assets_html IS NOT NULL AS has_assets,product_html IS NOT NULL AS has_product FROM topics WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 300",owner,owner),
         all(DB,"SELECT * FROM games WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 300",owner,owner),

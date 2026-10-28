@@ -341,6 +341,10 @@ describe('成员 Agent 本地模型审核协议',()=>{
       expect(material.actionRequired).toBe(true);
       expect((await run(['heartbeat',job.id])).find(value=>value.event==='heartbeat')).toMatchObject({ok:true,jobId:job.id});
       expect(material.screenshots).toHaveLength(4);expect(JSON.parse(await readFile(material.materialPath,'utf8'))).toMatchObject({schema:REVIEW_SCHEMA,evidenceHash:job.evidenceHash});
+      const readable=JSON.parse(await readFile(material.materialPath,'utf8'));
+      expect(readable.user.filter((p:any)=>p.type==='image')).toHaveLength(4);
+      expect(readable.user.filter((p:any)=>p.type==='image').every((p:any)=>p.path&&!p.data)).toBe(true);
+      expect(JSON.stringify(readable)).not.toContain('data:image/jpeg;base64,');
       for(const shot of material.screenshots)expect((await readFile(shot.path)).toString()).toBe('a');
       expect((await run(['wait',job.id])).find(value=>value.event==='action_required')).toMatchObject({jobId:job.id});
       const draftPath=join(directory,'draft.json');await writeFile(draftPath,JSON.stringify(s.draftBody(job)));

@@ -162,15 +162,19 @@ async function material(id:string,directory=output){
   const job=await api('job',{id});
   if(job.status==='done')return saveReport(id);
   const value=await api('material',await localLease(id));
-  if(!directory){print({event:'material',...value});return value;}
-  const target=resolve(directory);await mkdir(target,{recursive:true,mode:0o700});
+  const target=resolve(directory||join(dataDir,'materials',id));await mkdir(target,{recursive:true,mode:0o700});
   const materialPath=join(target,`${id}.material.json`);
-  await atomic(materialPath,JSON.stringify(value,null,2));
   const screenshots=[];
+  const parts=[];
   for(const [index,part] of value.user.entries())if(part.type==='image'){
     const match=String(part.data).match(/^data:image\/(jpeg|png|webp);base64,(.*)$/s);
-    if(match){const path=join(target,`${id}.shot-${screenshots.length+1}.${match[1]==='jpeg'?'jpg':match[1]}`);await atomic(path,Buffer.from(match[2],'base64'));screenshots.push({path,label:value.user[index-1]?.text||''});}
-  }
+    if(!match)throw new Error('截图材料不是可读取的图片，请重新获取原任务材料。');
+    const path=join(target,`${id}.shot-${screenshots.length+1}.${match[1]==='jpeg'?'jpg':match[1]}`);await atomic(path,Buffer.from(match[2],'base64'));screenshots.push({path,label:value.user[index-1]?.text||''});
+    parts.push({type:'image',path,label:value.user[index-1]?.text||''});
+  }else parts.push(part);
+  // The model must see the original image files through its image tool, never
+  // tokenize their base64 strings as text. Evidence bytes/hashes are unchanged.
+  await atomic(materialPath,JSON.stringify({...value,user:parts,imageInput:'使用图片工具实际查看 user 中每个 image.path；不要只读路径判断画面。图片文件为原始证据，未压缩或改动。'},null,2));
   print({event:'material',jobId:id,stage:value.stage,evidenceHash:value.evidenceHash,draftHash:value.draftHash,model:value.model,materialPath,screenshots,next:value.next,actionRequired:true,message:'采集工具已结束，平台不会自动调用模型。现在读取 system/user/schema 并实际查看四张截图，用你自己的模型初评后提交 draft，再用相同模型复核并 complete；最后读取 report 确认保存。不要空等或告知用户后台仍在审核。长推理可用 heartbeat 原任务续期；确实无法完成时用 fail --reason 说明原因。连接失败保留本地 JSON，使用相同请求重传。'});
   return value;
 }
