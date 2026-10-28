@@ -25,10 +25,24 @@ export async function claimCreationModel(DB:ModelThrottleDatabase,config:ModelCo
     const profile=profiles[profileId]!;
     if(!profile.enabled||!profile.encryptedKey||profile.protocol!=='anthropic'||!/^claude-opus-5-5$/i.test(profile.model)||!isRiffle(profile))continue;
     const runtime={...profile,apiKey:await decryptKey(profile.encryptedKey,secret)},key=await modelKeyId(runtime);if(seen.has(key))continue;seen.add(key);
-    const load=await DB.prepare('SELECT (SELECT count(*) FROM model_slots WHERE key_id=? AND expires_at>?) AS n,COALESCE((SELECT max(next_at,cooldown_until) FROM model_throttle WHERE id=?),0) AS ready').bind(key,Date.now(),key).first();
-    candidates.push({profileId,runtime,load:Number(load?.n||0),ready:Number(load?.ready||0)});
+    candidates.push({profileId,runtime,key});
   }
-  const now=Date.now();candidates.sort((a,b)=>Number(a.ready>now)-Number(b.ready>now)||a.load-b.load);
-  for(const c of candidates){const lease=await tryModelSlot(DB,c.runtime,id,Date.now()+14*60000);if(lease)return {config:{...config!,activeProfile:c.profileId,routes:{...config?.routes,create:c.profileId}},reserved:true,lease};}
-  return null;
+  if(!candidates.length)return null;
+  // Selection and reservation must share one SQL statement. Separate load reads
+  // let simultaneous idle tasks all choose the preferred Key before any lease
+  // is visible, leaving other Keys unused until that Key reaches its cap.
+  const now=Date.now();
+  const slot=await DB.prepare(`WITH candidates(key_id,position) AS (VALUES ${candidates.map((_,i)=>`(?,${i})`).join(',')}),
+    loads AS (SELECT key_id,position,
+      (SELECT count(*) FROM model_slots WHERE key_id=candidates.key_id AND expires_at>?) AS inflight,
+      COALESCE((SELECT max(next_at,cooldown_until) FROM model_throttle WHERE id=candidates.key_id),0) AS ready
+      FROM candidates),
+    winner AS (SELECT key_id FROM loads WHERE inflight<? ORDER BY (ready>?),inflight,position LIMIT 1)
+    INSERT INTO model_slots(request_id,key_id,expires_at)
+    SELECT ?,key_id,? FROM winner WHERE 1 ON CONFLICT(request_id) DO NOTHING RETURNING key_id`)
+    .bind(...candidates.map(c=>c.key),now,RIFFLE_CONCURRENCY,now,id,now+14*60000).first();
+  if(!slot)return null;
+  const c=candidates.find(c=>c.key===slot.key_id)!;
+  const lease={release:async()=>{await DB.prepare('DELETE FROM model_slots WHERE request_id=? AND key_id=?').bind(id,c.key).run();}};
+  return {config:{...config!,activeProfile:c.profileId,routes:{...config?.routes,create:c.profileId}},reserved:true,lease};
 }

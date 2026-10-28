@@ -16,6 +16,15 @@ async function setup(keys=['fixture-key-a','fixture-key-b']){
  return {sqlite,DB,config:config!,claim:(id:string)=>claimCreationModel(DB,config,'secret','game',id)};
 }
 describe('多 Key 制作调度',()=>{
+ it('三项同时提交先分到三把空闲 Key，六项填满后第七项排队',async()=>{
+  const s=await setup(['fixture-key-a','fixture-key-b','fixture-key-c']);
+  const first=await Promise.all(Array.from({length:3},(_,i)=>s.claim('spread-'+i)));
+  expect(new Set(first.map(v=>activeModelProfile(v!.config,'game')!.id)).size).toBe(3);
+  expect(s.sqlite.prepare('SELECT count(*) n FROM model_slots GROUP BY key_id ORDER BY n').all()).toEqual([{n:1},{n:1},{n:1}]);
+  const next=await Promise.all(Array.from({length:3},(_,i)=>s.claim('fill-'+i)));
+  expect(next.every(Boolean)).toBe(true);expect(await s.claim('waiting')).toBeNull();
+  expect(s.sqlite.prepare('SELECT count(*) n FROM model_slots GROUP BY key_id ORDER BY n').all()).toEqual([{n:2},{n:2},{n:2}]);
+ });
  it('两把不同 Key 分担四个同时任务，每把最多两个；第五个等待释放后继续',async()=>{
   const s=await setup(),leases=await Promise.all(Array.from({length:4},(_,i)=>s.claim('task-'+i)));
   expect(leases.every(Boolean)).toBe(true);expect(await s.claim('task-5')).toBeNull();
@@ -26,6 +35,12 @@ describe('多 Key 制作调度',()=>{
  });
  it('重复添加同一 Key 共享同一额度，不虚增并发',async()=>{
   const s=await setup(['same-key','same-key']);expect(await s.claim('one')).not.toBeNull();expect(await s.claim('two')).not.toBeNull();expect(await s.claim('three')).toBeNull();
+ });
+ it('优先使用未冷却的 Key，所有 Key 满载时不占新名额',async()=>{
+  const s=await setup(),key=await modelKeyId({...runtime,apiKey:'fixture-key-a'});
+  s.sqlite.prepare('INSERT INTO model_throttle(id,next_at,cooldown_until) VALUES(?,?,?)').run(key,0,Date.now()+60000);
+  const first=await s.claim('ready-first');expect(activeModelProfile(first!.config,'game')!.id).toBe('opus-1');
+  await first!.lease.release();expect(s.sqlite.prepare('SELECT count(*) n FROM model_slots').get()).toMatchObject({n:0});
  });
  it('停用配置不参与调度，过期租约可恢复，不影响其他 Key',async()=>{
   const s=await setup();s.config.profiles!['opus-1']!.enabled=false;
