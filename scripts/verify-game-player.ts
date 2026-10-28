@@ -44,6 +44,7 @@ try{
   await page.setViewport({width,height,isMobile:width<1000,hasTouch:width<1000});await page.goto(origin+'/test');await page.waitForSelector('#drawBtn');await page.click('[data-tab=products]');await page.waitForSelector('[data-act=viewProduct]');await page.click('[data-act=viewProduct]');
   const box=await verifyPlayer(page,'#modalBody iframe');assert(box.width<=width);assert(box.height<=height);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
   if(width===1360){await page.click('#modalBody [data-player-fullscreen]');await page.waitForFunction(()=>!!document.fullscreenElement);await verifyPlayer(page,'#modalBody iframe');await page.evaluate(()=>document.exitFullscreen());}
+  await page.click('#modalClose');assert.equal(await page.$('#modalBody iframe'),null,'Member close must stop game scripts');
  }
  assert.equal(modelCalls,0,'Preview must never generate again');assert.deepEqual(errors,[]);console.log('PASS 管理员直接试玩、材料与历史预览、重载与关闭、成员试玩、9:16 多屏适配、隔离和零模型调用。');
 }finally{await browser.close();await new Promise<void>(r=>server.close(()=>r()));}

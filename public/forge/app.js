@@ -125,8 +125,13 @@ function openModal(title, html, owner = null) {
   $("#modal").hidden = false;
   if (window.frameElement) window.frameElement.scrollIntoView({ block: 'center', behavior: 'instant' });
 }
-$("#modalClose").onclick = () => ($("#modal").hidden = true);
-$("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("#modal").hidden = true; });
+function closeModal() {
+  $("#modal").hidden = true;
+  modalOwner = null;
+  $("#modalBody").querySelectorAll('iframe').forEach(frame => frame.remove());
+}
+$("#modalClose").onclick = closeModal;
+$("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
 
 function showLogin() { location.replace('/login'); }
 $("#loginForm").onsubmit = (e) => { e.preventDefault(); showLogin(); };
@@ -1008,7 +1013,7 @@ async function showVersions(topic) {
     openModal(`${VERSION_LABELS[version.kind]||version.kind} · ${version.created_at||'历史版本'}`,`<div class="row section"><button class="ghost" id="backToVersions">返回版本列表</button><button class="ghost" id="copyVersion">复制内容</button><button class="primary" id="restoreVersion" ${version.current?'disabled':''}>${version.current?'当前版本':version.disposition==='pending'?'采用此结果':'恢复此版本'}</button></div>${version.stale?'<p class="small bad">生成时使用的上游内容已变化，采用前请核对。</p>':''}${versionDocument(version,topic.id)}`);
     $('#backToVersions').onclick=()=>showVersions(topic);
     $('#copyVersion').onclick=()=>copyText(content);
-    $('#restoreVersion').onclick=event=>guard(event.target,async()=>{await api('POST',`topics/${topic.id}/restore`,{version_id:version.id});toast('版本已恢复，依赖旧内容的产物仍可在历史中查看。');state.drawn=[];$('#modal').hidden=true;render();});
+    $('#restoreVersion').onclick=event=>guard(event.target,async()=>{await api('POST',`topics/${topic.id}/restore`,{version_id:version.id});toast('版本已恢复，依赖旧内容的产物仍可在历史中查看。');state.drawn=[];closeModal();render();});
   }));
 }
 
