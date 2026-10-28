@@ -8,8 +8,8 @@ import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
 import {build} from 'esbuild';
 import {reviewDeviceApi} from '../server/review-device-api';
-import {canonicalJson,digest,recoverDeviceReviews} from '../server/review-device-state';
-import {enqueueReview,getReviewJob,processReviewJob,purgeReviewInputs} from '../server/review-jobs';
+import {canonicalJson,digest,recoverDeviceReviews,failDeviceReview} from '../server/review-device-state';
+import {enqueueReview,getReviewJob,listReviewJobs,processReviewJob,purgeReviewInputs} from '../server/review-jobs';
 import {executeDeviceReview,ReviewRunner} from '../server/review-runner';
 import {reviewUsage,reviewActivity,reviewDay} from '../server/review-usage';
 import {dispatch} from '../server/forge-api';
@@ -50,6 +50,27 @@ async function setup(){
 }
 
 describe('成员 Agent 本地模型审核协议',()=>{
+  it('读取新鲜任务不写库或全站清理，成员轮询不清理其他成员的过期任务',async()=>{
+    const s=await setup(),a=await s.ready(),b=await s.submit('b'),old=new Date(Date.now()-25*3600000).toISOString();
+    s.sqlite.prepare('UPDATE review_jobs SET updated_at=? WHERE id=?').run(old,b.id);
+    const prepare=vi.spyOn(s.DB,'prepare');
+    await getReviewJob(s.env,a.id,'a');
+    expect(prepare.mock.calls.every(([query])=>/^SELECT /i.test(query as string))).toBe(true);
+    prepare.mockClear();
+    await listReviewJobs(s.env,'a');
+    expect(s.sqlite.prepare('SELECT status FROM review_jobs WHERE id=?').get(b.id)).toMatchObject({status:'queued'});
+    expect(Number(s.sqlite.prepare('SELECT COUNT(*) n FROM review_inputs WHERE job_id=?').get(b.id)?.n)).toBeGreaterThan(0);
+    await recoverDeviceReviews(s.DB);
+    expect(s.sqlite.prepare('SELECT status FROM review_jobs WHERE id=?').get(b.id)).toMatchObject({status:'error'});
+  });
+  it('过期清理与心跳竞争时保留已恢复任务、原租约及材料',async()=>{
+    const s=await setup(),job=await s.ready(),old=new Date(Date.now()-25*3600000).toISOString();
+    s.sqlite.prepare('UPDATE review_jobs SET updated_at=? WHERE id=?').run(old,job.id);
+    await s.ok('heartbeat',{job});
+    await failDeviceReview(s.DB,job.id,'expired snapshot',old);
+    expect(await getReviewJob(s.env,job.id,'a')).toMatchObject({status:'running'});
+    expect(Number(s.sqlite.prepare('SELECT COUNT(*) n FROM review_evidence WHERE job_id=?').get(job.id)?.n)).toBeGreaterThan(0);
+  });
   it('真人回填允许未领取任务的本人设备，上传内容按原 HTML 字节验证，领取后绑定原设备和租约',async()=>{
     const s=await setup(),queued=await s.submit(),hash=s.sqlite.prepare('SELECT input_hash FROM review_jobs WHERE id=?').get(queued.id)?.input_hash;
     expect(hash).toBe(await digest('<html><title>ORIGINAL_GAME</title><canvas></canvas></html>'));
@@ -317,6 +338,8 @@ describe('成员 Agent 本地模型审核协议',()=>{
       });
       const game=join(directory,'fixture.html');await writeFile(game,'<html>fixture</html>');
       const output=await run(['review',game,'--request-id',job.id,'--out',out]),material=output.find(value=>value.event==='material');
+      expect(material.actionRequired).toBe(true);
+      expect((await run(['heartbeat',job.id])).find(value=>value.event==='heartbeat')).toMatchObject({ok:true,jobId:job.id});
       expect(material.screenshots).toHaveLength(4);expect(JSON.parse(await readFile(material.materialPath,'utf8'))).toMatchObject({schema:REVIEW_SCHEMA,evidenceHash:job.evidenceHash});
       for(const shot of material.screenshots)expect((await readFile(shot.path)).toString()).toBe('a');
       expect((await run(['wait',job.id])).find(value=>value.event==='action_required')).toMatchObject({jobId:job.id});
@@ -330,6 +353,9 @@ describe('成员 Agent 本地模型审核协议',()=>{
       expect(repeated.find(value=>value.event==='report').report).toMatchObject({id:complete.find(value=>value.event==='report').report.id,result:report()});
       expect(JSON.parse(await readFile(join(out,`${job.id}.json`),'utf8')).result).toEqual(report());
       expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_jobs').get()).toMatchObject({n:1});expect(s.sqlite.prepare('SELECT COUNT(*) n FROM reviews').get()).toMatchObject({n:1});
+      const failed=await s.ready();
+      expect((await run(['fail',failed.id,'--reason','合成模型不可用'])).find(value=>value.event==='fail')).toMatchObject({ok:true,jobId:failed.id});
+      expect(await getReviewJob(s.env,failed.id,'a')).toMatchObject({status:'error',error:'合成模型不可用'});
       expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();
     }finally{
       await new Promise<void>((done,reject)=>server.close(error=>error?reject(error):done()));

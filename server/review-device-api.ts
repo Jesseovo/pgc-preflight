@@ -129,7 +129,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
     if(action==='claim'){
       if(!validId(b.claimId))throw problem('领取标识不正确。');
       await DB.prepare('UPDATE review_devices SET last_seen=?,version=? WHERE id=?').bind(stamp(),String(b.version||'member-capture-v1').slice(0,40),device.id).run();
-      await recoverDeviceReviews(DB);
+      await recoverDeviceReviews(DB,device.owner_id);
       const duplicate=await DB.prepare("SELECT * FROM review_jobs WHERE worker_id=? AND owner_id=? AND status='running' AND ((lease=? AND evidence_ready=0) OR (model_executor='agent' AND (? IS NOT NULL AND id=?)))").bind(device.id,device.owner_id,b.claimId,b.id||null,b.id||null).first();
       const pending=duplicate||await DB.prepare("SELECT * FROM review_jobs WHERE executor='device' AND owner_id=? AND status='queued' AND input_ready=1 AND (? IS NULL OR id=?) ORDER BY created_at LIMIT 1").bind(device.owner_id,b.id||null,b.id||null).first();
       if(!pending)return json(null);

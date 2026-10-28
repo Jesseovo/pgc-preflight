@@ -1,7 +1,7 @@
 // Background transport only. Scoring and calibration stay in the Forge review.
 import { activeModelProfile } from './settings';
 import { reviewDay, reviewUsage } from './review-usage';
-import { recoverDeviceReviews } from './review-device-state';
+import { recoverDeviceReviews, failDeviceReview } from './review-device-state';
 import {digest} from './review-device-state';
 import {withHumanReviews} from './human-review';
 
@@ -97,17 +97,20 @@ export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
 }
 
 export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string) {
-  await recoverDeviceReviews(env.DB);
+  await recoverDeviceReviews(env.DB,ownerId);
   const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-  await env.DB.prepare(`UPDATE review_jobs SET status = 'error', quota_charged = CASE WHEN model_started_at IS NULL THEN 0 ELSE quota_charged END, error = '后台审核已中断，未发布评分，请重新上传或重试。', updated_at = ? WHERE model_executor='platform' AND executor!='device' AND status = 'running' AND updated_at < ?${ownerId ? ' AND owner_id = ?' : ''}`)
-    .bind(stamp(),cutoff,...(ownerId ? [ownerId] : [])).run();
-  await env.DB.prepare("DELETE FROM review_inputs WHERE job_id IN (SELECT id FROM review_jobs WHERE status = 'error')").bind().run();
+  const stale=await env.DB.prepare(`SELECT id,updated_at FROM review_jobs WHERE model_executor='platform' AND executor!='device' AND status='running' AND updated_at<?${ownerId?' AND owner_id=?':''}`)
+    .bind(cutoff,...(ownerId?[ownerId]:[])).all();
+  for(const row of stale.results)await failDeviceReview(env.DB,row.id,'后台审核已中断，未发布评分，请重新上传或重试。',row.updated_at);
 }
 
 export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: string) {
-  await recoverDeviceReviews(env.DB);
   let row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ? AND owner_hidden=0').bind(id, ownerId).first();
   if (!row) throw fail('审核任务不存在。', 404);
+  if(['queued','running'].includes(row.status)&&row.executor==='device'&&Date.now()-Date.parse(row.updated_at)>(row.model_executor==='agent'?86400000:180000)){
+    await recoverDeviceReviews(env.DB,ownerId,id);
+    row=await env.DB.prepare('SELECT * FROM review_jobs WHERE id=? AND owner_id=?').bind(id,ownerId).first();
+  }
   const stale = row.model_executor!=='agent' && (row.status === 'running' && Date.now() - Date.parse(row.updated_at) > 15 * 60 * 1000
     || row.status === 'queued' && Date.now() - Date.parse(row.created_at) > (row.executor==='device'?24:3) * 60 * 60 * 1000);
   if (stale) {

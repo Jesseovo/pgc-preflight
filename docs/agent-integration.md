@@ -31,6 +31,8 @@ node review-agent.mjs review /absolute/path/game.html --out /absolute/path/revie
 
 `review` 提交游戏，顺序采集三种手机比例的四张完整 Chromium 视口图，锁定证据后导出材料并返回。它不会等待平台模型。每台设备同时只采集一款，已经采集完的不同游戏可以由 Agent 并行执行模型审核，没有平台模型并发上限。
 
+**工具返回材料后，审核还没有完成。** 你必须在当前会话继续使用自己的模型初评、提交 `draft`、用相同模型复核并提交 `complete`，最后读取 `report` 确认已保存。不能只运行 `review` 后让用户等网页自动出结果，也不能安装后台等待进程；网页不执行成员模型。先完成 AI 报告，真人站查询及回填失败不阻断这个流程。
+
 输出包含任务 `jobId`、`materialPath` 和四张截图的本地路径。读取材料 JSON 中的 `system`、`user`、`schema`，并实际查看四张图片；保留完整源码、观察记录、校准样本和证据边界。使用你自己的模型进行初评，把完整报告写到 JSON 文件：
 
 ```json
@@ -145,9 +147,13 @@ node review-agent.mjs status JOB_UUID
 node review-agent.mjs capture JOB_UUID
 node review-agent.mjs material JOB_UUID --out /absolute/path/material
 node review-agent.mjs report JOB_UUID --out /absolute/path/reports
+node review-agent.mjs heartbeat JOB_UUID
+node review-agent.mjs fail JOB_UUID --reason "无法完成的实际原因"
 ```
 
 `submit` 只提交文件，之后用 `capture` 采集；`review` 可接收多个 HTML 路径。重复执行相同内容会复用持久请求编号；明确开始新审核时，为单文件指定新的 `--request-id UUID`。`wait` 遇到本地任务会返回下一步操作，不会等待云端执行。
+
+网页显示“等待 Agent 初评结果”或“等待 Agent 复核结果”表示还没收到相应报告，不能据此宣称模型正在运行。用户让你继续时，先 `status` 查询原任务；`capture` 阶段续采集，`review` 阶段读取 `material` 后初评并 `draft`，`verify` 阶段读取原证据与草稿后用同一模型复核并 `complete`。不要重复上传或新建任务。长推理期间可按需用 `heartbeat` 续期，不设置常驻心跳。临时连接失败时保留本地报告和工具 outbox，用相同内容与原请求编号重传；不要丢弃已完成结果。确实无法执行模型审核时，用 `fail --reason` 明确结束，不能发布未复核草稿。
 
 工具使用加密 outbox 保存待传证据和报告请求，连接失败可重跑原命令。证据、初稿和已发布报告不可替换；相同内容重传返回原结果，修改内容需要新任务。断线后用原配对设备继续，不能把本地任务交给平台模型；24 小时未活动的任务会清理临时材料并明确过期。成功或失败立即清理服务端临时源码及证据分片，报告保留既有截图，已入广场的通过版独立保留。请在取回报告后删除不再需要的本地临时材料，并保留需要后续入场的投稿原文件。
 

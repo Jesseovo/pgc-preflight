@@ -19,7 +19,10 @@ const wakePolls = () => { for (const wake of pollWaiters) wake(); };
 document.addEventListener('visibilitychange', () => { if (!document.hidden) wakePolls(); });
 addEventListener('online', wakePolls);
 const labels = { staged: '待开始', waiting: '等待采集', probing: '采集画面', submitting: '提交中', queued: '等待本机 Agent', running: 'Agent 评分中', done: '已完成', error: '未完成' };
-const stageLabel = job => ['queued','running'].includes(job.status) && job.stage === 'capture' ? (job.status === 'queued' ? '等待采集' : '采集画面') : job.status === 'running' ? job.stage === 'verify' || /复核/.test(job.note || '') ? 'Agent 复核' : 'Agent 初评' : labels[job.status] || '正在处理';
+const agentWaiting = job => job.modelExecutor === 'agent' && ['queued','running'].includes(job.status) && (job.stage !== 'capture' || Date.now() - job.updatedAt > 180000);
+const working = job => active(job) && !agentWaiting(job) && !job.connectionLost;
+const stageLabel = job => job.connectionLost ? '状态暂不可用' : agentWaiting(job) ? (job.stage === 'verify' ? '等待 Agent 复核结果' : job.stage === 'review' ? '等待 Agent 初评结果' : '等待 Agent 继续采集') : ['queued','running'].includes(job.status) && job.stage === 'capture' ? (job.status === 'queued' ? '等待采集' : '采集画面') : job.status === 'running' ? job.stage === 'verify' || /复核/.test(job.note || '') ? '模型复核' : '模型初评' : labels[job.status] || '正在处理';
+const resumePrompt = job => `请重新阅读 ${location.origin}/agent.md 并更新审核工具，继续我已有的审核任务 ${job.requestId}（${job.title}）。不要重新提交游戏或新建任务。先用 status 查询：capture 阶段继续原任务采集；review 阶段读取 material 和四张真实截图，用你自己的模型完成初评并提交 draft；verify 阶段用初评的同一模型复核同一证据和草稿，再 complete 回传报告。网页不会代替你调用模型，不要只启动工具后等待。数据库暂不可用时保留本地结果，稍后用相同请求重传；如果确实无法执行，说明原因并用 fail 明确结束。最后读取 report 确认已保存。`;
 const stageSteps = job => {
   const step = job.status === 'done' ? 4 : job.stage === 'capture' ? 0 : job.status === 'running' ? job.stage === 'verify' || /复核/.test(job.note || '') ? 3 : 2 : ['submitting','queued'].includes(job.status) ? 1 : -1;
   return `<ol class="rv-stage-steps" aria-label="审核流程">${['本机采集','等待 Agent','Agent 初评','Agent 复核','回传报告'].map((label,i) => `<li class="${i < step ? 'is-complete' : i === step ? 'is-current' : ''}" ${i === step ? 'aria-current="step"' : ''}><i>${i < step ? '✓' : i+1}</i><span>${label}</span></li>`).join('')}</ol>`;
@@ -104,49 +107,63 @@ export function reviewHtml(report) {
   </article>`;
 }
 
+let polling = false;
 async function pollJob(job) {
-  if (polls.has(job.requestId)) return;
-  const requestId = job.requestId;
-  let missing = 0;
-  polls.add(requestId);
+  polls.add(job.requestId);
+  if (polling) return;
+  polling = true;
+  let errors = 0;
   try {
-    while (job.requestId === requestId && ['queued', 'running', 'submitting'].includes(job.status)) {
+    while (polls.size && dependencies?.isActive()) {
+      if (document.hidden) { await pause(60000); continue; }
       try {
-        const remote = await dependencies.api('GET', `review/jobs/${requestId}`);
-        missing = 0;
+        // One request covers the whole batch; never one timer per game.
+        const remoteJobs = await dependencies.api('GET', 'review/jobs');
+        errors = 0;
+        let completed = false;
+        for (const requestId of [...polls]) {
+        const job = jobs.find(item => item.requestId === requestId);
+        if (!job || !['queued','running','submitting'].includes(job.status)) { polls.delete(requestId); continue; }
+        const remote = remoteJobs.find(item => item.id === requestId) || await dependencies.api('GET', `review/jobs/${requestId}`);
         if (remote.status === 'done') {
           job.result = await dependencies.api('GET', `reviews/${remote.result_id}`);
         }
+        job.connectionLost = false;
+        job.modelExecutor = remote.model_executor;
+        job.updatedAt = Date.parse(remote.updated_at) || Date.now();
         job.status = remote.status;
         job.stage = remote.stage;
         job.error = remote.status === 'error' ? reviewError(remote.error) : remote.error;
         job.remoteFailed = remote.status === 'error';
-        job.note = remote.status === 'running' ? remote.error || '你的 Agent 正在用自己的模型结合画面、源码与校准样本评分' : '任务等待本人的 Agent 接取';
+        job.note = agentWaiting(job) ? `平台尚未收到${job.stage === 'verify' ? '复核报告' : '初评结果'}。请在原 Agent 对话中继续此任务；停留网页不会继续审核。最近任务活动：${date(remote.updated_at)}` : remote.error || '等待审核执行器处理';
         if (remote.status === 'done') {
           job.note = '报告已生成';
           job.html = null;
           job.file = null;
           job.prepared = null;
           if (!jobs.find(item => item.id === selected)?.result) selected = job.id;
-          void dependencies.updateHistory?.();
+          completed = true;
         }
         if (job.status === 'done') { job.progress?.update({label:`审核完成 · ${job.title}`}); job.progress?.done('审核报告已生成'); }
         if (job.status === 'error') failJobProgress(job);
-        refresh();
-        if (['done', 'error'].includes(job.status)) { void dependencies.updateUsage?.(); break; }
-      } catch (error) {
-        if (error.status === 404 && ++missing >= 3) {
-          job.status = 'error'; job.error = '后台没有找到这次任务，请重试提交。'; job.remoteFailed = true; failJobProgress(job);
-          refresh(); break;
+        if (['done', 'error'].includes(job.status)) { polls.delete(requestId); void dependencies.updateUsage?.(); }
         }
+        if(completed)void dependencies.updateHistory?.();
+        refresh();
+      } catch (error) {
         // A transient poll failure must never resubmit a model request.
-        job.note = '正在重新连接后台，任务会继续运行';
+        errors++;
+        for (const job of jobs.filter(item => polls.has(item.requestId))) {
+          job.connectionLost = true;
+          job.note = '暂时无法读取任务状态，不能确认是否仍在执行。保留原任务，连接恢复后自动查询；不要重复提交游戏。';
+        }
         refresh();
       }
-      await pause(3500);
+      if(polls.size)await pause(errors ? Math.min(60000,15000*2**(errors-1)) : jobs.some(job => polls.has(job.requestId)&&working(job)) ? 10000 : 60000);
     }
   } finally {
-    polls.delete(requestId);
+    polling = false;
+    polls.clear();
     void pump();
   }
 }
@@ -200,7 +217,7 @@ async function pump() {
     }
   } finally { preparing = false; }
 }
-const activeCount = () => jobs.filter(active).length;
+const activeCount = () => jobs.filter(working).length;
 
 let dragDepth = 0;
 document.addEventListener('dragenter', event => {
@@ -290,10 +307,10 @@ export async function mountReviewWorkspace(options) {
     const shots = arr(report.shots).filter(s => safeImage(s.data));
     $('#rvResult').querySelectorAll('[data-shot]').forEach(button => { button.onclick = () => { const shot = shots[Number(button.dataset.shot)]; openModal(shot.label, `<img class="rr-lightbox" src="${esc(shot.data)}" alt="${esc(shot.label)}">`); }; });
   };
-  const jobProgress = job => ({label:stageLabel(job),detail:job.note || '等待前面的游戏完成采集…',startedAt:job.startedAt,...(job.status === 'probing' ? job.captureProgress : {})});
+  const jobProgress = job => ({label:stageLabel(job),detail:job.note || '等待前面的游戏完成采集…',status:agentWaiting(job)||job.connectionLost?'waiting':'running',startedAt:agentWaiting(job)||job.connectionLost?undefined:job.startedAt,...(job.status === 'probing' ? job.captureProgress : {})});
   refresh = () => {
     for (const job of jobs.filter(active)) {
-      const signature = JSON.stringify([job.status,job.note,job.captureProgress]);
+      const signature = JSON.stringify([job.status,job.note,job.captureProgress,agentWaiting(job),job.connectionLost]);
       if (job.progress && signature !== job.progressSignature) {
         job.progressSignature = signature;
         job.progress.update({...jobProgress(job),label:`${stageLabel(job)} · ${job.title}`,value:job.status === 'probing' ? job.captureProgress?.value : undefined,total:job.status === 'probing' ? job.captureProgress?.total : undefined});
@@ -306,7 +323,7 @@ export async function mountReviewWorkspace(options) {
     const errors = jobs.filter(job => job.status === 'error').length;
     $('#rvQueueCount').textContent = String(jobs.length).padStart(2, '0');
     $('#rvBatchStats').textContent = `${done} 已完成${activeCount() ? ` · ${activeCount()} 进行中` : ''}${errors ? ` · ${errors} 未完成` : ''}`;
-    $('#rvBatchMeter').innerHTML = progressHtml({label:'本批报告',value:done,total:jobs.length,status:jobs.some(job => pending(job) && job.status !== 'staged') ? 'running' : errors ? 'error' : done === jobs.length ? 'done' : 'running',detail:`${done} 个报告已生成${errors ? ` · ${errors} 个未完成，可单独重试` : ''}${jobs.length-done-errors ? ` · ${jobs.length-done-errors} 个待完成` : ''}`});
+    $('#rvBatchMeter').innerHTML = progressHtml({label:'本批报告',value:done,total:jobs.length,status:activeCount() ? 'running' : jobs.some(pending) ? 'waiting' : errors ? 'error' : 'done',detail:`${done} 个报告已生成${errors ? ` · ${errors} 个未完成，可单独重试` : ''}${jobs.length-done-errors ? ` · ${jobs.length-done-errors} 个待完成` : ''}`});
     if($('#rvGo'))$('#rvGo').disabled = !staged;
     if($('#rvGo'))$('#rvGo').innerHTML = `${staged ? `开始审核 ${staged} 个` : started ? '添加游戏继续审核' : '开始审核'} ${svg('arrow')}`;
     $('#rvClear').disabled = !done && !errors;
@@ -314,7 +331,7 @@ export async function mountReviewWorkspace(options) {
     $('#rvExportAll').disabled = !jobs.some(job => job.result);
     $('#rvOverview').innerHTML = [['已完成',done],['进行中',activeCount()],['待处理',jobs.length-done-errors-activeCount()],['未完成',errors]].map(([label,count]) => `<div><b>${count}</b><span>${label}</span></div>`).join('');
     if (!jobs.some(job => job.id === selected)) selected = jobs[0]?.id || '';
-    $('#rvJobs').innerHTML = jobs.map(job => `<article class="rv-job ${job.id === selected ? 'is-selected' : ''}" data-job="${job.id}"><button type="button" class="rv-job-select" data-select="${job.id}" aria-pressed="${job.id === selected}"><span class="rv-file-icon">${svg(job.status === 'done' ? 'check' : 'file')}</span><span class="rv-job-info"><b>${esc(job.title)}</b><small>${esc(job.filename || '后台任务')}${job.bytes ? ` · ${size(job.bytes)}` : ''}</small><span class="rv-job-status ${active(job) ? 'is-active' : job.status}">${active(job) ? '<i class="rv-spinner"></i>' : '<i></i>'}${stageLabel(job)}${job.result ? ` · ${job.result.score}/9` : ''}</span>${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</span></button>${['staged','done','error'].includes(job.status) ? `<button type="button" class="rv-job-remove" data-remove="${job.id}" aria-label="移除 ${esc(job.title)}" title="移除任务">×</button>` : ''}${allowUpload && job.status === 'error' ? `<button type="button" class="rv-job-retry" data-retry="${job.id}">${svg('retry')}重试</button>` : ''}</article>`).join('');
+    $('#rvJobs').innerHTML = jobs.map(job => `<article class="rv-job ${job.id === selected ? 'is-selected' : ''}" data-job="${job.id}"><button type="button" class="rv-job-select" data-select="${job.id}" aria-pressed="${job.id === selected}"><span class="rv-file-icon">${svg(job.status === 'done' ? 'check' : 'file')}</span><span class="rv-job-info"><b>${esc(job.title)}</b><small>${esc(job.filename || '后台任务')}${job.bytes ? ` · ${size(job.bytes)}` : ''}</small><span class="rv-job-status ${working(job) ? 'is-active' : job.status}">${working(job) ? '<i class="rv-spinner"></i>' : '<i></i>'}${stageLabel(job)}${job.result ? ` · ${job.result.score}/9` : ''}</span>${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</span></button>${['staged','done','error'].includes(job.status) ? `<button type="button" class="rv-job-remove" data-remove="${job.id}" aria-label="移除 ${esc(job.title)}" title="移除任务">×</button>` : ''}${allowUpload && job.status === 'error' ? `<button type="button" class="rv-job-retry" data-retry="${job.id}">${svg('retry')}重试</button>` : ''}</article>`).join('');
     const job = jobs.find(item => item.id === selected) || jobs[0];
     if (!job) { $('#rvResult').innerHTML = ''; renderedId = ''; renderedResult = null; return; }
     selected = job.id;
@@ -323,7 +340,8 @@ export async function mountReviewWorkspace(options) {
     } else {
       renderedResult = null;
       renderedId = '';
-      $('#rvResult').innerHTML = `<div class="rv-result-placeholder ${job.status === 'error' ? 'is-error' : ''}"><span class="rv-placeholder-icon">${active(job) ? '<i class="rv-spinner"></i>' : svg(job.status === 'error' ? 'retry' : 'sparkle')}</span><span class="rr-kicker">${job.status === 'error' ? 'LET’S TRY AGAIN' : 'A BETTER GAME, ONE STEP AWAY'}</span><h3>${esc(job.title)}</h3><p>${esc(job.status === 'error' ? job.error : job.note || (job.status === 'staged' ? '文件已准备好，点击「开始审核」一起出发。' : '等待前面的任务，随后自动开始。'))}</p>${job.status === 'error' ? '<small>这次未完成审核，没有给游戏打分。</small>' : stageSteps(job)}${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</div>`;
+      $('#rvResult').innerHTML = `<div class="rv-result-placeholder ${job.status === 'error' ? 'is-error' : ''}"><span class="rv-placeholder-icon">${working(job) ? '<i class="rv-spinner"></i>' : svg(job.status === 'error' ? 'retry' : 'sparkle')}</span><span class="rr-kicker">${job.status === 'error' ? 'LET’S TRY AGAIN' : 'A BETTER GAME, ONE STEP AWAY'}</span><h3>${esc(job.title)}</h3><p>${esc(job.status === 'error' ? job.error : job.note || (job.status === 'staged' ? '文件已准备好，点击「开始审核」一起出发。' : '等待前面的任务，随后自动开始。'))}</p>${job.status === 'error' ? '<small>这次未完成审核，没有给游戏打分。</small>' : stageSteps(job)}${agentWaiting(job)?'<button type="button" class="rr-button rr-button-dark" id="rvResumeAgent">复制继续审核指令</button>':''}${active(job) || job.status === 'waiting' ? progressHtml(jobProgress(job)) : ''}</div>`;
+      if($('#rvResumeAgent'))$('#rvResumeAgent').onclick=()=>copyText(resumePrompt(job));
     }
   };
   if(allowUpload)$('#rvChoose').onclick = () => $('#rvFile').click();
@@ -427,7 +445,7 @@ export async function mountReviewWorkspace(options) {
   };
   $('#rvDevices').onclick=async event=>{const button=event.target.closest('[data-revoke]');if(!button)return;button.disabled=true;try{await withProgress('撤销智能助手授权',()=>api('POST','review/device/revoke',{id:button.dataset.revoke}));await workerStatus();}catch(error){dependencies.feedback(error.message,true);button.disabled=false;}};
   void workerStatus();
-  const workerTimer=setInterval(()=>{if(!current()){clearInterval(workerTimer);return;}if(!document.hidden)void workerStatus();},20000);
+  const workerTimer=setInterval(()=>{if(!current()){clearInterval(workerTimer);return;}if(!document.hidden)void workerStatus();},60000);
   refresh();
   void dependencies.updateUsage();
   void history();
@@ -435,7 +453,7 @@ export async function mountReviewWorkspace(options) {
     const remote = await withProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
     for (const item of remote) {
       if (!['queued', 'running', 'error'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
-      const job = { id: item.id, requestId: item.id, title: item.title, filename:item.filename, stage:item.stage, status: item.status, error:reviewError(item.error),remoteFailed:item.status==='error',note: '恢复后台审核任务' };
+      const job = { id: item.id, requestId: item.id, title: item.title, filename:item.filename, stage:item.stage, status: item.status,modelExecutor:item.model_executor,updatedAt:Date.parse(item.updated_at)||Date.now(),error:reviewError(item.error),remoteFailed:item.status==='error',note: '正在读取原任务的最新状态' };
       job.startedAt = Date.parse(item.created_at) || Date.now();
       job.progress = startTask(`AI 审核 · ${job.title}`,{key:`review-${job.id}`,compact:true,detail:job.note,startedAt:job.startedAt});
       jobs.push(job); selected ||= job.id;
@@ -446,4 +464,6 @@ export async function mountReviewWorkspace(options) {
     }
     refresh();
   } catch { /* Older history still renders if job recovery is temporarily unavailable. */ }
+  // Returning from another workbench tab must restart the shared observer.
+  for(const job of jobs.filter(active))void pollJob(job);
 }

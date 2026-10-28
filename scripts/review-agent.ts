@@ -57,7 +57,7 @@ async function api(action:string,body:any={}):Promise<any>{
 }
 function option(name:string){const i=args.indexOf(name);if(i<0)return undefined;const value=args[i+1];if(!value||value.startsWith('--'))throw new Error(`${name} 缺少值`);args.splice(i,2);return value;}
 const alsoWait=args.includes('--wait');if(alsoWait)args.splice(args.indexOf('--wait'),1);
-const output=option('--out'),requestId=option('--request-id'),jsonInput=option('--json'),humanReviewInput=option('--human-review'),gameInput=option('--game');
+const output=option('--out'),requestId=option('--request-id'),jsonInput=option('--json'),humanReviewInput=option('--human-review'),gameInput=option('--game'),failureReason=option('--reason');
 const creatorHubSource='https://creator-hub-7mi.pages.dev';
 const humanReviewDir=join(dataDir,'human-reviews');
 const humanReviewStatuses=new Set(['reviewed','pending','unavailable','unlinked']);
@@ -171,7 +171,7 @@ async function material(id:string,directory=output){
     const match=String(part.data).match(/^data:image\/(jpeg|png|webp);base64,(.*)$/s);
     if(match){const path=join(target,`${id}.shot-${screenshots.length+1}.${match[1]==='jpeg'?'jpg':match[1]}`);await atomic(path,Buffer.from(match[2],'base64'));screenshots.push({path,label:value.user[index-1]?.text||''});}
   }
-  print({event:'material',jobId:id,stage:value.stage,evidenceHash:value.evidenceHash,draftHash:value.draftHash,model:value.model,materialPath,screenshots,next:value.next,message:'读取材料中的 system/user/schema，查看四张真实截图；用你自己的相同模型依次初评和复核，再提交 JSON。'});
+  print({event:'material',jobId:id,stage:value.stage,evidenceHash:value.evidenceHash,draftHash:value.draftHash,model:value.model,materialPath,screenshots,next:value.next,actionRequired:true,message:'采集工具已结束，平台不会自动调用模型。现在读取 system/user/schema 并实际查看四张截图，用你自己的模型初评后提交 draft，再用相同模型复核并 complete；最后读取 report 确认保存。不要空等或告知用户后台仍在审核。长推理可用 heartbeat 原任务续期；确实无法完成时用 fail --reason 说明原因。连接失败保留本地 JSON，使用相同请求重传。'});
   return value;
 }
 async function submitLocal(action:'draft'|'complete',id:string){
@@ -246,7 +246,7 @@ async function submit(path:string){
 let lockPath:string|undefined,lockOwned=false,heartbeat:ReturnType<typeof setInterval>|undefined;
 try{
   if(command==='help'){
-    print({commands:['pair (PGC_PAIR_CODE or stdin)','review <file.html> [more.html] [--out directory] [--request-id UUID] [--human-review human.json (单文件)]','submit <file.html> [more.html] [--human-review human.json (单文件)]','human-review <job-id> --json human.json [--game original.html]','gallery <job-id> [--game original.html]','capture <job-id>','material <job-id> [--out directory]','draft <job-id> --json draft.json','complete <job-id> --json verified.json [--out directory]','status <job-id>','jobs','wait <job-id>','report <job-id> [--out directory]'],note:'review 提交、采集并导出可执行的审核材料后返回；Agent 使用自己的模型初评和同模型复核，分别提交 draft/complete。工具不配置、持有或调用模型 API。真人审核只回填用户明确匹配的作品与版本记录，不获取外部平台凭据。真人终审明确通过的原版游戏会共享到仅登录可见的游戏广场。'});
+    print({commands:['pair (PGC_PAIR_CODE or stdin)','review <file.html> [more.html] [--out directory] [--request-id UUID] [--human-review human.json (单文件)]','submit <file.html> [more.html] [--human-review human.json (单文件)]','human-review <job-id> --json human.json [--game original.html]','gallery <job-id> [--game original.html]','capture <job-id>','material <job-id> [--out directory]','draft <job-id> --json draft.json','complete <job-id> --json verified.json [--out directory]','heartbeat <job-id>','fail <job-id> --reason 原因','status <job-id>','jobs','wait <job-id>','report <job-id> [--out directory]'],note:'review 提交、采集并导出可执行的审核材料后返回；Agent 使用自己的模型初评和同模型复核，分别提交 draft/complete。工具不配置、持有或调用模型 API。真人审核只回填用户明确匹配的作品与版本记录，不获取外部平台凭据。真人终审明确通过的原版游戏会共享到仅登录可见的游戏广场。'});
   }else{
     await mkdir(dataDir,{recursive:true,mode:0o700});
     for(const sub of ['submissions','claims','outbox','sources'])await mkdir(join(dataDir,sub),{recursive:true,mode:0o700});
@@ -286,13 +286,18 @@ try{
         if(alsoWait)try{await waitFor(command==='review'?captured:ids);}catch(e){errors.push((e as Error).message);}
         if(errors.length)throw new Error(errors.join('\n'));
       }else if(command==='jobs')print(await api('jobs'));
-      else if(['status','report','wait','capture','material','draft','complete','human-review','gallery'].includes(command)){
+      else if(['status','report','wait','capture','material','draft','complete','heartbeat','fail','human-review','gallery'].includes(command)){
         if(args.length!==1||!uuid(args[0]))throw new Error('请提供一个任务编号（UUID）。');
         const id=args[0];
         if(command==='wait')await waitFor([id]);
         else if(command==='capture'){await capture(id);if(alsoWait)await waitFor([id]);}
         else if(command==='report')await saveReport(id);
         else if(command==='material')await material(id);
+        else if(command==='heartbeat')print({event:'heartbeat',jobId:id,...await api('heartbeat',{version:'agent-local-review-v3',freeMemoryMB:Math.floor(freemem()/1048576),job:await localLease(id)})});
+        else if(command==='fail'){
+          if(!failureReason?.trim())throw new Error('请用 --reason 说明审核无法完成的实际原因。临时断网请保留本地结果并重试原请求。');
+          print({event:'fail',jobId:id,...await api('fail',{...await localLease(id),message:failureReason})});
+        }
         else if(command==='draft'||command==='complete')await submitLocal(command,id);
         else if(command==='human-review'){if(!jsonInput)throw new Error('请用 --json 提供真人审核 JSON 文件。');await submitHumanReview(id,jsonInput);}
         else if(command==='gallery')await publishGame(id);
