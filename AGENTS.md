@@ -97,3 +97,5 @@
 - 用户已自行完成 Workers Paid 购买，控制台确认订阅激活，基础费用为 5 美元/月，超出包含额度另计；账号 `071443b43c7562efec975a5e964d5a9c`。额度由该账号全部项目共享，DeepSeek / Riffle 模型费用独立计算。
 - `wrangler.jsonc` 明确设置 `limits.cpu_ms: 30000`，保持付费套餐默认的单次活跃 CPU 上限，不提高到 300000；模型等待与 CPU 时间分别计量。升级不改变成员 Agent 自行审核和创作的执行方式，也不恢复成员平台模型调用。管理员及历史平台兼容长任务继续使用原 SQLite DO / Queue 路径，保留已有模型期限、看门狗和请求幂等。
 - 付费 DO 每月含 400000 GB-s，等待模型的活跃任务也可能计入运行时长。单次 CPU 上限、成员次数和预算告警都不是账号账单硬封顶；目前没有全团队月任务额度或自动费用熔断。不能宣称每月绝不超过 5 美元。参考：https://developers.cloudflare.com/billing/manage/budget-alerts/ 、https://developers.cloudflare.com/durable-objects/platform/pricing/ 。
+- 配置提交 `bf4a2ea` 已推送 `origin/main`，使用 `wrangler deploy --keep-vars` 发布为 Worker `d60b4340-ec1d-49f8-8371-be1899167fa0`，全部流量已切换；生产 API 确认 `standard=true`、`limits.cpu_ms=30000`。D1 已迁移至 `0021_game_square.sql`，本次没有数据库迁移。发布前后及验证后，8 个成员全部字段与平台设置哈希一致。
+- 付费发布验证：构建、28 个文件/226 项测试、部署 dry-run、本地真实 Agent bundle 的两款游戏/八张完整视口图与零平台扣次协议均通过。生产登录、权限、公开文档 UTF-8 与四份 Agent 文档/工具的构建内容一致；DeepSeek Flash 和 Opus 5.5 的文本/图片连接测试均成功。管理员使用一款合成游戏完成云端四张截图、DeepSeek 初评（16.4 秒）与同证据复核（18.9 秒），报告成功落库、临时输入已清理；本次合成任务、报告及证据分片已删除，保留脱敏模型运行日志。只证明本次完整审核成功，未测试大规模并发或长规格制作。脱敏证据为 ignored 的 `artifacts/paid-release-evidence-20261028.json`。
