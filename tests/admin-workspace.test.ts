@@ -28,6 +28,16 @@ async function setup(){
 }
 
 describe('管理员内容管理与手动审核入口',()=>{
+  it('管理员成品列表独立于最近选题，支持成员筛选且不返回游戏源码',async()=>{
+    const s=await setup();
+    const insert=s.sqlite.prepare("INSERT INTO topics(owner_id,batch,subject,medium,gesture,structure,mood,status,data,product_html,created_at,updated_at) VALUES(?,'fixture',?,'pixel','tap','score','calm','made',?,?,?,?)");
+    insert.run('a','old-product',JSON.stringify({title:'Member A Game'}),'PRIVATE_GAME_HTML','2000','2000');
+    insert.run('b','other-product',JSON.stringify({title:'Member B Game'}),'OTHER_PRIVATE_GAME_HTML','2001','2001');
+    for(let i=0;i<301;i++)insert.run('a','recent-topic-'+i,'{}',null,'2026','2026');
+    const all=await(await s.call('workspace')).json() as any;expect(all.topics).toHaveLength(300);expect(all.products).toHaveLength(2);
+    expect(all.products.find((p:any)=>p.owner_id==='a').data.title).toBe('Member A Game');expect(JSON.stringify(all)).not.toMatch(/PRIVATE_GAME_HTML|OTHER_PRIVATE_GAME_HTML/);
+    const mine=await(await s.call('workspace?owner=a')).json() as any;expect(mine.products).toHaveLength(1);expect(mine.products[0].owner_id).toBe('a');
+  });
   it('只有管理员可管理公共内容、上传游戏或导入报告，设备令牌不能借Cookie升权',async()=>{
     const s=await setup();
     for(const owner of ['','plain','a'])for(const[path,method]of [['workspace','GET'],['public-data','GET'],['public-data','POST'],['review-upload','POST'],['review-import','POST']] as const)expect((await s.call(path,method,method==='POST'?{}:undefined,owner)).status,`${owner} ${path}`).toBe(403);

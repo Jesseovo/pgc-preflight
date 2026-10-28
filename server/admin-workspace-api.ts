@@ -26,7 +26,7 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
     if(url.pathname.endsWith('/workspace')&&request.method==='GET'){
       const owner=url.searchParams.get('owner')||'';
       await recoverInterruptedReviews(env,owner||undefined);
-      const [topics,games,tasks,agents,suggestions,members,reviewJobs,reviews]=await Promise.all([
+      const [topics,games,tasks,agents,suggestions,members,reviewJobs,reviews,products]=await Promise.all([
         all(DB,"SELECT id,owner_id,subject,status,data,score,origin,requirements,content_revision,created_at,updated_at,brief_md IS NOT NULL AS has_brief,assets_html IS NOT NULL AS has_assets,product_html IS NOT NULL AS has_product FROM topics WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 300",owner,owner),
         all(DB,"SELECT * FROM games WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 300",owner,owner),
         all(DB,"SELECT * FROM forge_tasks WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 300",owner,owner),
@@ -34,8 +34,9 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
         all(DB,"SELECT * FROM vocab_suggestions WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200",owner,owner),store.list(),
         all(DB,"SELECT id,owner_id,title,filename,status,stage,error,result_id,model_executor,quota_charged,created_at,updated_at FROM review_jobs WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200",owner,owner),
         all(DB,"SELECT id,owner_id,job_id,title,score,model_executor,agent_id,model,created_at FROM reviews WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 200",owner,owner),
+        all(DB,"SELECT id,owner_id,subject,data,updated_at,1 AS has_product,product_status,product_error FROM topics WHERE product_html IS NOT NULL AND trim(product_html)<>'' AND (?='' OR owner_id=?) ORDER BY updated_at DESC,id DESC LIMIT 300",owner,owner),
       ]);
-      return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,tasks:tasks.map(publicCreatorTask),agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),reviewJobs:await withHumanReviews(DB,reviewJobs,true),reviews:await withHumanReviews(DB,reviews)});
+      return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),products:products.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,tasks:tasks.map(publicCreatorTask),agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),reviewJobs:await withHumanReviews(DB,reviewJobs,true),reviews:await withHumanReviews(DB,reviews)});
     }
     if(url.pathname.endsWith('/public-data')){
       if(request.method==='GET')return json({settings:await publicSettings(DB),vocab:await all(DB,'SELECT * FROM vocab ORDER BY dim,id'),games:await all(DB,'SELECT * FROM games WHERE is_public=1 ORDER BY id')});

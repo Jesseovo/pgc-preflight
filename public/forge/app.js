@@ -3,6 +3,7 @@ import { mountReviewWorkspace } from './review-workspace.js';
 import { startTask, withProgress, progressHtml } from './progress.js';
 import { readXlsxRows, listMembers, sheetToWorks } from './review-sheet.js';
 import {briefDocument,versionDocument} from './artifact-view.js';
+import {gamePlayer,bindGamePlayers} from './game-player.js';
 
 const DIMS = ["subject", "medium", "gesture", "structure", "mood"];
 const DIM_LABEL = { subject: "题材", medium: "美术媒介", gesture: "手势", structure: "挑战结构", mood: "情绪基调" };
@@ -120,6 +121,7 @@ function openModal(title, html, owner = null) {
   modalOwner = owner;
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = html;
+  bindGamePlayers($("#modalBody"));
   $("#modal").hidden = false;
   if (window.frameElement) window.frameElement.scrollIntoView({ block: 'center', behavior: 'instant' });
 }
@@ -800,7 +802,7 @@ async function showSavedProduct(topic,repaint=()=>{}) {
 }
 
 function showProduct(topic, html,repaint=()=>{}) {
-  openModal(`${topic.data?.title || '游戏'} · 成品`, `<div class="row" style="margin-bottom:10px"><button class="primary" id="downloadProduct">下载 HTML</button><button class="ghost" id="regenerateProduct" ${['queued','running'].includes(topic.product_status)?'disabled':''}>重新制作</button><button class="ghost" id="copyProductPrompt">复制 HTML</button></div><iframe class="product-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${esc(topic.data?.title || '游戏')}成品预览" src="/api/forge/topics/${topic.id}/product-preview"></iframe>`);
+  openModal(`${topic.data?.title || '游戏'} · 成品`, `<div class="row" style="margin-bottom:10px"><button class="primary" id="downloadProduct">下载 HTML</button><button class="ghost" id="regenerateProduct" ${['queued','running'].includes(topic.product_status)?'disabled':''}>重新制作</button><button class="ghost" id="copyProductPrompt">复制 HTML</button></div>${gamePlayer(`/api/forge/topics/${topic.id}/product-preview`,topic.data?.title||'游戏试玩')}`);
   $('#downloadProduct').onclick = () => download(`${topic.data?.title || 'game'}.html`, html, 'text/html');
   $('#copyProductPrompt').onclick = () => copyText(html);
   $('#regenerateProduct').onclick=()=>startProductJob(topic,repaint,{regenerate:true});

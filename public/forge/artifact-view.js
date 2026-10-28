@@ -1,3 +1,4 @@
+import {gamePlayer} from './game-player.js';
 const escape=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const inline=value=>escape(value).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
 
@@ -36,7 +37,9 @@ export function briefDocument(text){
 }
 
 export function versionDocument(version,topicId){
-  if(['game','assets','preview','product'].includes(version.kind))return `<iframe class="${version.kind==='game'||version.kind==='product'?'product-frame':'assets-frame'}" sandbox="allow-scripts" referrerpolicy="no-referrer" title="历史版本预览" src="/api/forge/topics/${topicId}/versions/${encodeURIComponent(version.id)}/preview"></iframe>`;
+  const previewUrl=`/api/forge/topics/${topicId}/versions/${encodeURIComponent(version.id)}/preview`;
+  if(['game','product'].includes(version.kind))return gamePlayer(previewUrl,'历史游戏版本');
+  if(['assets','preview'].includes(version.kind))return `<iframe class="assets-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="历史版本预览" src="${previewUrl}"></iframe>`;
   if(version.kind==='brief')return briefDocument(version.content);
   if(version.kind==='expand'){
     let data=version.content;try{if(typeof data==='string')data=JSON.parse(data);}catch{}

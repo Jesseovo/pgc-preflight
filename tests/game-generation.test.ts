@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { cleanGameHtml, gameUser } from '../server/game-generation';
 import { gameBrief } from '../server/forge/prompts.js';
+import {GAME_SYSTEM} from '../server/game-generation';
 
 const page = '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="https://example.invalid/game.css"><script src="https://example.invalid/game.js"></script></head><body><img src="https://example.invalid/hero.png"><script>document.body.textContent="Playable"</script></body></html>';
 
@@ -46,5 +47,9 @@ describe('Opus 游戏成品', () => {
     expect(prompt).toContain('Original garden design');
     expect(prompt).toContain('Latest requested changes');
     expect(prompt).toContain('Add drifting petals and a gold score counter.');
+  });
+  it('制作要求固定 9:16 舞台、等比缩放及触摸坐标换算',()=>{
+    expect(GAME_SYSTEM).toContain('fixed 9:16');expect(GAME_SYSTEM).toContain('540 by 960');expect(GAME_SYSTEM).toContain('getBoundingClientRect');expect(GAME_SYSTEM).toContain('physical keyboard must not be required');
+    expect(gameUser({data:{title:'Portrait'}},'','')).toContain('540x960 (9:16)');
   });
 });

@@ -39,6 +39,8 @@
 - Star 网页扩写、简报、样板图、资产、制作使用 forge_tasks 的 executor=platform，由每任务独立 SQLite ForgeRunner DO alarm 执行。成员 Agent 新建任务及网页补词建议/标签继续使用 executor=agent，仅由 Agent 领取回传。平台与 Agent 共享 owner:kind:topic 活动 scope，重复提交返回原任务，不转换执行来源。调度、恢复和执行入口都排除 Agent，不能套用云端 14 分钟超时。需迁移 `0016_forge_tasks.sql` 和 DO `v2-forge-runner`。活动 scope 唯一，重复提交返回原任务；调度响应丢失只能恢复同编号。旧 `pgc-forge-jobs` 消息按消息 ID 确定任务 ID，只调度 alarm，不在普通 Free Queue 执行模型或重放已完成任务。
 - 平台游戏制作必须使用 Opus 5.5；成员也可独立选择自己的 Agent 创作。平台执行前及每次真正付费请求前重新检查成员 enabled/star，撤销后未开始的任务明确失败，不发新请求。任务原子领取 `queued` → `running`，维持心跳，模型总期限 12 分钟、14 分钟中断看门狗。未知中断明确失败，不自动重放付费调用。不要隐式先生成长简报；生产选题 31 曾因此耗尽 Token。失败需用户明确重试并生成新编号，刷新只读取持久状态；排队超过 24 小时明确失败。
 - 成品存于选题 `product_html`，出现在所属成员「成品」页与管理员管理视图；列表与状态接口省略 HTML。预览用 `sandbox allow-scripts`、禁网络、无 `allow-same-origin`；下载作为附件。需要迁移 `0009_products.sql`。
+- 成品与历史游戏统一使用 `/forge/game-player.js` / `.css` 的固定 9:16 播放器，按容器及可用高度等比缩放，支持重载和全屏；关闭窗口移除 iframe，停止脚本与声音。新平台制作要求 540×960 逻辑舞台、桌面等比居中和触摸坐标换算，下载的 HTML 也应保持竖屏，不能只靠预览框掩盖横屏布局。
+- 管理员「内容与任务 → 制作成品」可按成员筛选并直接试玩、下载，材料和指定历史版本使用可视预览，源码折叠。后台 products 独立查询最近 300 份有内容的成品，不被近期无成品选题挤出；沿用管理员与所有权校验，列表不含 HTML。
 - 旧云端制作目标为紧凑可玩的第一版，提示限制 220 行和 15KB（不含已有资产库），预算 32,768 Token，思考与 HTML 共用。Anthropic Opus 传输明确允许超过旧 24k 限制，其他模型和审核预算不变。2026-10-27，生产 Misprint 在 16k 时没有文本；同输入 32,768 在 283 秒完成、HTML 14,634 字符。流式字符反馈最多每 5 秒更新一次，不展示未完成源码。截断必须失败，不自动发起新的付费生成。
 - 第一版保留扩写主题、核心循环、操作、美术与配色；缺失时 `gameBrief` 从简报 F1–F4 提取。完整简报和下载约定保留。界面明确是可玩的第一版，后期 Boss 等留后续迭代。真实长简报 Opus 在 low 下也曾只思考直到上限，不能把短诊断成功说成完整规格制作已验证。
 - Riffle `/v1/models` 声明 Opus 5.5 支持自适应思考和 `output_config.effort` 的 `low`、`medium`、`high`、`xhigh`、`max`。游戏制作在 Anthropic `claude-opus-5-5` 同时发 `thinking: {type: 'adaptive'}` 与 `output_config: {effort: 'low'}`；单发 effort 曾耗尽预算，明确组合后短诊断成功。不能发送不支持的 `thinking: disabled` 或把 Opus 专用字段发给其他模型，不改变其他流程的推理参数。
