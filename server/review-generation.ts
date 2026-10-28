@@ -1,6 +1,6 @@
 import { complete, routedModel } from './forge-llm';
 import { REVIEW_SCHEMA, REVIEW_VERIFICATION } from './forge/prompts.js';
-import { reviewReportErrors } from './review-report';
+import { reviewReportErrors,normalizeReviewOutput } from './review-report';
 
 type Environment = Parameters<typeof complete>[0];
 type Request = Pick<Parameters<typeof complete>[2], 'system' | 'user' | 'maxTokens' | 'idempotencyKey' | 'onWait' | 'onStart' | 'deadline'>;
@@ -27,7 +27,7 @@ export async function generateReviewStage(env: Environment, cfg: Record<string, 
   // stages, so provider prefix caching can reuse it. Verification instructions
   // remain system instructions; untrusted source cannot select the stage.
   const system = `${request.system}\n\n初评阶段没有平台附加的草稿，按原始证据输出初评。仅复核阶段在原始证据之后附上待复核草稿，并适用以下复核规则：\n${REVIEW_VERIFICATION}`;
-  const options = { ...request, system, schema: REVIEW_SCHEMA, validate: reviewReportErrors, purpose, maxTokens, timeoutMs: 300000, deadline, onWait };
+  const options = { ...request, system, schema: REVIEW_SCHEMA, normalize:normalizeReviewOutput, validate: reviewReportErrors, purpose, maxTokens, timeoutMs: 300000, deadline, onWait };
   await onWait('');
   if (purpose === 'review') return complete(env, cfg, options);
   if (!draft) throw new Error('初评结果缺失，不能开始复核。');

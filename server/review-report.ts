@@ -1,4 +1,17 @@
 // Validate the model's report without supplying scores or review conclusions.
+export function normalizeReviewOutput(value:any){
+  // Some JSON-mode responses wrap an otherwise complete report. Removing a
+  // single known envelope preserves every score, reason and suggestion. Never
+  // prefer nested scores over conflicting root fields or invent missing data.
+  if(value&&typeof value==='object'&&!Array.isArray(value)){
+    const keys=Object.keys(value);
+    if(keys.length===1&&['report','result','data','final_report','review'].includes(keys[0])){
+      const report=value[keys[0]];
+      if(!reviewReportErrors(report).length)return report;
+    }
+  }
+  return value;
+}
 export function reviewReportErrors(value: any): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ['report'];
   const errors: string[] = [];

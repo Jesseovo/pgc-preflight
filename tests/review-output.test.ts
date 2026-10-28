@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { complete } from '../server/forge-llm';
 import { encryptKey } from '../server/settings';
-import { reviewReportErrors } from '../server/review-report';
+import { reviewReportErrors,normalizeReviewOutput } from '../server/review-report';
 import { REVIEW_SCHEMA } from '../server/forge/prompts.js';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
@@ -10,11 +10,18 @@ async function setup() {
   const encryptedKey = await encryptKey('fixture-key', 'fixture-secret');
   const env = { SETTINGS_KEY: 'fixture-secret', modelStore: { get: async () => ({ baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', encryptedKey, enabled: true }) } };
   const onWait = vi.fn();
-  return { onWait, run: () => complete(env, {}, { system: 'fixture', user: 'fixture', schema: REVIEW_SCHEMA, validate: reviewReportErrors, purpose: 'review', maxTokens: 8192, idempotencyKey: 'fixture-review', onWait }) };
+  return { onWait, run: () => complete(env, {}, { system: 'fixture', user: 'fixture', schema: REVIEW_SCHEMA, normalize:normalizeReviewOutput,validate: reviewReportErrors, purpose: 'review', maxTokens: 8192, idempotencyKey: 'fixture-review', onWait }) };
 }
 const json = (value: unknown) => Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(value) } }] });
 
 describe('审核输出校验与恢复', () => {
+  it('完整报告的单层包装无损读取，只调用一次模型；不填补缺失字段或忽略冲突分数',async()=>{
+    const {run}=await setup();const value=report(),fetchMock=vi.fn(async()=>json({report:value}));vi.stubGlobal('fetch',fetchMock);
+    await expect(run()).resolves.toEqual(value);expect(fetchMock).toHaveBeenCalledTimes(1);
+    for(const key of ['report','result','data','final_report','review'])expect(normalizeReviewOutput({[key]:value})).toEqual(value);
+    const partial={report:{aes:2}},conflict={aes:1,report:value},metadata={report:value,other:'different'};
+    expect(normalizeReviewOutput(partial)).toBe(partial);expect(normalizeReviewOutput(conflict)).toBe(conflict);expect(normalizeReviewOutput(metadata)).toBe(metadata);
+  });
   it('只无损转换合法数字字符串，不补默认分数，不接受越界或残缺的问题条目', () => {
     const valid = { ...report(), aes: '3', ease: ' 2 ' };
     expect(reviewReportErrors(valid)).toEqual([]);

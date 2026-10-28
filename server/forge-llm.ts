@@ -51,7 +51,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (req.requiredProfile && (!active || active.profile.protocol !== 'anthropic' || !/^claude-opus-5-5$/i.test(active.profile.model))) throw new LLMError('游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。', 409);
@@ -115,9 +115,13 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       try {
         const text = await transport(attemptMessages);
         if (!req.schema) return text;
-        const value = parseJson(text);
+        const parsed = parseJson(text),value=req.normalize?req.normalize(parsed):parsed;
         const errors = req.validate?.(value) || [];
-        if (errors.length) throw new ModelOutputError(`模型评分报告字段不完整或格式错误：${errors.join('、')}。`, 'format');
+        if (errors.length){
+          const known=new Set(['report','result','data','final_report','review','final','scores','aes','ease','play','score_reasons','uncertainties','verdict','reviewer_comment','fix_prompt','strengths','issues','properties','type','required','verification','$schema']);
+          const shape=value&&typeof value==='object'&&!Array.isArray(value)?Object.keys(value).slice(0,12).map(k=>known.has(k)?k:'[其他字段]').join(','):Array.isArray(value)?'array':typeof value;
+          throw new ModelOutputError(`模型评分报告字段不完整或格式错误：${errors.join('、')}。根结构：${shape}`, 'format');
+        }
         return value;
       } catch (error) {
         lastError = error;
