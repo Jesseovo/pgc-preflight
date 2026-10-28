@@ -1,6 +1,20 @@
 // A shared launch gate prevents simultaneous Workers from racing the browser
 // acquisition limit. Sessions still run concurrently up to the account limit.
 type Limits = { activeSessions: unknown[]; maxConcurrentSessions: number; allowedBrowserAcquisitions: number; timeUntilNextAllowedBrowserAcquisition: number };
+export async function connectAcquiredBrowser<T>(acquire:()=>Promise<{sessionId:string}>,connect:(sessionId:string)=>Promise<T>,onWait?:(message:string)=>Promise<void>):Promise<T>{
+  const {sessionId}=await acquire();
+  for(let attempt=0;;attempt++){
+    try{return await connect(sessionId);}
+    catch(error){
+      // An acquisition can succeed before the CDP WebSocket is ready. Retry
+      // only our own newly acquired session; never enumerate/claim a colleague's.
+      if(!/Unable to connect to existing session|not ready yet|reading ['"]accept['"]/i.test(String(error)))throw error;
+      if(attempt>=3)throw new Error('截图浏览器会话暂时无法连接，已尝试原会话重连；本次尚未调用模型，请稍后重试。');
+      await onWait?.('截图浏览器已分配，正在等待连接就绪…');
+      await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));
+    }
+  }
+}
 export async function acquireBrowser<T>(DB:any, limits:()=>Promise<Limits>, launch:()=>Promise<T>, onWait?:(message:string)=>Promise<void>, timeoutMs=240000):Promise<T> {
   const deadline=Date.now()+timeoutMs, lease=crypto.randomUUID();
   let announced=false;

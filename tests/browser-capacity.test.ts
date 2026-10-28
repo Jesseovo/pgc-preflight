@@ -1,7 +1,20 @@
 import {afterEach,expect,it,vi} from 'vitest';
 import {DatabaseSync} from 'node:sqlite';
-import {acquireBrowser} from '../server/browser-capacity';
+import {acquireBrowser,connectAcquiredBrowser} from '../server/browser-capacity';
 afterEach(()=>vi.useRealTimers());
+it('会话已分配但连接未就绪时只重连同一会话，不重新申请或读取其他会话',async()=>{
+  vi.useFakeTimers();
+  const acquire=vi.fn(async()=>({sessionId:'own-session'})),connect=vi.fn().mockRejectedValueOnce(new Error("Unable to connect to existing session own-session: Cannot read properties of null (reading 'accept')")).mockResolvedValue('ready');
+  const task=connectAcquiredBrowser(acquire,connect);await vi.advanceTimersByTimeAsync(1100);
+  expect(await task).toBe('ready');expect(acquire).toHaveBeenCalledTimes(1);expect(connect.mock.calls).toEqual([['own-session'],['own-session']]);
+});
+it('会话连接恢复有界，永久错误直接结束',async()=>{
+  vi.useFakeTimers();const acquire=vi.fn(async()=>({sessionId:'own-session'})),connect=vi.fn().mockRejectedValue(new Error('Unable to connect to existing session own-session'));
+  const task=connectAcquiredBrowser(acquire,connect),rejection=expect(task).rejects.toThrow('尚未调用模型');await vi.advanceTimersByTimeAsync(6100);await rejection;
+  expect(acquire).toHaveBeenCalledTimes(1);expect(connect).toHaveBeenCalledTimes(4);
+  const permanent=vi.fn().mockRejectedValue(new Error('403 forbidden'));
+  await expect(connectAcquiredBrowser(acquire,permanent)).rejects.toThrow('403');expect(permanent).toHaveBeenCalledTimes(1);
+});
 function database(){
   const sqlite=new DatabaseSync(':memory:');
   sqlite.exec('CREATE TABLE browser_launch_gate(id TEXT PRIMARY KEY,lease TEXT,lease_until INTEGER,next_at INTEGER)');
