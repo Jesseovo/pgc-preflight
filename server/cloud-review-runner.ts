@@ -20,7 +20,7 @@ async function save(storage: any, phase: Phase, data: Checkpoint) {
     for (let i = count; i < old; i++) await tx.delete(`cloud:${i}`);
     await tx.put('cloudParts', count);
     await tx.put('cloudPhase', phase);
-    await tx.setAlarm(Date.now() + 100);
+    await tx.setAlarm(Date.now() + 30000);
   });
 }
 async function load(storage: any): Promise<Checkpoint> {
@@ -39,7 +39,10 @@ const clear = async (storage: any) => { await storage.deleteAlarm(); await stora
 // Only administrator/legacy platform cloud work reaches this runner. Member
 // Agent tasks and device captures keep their own protocol and never use a key.
 export async function cloudReviewAlarm(state: any, env: any, id: string) {
-  try { await runCloudReviewAlarm(state,env,id); }
+  // Keep normal stages in one execution: re-entering the alarm scheduler for
+  // every completed stage adds avoidable dispatch latency. Checkpoints + the
+  // recovery alarm remain durable between stages if this invocation stops.
+  try { while(await advanceCloudReview(state,env,id)) { /* continue safely */ } }
   catch {
     // D1/DO persistence can fail even after the model has completed. Keep the
     // exact checkpoint and re-enter it later. Started phases still fail closed
@@ -50,7 +53,7 @@ export async function cloudReviewAlarm(state: any, env: any, id: string) {
     await state.storage.setAlarm(Date.now()+30000);
   }
 }
-async function runCloudReviewAlarm(state: any, env: any, id: string) {
+export async function advanceCloudReview(state: any, env: any, id: string) {
   const DB = env.DB, storage = state.storage;
   const row = await DB.prepare('SELECT * FROM review_jobs WHERE id=?').bind(id).first();
   if (!row || row.executor !== 'cloud' || row.model_executor !== 'platform' || !['queued', 'running'].includes(row.status)) { await clear(storage); return; }
@@ -100,7 +103,7 @@ async function runCloudReviewAlarm(state: any, env: any, id: string) {
       const {images,...request} = await prepareReview(runtime,{...input,...evidence});
       await updateReviewProgress(env,id,'画面采集已完成，准备模型初评。');
       await save(storage,'prepared',{deadline,config,request,images,probe:evidence.probe,title:input.title,topic_id:input.topic_id||null});
-      return;
+      return true;
     }
     const data = await load(storage);
     if (Date.now() >= data.deadline) throw new Error('审核处理时限已到，未发布评分，请重试。');
@@ -119,10 +122,12 @@ async function runCloudReviewAlarm(state: any, env: any, id: string) {
       await storage.put('cloudPhase','review-started');
       data.draft=await generateReviewStage(runtime,{},request,'review');
       await save(storage,'draft-ready',data);
+      return true;
     } else if (phase === 'draft-ready') {
       await storage.put('cloudPhase','verify-started');
       data.result=await generateReviewStage(runtime,{},request,'review_verify',data.draft);
       await save(storage,'final-ready',data);
+      return true;
     } else throw new Error('审核阶段不正确，未发布评分。');
   } catch (error) {
     await failDeviceReview(DB,id,(error as Error).message||'审核未完成，请重试。');

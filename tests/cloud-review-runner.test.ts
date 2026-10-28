@@ -1,7 +1,7 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,readdirSync} from 'node:fs';
-import {cloudReviewAlarm} from '../server/cloud-review-runner';
+import {cloudReviewAlarm,advanceCloudReview} from '../server/cloud-review-runner';
 import {enqueueReview} from '../server/review-jobs';
 import {complete} from '../server/forge-llm';
 vi.mock('../server/forge-llm',async original=>({...await original<typeof import('../server/forge-llm')>(),complete:vi.fn()}));
@@ -20,11 +20,16 @@ function setup(){
   const draft={aes:2,ease:2,play:2,verdict:'打回',score_reasons:{aes:'图像证据',ease:'运行记录',play:'源码推断'},uncertainties:['长期节奏'],issues:[],strengths:[],reviewer_comment:'初稿',fix_prompt:'验证后再修改'};
   const final={...draft,play:3,verdict:'通过',reviewer_comment:'复核完成'};
   vi.mocked(complete).mockImplementation(async(_env,_cfg,req)=>{await req.onStart?.();await req.onWait?.('正在思考');return req.purpose==='review'?structuredClone(draft):structuredClone(final);});
-  const tick=async()=>{alarm=null;await cloudReviewAlarm({storage},env,input.request_id);};
+  const tick=async()=>{alarm=null;await advanceCloudReview({storage},env,input.request_id);};
+  const runAlarm=async()=>{alarm=null;await cloudReviewAlarm({storage},env,input.request_id);};
   const row=()=>sqlite.prepare('SELECT * FROM review_jobs WHERE id=?').get(input.request_id) as any;
-  return{sqlite,DB,env,storage,values,input,tick,row,draft,final,evidence};
+  return{sqlite,DB,env,storage,values,input,tick,runAlarm,row,draft,final,evidence};
 }
 describe('云端审核阶段检查点',()=>{
+  it('正常任务在单次alarm连续完成，阶段间不用再排队；故障仍能从检查点恢复',async()=>{
+    const s=setup();await enqueueReview(s.env,s.input,'admin');await s.runAlarm();
+    expect(s.row()).toMatchObject({status:'done',stage:'done'});expect(complete).toHaveBeenCalledTimes(2);expect(s.env.captureReview).toHaveBeenCalledTimes(1);expect(s.values.size).toBe(0);
+  });
   it('四图采集、初评、复核与保存独立恢复；两轮保持同模型、同材料、24k预算',async()=>{
     const s=setup();await enqueueReview(s.env,s.input,'admin');
     await s.tick();expect(await s.storage.get('cloudPhase')).toBe('prepared');expect(complete).not.toHaveBeenCalled();
@@ -46,7 +51,7 @@ describe('云端审核阶段检查点',()=>{
   it('终稿已完成后数据库临时故障只重试保存，绝不重新调用模型',async()=>{
     const s=setup();await enqueueReview(s.env,s.input,'admin');for(let i=0;i<3;i++)await s.tick();
     s.DB.batch.mockRejectedValueOnce(new Error('D1 temporary failure'));
-    await s.tick();expect(await s.storage.get('cloudPhase')).toBe('final-ready');expect(await s.storage.getAlarm()).toBeGreaterThan(Date.now());
+    await s.runAlarm();expect(await s.storage.get('cloudPhase')).toBe('final-ready');expect(await s.storage.getAlarm()).toBeGreaterThan(Date.now());
     await s.tick();expect(s.row().status).toBe('done');expect(complete).toHaveBeenCalledTimes(2);
   });
   it('初评或复核状态未知时明确失败，不重放请求、不发布未复核报告',async()=>{
