@@ -32,11 +32,11 @@
 - `npm run dev`：本地网站与浏览器检查接口，需要 Chrome/Edge，可用 `PGC_CHROME_PATH` 指定。
 - `npm run build`：类型检查、打包按需审核客户端、生产构建。`public/agent.md` 和 `/forge-agent.md` 分别从 docs 下对应接入文档生成；两个 `public/agent/*.mjs` 分别从 `scripts/review-agent.ts` / `forge-agent.ts` 生成，不能直接改生成文件。
 - `npm test`：验证、网络策略、权限、报告等回归测试。`npm run test:runtime` 为真实浏览器配合合成游戏与脚本模型响应，不能证明真实模型准确率。
-- `npm run deploy`：发布 Cloudflare Worker 静态资源、Browser Rendering 和 D1 配置；域名在 `wrangler.jsonc`。先应用 D1 迁移并配置 `ADMIN_PASSWORD` / `SETTINGS_KEY`。不得开通付费套餐。
+- `npm run deploy`：发布 Cloudflare Worker 静态资源、Browser Rendering 和 D1 配置；域名在 `wrangler.jsonc`。先应用 D1 迁移并配置 `ADMIN_PASSWORD` / `SETTINGS_KEY`。用户已于 2026-10-28 自行开通 Workers Paid；不得据此额外开通其他付费订阅或承诺账单封顶。
 
 ## 后台创作
 
-- 成员扩写、简报、样板图、资产、制作、补词建议和标签使用 `forge_tasks` 的 executor=agent 持久记录，仅由 Agent 领取回传。旧平台任务 executor=platform 才使用每任务独立 Free SQLite ForgeRunner DO alarm。调度、恢复和执行入口都排除 Agent，不能套用云端 14 分钟超时。需迁移 `0016_forge_tasks.sql` 和 DO `v2-forge-runner`。活动 scope 唯一，重复提交返回原任务；调度响应丢失只能恢复同编号。旧 `pgc-forge-jobs` 消息按消息 ID 确定任务 ID，只调度 alarm，不在普通 Free Queue 执行模型或重放已完成任务。
+- 成员扩写、简报、样板图、资产、制作、补词建议和标签使用 `forge_tasks` 的 executor=agent 持久记录，仅由 Agent 领取回传。旧平台任务 executor=platform 才使用每任务独立 SQLite ForgeRunner DO alarm。调度、恢复和执行入口都排除 Agent，不能套用云端 14 分钟超时。需迁移 `0016_forge_tasks.sql` 和 DO `v2-forge-runner`。活动 scope 唯一，重复提交返回原任务；调度响应丢失只能恢复同编号。旧 `pgc-forge-jobs` 消息按消息 ID 确定任务 ID，只调度 alarm，不在普通 Free Queue 执行模型或重放已完成任务。
 - 旧平台制作兼容逻辑使用 Opus；新成员制作一律由本地 Agent 完成。任务原子领取 `queued` → `running`，维持心跳，模型总期限 12 分钟、14 分钟中断看门狗。未知中断明确失败，不自动重放付费调用。不要隐式先生成长简报；生产选题 31 曾因此耗尽 Token。失败需用户明确重试并生成新编号，刷新只读取持久状态；排队超过 24 小时明确失败。
 - 成品存于选题 `product_html`，出现在所属成员「成品」页与管理员管理视图；列表与状态接口省略 HTML。预览用 `sandbox allow-scripts`、禁网络、无 `allow-same-origin`；下载作为附件。需要迁移 `0009_products.sql`。
 - 旧云端制作目标为紧凑可玩的第一版，提示限制 220 行和 15KB（不含已有资产库），预算 32,768 Token，思考与 HTML 共用。Anthropic Opus 传输明确允许超过旧 24k 限制，其他模型和审核预算不变。2026-10-27，生产 Misprint 在 16k 时没有文本；同输入 32,768 在 283 秒完成、HTML 14,634 字符。流式字符反馈最多每 5 秒更新一次，不展示未完成源码。截断必须失败，不自动发起新的付费生成。
@@ -83,7 +83,7 @@
 - 以下次数仅针对平台模型调用，本地 Agent 模型审核不扣次数且不受此限额。每成员原平台配置默认每天 50 次，`/admin` 可调 0–10000，北京零点重置；每游戏初评与复核合计一次。原子 SQLite `INSERT/SELECT` 校验额度并使用唯一请求编号，重复不能重复扣次。模型启动前失败退款，启动后仍计次。0 禁止新任务但不影响运行中任务；管理员无成员日限额。
 - 仅管理员 `/api/admin/review-activity` 支持北京日期/成员筛选、汇总、分页、游戏文件名、阶段、错误、评分、报告。成员可从本人视图移除已结束任务和报告，原始记录及额度仍由管理员保留；运行中的任务不可移除。禁止通过旧 `/api/check`、`/review/probe` 或同步 `/review` 绕过。
 - 平台模型兼容路径每人最多 50 个排队/运行任务；本地模型不套用此并发上限。审核工具每批最多 20 个。本地审核依赖智能助手完成全流程；旧平台任务证据上传后云端独立继续。两阶段不改证据、校准、思考或 24k 预算。模型在 15 分钟 DO alarm 内最多 12 分钟，看门狗不能静默重放未知付费调用。
-- 旧 Worker `5f3aa78f-55c2-4c40-bda3-52c821561bf8`，提交 `fc1828b599fe37cf973dba2be922548daabfcf86`，普通 Queue 已观测 CPU 50/98/242ms 超免费预算；付费 CPU 配置被 100328 拒绝。未授权或启用付费；Workflows Free 也有同类短 CPU 限制。
+- 旧 Worker `5f3aa78f-55c2-4c40-bda3-52c821561bf8`，提交 `fc1828b599fe37cf973dba2be922548daabfcf86`，普通 Queue 已观测 CPU 50/98/242ms 超免费预算；付费 CPU 配置被 100328 拒绝。截至 2026-10-27 未授权或启用付费；Workflows Free 也有同类短 CPU 限制。
 - 免费 SQLite DO 迁移已上线：提交 `5e22da4`、Worker `c2f86114-6b50-4335-a733-be732d5c9281`，迁移 `0014_review_capacity.sql`、`0015_local_review_worker.sql` 已应用。之前同账号 Free DO 的五个合成并发 CPU 174–283ms 只说明运行时可用，不是实测真实审核并发上限。
 - 生产验收使用真实临时成员、公开工具、官方 `deepseek-flash`：两款合成可玩 HTML，各四张完整 Chromium 视口图，两轮初评/复核共四次调用全部成功，两报告、2/50 额度、管理员记录和重复请求不重复扣次均通过，临时材料和账号已清理。脱敏证据为 `artifacts/agent-live-evidence.json`。
 - 生产 tail 109 事件均 `ok`；两次审核 alarm CPU 2028/997ms、耗时 56582/49878ms，无 CPU 异常，脱敏证据为 `artifacts/agent-live-runtime-evidence.json`。仅实测两任务重叠；50 是接纳上限，不能宣称实测 50 并发或无限并发。
@@ -91,3 +91,9 @@
 - 验证脚本：`scripts/verify-agent.ts` 使用实际 bundle、DPAPI、两款本机游戏、四张/款真实浏览器截图、本地初评与复核报告、清理、幂等及零平台模型调用/扣次；`scripts/verify-review.ts` 验证多文件/全页拖放、并行提交、重试、报告和移动端；`scripts/verify-review-capacity.ts` 验证额度与记录；`scripts/verify-review-evidence.ts` 验证 DOM/多 Canvas/可信触摸/网络隔离；`scripts/verify-model-routing.ts` 验证两组模型与 Key 配置；`scripts/verify-products.ts` 验证制作幂等/刷新/重试/沙箱/下载；`scripts/verify-progress.ts` 验证等待反馈和恢复。合成响应不证明真实模型准确率。本次新增迁移 `0017_star_agent_workspaces.sql` 包含 star、owner、版本、全站题材占用、补词建议和审核执行来源；`0018_review_material_snapshot.sql` 保存本地审核首次材料的规则/校准快照，初评与复核共用，终止后清理。最新发布的变更需相称回归与线上验证，不能只凭本地测试判上线成功。
 - 文档与权限隔离修复 `13a8af9` 已部署为 Worker `39699ca1-db45-4679-bf9a-8e9241e8242b`：真实浏览器确认说明为 UTF-8；成员只加载审核模块，管理脚本/接口拒绝成员与设备访问，跨成员任务操作拒绝；管理员真实登录与内嵌工作台正常。验证未发模型调用，临时成员和任务已清理；脱敏证据为 `artifacts/agent-scope-live-evidence.json`。
 - 限制来源：https://developers.cloudflare.com/durable-objects/platform/limits/ 、https://developers.cloudflare.com/durable-objects/platform/pricing/ 、https://developers.cloudflare.com/browser-run/limits/ 。合成探针脱敏证据为 ignored 的 `artifacts/free-review-capacity-evidence.json`。
+
+## Workers Paid（2026-10-28）
+
+- 用户已自行完成 Workers Paid 购买，控制台确认订阅激活，基础费用为 5 美元/月，超出包含额度另计；账号 `071443b43c7562efec975a5e964d5a9c`。额度由该账号全部项目共享，DeepSeek / Riffle 模型费用独立计算。
+- `wrangler.jsonc` 明确设置 `limits.cpu_ms: 30000`，保持付费套餐默认的单次活跃 CPU 上限，不提高到 300000；模型等待与 CPU 时间分别计量。升级不改变成员 Agent 自行审核和创作的执行方式，也不恢复成员平台模型调用。管理员及历史平台兼容长任务继续使用原 SQLite DO / Queue 路径，保留已有模型期限、看门狗和请求幂等。
+- 付费 DO 每月含 400000 GB-s，等待模型的活跃任务也可能计入运行时长。单次 CPU 上限、成员次数和预算告警都不是账号账单硬封顶；目前没有全团队月任务额度或自动费用熔断。不能宣称每月绝不超过 5 美元。参考：https://developers.cloudflare.com/billing/manage/budget-alerts/ 、https://developers.cloudflare.com/durable-objects/platform/pricing/ 。
