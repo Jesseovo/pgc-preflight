@@ -1,65 +1,247 @@
 import assert from 'node:assert/strict';
-import {createServer} from 'node:http';
-import {readFile,mkdir} from 'node:fs/promises';
-import {resolve,sep} from 'node:path';
-import {launchLocalBrowser} from '../server/local-browser';
+import { createServer } from 'node:http';
+import { mkdir, readFile } from 'node:fs/promises';
+import { resolve, sep } from 'node:path';
+import { launchLocalBrowser } from '../server/local-browser';
 
-const game=(v:number)=>`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="background:#eff4e9"><button id="play" onclick="this.textContent='Played ${v}'">Game ${v}</button><script>window.version=${v}</script></body></html>`;
-const asset='<!doctype html><html><body style="background:#f8ead9"><h1>Paper Garden</h1><canvas id="asset"></canvas></body></html>';
-const svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="30" fill="#789575"/></svg>';
-const brief='# 通用模板\n## A. 固定要求\n平台通用规则\n\n## F. 本款游戏设计\n### F1. 一句话\n**纸间花园**：收集随风飘落的花瓣。';
-const topic:any={id:1,status:'made',subject:'纸间花园',medium:'剪纸',gesture:'拖动',structure:'收集',mood:'安静',data:{title:'Paper Garden',logline:'Catch petals in a tiny paper world.',core_loop:'Catch falling petals',controls:'Drag to move',twist:'Collect petals without touching dark seeds',palette:['#eef1df','#789575','#d5ac71']},score:8,note:'',has_preview:1,has_brief:1,has_assets:1,has_product:1,brief_md:brief,assets_html:asset,preview_svg:svg,brief_status:'',assets_status:'',product_status:'',updated_at:'2026-10-28T04:00:00Z'};
-let html=game(1),sequence=0,notesSaved=false,restores=0;
-const posts:any[]=[],jobs:any[]=[],versions:any[]=[{id:'game-1',kind:'game',content:html,current:true,disposition:'current'},{id:'brief-1',kind:'brief',content:brief,current:true,disposition:'current'},{id:'asset-1',kind:'assets',content:asset,current:true,disposition:'current'}];
-function finish(kind:string){const j=jobs.slice().reverse().find(j=>j.kind===kind)!;assert(j);const v={id:kind+'-'+j.id,kind,content:kind==='game'?game(2):kind==='brief'?brief.replace('纸间花园','全新花园')+'\n### F2. 新美术\n透明纸片与金色花蕊。':svg,current:true,disposition:'current'};versions.filter(v=>v.kind===kind).forEach(v=>{v.current=false;v.disposition='historical';});versions.unshift(v);j.status='done';j.result={id:1,version_id:v.id,disposition:'current'};if(kind==='game'){html=v.content;topic.product_status='';}else if(kind==='brief'){topic.brief_md=v.content;topic.brief_status='';}else topic.preview_svg=v.content;}
-const server=createServer(async(req,res)=>{
-  const url=new URL(req.url!,'http://localhost'),parts=url.pathname.split('/');
-  const json=(v:any,status=200)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(v));};
-  const preview=(content:string)=>{res.writeHead(200,{'Content-Type':'text/html','Content-Security-Policy':"sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'"});res.end(content);};
-  try{
-    if(url.pathname==='/api/auth/me')return json({id:'fixture-star',role:'member',star:true,canReview:true,displayName:'交互验证'});
-    if(url.pathname==='/api/forge/state')return json({games:1,vocab:5});
-    if(url.pathname==='/api/forge/settings')return json({draw_size:2});
-    if(url.pathname==='/api/forge/vocab')return json([]);
-    if(url.pathname==='/api/forge/topics'||url.pathname==='/api/forge/products')return json([topic]);
-    if(url.pathname==='/api/forge/generation-jobs')return json(jobs.slice().reverse());
-    if(url.pathname.startsWith('/api/forge/generation-jobs/'))return json(jobs.find(j=>j.id===parts[4]));
-    if(url.pathname==='/api/forge/topics/1'){
-      if(req.method==='PATCH'){let text='';for await(const c of req)text+=c;await new Promise(r=>setTimeout(r,250));topic.note=JSON.parse(text).note;notesSaved=true;}
-      return json(topic);
+const game = (version: number) => `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;background:#eff4e9}button{width:100%;height:50vh}</style></head><body><button id="play" onclick="this.textContent='Played ${version}'">Game ${version}</button><script>window.version=${version}</script></body></html>`;
+const asset = '<!doctype html><html><body style="background:#f8ead9"><h1 id="asset">Paper Garden assets</h1></body></html>';
+const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="30" fill="#789575"/></svg>';
+const brief = '# 通用模板\n## A. 固定要求\n平台通用规则\n\n## F. 本款游戏设计\n### F1. 一句话\n**纸间花园**：收集随风飘落的花瓣。';
+
+function makeTopic(id: number, hasProduct: boolean) {
+  return {
+    id, status: 'made', subject: '纸间花园', medium: '剪纸', gesture: '拖动', structure: '收集', mood: '安静',
+    data: { title: id === 1 ? 'Paper Garden' : 'Paper Garden Two', logline: 'Catch petals in a tiny paper world.', core_loop: 'Catch falling petals', controls: 'Drag to move', twist: 'Collect petals without touching dark seeds', palette: ['#eef1df', '#789575', '#d5ac71'] },
+    score: 8, note: '', has_preview: 1, has_brief: 1, has_assets: 1, has_product: Number(hasProduct),
+    brief_md: brief, assets_html: asset, preview_svg: svg, brief_status: '', assets_status: '', product_status: '',
+    updated_at: '2026-10-28T04:00:00Z',
+  } as any;
+}
+
+const topics = new Map([[1, makeTopic(1, true)], [2, makeTopic(2, false)]]);
+const products = new Map([[1, game(1)]]);
+const posts: Array<{ kind: string; id: number; regenerate: string | null }> = [];
+const jobs: any[] = [];
+const versions = new Map<number, any[]>([[1, [
+  { id: 'game-1', kind: 'game', content: game(1), current: false, disposition: 'historical' },
+  { id: 'brief-1', kind: 'brief', content: brief, current: true, disposition: 'current' },
+  { id: 'asset-1', kind: 'assets', content: asset, current: true, disposition: 'current' },
+]], [2, []]]);
+let sequence = 0;
+let restored = 0;
+let delayNextTopicRead = 0;
+
+function finish(kind: string, topicId: number, outcome: 'done' | 'error' = 'done') {
+  const job = [...jobs].reverse().find(item => item.kind === kind && item.topicId === topicId);
+  assert(job, `Expected a ${kind} task for topic ${topicId}`);
+  if (outcome === 'error') {
+    job.status = 'error'; job.error = '合成失败：测试旧成品保留';
+    if (kind === 'game') { topics.get(topicId)!.product_status = 'error'; topics.get(topicId)!.product_error = job.error; }
+    return;
+  }
+  const content = kind === 'game' ? game(2) : kind === 'brief' ? brief.replace('纸间花园', '全新花园') + '\n### F2. 新美术\n透明纸片与金色花蕊。' : svg;
+  const kindVersions = versions.get(topicId)!;
+  kindVersions.filter(item => item.kind === kind).forEach(item => { item.current = false; item.disposition = 'historical'; });
+  const version = { id: `${kind}-${job.id}`, kind, content, current: true, disposition: 'current' };
+  kindVersions.unshift(version);
+  job.status = 'done'; job.result = { id: topicId, version_id: version.id, disposition: 'current' };
+  const topic = topics.get(topicId)!;
+  if (kind === 'game') { products.set(topicId, content); topic.has_product = 1; topic.product_status = ''; }
+  if (kind === 'brief') { topic.brief_md = content; topic.brief_status = ''; }
+  if (kind === 'preview') { topic.preview_svg = content; topic.preview_status = ''; }
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url!, 'http://localhost');
+  const parts = url.pathname.split('/');
+  const json = (value: unknown, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
+  const preview = (content: string) => { res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Security-Policy': "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'" }); res.end(content); };
+  try {
+    if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+    if (url.pathname === '/api/auth/me') return json({ id: 'fixture-star', role: 'member', star: true, canReview: true, displayName: '交互验证' });
+    if (url.pathname === '/api/forge/state') return json({ games: 2, vocab: 5 });
+    if (url.pathname === '/api/forge/settings') return json({ draw_size: 2 });
+    if (url.pathname === '/api/forge/vocab') return json([]);
+    if (url.pathname === '/api/forge/topics' || url.pathname === '/api/forge/products') return json([...topics.values()]);
+    if (url.pathname === '/api/forge/generation-jobs') return json([...jobs].reverse().map(({ topicId: _topicId, ...job }) => job));
+    if (url.pathname.startsWith('/api/forge/generation-jobs/')) return json(jobs.find(job => job.id === parts[4]));
+
+    const topicMatch = url.pathname.match(/^\/api\/forge\/topics\/(\d+)(?:\/(.*))?$/);
+    if (topicMatch) {
+      const id = Number(topicMatch[1]), tail = topicMatch[2] || '', topic = topics.get(id);
+      if (!topic) return json({ error: 'missing topic' }, 404);
+      if (tail === '' && req.method === 'PATCH') {
+        let body = ''; for await (const chunk of req) body += chunk;
+        topic.note = JSON.parse(body).note; await new Promise(resolve => setTimeout(resolve, 30)); return json(topic);
+      }
+      if (tail === '') {
+        if (delayNextTopicRead) { const delay = delayNextTopicRead; delayNextTopicRead = 0; await new Promise(resolve => setTimeout(resolve, delay)); }
+        return json(topic);
+      }
+      if (tail === 'versions' && req.method === 'GET') return json((versions.get(id) || []).map(({ content: _content, ...version }) => version));
+      const versionMatch = tail.match(/^versions\/([^/]+)(?:\/(preview))?$/);
+      if (versionMatch) {
+        const version = (versions.get(id) || []).find(item => item.id === versionMatch[1]);
+        if (!version) return json({ error: 'missing version' }, 404);
+        return versionMatch[2] ? preview(version.content) : json(version);
+      }
+      if (tail === 'restore' && req.method === 'POST') {
+        let body = ''; for await (const chunk of req) body += chunk;
+        const version = (versions.get(id) || []).find(item => item.id === JSON.parse(body).version_id);
+        assert(version); products.set(id, version.content); topic.has_product = 1; restored++;
+        return json({ ok: true });
+      }
+      if (tail === 'product') return json({ html: products.get(id) || '' });
+      if (tail === 'product-preview') return preview(products.get(id) || '');
+      if (tail === 'assets-preview') return preview(topic.assets_html);
+      if (tail === 'game' && req.method === 'GET') return json({ has_product: topic.has_product, product_status: topic.product_status, product_error: topic.product_error });
+      const kind = tail.match(/^(game|brief|preview|assets)$/)?.[1];
+      if (kind && req.method === 'POST') {
+        const regenerate = url.searchParams.get('regenerate');
+        if (topic.has_product && kind === 'game') assert.equal(regenerate, '1', 'Regenerating an existing game must create a new version');
+        posts.push({ kind, id, regenerate });
+        const idForJob = `job-${++sequence}`;
+        const job = { id: idForJob, topicId: id, kind, status: 'running', detail: '模型正在生成新版本…', scope: `fixture:${kind === 'game' ? 'game' : kind}: ${id}`, created_at: new Date().toISOString() };
+        // Match the production scope suffix expected by the UI.
+        job.scope = `fixture:${kind}:${id}`;
+        jobs.push(job);
+        if (kind === 'game') topic.product_status = 'running';
+        if (kind === 'brief') topic.brief_status = 'running';
+        if (kind === 'preview') topic.preview_status = 'running';
+        if (kind === 'assets') topic.assets_status = 'running';
+        return json({ pending: true, jobId: idForJob });
+      }
     }
-    if(url.pathname==='/api/forge/topics/1/versions')return json(versions.map(({content,...v})=>v));
-    if(url.pathname.startsWith('/api/forge/topics/1/versions/')){const v=versions.find(v=>v.id===parts[6]);assert(v);return parts[7]==='preview'?preview(v.content):json(v);}
-    if(url.pathname==='/api/forge/topics/1/restore'){let text='';for await(const c of req)text+=c;const v=versions.find(v=>v.id===JSON.parse(text).version_id);assert(v);html=v.content;restores++;return json({ok:true});}
-    if(url.pathname==='/api/forge/topics/1/product')return json({html});
-    if(url.pathname==='/api/forge/topics/1/product-preview')return preview(html);
-    if(url.pathname==='/api/forge/topics/1/assets-preview')return preview(asset);
-    if(url.pathname==='/api/forge/topics/1/game'&&req.method==='GET')return json({has_product:true,product_status:topic.product_status});
-    if(/^\/api\/forge\/topics\/1\/(game|brief|preview)$/.test(url.pathname)&&req.method==='POST'){
-      const kind=parts[5],regenerate=url.searchParams.get('regenerate');assert.equal(regenerate,'1','Existing artifacts must explicitly request a new version');
-      if(kind==='game')assert(notesSaved,'Generation must wait for the pending note save');
-      posts.push({kind,regenerate,note:topic.note});const id='job-'+(++sequence),job={id,kind,status:'running',detail:'模型正在生成新版本…',scope:`fixture:${kind==='game'?'game':kind}:1`,created_at:new Date().toISOString()};jobs.push(job);if(kind==='game')topic.product_status='running';else if(kind==='brief')topic.brief_status='running';return json({pending:true,jobId:id});
-    }
-    const root=resolve('public'),file=resolve(root,'.'+(url.pathname==='/test'?'/forge/index.html':url.pathname));if(!file.startsWith(root+sep))throw new Error('path');const bytes=await readFile(file);res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':file.endsWith('.html')?'text/html':'image/png');res.end(bytes);
-  }catch(error){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:(error as Error).message}));}
+
+    const publicRoot = resolve('public');
+    const file = resolve(publicRoot, '.' + (url.pathname === '/test' ? '/forge/index.html' : url.pathname));
+    if (!file.startsWith(publicRoot + sep)) throw new Error('path');
+    const bytes = await readFile(file);
+    res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.html') ? 'text/html' : file.endsWith('.png') ? 'image/png' : 'application/octet-stream');
+    res.end(bytes);
+  } catch (error) {
+    res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: (error as Error).message }));
+  }
 });
-await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${(server.address() as any).port}`;
-const browser=await launchLocalBrowser();await mkdir('artifacts',{recursive:true});
-try{
-  const page=await browser.newPage(),errors:string[]=[];page.on('pageerror',e=>errors.push(String(e)));await page.setViewport({width:1360,height:980});
-  await page.goto(origin+'/test');await page.waitForSelector('#drawBtn');await page.click('[data-tab=picks]');await page.waitForSelector('.creation-card');
-  assert.equal(await page.$$eval('.creation-main-actions .primary',els=>els.length),1);assert.equal(await page.$$eval('.creation-materials .material-link',els=>els.length),3);
-  await page.screenshot({path:'artifacts/creation-cards-desktop.png',fullPage:true});
-  await page.click('[data-act=brief]');await page.waitForSelector('.brief-document');assert.match(await page.$eval('.brief-document',el=>el.textContent!),/纸间花园/);assert.equal(await page.$('#modalBody > pre'),null);assert.equal(await page.$eval('.brief-contract',el=>(el as HTMLDetailsElement).open),false);
-  await page.screenshot({path:'artifacts/creation-brief-readable.png',fullPage:true});await page.click('#regenBrief');await page.waitForSelector('#briefProgress');assert.equal(posts.length,1);await page.click('#modalClose');await page.click('[data-act=brief]');assert.equal(posts.length,1);finish('brief');await page.waitForFunction('document.querySelector(".brief-document")?.textContent.includes("全新花园")');
-  await page.click('#modalClose');await page.click('[data-act=preview]');await page.waitForSelector('#regenSvg');assert((await page.$eval('#modalBody img',el=>el.getAttribute('src')))?.startsWith('data:image/svg+xml'));await page.click('#regenSvg');await page.waitForSelector('#previewProgress');finish('preview');await page.waitForSelector('#regenSvg');assert.equal(posts.filter(p=>p.kind==='preview').length,1);
-  await page.click('#modalClose');await page.click('[data-act=assets]');await page.waitForSelector('.assets-frame');const assets=await (await page.$('.assets-frame'))!.contentFrame();await assets!.waitForSelector('#asset');assert.equal(await assets!.evaluate('typeof parent.document').catch(()=> 'blocked'),'blocked');
-  await page.click('#modalClose');await page.click('[data-act=versions]');await page.waitForSelector('[data-version=game-1]');await page.click('[data-version=game-1]');await page.waitForSelector('iframe.product-frame');const historic=await (await page.$('iframe.product-frame'))!.contentFrame();await historic!.waitForSelector('#play');await historic!.click('#play');assert.equal(await historic!.$eval('#play',el=>el.textContent),'Played 1');assert.equal(await page.$('#modalBody pre'),null);await page.screenshot({path:'artifacts/creation-history-playable.png',fullPage:true});assert.equal(posts.filter(p=>p.kind==='game').length,0);
-  await page.click('#modalClose');await page.click('.creation-note input');await page.type('.creation-note input','增加花瓣的飘动反馈');await page.click('.creation-more summary');await page.click('[data-act=regenerateGame]');await page.waitForSelector('#productProgress');await page.waitForFunction('document.querySelector("#productProgress").textContent.includes("新版本")');assert.equal(posts.filter(p=>p.kind==='game').length,1);assert.equal(posts.at(-1).note,'增加花瓣的飘动反馈');
-  await page.click('#modalClose');await page.click('[data-act=viewProduct]');await page.waitForSelector('#regenerateProduct:disabled');const old=await (await page.$('iframe.product-frame'))!.contentFrame();await old!.waitForSelector('#play');assert.equal(await old!.$eval('#play',el=>el.textContent),'Game 1');
-  await page.click('#modalClose');await page.reload();await page.waitForSelector('#drawBtn');await page.click('[data-tab=products]');await page.waitForSelector('[data-act=viewProduct]');await page.waitForSelector('[data-task-key=product-1]');assert.equal(posts.filter(p=>p.kind==='game').length,1);finish('game');await page.waitForSelector('[data-task-key=product-1][data-task-state=done]');assert.equal(await page.$eval('#modal',el=>(el as HTMLElement).hidden),true);
-  await page.click('[data-act=viewProduct]');const fresh=await (await page.waitForSelector('iframe.product-frame'))!.contentFrame();await fresh!.waitForSelector('#play');assert.equal(await fresh!.$eval('#play',el=>el.textContent),'Game 2');await page.click('#modalClose');
-  await page.click('[data-act=versions]');await page.waitForSelector('[data-version=game-1]');await page.click('[data-version=game-1]');await page.waitForSelector('#restoreVersion:not(:disabled)');await page.click('#restoreVersion');await page.waitForFunction('document.querySelector("#modal").hidden');assert.equal(restores,1);assert.equal(posts.filter(p=>p.kind==='game').length,1,'Restoring never calls a model');
-  await page.setViewport({width:390,height:844,isMobile:true,hasTouch:true});await page.waitForSelector('#drawBtn');await page.click('[data-tab=picks]');await page.waitForSelector('.creation-card');assert(await page.evaluate('document.documentElement.scrollWidth<=innerWidth+1'));await page.screenshot({path:'artifacts/creation-cards-mobile.png',fullPage:true});assert.deepEqual(errors,[]);
-  console.log('PASS 卡片主次操作、材料真实预览、简报正文、三种重新生成、制作要求先保存、旧成品保留、刷新去重、历史试玩和恢复、手机布局。');
-}finally{await browser.close();await new Promise<void>(r=>server.close(()=>r()));}
+
+await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+const origin = `http://127.0.0.1:${(server.address() as any).port}`;
+const browser = await launchLocalBrowser();
+await mkdir('artifacts', { recursive: true });
+
+async function waitForPost(kind: string, id: number) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (posts.some(post => post.kind === kind && post.id === id)) return;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.fail(`No ${kind} request was sent for topic ${id}`);
+}
+
+async function checkPlayer(page: any, selector: string, expected: string) {
+  const iframe = await page.waitForSelector(selector, { visible: true });
+  const box = await iframe.boundingBox(); assert(box);
+  assert(Math.abs(box.width / box.height - 9 / 16) < 0.003, 'Game player must retain its 9:16 ratio');
+  const frame = await iframe.contentFrame(); assert(frame);
+  await frame.waitForSelector('#play'); await frame.click('#play');
+  assert.equal(await frame.$eval('#play', (element: any) => element.textContent), `Played ${expected}`);
+  assert.equal(await frame.evaluate('typeof parent.document').catch(() => 'blocked'), 'blocked', 'Game must stay origin-isolated');
+  assert.equal(await iframe.evaluate((element: any) => element.getAttribute('sandbox')), 'allow-scripts');
+  return iframe;
+}
+
+try {
+  const page = await browser.newPage(), errors: string[] = [];
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('response', response => { if (response.status() >= 500) errors.push(`HTTP ${response.status()} ${new URL(response.url()).pathname}`); });
+  await page.setViewport({ width: 1360, height: 980 });
+  await page.goto(origin + '/test'); await page.waitForSelector('#drawBtn');
+  await page.click('[data-tab=picks]'); await page.waitForSelector('.creation-card');
+  assert.equal(await page.$$eval('.creation-card', cards => cards.length), 2);
+  assert.equal(await page.$$eval('.creation-main-actions .primary', buttons => buttons.length), 2);
+  assert.equal(await page.$$eval('.creation-materials .material-link', buttons => buttons.length), 6);
+  assert.equal(await page.$$eval('.creation-note-fold:not([open])', notes => notes.length), 2, 'Optional production notes should stay collapsed until requested');
+  await page.screenshot({ path: 'artifacts/creation-cards-desktop.png', fullPage: true });
+
+  // Reading a material should expand inside its card, without a blocking dialog.
+  const firstCard = '[data-id="1"]';
+  await page.click(`${firstCard} [data-act=brief]`); await page.waitForSelector(`${firstCard} .brief-document`);
+  assert.match(await page.$eval(`${firstCard} .brief-document`, (element: any) => element.textContent), /纸间花园/);
+  assert.equal(await page.$eval('#modal', (element: any) => element.hidden), true, 'Viewing material must not open a modal');
+  assert.equal(await page.$eval(`${firstCard} .brief-contract`, (element: any) => element.open), false);
+  await page.screenshot({ path: 'artifacts/creation-brief-readable.png', fullPage: true });
+
+  // Starting another version shows progress in the owning card and creates one job.
+  await page.click(`${firstCard} [data-viewer-act=regenerate]`); await waitForPost('brief', 1);
+  assert.equal(posts.filter(post => post.kind === 'brief' && post.id === 1).length, 1);
+  assert.equal(await page.$eval('#modal', (element: any) => element.hidden), true);
+  assert(await page.$(`${firstCard} .creation-job-progress`), 'Progress should remain beside the card being changed');
+  assert.equal(await page.evaluate(() => { const tray = document.querySelector('.pgc-task-tray'); return !tray || getComputedStyle(tray).display === 'none'; }), true, 'The task tray should stay visually hidden in the creator workspace');
+  assert.equal(await page.$eval('#toast', (element: any) => (element as HTMLDivElement).hidden), true, 'Creator actions should not surface a floating toast');
+  finish('brief', 1);
+  await page.waitForFunction(() => document.querySelector('[data-id="1"] .brief-document')?.textContent?.includes('全新花园'));
+  assert.equal(await page.$eval('#modal', (element: any) => element.hidden), true);
+
+  // Preview, assets and game run in the card; closing the viewer removes frames.
+  await page.click(`${firstCard} [data-act=preview]`); await page.waitForSelector(`${firstCard} .creation-viewer img.preview`);
+  assert((await page.$eval(`${firstCard} img.preview`, (element: any) => element.getAttribute('src')))?.startsWith('data:image/svg+xml'));
+  await page.click(`${firstCard} [data-viewer-act=close]`); assert.equal(await page.$(`${firstCard} .creation-viewer`), null);
+  await page.click(`${firstCard} [data-act=assets]`); const assetFrame = await page.waitForSelector(`${firstCard} iframe.assets-frame`);
+  const assetContent = await assetFrame!.contentFrame(); await assetContent!.waitForSelector('#asset');
+  await page.click(`${firstCard} [data-viewer-act=close]`); assert.equal(await page.$(`${firstCard} iframe.assets-frame`), null, 'Closing the viewer should unload its iframe');
+
+  // Historical game version is playable, isolated, and restorable without a model request.
+  await page.click(`${firstCard} [data-act=versions]`); await page.waitForSelector(`${firstCard} [data-viewer-version=game-1]`);
+  await page.click(`${firstCard} [data-viewer-version=game-1]`);
+  await checkPlayer(page, `${firstCard} iframe.product-frame`, '1');
+  await page.screenshot({ path: 'artifacts/creation-history-playable.png', fullPage: true });
+  assert.equal(await page.$eval('#modal', (element: any) => element.hidden), true);
+  await page.click(`${firstCard} [data-viewer-act=close]`); assert.equal(await page.$(`${firstCard} iframe.product-frame`), null);
+  await page.click(`${firstCard} [data-act=versions]`); await page.waitForSelector(`${firstCard} [data-viewer-version=game-1]`);
+  await page.click(`${firstCard} [data-viewer-version=game-1]`); await page.waitForSelector(`${firstCard} [data-viewer-act=restore]:not(:disabled)`);
+  const beforeRestore = posts.length;
+  await page.click(`${firstCard} [data-viewer-act=restore]`); await page.waitForFunction(() => (document.querySelector('#modal') as HTMLDivElement | null)?.hidden);
+  assert.equal(restored, 1); assert.equal(posts.length, beforeRestore, 'Restoring a version must not call a model');
+
+  // A failed remake leaves the previous build available to play.
+  await page.click('[data-tab=products]'); await page.waitForSelector('[data-id="1"] [data-act=viewProduct]');
+  await page.click('[data-id="1"] .creation-more summary'); await page.click('[data-id="1"] [data-act=regenerateGame]');
+  await waitForPost('game', 1); finish('game', 1, 'error');
+  await page.waitForFunction(() => document.querySelector('[data-id="1"] .bad.small')?.textContent?.includes('合成失败'));
+  await page.click('[data-id="1"] [data-act=viewProduct]');
+  await checkPlayer(page, '[data-id="1"] iframe.product-frame', '1');
+  await page.click('[data-id="1"] [data-viewer-act=close]');
+
+  // Start a first game, reload while it is running, and ensure recovery never submits a duplicate.
+  await page.click('[data-tab=picks]'); await page.waitForSelector('[data-id="2"] [data-act=makeGame]');
+  await page.click('[data-id="2"] [data-act=makeGame]'); await waitForPost('game', 2);
+  assert.equal(posts.filter(post => post.kind === 'game' && post.id === 2).length, 1);
+  await page.reload(); await page.waitForSelector('#drawBtn'); await page.click('[data-tab=products]');
+  await page.waitForSelector('[data-id="2"] .product-job-progress');
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(posts.filter(post => post.kind === 'game' && post.id === 2).length, 1, 'Reload recovery must not resubmit a running game');
+  finish('game', 2);
+  await page.waitForSelector('[data-id="2"] [data-act=viewProduct]');
+  await page.click('[data-id="2"] [data-act=viewProduct]'); await checkPlayer(page, '[data-id="2"] iframe.product-frame', '2');
+  await page.click('[data-id="2"] [data-viewer-act=close]');
+
+  // Late material reads must not open an old card after switching sections.
+  delayNextTopicRead = 350;
+  await page.click('[data-tab=picks]'); await page.waitForSelector('[data-id="1"] [data-act=brief]');
+  await page.click('[data-id="1"] [data-act=brief]'); await page.click('[data-tab=products]');
+  await page.waitForSelector('[data-id="1"] [data-act=viewProduct]'); await new Promise(resolve => setTimeout(resolve, 450));
+  assert.equal(await page.$('.creation-viewer'), null, 'A late reply must not reopen a viewer in another section');
+
+  // Touch-sized controls and no horizontal overflow at common phone dimensions.
+  await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+  await page.click('[data-tab=picks]'); await page.waitForSelector('.creation-card');
+  assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'));
+  await page.screenshot({ path: 'artifacts/creation-cards-mobile.png', fullPage: true });
+  const touchHeight = await page.$eval('.creation-materials .material-link', (element: any) => element.getBoundingClientRect().height);
+  assert(touchHeight >= 36, 'Material buttons should remain comfortable to tap');
+  assert.deepEqual(errors, []);
+  console.log('PASS 创作卡片内查看、材料预览、iframe 卸载、9:16 隔离试玩、历史恢复、失败重制保留旧成品、刷新去重、迟到响应、手机布局。');
+} finally {
+  await browser.close();
+  await new Promise<void>(resolve => server.close(() => resolve()));
+}

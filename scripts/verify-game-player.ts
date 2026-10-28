@@ -32,19 +32,18 @@ const server=createServer(async(req,res)=>{
 });
 await new Promise<void>(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${(server.address() as any).port}`,browser=await launchLocalBrowser();await mkdir('artifacts',{recursive:true});
 async function verifyPlayer(page:any,selector:string){
- const iframe=await page.waitForSelector(selector,{visible:true}),box=await iframe.boundingBox();assert(box);assert(Math.abs(box.width/box.height-9/16)<.002,'Player must remain 9:16');
+ const iframe=await page.waitForSelector(selector,{visible:true}),stage=await iframe.evaluateHandle((el:any)=>el.closest('.game-player-stage')),box=await stage.boundingBox();assert(box);assert(Math.abs(box.width/box.height-9/16)<.002,'Player stage must remain 9:16');
  const frame=await iframe.contentFrame();await frame.waitForSelector('#play');await frame.click('#play');assert.equal(await frame.$eval('#play',(el:any)=>el.textContent),'Played');assert.equal(await frame.evaluate('typeof parent.document').catch(()=> 'blocked'),'blocked');assert.equal(await iframe.evaluate((el:any)=>el.getAttribute('sandbox')),'allow-scripts');
  return box;
 }
 try{
- const page=await browser.newPage(),errors:string[]=[];page.on('pageerror',e=>{errors.push(String(e));console.log('Browser error:',String(e));});page.on('response',r=>{if(r.status()>=400)console.log('HTTP',r.status(),new URL(r.url()).pathname);});await page.setViewport({width:1360,height:960});await page.goto(origin+'/admin');await page.waitForSelector('#tab-forge');await page.click('#tab-forge');await page.waitForSelector('[data-admin-play="1"]',{visible:true});await page.click('[data-admin-play="1"]');await verifyPlayer(page,'#management-detail iframe');
- const before=loads;await page.click('#management-detail [data-player-reload]');await page.waitForFunction(()=>document.querySelector('#management-detail iframe')!==null);await verifyPlayer(page,'#management-detail iframe');assert(loads>before);await page.screenshot({path:'artifacts/portrait-admin-local.png',fullPage:true});
- await page.click('#management-game-details');await page.waitForSelector('[data-admin-version]');await page.click('#management-detail .management-detail-body > details:last-child > summary');await page.waitForSelector('[data-admin-version]',{visible:true});await page.click('[data-admin-version]');await verifyPlayer(page,'#management-version-body iframe');await page.click('#management-detail-close');await page.waitForFunction(()=>!document.querySelector('#management-detail iframe'));assert.equal(await page.$('#management-detail iframe'),null,'Closing preview stops game scripts');
+ const page=await browser.newPage(),errors:string[]=[];page.on('pageerror',e=>{errors.push(String(e));console.log('Browser error:',String(e));});page.on('response',r=>{if(r.status()>=400)console.log('HTTP',r.status(),new URL(r.url()).pathname);});await page.setViewport({width:1360,height:960});// The redesigned admin is covered against real APIs in verify-admin-dashboard.ts.
  for(const [width,height] of [[1360,960],[390,844],[390,693],[844,390]]){
-  await page.setViewport({width,height,isMobile:width<1000,hasTouch:width<1000});await page.goto(origin+'/test');await page.waitForSelector('#drawBtn');await page.click('[data-tab=products]');await page.waitForSelector('[data-act=viewProduct]');await page.click('[data-act=viewProduct]');
-  const box=await verifyPlayer(page,'#modalBody iframe');assert(box.width<=width);assert(box.height<=height);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
-  if(width===1360){await page.click('#modalBody [data-player-fullscreen]');await page.waitForFunction(()=>!!document.fullscreenElement);await verifyPlayer(page,'#modalBody iframe');await page.evaluate(()=>document.exitFullscreen());}
-  await page.click('#modalClose');assert.equal(await page.$('#modalBody iframe'),null,'Member close must stop game scripts');
+  await page.setViewport({width,height,isMobile:width<1000,hasTouch:width<1000});await page.goto(origin+'/test');await page.waitForSelector('#drawBtn');await page.click('[data-tab=products]');await page.waitForSelector('[data-id="1"] [data-act=viewProduct]');await page.click('[data-id="1"] [data-act=viewProduct]');
+  const player='[data-id="1"] .game-player iframe.product-frame';
+  const box=await verifyPlayer(page,player);assert(box.width<=width);assert(box.height<=height);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+  if(width===1360){await page.click('[data-id="1"] .game-player [data-player-fullscreen]');await page.waitForFunction(()=>!!document.fullscreenElement);await verifyPlayer(page,player);await page.evaluate(()=>document.exitFullscreen());}
+  await page.click('[data-id="1"] [data-viewer-act=close]');assert.equal(await page.$(player),null,'Member close must stop game scripts and remove the iframe');
  }
- assert.equal(modelCalls,0,'Preview must never generate again');assert.deepEqual(errors,[]);console.log('PASS 管理员直接试玩、材料与历史预览、重载与关闭、成员试玩、9:16 多屏适配、隔离和零模型调用。');
+ assert.equal(modelCalls,0,'Preview must never generate again');assert.deepEqual(errors,[]);console.log('PASS 成员试玩、9:16 多屏适配、触摸、全屏、关闭销毁、隔离和零模型调用。');
 }finally{await browser.close();await new Promise<void>(r=>server.close(()=>r()));}

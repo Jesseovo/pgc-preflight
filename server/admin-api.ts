@@ -8,6 +8,7 @@ import type {MemberStore} from './members';
 import {adminWorkspaceApi} from './admin-workspace-api';
 import {reviewActivity} from './review-usage';
 import {modelQuota} from './model-quota';
+import {adminDashboardApi} from './admin-dashboard-api';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
@@ -28,6 +29,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json({ok:true},200,{'Set-Cookie':sessionCookie(token,8*60*60)});
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
+    const dashboard=await adminDashboardApi(request,{...secrets,DB,modelStore:store,...runtime});if(dashboard)return dashboard;
     const workspace=await adminWorkspaceApi(request,{...secrets,DB,modelStore:store,...runtime});if(workspace)return workspace;
     if(url.pathname==='/api/admin/logout'&&request.method==='POST')return json({ok:true},200,{'Set-Cookie':sessionCookie('',0)});
     if(url.pathname==='/api/admin/review-activity'&&request.method==='GET'){
@@ -35,7 +37,18 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json(await reviewActivity(DB,url.searchParams));
     }
     if(url.pathname==='/api/admin/members'){
-      if(request.method==='GET')return json({members:(await members.list()).map(publicMember)});
+      if(request.method==='GET'){
+        const people=await members.list();
+        // Content activity is independent from account and permission edits.
+        const activity=DB?await (DB.prepare(`SELECT owner_id,MAX(last_activity) AS last_activity FROM (
+          SELECT owner_id,MAX(updated_at) AS last_activity FROM topics GROUP BY owner_id
+          UNION ALL SELECT owner_id,MAX(updated_at) AS last_activity FROM games GROUP BY owner_id
+          UNION ALL SELECT owner_id,MAX(updated_at) AS last_activity FROM forge_tasks GROUP BY owner_id
+          UNION ALL SELECT owner_id,MAX(updated_at) AS last_activity FROM review_jobs GROUP BY owner_id
+        ) GROUP BY owner_id`).bind() as any).all():{results:[]};
+        const times=new Map<string,string>((activity.results||[]).map((row:any)=>[row.owner_id,row.last_activity]));
+        return json({members:people.map(member=>({...publicMember(member),lastActivity:times.get(member.id)||null}))});
+      }
       if(request.method==='POST')return json(publicMember(await createMember(await smallJson(request),members)),201);
     }
     const memberId=url.pathname.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/)?.[1];

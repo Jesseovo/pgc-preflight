@@ -16,7 +16,7 @@ import {captureFor} from './cloud-review-capture';
 import {forgeAgentApi,forgeAgentWeb} from './forge-agent-api';
 import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
 import {galleryApi} from './gallery';
-import {enqueueForgeTask,recoverForgeTasks,type ForgeRunnerBinding} from './forge-tasks';
+import {enqueueForgeTask,purgeOldForgeTasks,recoverForgeTasks,type ForgeRunnerBinding} from './forge-tasks';
 export {ReviewRunner} from './review-runner';
 export {ForgeRunner} from './forge-runner';
 
@@ -59,7 +59,7 @@ const app = {
     }
     if(url.pathname.startsWith('/api/admin/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`admin:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
-      return (await adminApi(request,store,env,members,env.DB,{captureReview:captureFor(env)}))!;
+      return (await adminApi(request,store,env,members,env.DB,{captureReview:captureFor(env),FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE}))!;
     }
     if(url.pathname.startsWith('/api/auth/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`auth:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'登录操作较频繁，请稍后重试。'},429);}
@@ -150,7 +150,7 @@ const app = {
     }
     await purgeReviewInputs(env);
     await recoverForgeTasks({...env,modelStore:configStore(env.DB)});
-    await env.DB.prepare("DELETE FROM forge_tasks WHERE executor='platform' AND status IN ('done','error') AND updated_at < ?").bind(new Date(Date.now()-30*86400000).toISOString()).run();
+    await purgeOldForgeTasks(env.DB);
     await env.DB.prepare('DELETE FROM model_slots WHERE expires_at < ?').bind(Date.now()).run();
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ? AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE forge_tasks.owner_id=topics.owner_id AND executor='agent' AND scope=topics.owner_id||':game:'||topics.id AND status IN ('queued','running'))")

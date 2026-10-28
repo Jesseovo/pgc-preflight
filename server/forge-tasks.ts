@@ -2,7 +2,7 @@ import {inputSnapshot} from './forge-workspace';
 import type { ForgeEnv, ForgeJob } from './forge-api';
 
 export interface ForgeRunnerBinding { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } }
-export interface ForgeTask { owner_id?:string;executor?:string;input_snapshot?:string; id: string; kind: string; scope: string; payload: string; status: string; detail: string; error: string; result: string | null; created_at: string; updated_at: string; started_at: string | null; model_started_at: string | null }
+export interface ForgeTask { owner_id?:string;executor?:string;input_snapshot?:string;retry_of?:string|null;requested_by?:string|null; id: string; kind: string; scope: string; payload: string; status: string; detail: string; error: string; result: string | null; created_at: string; updated_at: string; started_at: string | null; model_started_at: string | null }
 const stamp = () => new Date().toISOString();
 export const FORGE_TASK_LIMIT_MS = 14 * 60000;
 export const taskScope = (job: ForgeJob,owner='admin') => `${owner}:${job.type}:${job.type==='expand'?job.ids[0]:job.type==='suggest'?job.dim:job.type==='tag'?'all':'id' in job?job.id:''}`;
@@ -79,4 +79,13 @@ export async function recoverForgeTasks(env: ForgeEnv, topicId?: number) {
   const rows: ForgeTask[] = (await env.DB.prepare(`SELECT * FROM forge_tasks WHERE executor='platform' AND (?='admin' OR owner_id=?) AND status IN ('queued','running')${topicId == null ? '' : " AND COALESCE(json_extract(payload,'$.id'),json_extract(payload,'$.ids[0]'))=?"} ORDER BY created_at LIMIT 100`)
     .bind(owner,owner,...(topicId==null?[]:[topicId])).all()).results;
   for (const row of rows) await readForgeTask(env,row.id);
+}
+
+// Keep retry ancestry while a direct retry still exists. The foreign key is
+// intentionally restrictive so maintenance must prune descendants before
+// their original tasks; a later maintenance pass can remove the parent.
+export async function purgeOldForgeTasks(DB: any, now = Date.now()) {
+  const cutoff = new Date(now - 30 * 86400000).toISOString();
+  return DB.prepare("DELETE FROM forge_tasks WHERE executor='platform' AND status IN ('done','error') AND updated_at < ? AND NOT EXISTS(SELECT 1 FROM forge_tasks retry WHERE retry.retry_of=forge_tasks.id)")
+    .bind(cutoff).run();
 }

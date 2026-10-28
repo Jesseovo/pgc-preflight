@@ -1,4 +1,4 @@
-import { startTask, withProgress, progressHtml } from './progress.js';
+import { startTask, progressHtml } from './progress.js';
 // Shared by the member workspace and the administrator's review tab.
 const LIMIT = 20;
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -203,7 +203,7 @@ async function pump() {
       const job = jobs.find(item => item.status === 'waiting');
       if (!job) break;
       job.startedAt ||= Date.now();
-      job.progress ||= startTask(`AI 审核 · ${job.title}`, {key:`review-${job.id}`,compact:true,detail:'准备上传游戏…',startedAt:job.startedAt});
+      job.progress ||= startTask(`AI 审核 · ${job.title}`, {key:`review-${job.id}`,compact:true,tray:false,detail:'准备上传游戏…',startedAt:job.startedAt});
       try {
         await submit(job);
       } catch (error) {
@@ -218,6 +218,26 @@ async function pump() {
   } finally { preparing = false; }
 }
 const activeCount = () => jobs.filter(working).length;
+function withReviewProgress(label,work,delay=350){
+  const task=startTask(label,{compact:true,tray:false});
+  let timer,element;
+  timer=setTimeout(()=>{
+    if(!dependencies?.isActive())return;
+    const slot=dependencies.progressRoot?.();
+    if(!slot)return;
+    element=document.createElement('div');
+    slot.hidden=false;
+    slot.append(element);
+    task.attach(element);
+  },delay);
+  return Promise.resolve().then(()=>work(task)).then(result=>{task.done();return result;},error=>{task.fail(error?.message);throw error;}).finally(()=>{
+    clearTimeout(timer);
+    task.dismiss();
+    element?.remove();
+    const slot=dependencies?.progressRoot?.();
+    if(slot)slot.hidden=!slot.childElementCount;
+  });
+}
 
 let dragDepth = 0;
 document.addEventListener('dragenter', event => {
@@ -242,7 +262,7 @@ addEventListener('beforeunload', event => {
 
 function addFiles(files) {
   if(!dependencies?.allowUpload){dependencies?.feedback('请把本地 HTML 交给自己的 Agent，由它完成审核和提交。');return Promise.resolve();}
-  adding = adding.then(() => withProgress('读取游戏文件', async progress => {
+  adding = adding.then(() => withReviewProgress('读取游戏文件', async progress => {
     const rejected = [];
     let added = 0;
     progress.update({value:0,total:files.length});
@@ -270,7 +290,7 @@ function addFiles(files) {
 export async function mountReviewWorkspace(options) {
   const { view, api, alive, topics, probeGame, setProbing, checksHtml, probeChecks, copyText, download, openModal } = options;
   const allowUpload = options.allowUpload === true;
-  view.innerHTML = `<div class="review-page"><section class="review-intro"><div><div class="eyebrow"><span></span>AI 游戏模拟审核</div><h1>下一款好游戏，准备出发<span>。</span></h1><p>连接自己的 Agent，使用它的模型采集真实画面、完成初评与复核，并回传修改建议。</p><div class="review-intro-tags"><span>本机 Agent 执行</span><i>·</i><span>自有模型</span><i>·</i><span>双轮评分核对</span></div></div><img class="review-mascot" src="/artwork/pixel-cat.png" width="74" height="74" alt=""></section>
+  view.innerHTML = `<div class="review-page"><section class="review-intro"><div><div class="eyebrow"><span></span>AI 游戏模拟审核</div><h1>下一款好游戏，准备出发<span>。</span></h1><p>连接自己的 Agent，使用它的模型采集真实画面、完成初评与复核，并回传修改建议。</p><div class="review-intro-tags"><span>本机 Agent 执行</span><i>·</i><span>自有模型</span><i>·</i><span>双轮评分核对</span></div></div><img class="review-mascot" src="/artwork/pixel-cat.png" width="74" height="74" alt=""></section><div class="rv-inline-progress" id="rvInlineProgress" aria-live="polite" hidden></div>
     <section class="review-workspace"><div class="review-upload-panel"><div class="section-label"><span><i class="step-number">01</i>添加游戏</span><b>每批最多 20 个</b></div><div class="review-dropzone" id="rvDropzone"><div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div><h2>把游戏们，一起拖进来。</h2><p>支持拖到页面任意位置，也可以选择多个文件</p><button type="button" class="rr-button rr-button-dark" id="rvChoose">${svg('upload')}选择游戏文件</button><input type="file" id="rvFile" accept=".html,.htm,text/html" multiple hidden><div class="upload-meta"><span>.html / .htm</span><span>单个 ≤ 8 MB</span><span>支持多选</span></div></div><p class="rv-feedback" id="rvFeedback" role="status" aria-live="polite">每个游戏计 1 次，含初评与复核。北京时间零点重置；模型调用前的平台失败退回次数。</p><div class="review-action-row"><span class="rv-quota" id="rvQuota" role="status">正在读取今日次数…</span>${topics.length ? `<label class="rv-topic">关联选题<select id="rvTopic"><option value="">不关联</option>${topics.map(t => `<option value="${t.id}">${esc(t.data.title)}</option>`).join('')}</select></label>` : ''}<button type="button" class="rr-button rr-button-dark" id="rvGo" disabled>开始审核 ${svg('arrow')}</button></div></div>
     <aside class="review-scope-panel"><div class="section-label"><span><i class="step-number">02</i>同一份审核标准</span></div><div class="rv-criteria">${[['01', '美学', '画面协调、风格表达、视觉反馈'], ['02', '易玩性', '规则理解、上手门槛、操作引导'], ['03', '可玩性', '机制趣味、挑战节奏、重玩动力']].map(([n, t, d]) => `<div><span>${n}</span><section><h3>${t}<small>3 分</small></h3><p>${d}</p></section></div>`).join('')}</div><div class="rv-threshold"><strong>7<span> / 9</span></strong><div><b>模拟通过线</b><p>2 + 2 + 2 = 6，仍需修改</p></div></div><p class="rv-scope-foot">沿用平台真实审核校准样本<br>AI 模拟评分 · 人工最终确认</p></aside></section>
     <section class="rv-batch" id="rvBatch" hidden><div class="rv-batch-heading"><div><span class="rr-kicker">审核队列</span><h2>这一批，逐个变好。<span id="rvQueueCount"></span></h2></div><div class="rv-batch-actions"><span id="rvBatchStats" role="status" aria-live="polite"></span><button type="button" class="rr-button" id="rvRetryAll" disabled>重试失败</button><button type="button" class="rr-button" id="rvExportAll" disabled>导出报告</button><button type="button" class="rr-button" id="rvClear">清除已结束</button></div></div><div id="rvOverview" class="rv-overview"></div><div id="rvBatchMeter"></div><div class="rv-results-grid"><div class="rv-job-list" id="rvJobs" aria-label="审核任务"></div><div id="rvResult" class="rv-selected" aria-live="polite"></div></div></section>
@@ -288,7 +308,7 @@ export async function mountReviewWorkspace(options) {
   }
   let renderedId = '';
   let renderedResult;
-  dependencies = { allowUpload, api, probeGame, setProbing, isActive: current,
+  dependencies = { allowUpload, api, probeGame, setProbing, isActive: current, progressRoot: () => $('#rvInlineProgress'),
     chooseFile: () => { if (current() && allowUpload) $('#rvFile')?.click(); },
     topicId: () => Number($('#rvTopic')?.value) || null,
     highlight: yes => $('#rvDropzone')?.classList.toggle('drag-over', yes),
@@ -396,7 +416,7 @@ export async function mountReviewWorkspace(options) {
   $('#rvHistoryFilter').onchange = renderHistory;
   const history = async () => {
     try {
-      const list = await withProgress('读取审核记录', () => api('GET', 'reviews'));
+      const list = await withReviewProgress('读取审核记录', () => api('GET', 'reviews'));
       if (!current()) return;
       historyItems = list; renderHistory();
     } catch (error) { if (current()) $('#rvHistory').textContent = `记录暂时无法读取：${error.message}`; }
@@ -418,7 +438,7 @@ export async function mountReviewWorkspace(options) {
     if (!button) return;
     button.disabled = true;
     try {
-      const report = await withProgress('读取审核报告', () => api('GET', `reviews/${button.dataset.history}`));
+      const report = await withReviewProgress('读取审核报告', () => api('GET', `reviews/${button.dataset.history}`));
       if (!current()) return;
       let job = jobs.find(item => item.result?.id === report.id);
       if (!job) { job = { id: `history-${report.id}`, title: report.title, result: report, status: 'done' }; jobs.push(job); }
@@ -434,7 +454,7 @@ export async function mountReviewWorkspace(options) {
   $('#rvDropzone').closest('.review-upload-panel').insertAdjacentHTML('beforeend',`<details class="rv-device"><summary>智能助手接入</summary><div class="rv-agent-prompt"><b>复制给智能助手</b><p id="rvAgentText">请阅读 ${location.origin}/agent.md，连接我的审核账号。首次连接时请让我生成一次性配对码并直接在本对话中询问我，收到后由你自行完成配对，不要让我打开命令窗口。使用你自己的模型采集并审核指定的本地 HTML 游戏，完成初评和同模型复核后提交中文报告。提交游戏时，使用你已有的 creator-hub 授权查询本人准确作品和投稿版本的真人分数与意见；没有结果时照常完成 AI 审核，有结果后再回填。</p><button class="rr-button" id="rvCopyAgent">复制接入指令</button></div><div class="rv-device-actions"><button class="rr-button" id="rvPair">生成一次性配对码</button><a class="rr-button" href="/agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p>首次使用需授权，配对码 5 分钟内有效。</p><div id="rvPairCode" role="status"></div><div id="rvDevices"></div></details>`);
   $('#rvPair').onclick=async()=>{
     const button=$('#rvPair');button.disabled=true;
-    try{const value=await withProgress('生成本机配对码',()=>api('POST','review/device/pairing',{}));if(!current())return;$('#rvPairCode').innerHTML=`<label>配对码 · 5 分钟内一次有效<input type="text" readonly value="${esc(value.code)}" aria-label="配对码"></label><button class="rr-button" id="rvCopyCode">复制配对码</button>`;$('#rvCopyCode').onclick=()=>copyText(value.code);setTimeout(()=>{if(current())$('#rvPairCode').replaceChildren();},300000);}
+    try{const value=await withReviewProgress('生成本机配对码',()=>api('POST','review/device/pairing',{}));if(!current())return;$('#rvPairCode').innerHTML=`<label>配对码 · 5 分钟内一次有效<input type="text" readonly value="${esc(value.code)}" aria-label="配对码"></label><button class="rr-button" id="rvCopyCode">复制配对码</button>`;$('#rvCopyCode').onclick=()=>copyText(value.code);setTimeout(()=>{if(current())$('#rvPairCode').replaceChildren();},300000);}
     catch(error){dependencies.feedback(error.message,true);}finally{button.disabled=false;}
   };
   $('#rvCopyAgent').onclick=()=>copyText($('#rvAgentText').textContent);
@@ -443,19 +463,19 @@ export async function mountReviewWorkspace(options) {
     try{const status=await api('GET','review/worker-status');if(!current())return;const authorized=status.devices.filter(d=>!d.revoked&&Date.parse(d.expires_at)>Date.now());$('#rvWorkerStatus').textContent=status.online?'智能助手最近已连接 · 本机采集与模型审核':authorized.length?'智能助手已授权 · 按需执行即可':'尚未授权智能助手 · 展开下方接入';$('#rvDevices').innerHTML=authorized.map(d=>`<div class="rv-device-row"><span><b>${esc(d.name)}</b> · ${d.online?'最近已连接':'已授权'}<small>授权至 ${esc(date(d.expires_at))}${d.last_seen?' · 最近连接 '+esc(date(d.last_seen)):''}</small></span><button class="rr-button" data-revoke="${esc(d.id)}">撤销授权</button></div>`).join('')||'<p>尚未授权设备，让智能助手按接入说明完成一次配对。</p>';}
     catch{if(current())$('#rvWorkerStatus').textContent='智能助手授权状态暂时无法读取';}
   };
-  $('#rvDevices').onclick=async event=>{const button=event.target.closest('[data-revoke]');if(!button)return;button.disabled=true;try{await withProgress('撤销智能助手授权',()=>api('POST','review/device/revoke',{id:button.dataset.revoke}));await workerStatus();}catch(error){dependencies.feedback(error.message,true);button.disabled=false;}};
+  $('#rvDevices').onclick=async event=>{const button=event.target.closest('[data-revoke]');if(!button)return;button.disabled=true;try{await withReviewProgress('撤销智能助手授权',()=>api('POST','review/device/revoke',{id:button.dataset.revoke}));await workerStatus();}catch(error){dependencies.feedback(error.message,true);button.disabled=false;}};
   void workerStatus();
   const workerTimer=setInterval(()=>{if(!current()){clearInterval(workerTimer);return;}if(!document.hidden)void workerStatus();},60000);
   refresh();
   void dependencies.updateUsage();
   void history();
   try {
-    const remote = await withProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
+    const remote = await withReviewProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
     for (const item of remote) {
       if (!['queued', 'running', 'error'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
       const job = { id: item.id, requestId: item.id, title: item.title, filename:item.filename, stage:item.stage, status: item.status,modelExecutor:item.model_executor,updatedAt:Date.parse(item.updated_at)||Date.now(),error:reviewError(item.error),remoteFailed:item.status==='error',note: '正在读取原任务的最新状态' };
       job.startedAt = Date.parse(item.created_at) || Date.now();
-      job.progress = startTask(`AI 审核 · ${job.title}`,{key:`review-${job.id}`,compact:true,detail:job.note,startedAt:job.startedAt});
+      job.progress = startTask(`AI 审核 · ${job.title}`,{key:`review-${job.id}`,compact:true,tray:false,detail:job.note,startedAt:job.startedAt});
       jobs.push(job); selected ||= job.id;
       if (item.status === 'error') {
         failJobProgress(job);

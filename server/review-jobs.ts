@@ -54,16 +54,16 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
-  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash)
-    SELECT ?,?,?,?,'capture',?,?,?,'device',0,'agent',0,? WHERE
+  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,topic_id,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash)
+    SELECT ?,?,?,?,?,'capture',?,?,?,'device',0,'agent',0,? WHERE
     (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))`)
-    .bind(id,ownerId,title,filename,day,now,now,inputHash,ownerId,ownerId).run()
-    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash)
-    SELECT ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',? WHERE
+    .bind(id,ownerId,title,filename,payload.topic_id||null,day,now,now,inputHash,ownerId,ownerId).run()
+    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, topic_id, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash)
+    SELECT ?, ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',? WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
-    .bind(id, ownerId, title, filename, day, now, now,env.reviewExecutor||'cloud',inputHash, ownerId, ownerId, ownerId, ownerId, day).run();
+    .bind(id, ownerId, title, filename, payload.topic_id||null, day, now, now,env.reviewExecutor||'cloud',inputHash, ownerId, ownerId, ownerId, ownerId, day).run();
   if (!inserted.meta.changes) {
     const duplicate = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
     if (duplicate) return publicJob((await withHumanReviews(env.DB,[duplicate],true))[0]);

@@ -17,6 +17,7 @@ function setup() {
   sqlite.exec("ALTER TABLE review_jobs ADD COLUMN model_executor TEXT NOT NULL DEFAULT 'platform'; ALTER TABLE review_jobs ADD COLUMN local_model TEXT;");
   sqlite.exec(readFileSync('migrations/0019_review_visibility.sql','utf8'));
   sqlite.exec(readFileSync('migrations/0020_human_review.sql','utf8'));
+  sqlite.exec('ALTER TABLE review_jobs ADD COLUMN topic_id INTEGER;');
   const DB = {
     prepare(sql: string) {
       return { bind(...params: any[]) {
@@ -88,6 +89,15 @@ describe('后台并发审核的传输与隔离', () => {
     const activity=await reviewActivity(env.DB,new URLSearchParams());
     expect(activity.total).toBe(1);
     expect(activity.records[0]).toMatchObject({title:'today',filename:'today.html',status:'error',quota_charged:0,display_name:'甲'});
+    const all=await reviewActivity(env.DB,new URLSearchParams({scope:'all'}));
+    expect(all.total).toBe(2);
+    expect(all.records.some((record:any)=>record.owner_id==='admin'&&record.display_name==='超级管理员')).toBe(true);
+    const admin=await reviewActivity(env.DB,new URLSearchParams({scope:'admin'}));
+    expect(admin.total).toBe(1);
+    expect(admin.records[0]).toMatchObject({owner_id:'admin',title:'admin test'});
+    expect(admin.members).toHaveLength(1);
+    const adminOnly=await reviewActivity(env.DB,new URLSearchParams({scope:'all',member:'admin'}));
+    expect(adminOnly.total).toBe(1);
   });
   it('审核模型停用时拒绝入队，不留下任务或临时输入', async () => {
     const { env, payload, sqlite, send } = setup();

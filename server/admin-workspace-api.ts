@@ -6,6 +6,7 @@ import {publicCreatorTask} from './forge-agent-api';
 import {reviewReportErrors} from './review-report';
 import {enqueueReview,recoverInterruptedReviews} from './review-jobs';
 import {withHumanReviews} from './human-review';
+import {reviewDay} from './review-usage';
 
 const paths=new Set(['/api/admin/workspace','/api/admin/public-data','/api/admin/review-upload','/api/admin/review-import']);
 const json=(v:any,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
@@ -39,7 +40,14 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
       return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),products:products.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,tasks:tasks.map(publicCreatorTask),agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),reviewJobs:await withHumanReviews(DB,reviewJobs,true),reviews:await withHumanReviews(DB,reviews)});
     }
     if(url.pathname.endsWith('/public-data')){
-      if(request.method==='GET')return json({settings:await publicSettings(DB),vocab:await all(DB,'SELECT * FROM vocab ORDER BY dim,id'),games:await all(DB,'SELECT * FROM games WHERE is_public=1 ORDER BY id')});
+      if(request.method==='GET'){
+        const [settings,vocab,games,publishableGames,suggestions]=await Promise.all([
+          publicSettings(DB),all(DB,'SELECT * FROM vocab ORDER BY dim,id'),all(DB,'SELECT * FROM games WHERE is_public=1 ORDER BY id'),
+          all(DB,'SELECT id,ext_id,title,descr,status,score,aes,ease,play,revisions,feedback,subject,medium,gesture,structure,mood,source,updated_at,owner_id,is_public FROM games ORDER BY updated_at DESC,id DESC'),
+          all(DB,"SELECT s.id,s.owner_id,COALESCE(m.display_name,'历史管理员档案') ownerName,s.dim,s.words,s.status,s.created_at,s.updated_at FROM vocab_suggestions s LEFT JOIN members m ON m.id=s.owner_id WHERE s.status='pending' ORDER BY s.created_at DESC,s.id DESC"),
+        ]);
+        return json({settings,vocab,games,publishableGames,suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)}))});
+      }
       if(request.method!=='POST')throw problem('请使用 GET 或 POST。',405);
       const b=await body(request),at=stamp();
       if(b.action==='settings'){
@@ -75,7 +83,7 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
     if(prior){if(prior.model_executor!=='manual-admin'||prior.local_result_hash!==hash)throw problem('请求编号已用于其他内容。',409);return json({id:prior.result_id,job_id:prior.id});}
     const at=stamp();
     await DB.batch([
-      DB.prepare("INSERT OR IGNORE INTO review_jobs(id,owner_id,title,filename,status,stage,created_at,updated_at,quota_charged,input_ready,model_executor,local_result_hash) VALUES(?,?,?,?,'done','done',?,?,0,0,'manual-admin',?)").bind(b.request_id,owner,String(b.title||'管理员导入').slice(0,120),String(b.filename||'').slice(0,200),at,at,hash),
+      DB.prepare("INSERT OR IGNORE INTO review_jobs(id,owner_id,title,filename,status,stage,usage_day,created_at,updated_at,quota_charged,input_ready,model_executor,local_result_hash) VALUES(?,?,?,?,'done','done',?,?,?,0,0,'manual-admin',?)").bind(b.request_id,owner,String(b.title||'管理员导入').slice(0,120),String(b.filename||'').slice(0,200),reviewDay(),at,at,hash),
       DB.prepare("INSERT OR IGNORE INTO reviews(owner_id,title,score,result,probe,shots,created_at,job_id,model_executor) SELECT owner_id,title,?,?,?,?,?,id,'manual-admin' FROM review_jobs WHERE id=? AND local_result_hash=? AND model_executor='manual-admin'").bind(b.result.aes+b.result.ease+b.result.play,canonicalJson(b.result),JSON.stringify({...b.probe,evidenceOrigin:'admin-upload',modelExecutor:'manual-admin'}),JSON.stringify(b.shots||[]),at,b.request_id,hash),
       DB.prepare('UPDATE review_jobs SET result_id=(SELECT id FROM reviews WHERE job_id=?) WHERE id=? AND local_result_hash=?').bind(b.request_id,b.request_id,hash),
     ]);

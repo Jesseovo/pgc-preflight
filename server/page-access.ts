@@ -11,13 +11,13 @@ export function isPrivateAsset(request: Request): boolean {
   let pathname;
   try { pathname = decodeURIComponent(new URL(request.url).pathname); } catch { return true; }
   return pathname.startsWith('/forge/') && !reviewAssets.has(pathname)
-    || /^\/assets\/admin-[^/]+\.js(?:\.map)?$/.test(pathname);
+    || /^\/assets\/(?:admin|model-panel)-[^/]+\.js(?:\.map)?$/.test(pathname);
 }
 export async function guardPrivateAsset(request: Request, members: MemberStore, secrets: AppSecrets): Promise<Response | null> {
   if (!isPrivateAsset(request)) return null;
   const user = await identity(request.headers.get('Cookie'), members, secrets);
   if (user?.role === 'admin') return null;
-  if(user?.star && !/^\/assets\/admin-/.test(decodeURIComponent(new URL(request.url).pathname))) return null;
+  if(user?.star && !/^\/assets\/(?:admin|model-panel)-/.test(decodeURIComponent(new URL(request.url).pathname))) return null;
   return new Response('无权访问此资源。', { status: 403, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
 }
 

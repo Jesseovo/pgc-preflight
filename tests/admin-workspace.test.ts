@@ -6,6 +6,7 @@ import worker from '../server/worker';
 import {hashPassword,memberLogin} from '../server/members';
 import {memberStore} from '../server/storage';
 import {login} from '../server/settings';
+import {reviewActivity,reviewDay} from '../server/review-usage';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{vi.unstubAllGlobals();databases.splice(0).forEach(db=>db.close());});
@@ -65,6 +66,10 @@ describe('管理员内容管理与手动审核入口',()=>{
     const saved=s.sqlite.prepare('SELECT * FROM reviews').get() as any;expect(saved).toMatchObject({id:original.id,owner_id:'a',model_executor:'manual-admin',score:7});
     expect(JSON.parse(saved.probe)).toMatchObject({evidenceOrigin:'admin-upload',modelExecutor:'manual-admin'});
     expect(s.sqlite.prepare('SELECT quota_charged,status,model_executor FROM review_jobs').get()).toMatchObject({quota_charged:0,status:'done',model_executor:'manual-admin'});
+    expect(s.sqlite.prepare('SELECT usage_day FROM review_jobs').get()).toMatchObject({usage_day:reviewDay()});
+    expect((await reviewActivity(s.DB,new URLSearchParams({scope:'all'}))).total).toBe(1);
+    s.sqlite.prepare('UPDATE review_jobs SET usage_day=NULL').run();
+    expect((await reviewActivity(s.DB,new URLSearchParams({scope:'all'}))).total).toBe(1);
     expect(s.sqlite.prepare('SELECT count(*) n FROM review_inputs').get()).toMatchObject({n:0});expect(s.send).not.toHaveBeenCalled();expect(s.fetcher).not.toHaveBeenCalled();
   });
 
