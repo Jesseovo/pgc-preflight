@@ -194,9 +194,9 @@ export function gameUser(topic, brief, assetHtml) {
   const assetSource = match?.[2]?.slice(0, 100000) || '';
   const d = topic.data || {};
   const core = d.core_loop || !String(brief || '').trim()
-    ? JSON.stringify({title:d.title,concept:d.logline,core_loop:String(d.core_loop || '').slice(0,1000),controls:String(d.controls || topic.gesture || '').slice(0,600),art_direction:String(d.art_direction || topic.medium || '').slice(0,700),palette:d.palette,notes:topic.note || ''})
+    ? JSON.stringify({title:d.title,concept:d.logline,core_loop:String(d.core_loop || '').slice(0,1000),controls:String(d.controls || topic.gesture || '').slice(0,600),art_direction:String(d.art_direction || topic.medium || '').slice(0,700),palette:d.palette})
     : gameBrief(brief);
-  return `Make a small mobile game named ${d.title || 'Untitled'}.\nDesign reference:\n${core}${assetSource ? `\nExisting asset library (use its GAME_ASSETS drawing functions where applicable):\n${assetSource}` : ''}\nDeliver the complete playable HTML first version, under 220 lines excluding the asset library. Preserve the core mechanic, defer later expansion. No explanation.`;
+  return `Make a small mobile game named ${d.title || 'Untitled'}.\nDesign reference:\n${core}${topic.note ? `\nLatest requested changes (apply to this version):\n${topic.note}` : ''}${assetSource ? `\nExisting asset library (use its GAME_ASSETS drawing functions where applicable):\n${assetSource}` : ''}\nDeliver the complete playable HTML first version, under 220 lines excluding the asset library. Preserve the core mechanic, defer later expansion. No explanation.`;
 }
 
 // The saved brief remains the full production specification. The one-shot

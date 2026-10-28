@@ -41,4 +41,10 @@ describe('Opus 游戏成品', () => {
     expect(prompt).toContain('Drag');
     expect(prompt).toContain('Two-color Riso');
   });
+  it('沿用已有简报重新制作也必须传递最新修改要求', () => {
+    const prompt = gameUser({data:{title:'Paper Garden'},note:'Add drifting petals and a gold score counter.'}, '## F. Original garden design', '');
+    expect(prompt).toContain('Original garden design');
+    expect(prompt).toContain('Latest requested changes');
+    expect(prompt).toContain('Add drifting petals and a gold score counter.');
+  });
 });

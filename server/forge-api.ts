@@ -75,7 +75,7 @@ export interface ForgeEnv {
   reviewExecutor?: 'device';
 }
 
-export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string } | { type: 'review'; id: string } | {type:'preview';id:number} | {type:'suggest';dim:string;n:number} | {type:'tag'};
+export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string; regenerate?:boolean } | { type: 'review'; id: string } | {type:'preview';id:number} | {type:'suggest';dim:string;n:number} | {type:'tag'};
 
 // Per-topic background jobs share one claim/lease/recovery path.
 type TopicJobKind = 'brief' | 'assets';
@@ -136,11 +136,16 @@ function attachment(content, type, topic, suffix) {
   } });
 }
 
+function artifactPreview(content:string,kind:string){
+  const html=kind==='preview'?`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;background:#f8faf7;display:grid;place-items:center}img{display:block;max-width:100%;max-height:100vh}</style></head><body><img alt="风格样板" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(content)}"></body></html>`:content;
+  return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Content-Security-Policy':"sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'"}});
+}
+
 export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
   const [a, b, c] = route;
   if(a==='topics'&&c==='versions'&&method==='GET'){
     const topic=await getTopic(env,Number(b));
-    if(route[3]){const v=await first(env,'SELECT * FROM artifact_versions WHERE id=? AND topic_id=? AND owner_id=?',route[3],topic.id,topic.owner_id);if(!v)throw new HttpError(404,'版本不存在。');return v;}
+    if(route[3]){const v=await first(env,'SELECT * FROM artifact_versions WHERE id=? AND topic_id=? AND owner_id=?',route[3],topic.id,topic.owner_id);if(!v)throw new HttpError(404,'版本不存在。');if(route[4]==='preview'){if(!['game','assets','preview'].includes(v.kind))throw new HttpError(400,'这个版本不是可视预览。');return artifactPreview(v.content,v.kind);}return v;}
     return versionList(env.DB,topic.owner_id,topic.id);
   }
   if(a==='topics'&&c==='restore'&&method==='POST'){
@@ -233,6 +238,11 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
       if (!topic.assets_html?.trim()) throw new HttpError(409, "资产尚未生成，请稍后再下载。");
       return attachment(topic.assets_html, 'text/html; charset=utf-8', topic, 'assets.html');
     }
+    case "GET topics/:id/assets-preview": {
+      const topic=await getTopic(env,id);
+      if(!topic.assets_html?.trim())throw new HttpError(409,'资产尚未生成。');
+      return artifactPreview(topic.assets_html,'assets');
+    }
     case "GET topics/:id/product": {
       const topic = await getTopic(env, id);
       if (!topic.product_html?.trim()) throw new HttpError(409, "成品尚未生成。");
@@ -253,12 +263,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     case "GET topics/:id/product-preview": {
       const topic = await getTopic(env, id);
       if (!topic.product_html?.trim()) throw new HttpError(409, "成品尚未生成。");
-      return new Response(topic.product_html, { headers: {
-        'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store',
-        'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; font-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'",
-        'Referrer-Policy': 'no-referrer',
-      } });
+      return artifactPreview(topic.product_html,'game');
     }
     case "GET topics/:id/product-file": {
       const topic = await getTopic(env, id);
@@ -273,7 +278,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     }
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
     case "POST topics/:id/assets": return startTopicJob(env, 'assets', id, ctx, new URL(request.url).searchParams.get('regenerate') === '1', assetsJob);
-    case "POST topics/:id/game": return startGameJob(env, id);
+    case "POST topics/:id/game": return startGameJob(env, id,new URL(request.url).searchParams.get('regenerate')==='1');
     case "POST review": throw new HttpError(410, '请使用后台审核队列提交游戏。');
     case "GET reviews": return listReviews(env, ownerId);
     case "GET reviews/:id": return getReview(env, id, ownerId);
@@ -843,16 +848,16 @@ function brief(env, id, ctx, regenerate = false) {
   return startTopicJob(env, 'brief', id, ctx, regenerate, briefJob);
 }
 
-async function startGameJob(env: ForgeEnv, id: number) {
+async function startGameJob(env: ForgeEnv, id: number,regenerate=false) {
   const topic = await getTopic(env, id);
-  if (topic.product_html?.trim()) return { id, status: 'done', has_product: true };
+  if (!regenerate&&topic.product_html?.trim()) return { id, status: 'done', has_product: true };
   if (!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
   const model = activeModelProfile(await env.modelStore.get(), 'game');
   if (!model?.profile.enabled || !model.profile.encryptedKey) {
     throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
   }
   if(env.FORGE_RUNNER){
-    const task=await enqueueForgeTask(env,{type:'game',id,requestId:crypto.randomUUID()});
+    const task=await enqueueForgeTask(env,{type:'game',id,requestId:crypto.randomUUID(),...(regenerate?{regenerate:true}:{})});
     return {id,pending:true,status:'pending',taskId:task.id,jobId:task.id,executor:task.executor};
   }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
@@ -861,7 +866,7 @@ async function startGameJob(env: ForgeEnv, id: number) {
   if (!claim.meta?.changes) return { id, status: 'pending' };
   try {
     if (!env.FORGE_QUEUE) throw new HttpError(503, "后台制作队列尚未就绪，请稍后重试。");
-    await env.FORGE_QUEUE.send({ type: 'game', id, requestId });
+    await env.FORGE_QUEUE.send({ type: 'game', id, requestId,...(regenerate?{regenerate:true}:{}) });
   } catch (error) {
     await run(env, "UPDATE topics SET product_status = 'error', product_error = ?, updated_at = ? WHERE id = ? AND product_request_id = ?", String(error?.message || error).slice(0, 500), now(), id, requestId);
     throw new HttpError(503, "制作任务未能进入后台队列，请重试。");
@@ -905,7 +910,7 @@ export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
   if(job.type==='suggest')return suggestVocab(env,job);
   if(job.type==='tag')return tagGames(env);
   if (job.type === 'review') return processReviewJob(env, job.id, (payload, ownerId, jobId) => review(env, payload, ownerId, jobId));
-  if (job.type === 'game') return produceGame(env, job.id, job.requestId);
+  if (job.type === 'game') return produceGame(env, job.id, job.requestId,job.regenerate);
   if (job.type === 'expand') {
     try { return await expandBatch(env, job.ids); }
     catch (error) {
@@ -996,7 +1001,7 @@ async function assetsJob(env, id, t) {
   }
 }
 
-async function produceGame(env: ForgeEnv, id: number, requestId: string) {
+async function produceGame(env: ForgeEnv, id: number, requestId: string,regenerate=false) {
   const claim = await run(env, "UPDATE topics SET product_status = 'running', product_error = '正在准备制作材料…', updated_at = ? WHERE id = ? AND product_request_id = ? AND product_status = 'queued'", now(), id, requestId);
   if (!claim.meta?.changes) return { id, status: 'ignored' };
   const deadline = Date.now() + 12 * 60 * 1000;
@@ -1004,7 +1009,7 @@ async function produceGame(env: ForgeEnv, id: number, requestId: string) {
   return withTopicLease(env, [id], 'product_status', async () => {
   try {
     const topic = env.generationSnapshot?.topic || await getTopic(env, id);
-    if (topic.product_html?.trim()) return { id, status: 'done' };
+    if (!regenerate&&topic.product_html?.trim()) return { id, status: 'done' };
     const model = activeModelProfile(await env.modelStore.get(), 'game');
     if (!model?.profile.enabled || !model.profile.encryptedKey) throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
     const cfg = await getSettings(env);

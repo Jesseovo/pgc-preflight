@@ -27,7 +27,7 @@ async function setup(){
   // Historical platform tasks still exercise the internal runner and transport.
   // Public creation authorization is covered by star-workspaces/forge-agent.
   const request=async(method:string,path:string,data?:unknown)=>{
-    try{const result=await dispatchForge(method,path.split('/'),new Request(`https://test.example/api/forge/${path}`,{method,headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}),env,'admin',undefined);return result instanceof Response?result:Response.json(result);}
+    try{const result=await dispatchForge(method,path.split('?')[0].split('/'),new Request(`https://test.example/api/forge/${path}`,{method,headers:{'Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}),env,'admin',undefined);return result instanceof Response?result:Response.json(result);}
     catch(error){return Response.json({error:(error as Error).message},{status:(error as any).status||500});}
   };
   const row=()=>sqlite.prepare('SELECT * FROM topics WHERE id=9').get() as any;
@@ -37,6 +37,24 @@ async function setup(){
 const response=(text:string,stop_reason='end_turn')=>Response.json({content:[{type:'text',text}],stop_reason});
 
 describe('后台创作的持久任务',()=>{
+  it('明确重新制作生成新版本、重复点击只建一任务；失败仍保留已有成品',async()=>{
+    const s=await setup();let revision=1,fail=false;
+    const html=()=>`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><button>Version ${revision}</button><script>let score=0;</script></body></html>`;
+    const fetcher=vi.fn(async()=>{if(fail)throw new Error('fixture upstream unavailable');return response(html());});vi.stubGlobal('fetch',fetcher);
+    const first=await (await s.request('POST','topics/9/game')).json() as any;await executeForgeTask(s.env,first.jobId);const original=html();
+    expect(s.row().product_html).toBe(original);
+    expect(await (await s.request('POST','topics/9/game')).json()).toMatchObject({status:'done'});expect(fetcher).toHaveBeenCalledTimes(1);
+    const fresh=await (await s.request('POST','topics/9/game?regenerate=1')).json() as any;
+    const repeat=await (await s.request('POST','topics/9/game?regenerate=1')).json() as any;
+    expect(fresh.jobId).not.toBe(first.jobId);expect(repeat.jobId).toBe(fresh.jobId);expect(s.row().product_html).toBe(original);
+    revision=2;await executeForgeTask(s.env,fresh.jobId);expect(fetcher).toHaveBeenCalledTimes(2);expect(s.row().product_html).toBe(html());
+    expect(s.sqlite.prepare("SELECT count(*) n FROM artifact_versions WHERE kind='game'").get()).toMatchObject({n:2});
+    const versions=(await (await s.request('GET','topics/9/versions')).json()) as any[];
+    const old=versions.find(v=>!v.current),preview=await s.request('GET',`topics/9/versions/${old.id}/preview`);
+    expect(preview.headers.get('Content-Type')).toContain('text/html');expect(preview.headers.get('Content-Security-Policy')).toContain('sandbox allow-scripts');expect(preview.headers.get('Content-Security-Policy')).toContain("connect-src 'none'");expect(await preview.text()).toBe(original);
+    fail=true;const failed=await (await s.request('POST','topics/9/game?regenerate=1')).json() as any;await executeForgeTask(s.env,failed.jobId);
+    expect(s.task(failed.jobId).status).toBe('error');expect(s.row().product_html).toBe(html());expect(fetcher).toHaveBeenCalledTimes(3);
+  });
   it('Key 满载时保持 queued 并通过 alarm 再调度，释放后执行；排队不占十二分钟制作期限',async()=>{
     const s=await setup(),runtime={baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',protocol:'anthropic' as const,apiKey:'fixture-capacity-key'};
     const configured=await saveConfig({...runtime,profile:'opus'},s.env.modelStore,s.env.SETTINGS_KEY);

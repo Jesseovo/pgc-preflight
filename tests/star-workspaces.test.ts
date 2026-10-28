@@ -53,6 +53,10 @@ describe('Star 工作区迁移与所有权',()=>{
     expect(s.sqlite.prepare('SELECT owner_id,executor,model,disposition FROM artifact_versions WHERE task_id=?').get(first.taskId)).toMatchObject({owner_id:'a',executor:'platform',model:'claude-opus-5-5',disposition:'current'});
     expect((await s.request('a','GET','products')).status).toBe(200);
     expect(await (await s.request('a','GET',`topics/${id}/product-file`)).text()).toBe(html);
+    const version=s.sqlite.prepare('SELECT id FROM artifact_versions WHERE task_id=?').get(first.taskId) as any;
+    expect((await s.request('b','GET',`topics/${id}/versions/${version.id}/preview`)).status).toBe(404);
+    const preview=await s.request('a','GET',`topics/${id}/versions/${version.id}/preview`);
+    expect(await preview.text()).toBe(html);expect(preview.headers.get('Content-Security-Policy')).toContain("connect-src 'none'");
   });
 
   it('平台与 Agent 在同一选题同一环节互斥，不会偷偷转换已有 Agent 任务',async()=>{
@@ -175,7 +179,7 @@ describe('Star 工作区迁移与所有权',()=>{
       const text=await res.text();expect(text,path).not.toContain('B_PRIVATE');expect(text,path).not.toContain('PRIVATE_MODEL_KEY');
     }
     expect((await s.request('a','GET',`topics/${a}/brief`)).status).toBe(200);
-    for(const suffix of ['', '/brief','/assets','/product','/product-preview','/product-file','/game','/versions'])expect((await s.request('a','GET',`topics/${b}${suffix}`)).status,suffix).toBe(404);
+    for(const suffix of ['', '/brief','/assets','/assets-preview','/product','/product-preview','/product-file','/game','/versions'])expect((await s.request('a','GET',`topics/${b}${suffix}`)).status,suffix).toBe(404);
     expect((await s.request('a','GET',`reviews/${br}`)).status).toBe(404);
     expect((await s.request('a','PATCH',`topics/${b}`,{status:'rejected',note:'attacker'})).status).toBe(404);
     expect((await s.request('a','PATCH',`games/${bg}`,{title:'attacker'})).status).toBe(404);

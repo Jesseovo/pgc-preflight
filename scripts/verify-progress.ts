@@ -19,6 +19,7 @@ const server = createServer(async (request, response) => {
   try {
     if (url.pathname === '/api/forge/state') return json({ games: 1, vocab: 5, fresh_subjects: 100, providers: { deepseek: true }, provider: 'deepseek', model: 'deepseek-chat' });
     if (url.pathname === '/api/forge/settings') return json({ draw_size: 2 });
+    if (url.pathname === '/api/forge/generation-jobs') return json([]);
     if (url.pathname === '/api/forge/vocab') return json(['subject', 'medium', 'gesture', 'structure', 'mood'].map((dim, i) => ({ id: i, dim, word: '样例', enabled: 1 })));
     if (url.pathname === '/api/forge/topics') return json(url.search.includes('liked') ? topics.filter(t => t.status === 'liked') : topics.filter(t => t.status === 'drawn'));
     if (url.pathname === '/api/forge/draw') {
@@ -48,7 +49,7 @@ const server = createServer(async (request, response) => {
       return json({ ...profile, activeProfile: 'deepseek', profiles: { deepseek: profile, opus: { ...profile, protocol: 'anthropic' } }, routes: {}, effective: {} });
     }
     if (url.pathname === '/api/auth/login') { await pause(1800); return json({ error: '合成登录错误' }, 401); }
-    if (url.pathname === '/api/auth/me') return json({ error: 'not signed in' }, 401);
+    if (url.pathname === '/api/auth/me') return request.headers.referer?.includes('/login')?json({error:'not signed in'},401):json({id:'fixture-star',role:'member',star:true,canReview:true,displayName:'进度验证'});
     if (url.pathname === '/test') { response.setHeader('Content-Type', 'text/html'); return response.end(await readFile('public/forge/index.html')); }
     if (url.pathname === '/host') { response.setHeader('Content-Type', 'text/html'); return response.end(`<html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><script type="module">import '/forge/progress.js';document.body.insertAdjacentHTML('beforeend','<iframe title="workbench" src="/test?embedded=1" style="width:100%;height:1000px;border:0"></iframe>');</script></body></html>`); }
     const root = resolve(url.pathname.startsWith('/forge/') || url.pathname.startsWith('/artwork/') ? 'public' : 'dist');
@@ -88,16 +89,17 @@ try {
   complete = true;
   await page.waitForSelector('[data-task-key="brief-1"][data-task-state="done"]');
   assert.equal(await page.$eval('#modal', el => (el as HTMLElement).hidden), true, 'Background completion must not reopen a closed modal');
+  if (await page.$('.pgc-task-toggle[aria-expanded="false"]')) await page.click('.pgc-task-toggle');
   await page.click('[data-task-key="brief-1"] button');
   await page.waitForSelector('#regenBrief');
-  assert.match(await page.$eval('#modalBody pre', el => el.textContent!), /新简报 1/);
+  assert.match(await page.$eval('.brief-document', el => el.textContent!), /新简报 1/);
   complete = false;
   await page.click('#regenBrief');
   await page.waitForSelector('#briefProgress [role="progressbar"]');
   await page.waitForFunction('document.querySelector("#briefProgress").textContent.includes("后台")');
   complete = true;
   await page.waitForSelector('#regenBrief');
-  assert.match(await page.$eval('#modalBody pre', el => el.textContent!), /新简报 2/);
+  assert.match(await page.$eval('.brief-document', el => el.textContent!), /新简报 2/);
   assert.equal(requests, 2);
   console.log('PASS 简报即时反馈、计时、断线恢复、重复点击去重、切栏目保留任务、完成不抢焦点、重新生成。');
 
@@ -144,7 +146,8 @@ try {
   assert.equal(await batch.$eval('#progress [role="progressbar"]', el => el.getAttribute('aria-valuemax')), '2');
   expansionFinished = true;
   await batch.waitForSelector('#progress .is-error');
-  assert.equal(await batch.$eval('#progress [role="progressbar"]', el => el.getAttribute('aria-valuenow')), '1', 'Failed expansion is not counted as a generated topic');
+  assert.equal(await batch.$eval('#progress [role="progressbar"]', el => el.getAttribute('aria-valuenow')), '2', 'Progress counts settled jobs, including explicit failures');
+  assert.match(await batch.$eval('#progress', el => el.textContent!), /1 个已生成/);
   assert.match(await batch.$eval('#progress', el => el.textContent!), /1 个未完成/);
   console.log('PASS 批量扩写真实完成计数，部分失败不显示全部完成。');
   await batch.close();
@@ -169,6 +172,7 @@ try {
   assert.equal(await admin.$('.pgc-task[data-task-state="error"]'), null, 'The expected initial login gate must not leave a failed task');
   await admin.type('#admin-password', 'synthetic-admin'); await admin.click('#login-form button');
   await admin.waitForSelector('#tab-model'); await admin.click('#tab-model');
+  await admin.click('[data-profile="deepseek"]');
   await admin.click('#test-model');
   await admin.waitForFunction('document.querySelector(".pgc-task-tray").textContent.includes("测试模型连接")');
   assert(modelTest);

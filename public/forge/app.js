@@ -2,6 +2,7 @@
 import { mountReviewWorkspace } from './review-workspace.js';
 import { startTask, withProgress, progressHtml } from './progress.js';
 import { readXlsxRows, listMembers, sheetToWorks } from './review-sheet.js';
+import {briefDocument,versionDocument} from './artifact-view.js';
 
 const DIMS = ["subject", "medium", "gesture", "structure", "mood"];
 const DIM_LABEL = { subject: "题材", medium: "美术媒介", gesture: "手势", structure: "挑战结构", mood: "情绪基调" };
@@ -59,7 +60,7 @@ async function api(method,path,data,progress) {
   return out?.pending && out.jobId ? observeGeneration({id:out.jobId},progress) : out;
 }
 const generationPolls=new Map();
-const GENERATION_LABELS={preview:'生成样板图',suggest:'补充词库',tag:'自动打标签'};
+const GENERATION_LABELS={suggest:'补充词库',tag:'自动打标签'};
 function observeGeneration(row,provided) {
   if(generationPolls.has(row.id))return generationPolls.get(row.id);
   const task=provided||startTask(GENERATION_LABELS[row.kind]||'后台生成',{key:`generation-${row.id}`,retain:true,detail:row.detail||'等待后台执行…'});
@@ -189,7 +190,18 @@ function artStyle(d) {
 }
 
 function chipsHtml(t) {
-  return `<div class="chips">${DIMS.map((d) => `<span class="chip" title="${DIM_LABEL[d]}">${esc(t[d])}</span>`).join("")}</div>`;
+  return `<div class="chips">${DIMS.filter(d=>t[d]).map((d) => `<span class="chip" title="${DIM_LABEL[d]}">${esc(t[d])}</span>`).join("")}</div>`;
+}
+
+function creationFooter(t,mode){
+  const active=['queued','running'].includes(t.product_status),saved=!!t.has_product;
+  const action=saved?'viewProduct':active?'resumeProduct':t.product_status==='error'?'retryProduct':'makeGame';
+  const label=saved?'试玩游戏':active?'查看制作进度':t.product_status==='error'?'重试制作':'开始制作';
+  const materials=mode==='picks'?`<div class="creation-materials">${[['preview','样板图','has_preview','preview_status'],['brief','简报','has_brief','brief_status'],['assets','美术资产','has_assets','assets_status']].map(([kind,title,has,status])=>{
+    const running=t[status]==='running',blocked=kind==='assets'&&!t.has_brief&&!t[has];
+    return `<button class="material-link" data-act="${kind}" ${blocked?'disabled title="先生成简报，再生成美术资产"':''}><span>${title}</span><small>${running?'生成中 →':t[has]?'查看 →':t[status]==='error'?'重试 →':blocked?'需先生成简报':'生成 →'}</small></button>`;
+  }).join('')}</div>`:'';
+  return `<footer class="creation-footer">${materials}<div class="creation-main-actions"><button class="primary" data-act="${mode==='picks'&&!saved?'makeGame':action}">${label}</button>${saved&&active?'<button class="ghost" data-act="resumeProduct">制作进度</button>':''}<button class="ghost" data-act="versions">历史版本</button></div><details class="creation-more"><summary>更多操作</summary><div>${saved?`<button class="ghost" data-act="regenerateGame" ${active?'disabled':''}>${active?'新版本制作中':'重新制作游戏'}</button>`:''}${mode==='products'&&saved?`<a class="btn" href="/api/forge/topics/${t.id}/product-file">下载 HTML</a>`:''}${mode==='picks'?`<button class="ghost" data-act="${t.status==='made'?'unmake':'make'}">${t.status==='made'?'取消已制作标记':'标记为外部已制作'}</button><button class="ghost bad" data-act="reject">移出候选</button>`:''}</div></details></footer>`;
 }
 
 function topicCard(t, mode) {
@@ -212,35 +224,26 @@ function topicCard(t, mode) {
       : `<button class="ghost good" data-act="make">标记已制作</button>`);
     acts.push(`<button class="ghost bad" data-act="reject">移出候选</button>`);
   }
-  if (mode === 'picks') acts.unshift(`<button class="${t.has_product ? 'ghost' : 'primary'}" data-act="makeGame">${['queued', 'running'].includes(t.product_status) ? '查看制作进度' : t.has_product ? '查看成品' : t.product_status === 'error' ? '重试制作' : '开始制作'}</button>`);
   if (mode === 'products') acts.push(`<button class="primary" data-act="viewProduct">查看成品</button>`);
   acts.push(`<button class="ghost" data-act="preview">${t.has_preview ? "看样板图" : "生成样板图"}</button>`);
   acts.push(`<button class="${mode === "picks" ? "primary" : "ghost"}" data-act="brief">${t.brief_status === 'running' ? "查看生成进度" : t.has_brief ? "看简报" : "生成简报"}</button>`);
   if (mode === "picks" && t.has_brief) acts.push(`<button class="ghost" data-act="assets">${t.assets_status === 'running' ? "查看资产进度" : t.has_assets ? "看资产" : "生成资产"}</button>`);
-  return `<article class="card state-${t.status}" data-id="${t.id}">
+  const working=[['product_status','游戏制作'],['brief_status','简报生成'],['assets_status','资产生成'],['preview_status','样板图生成']].filter(([key])=>['queued','running'].includes(t[key])).map(([,label])=>label);
+  return `<article class="card state-${t.status} ${mode==='picks'?'creation-card':''}" data-id="${t.id}">
     <div class="art" style="${artStyle(d)}"><div class="title">${esc(d.title)}</div><div class="score" title="预估 美学/易玩性/可玩性">${esc(sc)}</div></div>
     <div class="body">
       ${chipsHtml(t)}
       <div>${esc(d.logline)}</div>
-      ${t.brief_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'制作简报',detail:'后台正在生成，可查看进度。'})}</div>` : ''}
-      ${t.assets_status === 'running' ? `<div class="pgc-inline-wait">${progressHtml({label:'生成资产',detail:'后台正在生成，可查看进度。'})}</div>` : ''}
-      ${mode === 'picks' && ['queued', 'running'].includes(t.product_status) ? `<div class="pgc-inline-wait">${progressHtml({label:t.product_status === 'queued' ? '等待后台制作' : '正在制作游戏',detail:t.product_error || '直接使用选题资料生成单文件 HTML，可切到成品栏目查看任务。'})}</div>` : ''}
+      ${working.length?`<div class="pgc-inline-wait">${progressHtml({label:working.join(' · '),detail:t.product_error||'正在后台处理，完成后自动更新。'})}</div>`:''}
       ${mode === 'picks' && t.product_status === 'error' ? `<div class="small bad">${esc(t.product_error || '制作未完成，可重试。')}</div>` : ''}
       ${t.status === "dup" ? `<div class="small bad">与「${esc(d.dup_of)}」撞题</div>` : ""}
-      <div class="kv"><b>新机制</b>${esc(d.twist)}</div>
-      <div class="kv"><b>操作</b>${esc(d.controls)}</div>
+      ${d.twist?`<div class="kv"><b>新机制</b>${esc(d.twist)}</div>`:''}
+      ${d.controls?`<div class="kv"><b>操作</b>${esc(d.controls)}</div>`:''}
       <div class="swatches">${sw}</div>
-      <details><summary>完整方案</summary>
-        <div class="kv"><b>核心循环</b>${esc(d.core_loop)}</div>
-        <div class="kv"><b>节奏</b>${esc(d.progression)}</div>
-        <div class="kv"><b>美术</b>${esc(d.art_direction)}</div>
-        <div class="kv"><b>音频</b>${esc(d.audio)}</div>
-        <div class="kv"><b>成瘾点</b>${esc(d.why_addictive)}</div>
-        <div class="kv"><b>风险</b>${esc(d.risks)}</div>
-      </details>
-      ${mode === "picks" ? `<input class="note" type="text" data-act="note" placeholder="补充要求（会写进简报），失焦自动保存" value="${esc(t.note)}">` : ""}
+      <details><summary>完整方案</summary>${[['core_loop','核心循环'],['progression','节奏'],['art_direction','美术'],['audio','音频'],['why_addictive','吸引点'],['risks','风险']].filter(([key])=>d[key]).map(([key,label])=>`<div class="kv"><b>${label}</b>${esc(d[key])}</div>`).join('')}</details>
+      ${mode === "picks" ? `<label class="creation-note">制作要求<input class="note" type="text" data-act="note" placeholder="填写希望调整的内容，自动保存" value="${esc(t.note)}"></label>` : ""}
     </div>
-    <div class="acts">${acts.join("")}</div>
+    ${mode==='picks'?creationFooter(t,mode):`<div class="acts">${acts.join('')}</div>`}
   </article>`;
 }
 
@@ -259,7 +262,8 @@ function bindCards(root, list, rerender) {
       else startProductJob(t, repaint, {resume:['queued', 'running'].includes(t.product_status)});
       return;
     }
-    if (act === 'viewProduct') { await showSavedProduct(t); return; }
+    if(act==='resumeProduct'||act==='retryProduct'||act==='regenerateGame'){startProductJob(t,repaint,{resume:act==='resumeProduct',regenerate:act==='regenerateGame'});return;}
+    if (act === 'viewProduct') { await guard(btn,()=>showSavedProduct(t,repaint),'读取游戏成品'); return; }
     const job = TOPIC_JOBS[act];
     if (job && (!t[job.has] || t[job.status] === 'running' || jobRequests.get(`${act}-${id}`)?.pending)) {
       generateTopicJob(act, t, repaint); return;
@@ -272,20 +276,9 @@ function bindCards(root, list, rerender) {
         rerender();
       } else if (act === "retry") {
         await expandIds([id]);
-      } else if (act === "preview") {
-        let svg;
-        if (t.has_preview) svg = (await api("GET", `topics/${id}`)).preview_svg;
-        else {
-          progress.update({detail:"后台正在绘制风格样板…"});
-          svg = (await api("POST", `topics/${id}/preview`,undefined,progress)).svg;
-          t.has_preview = 1;
-          toast("样板图好了");
-          rerender();
-        }
-        showPreview(t, svg);
       } else if (job) {
         const saved = await api("GET", `topics/${id}`);
-        if (root.isConnected) job.show(t, job.read(saved));
+        if (root.isConnected) job.show(t, job.read(saved),repaint);
       }
     });
   });
@@ -293,10 +286,7 @@ function bindCards(root, list, rerender) {
     if (e.target.dataset.act !== "note") return;
     const id = Number(e.target.closest(".card").dataset.id);
     const t = list().find((x) => x.id === id);
-    await guard(null, async () => {
-      Object.assign(t, await api("PATCH", `topics/${id}`, { note: e.target.value }));
-      toast("补充要求已保存；已生成的简报需要重新生成才会包含它");
-    });
+    void guard(null,()=>saveTopicNote(t,e.target.value),'保存制作要求');
   });
   // Restore observation after a reload without starting a second model job.
   for (const [kind, job] of Object.entries(TOPIC_JOBS)) {
@@ -309,18 +299,26 @@ function bindCards(root, list, rerender) {
   }
 }
 
+const pendingNotes=new Map();
+function saveTopicNote(topic,value){
+  topic.note=value;
+  const request=(pendingNotes.get(topic.id)||Promise.resolve()).catch(()=>{}).then(()=>rawApi('PATCH',`topics/${topic.id}`,{note:value})).then(saved=>{topic.note=saved.note;topic.content_revision=saved.content_revision;toast('制作要求已保存，下一次生成会使用新要求。');});
+  pendingNotes.set(topic.id,request);return request;
+}
+
 // Background jobs that produce one artifact per topic. They share queueing,
 // progress, reconnect and reclaim behaviour; only names and outputs differ.
 const TOPIC_JOBS = {
+  preview:{label:'生成样板图',noun:'样板图',status:'preview_status',error:'preview_error',has:'has_preview',result:'svg',output:saved=>saved?.preview_svg,read:saved=>saved?.preview_svg,done:'样板图已生成，可以预览。',show:(t,svg,repaint)=>showPreview(t,svg,repaint)},
   brief: {
     label: "制作简报", noun: "简报", status: "brief_status", error: "brief_error", has: "has_brief",
     output: (saved) => saved?.brief_md, read: (saved) => saved?.brief_export || saved?.brief_md,
-    done: "简报已生成，可以复制或下载。", show: (t, md) => showBrief(t, md),
+    done: "简报已生成，可以复制或下载。", show: (t, md,repaint) => showBrief(t, md,repaint),
   },
   assets: {
     label: "生成资产", noun: "资产", status: "assets_status", error: "assets_error", has: "has_assets",
     output: (saved) => saved?.assets_html, read: (saved) => saved?.assets_html,
-    done: "资产已生成，可以预览或下载。", show: (t, html) => showAssets(t, html),
+    done: "资产已生成，可以预览或下载。", show: (t, html,repaint) => showAssets(t, html,repaint),
   },
 };
 const jobRequests = new Map();
@@ -333,40 +331,43 @@ function generateTopicJob(kind, topic, repaint = () => {}, regenerate = false, {
   const job = TOPIC_JOBS[kind];
   const key = `${kind}-${topic.id}`;
   const current = jobRequests.get(key);
-  if (current?.pending) { showJobProgress(kind, current); return; }
-  const entry = {topic, pending:true};
+  if (current?.pending) {Object.assign(topic,current.topic);if(!current.listeners.some(v=>v.topic===topic))current.listeners.push({topic,repaint});if(show)showJobProgress(kind,current);return;}
+  const entry = {topic, pending:true,listeners:[{topic,repaint}]};
+  entry.repaint=()=>{for(const listener of entry.listeners){Object.assign(listener.topic,entry.topic);listener.repaint();}};
   entry.task = startTask(`${job.label} · ${topic.data.title}`, {key, retain:true, detail:resume ? "已恢复后台任务，正在读取生成状态…" : "正在提交后台任务…", action:() => showJobProgress(kind, entry), actionLabel:"查看进度"});
   if (current) current.task.dismiss();
   jobRequests.set(key, entry);
   topic[job.status] = 'running'; repaint(); if (show) showJobProgress(kind, entry);
   void (async () => {
     try {
+      if(!resume)await pendingNotes.get(topic.id);
       const value = await requestTopicJob(kind, topic.id, regenerate, detail => entry.task.update({detail}), resume);
       topic[job.has] = 1; topic[job.status] = '';
       if (kind === 'brief' && topic.status !== 'made') topic.status = 'liked';
-      entry.task.done(job.done, () => job.show(topic, value));
-      repaint();
-      if (modalOwner === entry && !$("#modal").hidden) job.show(topic, value);
+      entry.pending=false;entry.task.done(job.done, () => job.show(topic, value,entry.repaint));
+      entry.repaint();
+      if (modalOwner === entry && !$("#modal").hidden) job.show(topic, value,entry.repaint);
     } catch (error) {
-      if(error.versionPending){topic[job.status]='';entry.task.done(error.message,()=>showVersions(topic));repaint();return;}
+      if(error.versionPending){topic[job.status]='';entry.pending=false;entry.task.done(error.message,()=>showVersions(topic));entry.repaint();return;}
       topic[job.status] = 'error';
       entry.task.fail(error.message);
       entry.task.update({action:() => generateTopicJob(kind, topic, repaint, regenerate),actionLabel:"重试 / 继续等待"});
-      repaint();
+      entry.repaint();
     } finally { entry.pending = false; }
   })();
 }
 async function requestTopicJob(kind, id, regenerate = false, update = () => {}, resume = false) {
   const job = TOPIC_JOBS[kind];
+  const previous=regenerate?job.output(await rawApi('GET',`topics/${id}`)):undefined;
   if(resume){
     const rows=await rawApi('GET','generation-jobs');
     const latest=rows.find(row=>row.kind===kind&&row.scope?.endsWith(`:${kind}:${id}`));
-    if(latest){const value=await observeGeneration(latest,{update:state=>update(state.detail)});if(value?.[kind])return value[kind];}
+    if(latest){const value=await observeGeneration(latest,{update:state=>update(state.detail)});if(value?.[job.result||kind])return value[job.result||kind];}
   }
   if (!resume) try {
     const queued = await rawApi("POST", `topics/${id}/${kind}${regenerate ? '?regenerate=1' : ''}`);
     const started=queued?.jobId?await observeGeneration({id:queued.jobId},{update:state=>update(state.detail)}):queued;
-    if (started?.[kind]) return started[kind];
+    if (started?.[job.result||kind]) return started[job.result||kind];
     update(`任务已保存，后台正在生成${job.noun}。可以继续使用工作台。`);
   } catch (error) {
     if(error.versionPending)throw error;
@@ -382,7 +383,7 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
     try {
       const saved = await api("GET", `topics/${id}`);
       if (saved?.[job.status] === 'error') throw new Error(`${failed}：${saved[job.error] || "请查看错误原因后手动重试。"}`);
-      if (job.output(saved) && saved[job.status] !== 'running') return job.read(saved);
+      if (job.output(saved) && saved[job.status] !== 'running'&&(!regenerate||job.output(saved)!==previous)) return job.read(saved);
       update(saved?.[job.error] || `模型正在生成完整${job.noun}…`);
     } catch (error) {
       if (error instanceof Error && error.message.startsWith(failed)) throw error;
@@ -392,37 +393,32 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
   throw new Error(`${job.noun}仍在生成中，请稍后刷新候选列表查看结果。`);
 }
 
-function showPreview(t, svg) {
+function showPreview(t, svg,repaint=()=>{}) {
   const src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
   openModal(`${t.data.title} · 风格样板`, `<img class="preview" style="max-width:360px;margin:0 auto" src="${src}" alt="">
     <div class="row" style="margin-top:10px"><button class="ghost" id="dlSvg">下载 SVG</button>
     <button class="ghost" id="regenSvg">重新生成</button></div>`);
   $("#dlSvg").onclick = () => download(`${t.data.title}.svg`, svg, "image/svg+xml");
-  $("#regenSvg").onclick = (e) => guard(e.target, async (progress) => {
-    progress.update({label:"重新生成样板图",detail:"后台正在绘制新样板…"});
-    const r = await api("POST", `topics/${t.id}/preview`,undefined,progress);
-    showPreview(t, r.svg);
-  });
+  $("#regenSvg").onclick = ()=>generateTopicJob('preview',t,repaint,true);
 }
 
-function showBrief(t, md) {
-  openModal(`${t.data.title} · 制作简报`, `<p class="muted small">整段复制给 Claude Code（或任何能写代码的模型）即可开工。</p>
+function showBrief(t, md,repaint=()=>{}) {
+  openModal(`${t.data.title} · 制作简报`, `
     <div class="row" style="margin-bottom:8px"><button class="primary" id="cpBrief">复制简报</button>
     <a class="btn" id="dlBrief" href="/api/forge/topics/${t.id}/brief" download style="text-decoration:none">下载 .md</a><button class="ghost" id="regenBrief">重新生成</button></div>
-    <pre class="md">${esc(md)}</pre>`);
+    ${briefDocument(md)}`);
   $("#cpBrief").onclick = () => copyText(md);
-  $("#regenBrief").onclick = () => generateTopicJob('brief', t, () => {}, true);
+  $("#regenBrief").onclick = () => generateTopicJob('brief', t, repaint, true);
 }
 
 // The asset file is model-generated HTML: preview it only in an opaque-origin
 // sandbox, never in the workbench origin.
-function showAssets(t, html) {
-  openModal(`${t.data.title} · 美术资产`, `<p class="muted small">上面是合成的游戏画面（概念图），下面是逐个资产。确认后下载 HTML，和简报一起交给 Claude Code；简报里已写明要原样使用其中的 GAME_ASSETS。</p>
+function showAssets(t, html,repaint=()=>{}) {
+  openModal(`${t.data.title} · 美术资产`, `
     <div class="row" style="margin-bottom:8px"><a class="btn primary" id="dlAssets" href="/api/forge/topics/${t.id}/assets" download style="text-decoration:none">下载资产 HTML</a>
     <button class="ghost" id="regenAssets">重新生成</button><span class="muted small">${Math.round(html.length / 1024)} KB</span></div>
-    <iframe class="assets-frame" sandbox="allow-scripts" title="美术资产预览"></iframe>`);
-  $("#modalBody .assets-frame").srcdoc = html;
-  $("#regenAssets").onclick = () => generateTopicJob('assets', t, () => {}, true);
+    <iframe class="assets-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="美术资产预览" src="/api/forge/topics/${t.id}/assets-preview"></iframe>`);
+  $("#regenAssets").onclick = () => generateTopicJob('assets', t, repaint, true);
 }
 
 // ---------- 选题台 ----------
@@ -437,6 +433,7 @@ async function renderDraw(alive) {
   }
   const vocab = await loadVocab();
   if (!state.drawn.length) state.drawn = await api("GET", "topics?status=drawn,new,dup&limit=60");
+  await syncPreviewTasks(state.drawn);
   if (!alive()) return;
   const opts = (d) => vocab.filter((v) => v.dim === d && v.enabled && !v.used)
     .map((v) => `<option value="${esc(v.word)}">${esc(v.word)}</option>`).join("");
@@ -663,6 +660,7 @@ async function expandIds(ids, {resume = false} = {}) {
 
 async function renderPicks(alive) {
   const list = await api("GET", "topics?status=liked,made&limit=200");
+  await syncPreviewTasks(list);
   if (!alive()) return;
   view.innerHTML = `<div class="row section"><h2 class="grow">候选选题</h2><span class="muted small">${list.length} 个</span></div>
     <p class="muted small section">点击“开始制作”，平台使用 Opus 5.5 生成可试玩的单文件游戏，完成后在“成品”栏目查看。</p>
@@ -675,6 +673,11 @@ async function renderPicks(alive) {
   paint();
 }
 
+async function syncPreviewTasks(topics){
+  try{const rows=await rawApi('GET','generation-jobs');for(const topic of topics){const latest=rows.find(row=>row.kind==='preview'&&row.scope?.endsWith(`:preview:${topic.id}`));if(latest)topic.preview_status=['queued','running'].includes(latest.status)?'running':latest.status==='error'?'error':'';}}
+  catch{} // Listing materials remains usable if task status is temporarily unavailable.
+}
+
 async function renderProducts(alive) {
   const list = await api('GET', 'products');
   if (!alive()) return;
@@ -684,11 +687,7 @@ async function renderProducts(alive) {
     <div class="cards" id="productCards"></div>`;
   const paint = () => {
     if (!alive()) return;
-    const cards = products.map(topic => ['queued', 'running'].includes(topic.product_status)
-      ? `<article class="card pending" data-id="${topic.id}"><div class="art"><div class="title">${esc(topic.data?.title || '制作中')}</div></div><div class="body">${progressHtml({label:'游戏制作中',detail:topic.product_error || '等待后台执行。页面关闭后可恢复查看任务。'})}</div><div class="acts"><button class="ghost" data-act="resumeProduct">查看进度</button></div></article>`
-      : topic.product_status === 'error'
-        ? `<article class="card" data-id="${topic.id}"><div class="art"><div class="title">${esc(topic.data?.title || '制作未完成')}</div></div><div class="body"><p class="bad">${esc(topic.product_error || '制作失败，可重试。')}</p></div><div class="acts"><button class="primary" data-act="retryProduct">重试制作</button></div></article>`
-        : productCard(topic)).join('');
+    const cards = products.map(productCard).join('');
     $('#productCards').innerHTML = cards || `<p class="muted">还没有成品。到候选栏目选中一款游戏，点击“开始制作”。</p>`;
   };
   bindProductCards($('#productCards'), products, paint);
@@ -700,7 +699,8 @@ async function renderProducts(alive) {
 
 function productCard(topic) {
   const data = topic.data || {};
-  return `<article class="card" data-id="${topic.id}"><div class="art" style="${artStyle(data)}"><div class="title">${esc(data.title || 'Untitled')}</div><div class="score">可试玩</div></div><div class="body">${chipsHtml(topic)}<p>${esc(data.logline || '')}</p><p class="muted small">单文件 HTML · ${esc(topic.updated_at || '')}</p></div><div class="acts"><button class="primary" data-act="viewProduct">查看成品</button><button class="ghost" data-act="versions">历史版本</button><a class="btn" href="/api/forge/topics/${topic.id}/product-file">下载 HTML</a></div></article>`;
+  const active=['queued','running'].includes(topic.product_status);
+  return `<article class="card creation-card" data-id="${topic.id}"><div class="art" style="${artStyle(data)}"><div class="title">${esc(data.title || 'Untitled')}</div><div class="score">${topic.has_product?'可试玩':active?'制作中':'未完成'}</div></div><div class="body">${chipsHtml(topic)}<p>${esc(data.logline || '')}</p>${active?progressHtml({label:topic.has_product?'正在制作新版本':'游戏制作中',detail:topic.product_error||'等待后台执行…'}):topic.product_status==='error'?`<p class="bad small">${esc(topic.product_error||'制作未完成，可重试。')}${topic.has_product?' 现有成品仍可试玩。':''}</p>`:''}<p class="muted small">${topic.has_product?'单文件 HTML · '+esc(topic.updated_at||''):'完成后会自动出现在这里。'}</p></div>${creationFooter(topic,'products')}</article>`;
 }
 
 function bindProductCards(root, list, paint) {
@@ -709,9 +709,10 @@ function bindProductCards(root, list, paint) {
     if (!button) return;
     const topic = list.find(item => item.id === Number(button.closest('[data-id]').dataset.id));
     if(button.dataset.act==='versions' && topic){await guard(button,()=>showVersions(topic),'读取历史版本');return;}
-    if (button.dataset.act === 'viewProduct' && topic) await guard(button, () => showSavedProduct(topic), '读取游戏成品');
+    if (button.dataset.act === 'viewProduct' && topic) await guard(button, () => showSavedProduct(topic,paint), '读取游戏成品');
     if (button.dataset.act === 'resumeProduct' && topic) startProductJob(topic, paint, {resume:true});
     if (button.dataset.act === 'retryProduct' && topic) startProductJob(topic, paint);
+    if(button.dataset.act==='regenerateGame'&&topic)startProductJob(topic,paint,{regenerate:true});
   });
 }
 
@@ -721,7 +722,8 @@ function productProgress(topic, entry) {
   entry.task.attach($('#productProgress'));
 }
 
-function startProductJob(topic, repaint = () => {}, {show = true, resume = false} = {}) {
+function startProductJob(topic, repaint = () => {}, {show = true, resume = false,regenerate=false} = {}) {
+  regenerate=regenerate||!!topic.has_product;
   const existing = productRequests.get(topic.id);
   if (existing?.pending) {
     existing.listeners.push({topic, repaint});
@@ -729,7 +731,8 @@ function startProductJob(topic, repaint = () => {}, {show = true, resume = false
     if (show) productProgress(topic, existing);
     return;
   }
-  const entry = {topic, pending:true, listeners:[{topic, repaint}]};
+  const entry = {topic, pending:true,regenerate,listeners:[{topic, repaint}]};
+  if(existing)existing.task.dismiss();
   entry.repaint = () => { for (const listener of entry.listeners) { Object.assign(listener.topic, entry.topic); listener.repaint(); } };
   entry.task = startTask(`AI 制作 · ${topic.data?.title || '游戏'}`, {key:`product-${topic.id}`, retain:true, detail:resume ? '正在恢复后台任务状态…' : '正在提交制作任务…', action:() => productProgress(topic, entry), actionLabel:'查看进度'});
   productRequests.set(topic.id, entry);
@@ -737,29 +740,31 @@ function startProductJob(topic, repaint = () => {}, {show = true, resume = false
   repaint(); if (show) productProgress(topic, entry);
   void (async () => {
     try {
+      if(!resume)await pendingNotes.get(topic.id);
       const html = await requestProductJob(topic.id, entry, resume);
       topic.has_product = 1; topic.product_status = ''; topic.product_error = ''; topic.status = 'made';
-      entry.task.done('游戏已生成，可预览或下载。', () => showProduct(topic, html));
+      entry.task.done('游戏已生成，可预览或下载。', () => showProduct(topic, html,entry.repaint));
       entry.repaint();
-      if (modalOwner === entry && !$('#modal').hidden) showProduct(topic, html);
+      if (modalOwner === entry && !$('#modal').hidden) showProduct(topic, html,entry.repaint);
     } catch (error) {
       if(error.versionPending){topic.product_status='';entry.task.done(error.message,()=>showVersions(topic));entry.repaint();return;}
       topic.product_status = 'error'; topic.product_error = error.message;
       entry.task.fail(error.message);
-      entry.task.update({action:() => startProductJob(topic, repaint), actionLabel:'重试制作'});
+      entry.task.update({action:() => startProductJob(topic, repaint,{regenerate:entry.regenerate}), actionLabel:'重试制作'});
       entry.repaint();
     } finally { entry.pending = false; }
   })();
 }
 
 async function requestProductJob(id, entry, resume = false) {
+  const previous=entry.regenerate?(await rawApi('GET',`topics/${id}/product`)).html:null;
   if(resume){
     const rows=await rawApi('GET','generation-jobs');
     const latest=rows.find(row=>row.kind==='game'&&row.scope?.endsWith(`:game:${id}`));
     if(latest){const value=await observeGeneration(latest,{update:state=>entry.task.update(state)});if(value?.html)return value.html;}
   }
   if (!resume) try {
-    const queued=await rawApi('POST',`topics/${id}/game`);
+    const queued=await rawApi('POST',`topics/${id}/game${entry.regenerate?'?regenerate=1':''}`);
     const started=queued?.jobId?await observeGeneration({id:queued.jobId},entry.task):queued;
     if(started.html)return started.html;
     if (started.status === 'done' && started.has_product) return (await api('GET', `topics/${id}/product`)).html;
@@ -775,7 +780,10 @@ async function requestProductJob(id, entry, resume = false) {
       const saved = await api('GET', `topics/${id}/game`);
       Object.assign(entry.topic, saved);
       if (saved.product_status === 'error') throw Object.assign(new Error(saved.product_error || '制作失败，请重试。'), {terminal:true});
-      if (saved.has_product && saved.product_status !== 'running') return (await api('GET', `topics/${id}/product`)).html;
+      if (saved.has_product && !['queued','running'].includes(saved.product_status)){
+        const html=(await api('GET',`topics/${id}/product`)).html;
+        if(!entry.regenerate||html!==previous)return html;
+      }
       entry.task.update({detail:saved.product_error || 'Opus 正在制作 HTML 游戏，等待完整版本…'});
       entry.repaint();
       if (!['queued', 'running'].includes(saved.product_status)) throw Object.assign(new Error('后台没有接收到制作任务，请重新开始制作。'), {terminal:true});
@@ -786,15 +794,16 @@ async function requestProductJob(id, entry, resume = false) {
   }
 }
 
-async function showSavedProduct(topic) {
-  const saved = topic.product_html ? {html:topic.product_html} : await api('GET', `topics/${topic.id}/product`);
-  showProduct(topic, saved.html);
+async function showSavedProduct(topic,repaint=()=>{}) {
+  const saved = await api('GET', `topics/${topic.id}/product`);
+  showProduct(topic, saved.html,repaint);
 }
 
-function showProduct(topic, html) {
-  openModal(`${topic.data?.title || '游戏'} · 成品`, `<p class="muted small">单文件游戏，在隔离环境中预览。外部网络连接已禁用。</p><div class="row" style="margin-bottom:10px"><button class="primary" id="downloadProduct">下载 HTML</button><button class="ghost" id="copyProductPrompt">复制 HTML</button></div><iframe class="product-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${esc(topic.data?.title || '游戏')}成品预览" src="/api/forge/topics/${topic.id}/product-preview"></iframe>`);
+function showProduct(topic, html,repaint=()=>{}) {
+  openModal(`${topic.data?.title || '游戏'} · 成品`, `<div class="row" style="margin-bottom:10px"><button class="primary" id="downloadProduct">下载 HTML</button><button class="ghost" id="regenerateProduct" ${['queued','running'].includes(topic.product_status)?'disabled':''}>重新制作</button><button class="ghost" id="copyProductPrompt">复制 HTML</button></div><iframe class="product-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="${esc(topic.data?.title || '游戏')}成品预览" src="/api/forge/topics/${topic.id}/product-preview"></iframe>`);
   $('#downloadProduct').onclick = () => download(`${topic.data?.title || 'game'}.html`, html, 'text/html');
   $('#copyProductPrompt').onclick = () => copyText(html);
+  $('#regenerateProduct').onclick=()=>startProductJob(topic,repaint,{regenerate:true});
 }
 
 // ---------- 审核 ----------
@@ -990,11 +999,11 @@ const VERSION_LABELS={expand:'扩写',brief:'简报',preview:'样板图',assets:
 async function showVersions(topic) {
   const response=await api('GET',`topics/${topic.id}/versions`);
   const versions=Array.isArray(response)?response:response.versions||[];
-  openModal(`${topic.data?.title || '选题'} · 历史版本`, `<p class="muted small">上游内容更新后，旧结果仍保留。恢复历史内容会创建新的当前版本，后续任务从新版本继续。</p><div class="version-list">${versions.map(version=>`<div class="version-row"><span><b>${esc(VERSION_LABELS[version.kind]||version.kind)}</b><small>${esc(version.created_at)} · ${version.executor==='agent'?'我的 Agent':esc(version.executor||'历史记录')}${version.model?' · '+esc(version.model):''}</small><small>${version.current||version.disposition==='current'?'当前版本':version.disposition==='pending'?'待确认结果':'历史版本'}${version.stale?' · 上游版本已变化':''}</small></span><button class="ghost" data-version="${esc(version.id)}">查看 / 恢复</button></div>`).join('')||'<p>还没有版本记录。</p>'}</div>`);
+  openModal(`${topic.data?.title || '选题'} · 历史版本`, `<div class="version-list">${versions.map(version=>`<div class="version-row"><span><b>${esc(VERSION_LABELS[version.kind]||version.kind)}</b><small>${esc(version.created_at)} · ${version.executor==='agent'?'我的 Agent':esc(version.executor||'历史记录')}${version.model?' · '+esc(version.model):''}</small><small>${version.current||version.disposition==='current'?'当前版本':version.disposition==='pending'?'待确认结果':'历史版本'}${version.stale?' · 上游版本已变化':''}</small></span><button class="ghost" data-version="${esc(version.id)}">${['game','assets','preview'].includes(version.kind)?'预览':'阅读'}</button></div>`).join('')||'<p>还没有版本记录。</p>'}</div>`);
   $('#modalBody').querySelectorAll('[data-version]').forEach(button=>button.onclick=()=>guard(button,async()=>{
-    const version=await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(button.dataset.version)}`);
+    const version={...versions.find(v=>v.id===button.dataset.version),...await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(button.dataset.version)}`)};
     const content=typeof version.content==='string'?version.content:JSON.stringify(version.content,null,2);
-    openModal(`${VERSION_LABELS[version.kind]||version.kind} · ${version.created_at||'历史版本'}`,`<div class="row section"><button class="ghost" id="backToVersions">返回版本列表</button><button class="ghost" id="copyVersion">复制内容</button><button class="primary" id="restoreVersion">${version.disposition==='pending'?'采用此结果':'恢复此版本'}</button></div>${version.stale?'<p class="small bad">生成时使用的上游内容已变化，采用前请核对。</p>':''}<pre class="md">${esc(content)}</pre>`);
+    openModal(`${VERSION_LABELS[version.kind]||version.kind} · ${version.created_at||'历史版本'}`,`<div class="row section"><button class="ghost" id="backToVersions">返回版本列表</button><button class="ghost" id="copyVersion">复制内容</button><button class="primary" id="restoreVersion" ${version.current?'disabled':''}>${version.current?'当前版本':version.disposition==='pending'?'采用此结果':'恢复此版本'}</button></div>${version.stale?'<p class="small bad">生成时使用的上游内容已变化，采用前请核对。</p>':''}${versionDocument(version,topic.id)}`);
     $('#backToVersions').onclick=()=>showVersions(topic);
     $('#copyVersion').onclick=()=>copyText(content);
     $('#restoreVersion').onclick=event=>guard(event.target,async()=>{await api('POST',`topics/${topic.id}/restore`,{version_id:version.id});toast('版本已恢复，依赖旧内容的产物仍可在历史中查看。');state.drawn=[];$('#modal').hidden=true;render();});
