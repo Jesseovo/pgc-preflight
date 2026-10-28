@@ -175,7 +175,7 @@ export function publicConfig(config: ModelConfig | null) {
   const profiles = modelProfiles(config);
   const publicProfiles = Object.fromEntries([...new Set([...MODEL_PROFILES, ...Object.keys(profiles)])].map(id => {
     const p = profiles[id];
-    return [id, p ? { name: p.name || PROFILE_DEFAULTS[id]?.name || p.model, baseUrl: p.baseUrl, model: p.model, protocol: p.protocol || 'openai', enabled: p.enabled, vision: p.vision !== false, effort:p.effort || 'auto', maxOutputTokens:p.maxOutputTokens || 0, hasKey: !!p.encryptedKey, updatedAt: p.updatedAt } : { ...PROFILE_DEFAULTS[id], enabled: true, vision: true, hasKey: false, updatedAt: '' }];
+    return [id, p ? { name: p.name || PROFILE_DEFAULTS[id]?.name || p.model, baseUrl: p.baseUrl, model: p.model, protocol: p.protocol || 'openai', enabled: p.enabled, vision: p.vision !== false, effort:p.effort || 'auto', maxOutputTokens:p.maxOutputTokens || 0, hasKey: !!p.encryptedKey, keySuffix:'', updatedAt: p.updatedAt } : { ...PROFILE_DEFAULTS[id], enabled: true, vision: true, hasKey: false, keySuffix:'', updatedAt: '' }];
   }));
   const routes = Object.fromEntries(MODEL_GROUPS.map(group => [group, config?.routes?.[group] || '']));
   const effective = Object.fromEntries(MODEL_PURPOSES.map(purpose => [purpose, activeModelProfile(config, purpose)?.id || '']));

@@ -69,7 +69,7 @@ export interface ForgeEnv {
   modelStore: ConfigStore;
   FORGE_QUEUE?: { send(message: ForgeJob): Promise<void> };
   FORGE_RUNNER?: ForgeRunnerBinding;
-  generation?: {id:string; deadline:number; onStart():Promise<void>; onWait(message:string):Promise<void>};
+  generation?: {id:string; deadline:number; capacityReserved?:boolean;onUncertain?():void;onStart():Promise<void>; onWait(message:string):Promise<void>};
   REVIEW_QUEUE?: { send(message: { type: 'review'; id: string }): Promise<void> };
   captureReview?: (html: string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
   reviewExecutor?: 'device';

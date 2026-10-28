@@ -51,7 +51,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;capacityReserved?:boolean;onUncertain?():void;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (req.requiredProfile && (!active || active.profile.protocol !== 'anthropic' || !/^claude-opus-5-5$/i.test(active.profile.model))) throw new LLMError('游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。', 409);
@@ -102,7 +102,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         // any text arrives. Keep streaming only for long artifacts that need
         // live heartbeats; bounded admin generations use one JSON response.
         stream,
-        onStart: req.onStart,
+        onStart: req.onStart, capacityReserved:env.generation?.capacityReserved,onUncertain:env.generation?.onUncertain,
         onProgress: req.onProgress,
         onActivity: req.onWait ? (phase, characters) => req.onWait!(phase === 'thinking' ? '模型正在思考，连接正常，尚未输出正文…' : `模型正在输出，已接收 ${characters.toLocaleString('en-US')} 个字符…`) : undefined,
         onMetrics: async metrics => {

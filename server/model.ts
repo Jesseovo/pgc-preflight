@@ -1,3 +1,4 @@
+import {tryModelSlot} from './model-capacity';
 import type { CheckReport, Finding, Status } from '../src/types';
 import type { ModelRuntime } from './settings';
 import { inferenceOptions, modelCapabilities, type ThinkingEffort } from '../src/model-options';
@@ -98,7 +99,7 @@ async function upstreamError(response: Response, apiKey: string): Promise<ModelH
     !streamFailure && !wrapped503 && (response.status === 429 || response.status === 503));
 }
 
-export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string; stream?: boolean } = {}): ModelTransport {
+export function modelTransport(config: ModelRuntime, options: { maxTokens?: number; timeoutMs?: number; totalTimeoutMs?: number; idempotencyKey?: string; DB?: ModelThrottleDatabase; onWait?: ModelWait; onStart?: () => Promise<void>; capacityReserved?:boolean;onUncertain?:()=>void; onProgress?: (characters: number) => Promise<void>; onActivity?: (phase: 'thinking' | 'output', characters: number) => Promise<void>; onMetrics?: (metrics: ModelMetrics) => Promise<void>; json?: boolean; reasoningEffort?: ThinkingEffort; outputEffort?: ThinkingEffort; purpose?: string; stream?: boolean } = {}): ModelTransport {
   const throttle = createModelThrottle(options.DB, config);
   return async messages => {
     const inferred = inferenceOptions(config, options.purpose, options.maxTokens);
@@ -123,7 +124,11 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
     };
+    let capacity:Awaited<ReturnType<typeof tryModelSlot>>=null;let uncertain=false;
     const once = async () => {
+      if(!options.capacityReserved&&!capacity){
+        while(!capacity){capacity=await abortable(tryModelSlot(options.DB,config,crypto.randomUUID(),deadline+120000),controller.signal);if(!capacity){await options.onWait?.(5000,'pace');await pauseModel(5000,controller.signal);}}
+      }
       await abortable(throttle.wait(controller.signal, options.onWait), controller.signal);
       if (options.onWait) await abortable(Promise.resolve(options.onWait(0, 'pace')), controller.signal);
       touch();
@@ -132,6 +137,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         : {'Content-Type':'application/json', ...(deepseek ? { Accept: 'text/event-stream' } : {}), Authorization:`Bearer ${config.apiKey}`};
       if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
       if (options.onStart) await abortable(options.onStart(), controller.signal);
+      uncertain=true;
       const response = await abortable(fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST', headers,
         body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens, stream), ...(inferred.capability.kind === 'adaptive' ? {thinking:{type:'adaptive'},output_config:{effort}} : {}) } : {
@@ -141,6 +147,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         }),
         signal:controller.signal, redirect:'manual',
       }), controller.signal);
+      if(!response.ok)uncertain=false;
       if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
       if (!response.ok) throw await abortable(upstreamError(response, config.apiKey), controller.signal);
       const contentType = response.headers.get('content-type') || '';
@@ -238,12 +245,14 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           throw error;
         }
         finally { try { reader.releaseLock(); } catch {} }
+        if(ended)uncertain=false;
         if (truncated) throw new ModelOutputError(`模型${thinking ? '思考与报告' : '输出'}达到长度上限，内容不完整。`, 'truncated');
         if (!ended) throw new ModelOutputError('模型连接提前结束，报告尚未完整接收，请重试。', 'incomplete');
         if (content.trim()) return content;
         throw new ModelOutputError(thinking ? '模型只返回了思考过程，没有生成报告正文。' : `模型没有返回可读的审核内容，请确认接口兼容 ${anthropic ? 'Anthropic Messages' : 'Chat Completions'}。`, 'empty');
       }
       const data = await abortable(response.json(), controller.signal) as {choices?:{finish_reason?:string;message?:{content?:string;reasoning_content?:string}}[];stop_reason?:string;content?:{type?:string;text?:string}[]};
+      uncertain=false;
       usage((data as any).usage); metrics.finishReason = data.stop_reason || data.choices?.[0]?.finish_reason || '';
       if (data.stop_reason === 'max_tokens' || data.choices?.[0]?.finish_reason === 'length') throw new ModelOutputError('模型思考与报告达到长度上限，内容不完整。', 'truncated');
       const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
@@ -258,6 +267,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         catch (error) {
           clearTimeout(timeout);
           const pendingRequest = Boolean(options.idempotencyKey) && error instanceof ModelHttpError && error.upstreamStatus === 409 && /^(?:IDEMPOTENCY_(?:IN_PROGRESS|PENDING)|REQUEST_(?:IN_PROGRESS|PENDING)|INFLIGHT)$/i.test(error.code);
+          const capacityWait=error instanceof ModelHttpError&&error.code==='KEY_QUEUE_FULL';
           const retryableTransport = error instanceof ModelHttpError && error.retryable;
           if (!(error instanceof ModelHttpError) || metrics.characters > 0 || metrics.thinkingCharacters > 0 || (!pendingRequest && !retryableTransport) || /quota|balance|credit|billing/i.test(error.code)) throw error;
           // Pending polls only retrieve the original request. Let a slow Opus
@@ -265,8 +275,8 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           // polls. Rejected HTTP calls still have at most three retries.
           const wait = Math.max(1000, error.retryMs ?? (pendingRequest ? 15000 : 15000 * 2 ** retries));
           if (!pendingRequest) await abortable(throttle.cooldown(wait), controller.signal);
-          if ((!pendingRequest && retries >= 3) || Date.now() + wait + 1000 >= deadline) throw error;
-          if (!pendingRequest) retries++;
+          if ((!pendingRequest && !capacityWait && retries >= 3) || Date.now() + wait + 1000 >= deadline) throw error;
+          if (!pendingRequest && !capacityWait) retries++;
           if (options.onWait) await abortable(Promise.resolve(options.onWait(wait, pendingRequest ? 'pending' : error.upstreamStatus === 503 ? 'unavailable' : 'rate_limit')), controller.signal);
           await pauseModel(wait, controller.signal);
         }
@@ -278,6 +288,9 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
     } finally {
       clearTimeout(timeout);
       clearTimeout(totalTimeout);
+      if(uncertain)options.onUncertain?.();
+      const leased=capacity as {release():Promise<void>}|null;
+      if(leased&&!uncertain)await leased.release().catch(()=>{});
       metrics.elapsedMs = Date.now() - started;
       if (options.onMetrics) {
         let metricsTimer: ReturnType<typeof setTimeout> | undefined;

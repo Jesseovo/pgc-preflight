@@ -6,6 +6,7 @@ import {executeForgeTask,ForgeRunner} from '../server/forge-runner';
 import {enqueueForgeTask,failForgeTask,readForgeTask} from '../server/forge-tasks';
 import {complete} from '../server/forge-llm';
 import {saveConfig} from '../server/settings';
+import {tryModelSlot} from '../server/model-capacity';
 import type {ModelConfig} from '../server/settings';
 
 const databases:DatabaseSync[]=[];
@@ -36,6 +37,20 @@ async function setup(){
 const response=(text:string,stop_reason='end_turn')=>Response.json({content:[{type:'text',text}],stop_reason});
 
 describe('后台创作的持久任务',()=>{
+  it('Key 满载时保持 queued 并通过 alarm 再调度，释放后执行；排队不占十二分钟制作期限',async()=>{
+    const s=await setup(),runtime={baseUrl:'https://riffle-api.pages.dev',model:'claude-opus-5-5',protocol:'anthropic' as const,apiKey:'fixture-capacity-key'};
+    const configured=await saveConfig({...runtime,profile:'opus'},s.env.modelStore,s.env.SETTINGS_KEY);
+    s.sqlite.prepare("UPDATE settings SET value=? WHERE id='model'").run(JSON.stringify(configured));
+    const one=await tryModelSlot(s.env.DB,runtime,'other-one',Date.now()+14*60000),two=await tryModelSlot(s.env.DB,runtime,'other-two',Date.now()+14*60000);
+    const row=await enqueueForgeTask(s.env,{type:'game',id:9,requestId:'unused'});
+    const fetcher=vi.fn(async()=>response('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><canvas></canvas><script>let score=0;</script></body></html>'));vi.stubGlobal('fetch',fetcher);
+    const storage={get:async()=>row.id,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    await new ForgeRunner({storage},s.env).alarm();
+    expect(s.task(row.id)).toMatchObject({status:'queued',model_started_at:null,started_at:null});expect(fetcher).not.toHaveBeenCalled();
+    expect(storage.deleteAll).not.toHaveBeenCalled();expect(storage.setAlarm.mock.calls.at(-1)![0]-Date.now()).toBeGreaterThan(4000);
+    await one!.release();await executeForgeTask(s.env,row.id);expect(s.task(row.id).status).toBe('done');expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(s.sqlite.prepare('SELECT count(*) n FROM model_slots').get()).toMatchObject({n:1});await two!.release();
+  });
   it('排队超过旧租约、重复点击和恢复调度都沿用一个任务；完成后重复执行不收费',async()=>{
     const s=await setup();
     const first=await (await s.request('POST','topics/9/brief')).json() as any;

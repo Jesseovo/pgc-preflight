@@ -47,6 +47,7 @@ try {
   await page.setViewport({width:1440,height:1050});await page.goto(origin+'/admin');await page.waitForSelector('#admin-password');
   await page.type('#admin-password',secrets.ADMIN_PASSWORD);await page.click('#login-form button[type="submit"]');await page.waitForSelector('#tab-model');await page.click('#tab-model');
   await page.waitForFunction('document.querySelector("[data-model-row=opus] .provider-balance").textContent.includes("900.00")');
+  assert((await page.$eval('[data-model-row="opus"] .provider-copy',el=>el.textContent)).includes('Key •••• opus'));
   assert.equal(await page.$eval('.model-library',el=>(el as HTMLElement).hidden),true,'Editor starts collapsed');
   await page.click('[data-model-row="opus"] [data-use="review"]');
   await page.waitForFunction('document.querySelector("#switch-message").textContent.includes("审核已切换")');

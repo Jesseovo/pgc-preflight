@@ -34,6 +34,8 @@ const app = {
     // Gallery browsing is a member-session surface backed by D1. Route it
     // before the generic control-plane proxy so its auth and admin checks run.
     if(url.pathname.startsWith('/api/square/'))return (await galleryApi(request,env)) || json({error:'接口不存在。'},404);
+    // A read-only provider query does not need the shared JSON control object.
+    if(url.pathname==='/api/admin/quota')return (await adminApi(request,configStore(env.DB),env,memberStore(env.DB),env.DB))!;
     // The ordinary Free Worker only routes API traffic. JSON processing and
     // control-plane work use the free SQLite Durable Object CPU allowance.
     if(url.pathname.startsWith('/api/')&&(env as any).CONTROL_PLANE){
@@ -149,6 +151,7 @@ const app = {
     await purgeReviewInputs(env);
     await recoverForgeTasks({...env,modelStore:configStore(env.DB)});
     await env.DB.prepare("DELETE FROM forge_tasks WHERE executor='platform' AND status IN ('done','error') AND updated_at < ?").bind(new Date(Date.now()-30*86400000).toISOString()).run();
+    await env.DB.prepare('DELETE FROM model_slots WHERE expires_at < ?').bind(Date.now()).run();
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ? AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE forge_tasks.owner_id=topics.owner_id AND executor='agent' AND scope=topics.owner_id||':game:'||topics.id AND status IN ('queued','running'))")
       .bind(new Date().toISOString(), new Date(Date.now() - 15 * 60 * 1000).toISOString()).run();

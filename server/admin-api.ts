@@ -1,5 +1,5 @@
 import { activateProfile, authorized, login, modelProfiles, publicConfig, saveConfig, saveRoutes, validateModelFields, decryptKey, deleteProfile, profileId } from './settings';
-import type { AppSecrets, ConfigStore } from './settings';
+import type { AppSecrets, ConfigStore, ModelConfig } from './settings';
 import { modelTransport } from './model';
 import { inferenceOptions } from '../src/model-options';
 import type { ModelThrottleDatabase } from './model-throttle';
@@ -11,6 +11,7 @@ import {modelQuota} from './model-quota';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
+  const view=async(config:ModelConfig|null)=>{const data=publicConfig(config);for(const[id,p]of Object.entries(modelProfiles(config))){if(p?.encryptedKey)try{data.profiles[id].keySuffix=(await decryptKey(p.encryptedKey,secrets.SETTINGS_KEY)).slice(-4);}catch{data.profiles[id].keySuffix='';}}return data;};
   if(request.headers.has('Authorization'))return Response.json({error:'设备凭据不能访问管理接口。'},{status:403});
   if(!url.pathname.startsWith('/api/admin/'))return null;
   const json=(value:unknown,status=200,headers:Record<string,string>={})=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});
@@ -40,18 +41,18 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
     const memberId=url.pathname.match(/^\/api\/admin\/members\/([a-f0-9-]+)$/)?.[1];
     if(memberId&&request.method==='PATCH')return json(publicMember(await updateMember(memberId,await smallJson(request),members)));
     if(url.pathname==='/api/admin/config'){
-      if(request.method==='GET')return json(publicConfig(await store.get()));
-      if(request.method==='PUT')return json(publicConfig(await saveConfig(await smallJson(request),store,secrets.SETTINGS_KEY)));
+      if(request.method==='GET')return json(await view(await store.get()));
+      if(request.method==='PUT')return json(await view(await saveConfig(await smallJson(request),store,secrets.SETTINGS_KEY)));
     }
     if(url.pathname==='/api/admin/quota'&&request.method==='GET')return json(await modelQuota(store,secrets.SETTINGS_KEY,url.searchParams.get('profile')));
     if(url.pathname==='/api/admin/config/active'&&request.method==='POST'){
       const body=await smallJson(request) as {profile?:unknown};
-      return json(publicConfig(await activateProfile(body.profile,store)));
+      return json(await view(await activateProfile(body.profile,store)));
     }
-    if(url.pathname==='/api/admin/config/routes'&&request.method==='POST')return json(publicConfig(await saveRoutes(await smallJson(request),store)));
+    if(url.pathname==='/api/admin/config/routes'&&request.method==='POST')return json(await view(await saveRoutes(await smallJson(request),store)));
     if(url.pathname==='/api/admin/config/profile'&&request.method==='DELETE'){
       const body=await smallJson(request) as {profile?:unknown};
-      return json(publicConfig(await deleteProfile(body.profile,store)));
+      return json(await view(await deleteProfile(body.profile,store)));
     }
     if(url.pathname==='/api/admin/runs'&&request.method==='GET'){
       if (!DB) return json({runs:[]});

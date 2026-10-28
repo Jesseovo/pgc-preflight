@@ -10,7 +10,7 @@ const databases: DatabaseSync[] = [];
 afterEach(() => { databases.splice(0).forEach(db => db.close()); vi.unstubAllGlobals(); vi.useRealTimers(); });
 function setup() {
   const sqlite = new DatabaseSync(':memory:'); databases.push(sqlite);
-  sqlite.exec(readFileSync('migrations/0007_model_throttle.sql', 'utf8'));
+  sqlite.exec(readFileSync('migrations/0007_model_throttle.sql', 'utf8'));sqlite.exec(readFileSync('migrations/0023_model_slots.sql', 'utf8'));
   return { sqlite, DB: { prepare(sql: string) { return { bind(...params: any[]) { return {
     first: async () => sqlite.prepare(sql).get(...params), run: async () => sqlite.prepare(sql).run(...params),
   }; } }; } } };
