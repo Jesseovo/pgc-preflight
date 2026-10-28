@@ -16,7 +16,7 @@ export function providerStatus(_env: unknown, cfg: Record<string, string>) {
 export function activeModel(cfg: Record<string, string>) { return cfg.openai_model || cfg.anthropic_model || '（未配置）'; }
 
 function jsonTail(schema: unknown) {
-  return schema ? '\n\n只输出一个 JSON 对象，不要任何解释或代码块标记。不要尾随逗号；字符串内换行写成 \\n。它必须符合这个 JSON Schema：\n' + JSON.stringify(schema) : '';
+  return schema ? '\n\n只输出一个 JSON 数据对象，不要返回 Schema、解释或代码块，不要用 report/data/result 再包一层。根对象直接包含顶层 properties 定义的字段；嵌套对象保持 Schema 规定的层级。严格按字段类型输出；字符串必须是字符串，字符串数组只能包含字符串，空列表用 []。不要尾随逗号；字符串内换行写成 \\n。它必须符合这个 JSON Schema：\n' + JSON.stringify(schema) : '';
 }
 
 // A text-only model gets a note in place of the screenshots, so the report
@@ -89,6 +89,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       const attemptKey = idempotencyKey && freshRequest ? `${idempotencyKey}-retry-${attempt}` : idempotencyKey;
       const stream = req.purpose === 'game' || req.purpose === 'assets';
       const remaining = Math.max(1, deadline - Date.now());
+      const runId=crypto.randomUUID();
       const transport = modelTransport({ ...active.profile, apiKey }, {
         DB: env.DB, maxTokens,
         // A non-streaming request has no activity until the entire artifact
@@ -107,7 +108,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         onMetrics: async metrics => {
           if (!env.DB) return;
           await env.DB.prepare('INSERT INTO model_runs (id,profile_id,model,purpose,status,effort,max_tokens,input_tokens,output_tokens,reasoning_tokens,first_text_ms,elapsed_ms,characters,finish_reason,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-            .bind(crypto.randomUUID(),active.id,active.profile.model,req.purpose || 'create',metrics.status,metrics.effort,metrics.maxTokens,metrics.inputTokens,metrics.outputTokens,metrics.reasoningTokens,metrics.firstTextMs,metrics.elapsedMs,metrics.characters,metrics.finishReason,metrics.error,new Date().toISOString()).run();
+            .bind(runId,active.id,active.profile.model,req.purpose || 'create',metrics.status,metrics.effort,metrics.maxTokens,metrics.inputTokens,metrics.outputTokens,metrics.reasoningTokens,metrics.firstTextMs,metrics.elapsedMs,metrics.characters,metrics.finishReason,metrics.error,new Date().toISOString()).run();
         },
         onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'unavailable' ? '模型上游暂时繁忙，正在等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });
@@ -123,6 +124,12 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         const message = String(error instanceof Error ? error.message : error);
         const parseFailure = !env.generation && /模型返回的不是合法 JSON/.test(message);
         const outputFailure = !env.generation && error instanceof ModelOutputError && error.kind !== 'incomplete';
+        if(env.DB&&(parseFailure||outputFailure)){
+          // A completed HTTP stream can still be an unusable report. Log only
+          // structural field names, never source, provider output or reasoning.
+          const detail=error instanceof ModelOutputError&&error.kind==='format'?message.slice(0,250):parseFailure?'模型返回的不是合法 JSON。':`模型输出未通过校验（${(error as ModelOutputError).kind}）。`;
+          await env.DB.prepare("UPDATE model_runs SET status='error',error=? WHERE id=?").bind(detail,runId).run().catch(()=>{});
+        }
         // All HTTP retry decisions belong to transport. A second retry loop
         // would multiply 503 calls and replay interrupted paid generations.
         if (attempt + 1 >= attempts || deadline - Date.now() < 30000 || (!parseFailure && !outputFailure)) throw error;

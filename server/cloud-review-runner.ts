@@ -39,6 +39,18 @@ const clear = async (storage: any) => { await storage.deleteAlarm(); await stora
 // Only administrator/legacy platform cloud work reaches this runner. Member
 // Agent tasks and device captures keep their own protocol and never use a key.
 export async function cloudReviewAlarm(state: any, env: any, id: string) {
+  try { await runCloudReviewAlarm(state,env,id); }
+  catch {
+    // D1/DO persistence can fail even after the model has completed. Keep the
+    // exact checkpoint and re-enter it later. Started phases still fail closed
+    // on recovery; this is not a new provider request. Bound abandoned storage.
+    const since=await state.storage.get('cloudRecoverySince')||Date.now();
+    if(Date.now()-since>=86400000){await clear(state.storage);return;}
+    await state.storage.put('cloudRecoverySince',since);
+    await state.storage.setAlarm(Date.now()+30000);
+  }
+}
+async function runCloudReviewAlarm(state: any, env: any, id: string) {
   const DB = env.DB, storage = state.storage;
   const row = await DB.prepare('SELECT * FROM review_jobs WHERE id=?').bind(id).first();
   if (!row || row.executor !== 'cloud' || row.model_executor !== 'platform' || !['queued', 'running'].includes(row.status)) { await clear(storage); return; }

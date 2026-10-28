@@ -46,7 +46,7 @@ describe('云端审核阶段检查点',()=>{
   it('终稿已完成后数据库临时故障只重试保存，绝不重新调用模型',async()=>{
     const s=setup();await enqueueReview(s.env,s.input,'admin');for(let i=0;i<3;i++)await s.tick();
     s.DB.batch.mockRejectedValueOnce(new Error('D1 temporary failure'));
-    await expect(s.tick()).rejects.toThrow('D1 temporary');expect(await s.storage.get('cloudPhase')).toBe('final-ready');
+    await s.tick();expect(await s.storage.get('cloudPhase')).toBe('final-ready');expect(await s.storage.getAlarm()).toBeGreaterThan(Date.now());
     await s.tick();expect(s.row().status).toBe('done');expect(complete).toHaveBeenCalledTimes(2);
   });
   it('初评或复核状态未知时明确失败，不重放请求、不发布未复核报告',async()=>{
