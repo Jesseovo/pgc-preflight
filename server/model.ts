@@ -282,6 +282,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         }
       }
     } catch (error) {
+      if(error instanceof ModelHttpError&&error.upstreamStatus===429&&!error.retryable)await throttle.cooldown(30000).catch(()=>{});
       metrics.error = controller.signal.aborted ? '模型响应超时' : redact(error instanceof Error ? error.message : String(error), config.apiKey);
       if (controller.signal.aborted) throw new Error('模型响应超时，本次未完整生成，请稍后重试或检查模型配置。');
       throw error;

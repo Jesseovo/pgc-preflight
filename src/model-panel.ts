@@ -27,7 +27,7 @@ export function mountModelPanel(root: HTMLElement, initial: ModelView, api: (pat
       const id=row.dataset.modelRow!,p=config.profiles[id],q=quotas.get(id);
       const create=(config.effective.create||config.activeProfile)===id,review=(config.effective.review||config.activeProfile)===id;
       row.classList.toggle('in-use',create||review);
-      row.querySelector('.provider-usage')!.textContent=[create?'创作首选':'',review?'审核使用中':''].filter(Boolean).join(' · ');
+      row.querySelector('.provider-usage')!.textContent=[create?'创作首选':'',review?'审核使用中':'',riffle(p)&&p.enabled?'制作池':''].filter(Boolean).join(' · ');
       for(const button of row.querySelectorAll<HTMLButtonElement>('[data-use]')){const active=button.dataset.use==='create'?create:review;button.disabled=busy||!p.enabled||!p.hasKey||active;button.textContent=active?(button.dataset.use==='create'?'创作首选':'审核使用中'):(button.dataset.use==='create'?'用于创作':'用于审核');}
       const el=row.querySelector<HTMLElement>('.provider-balance')!;
       el.classList.toggle('quota-error',!!q?.error);

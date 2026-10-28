@@ -11,7 +11,7 @@ import {modelQuota} from './model-quota';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
-  const view=async(config:ModelConfig|null)=>{const data=publicConfig(config);for(const[id,p]of Object.entries(modelProfiles(config))){if(p?.encryptedKey)try{data.profiles[id].keySuffix=(await decryptKey(p.encryptedKey,secrets.SETTINGS_KEY)).slice(-4);}catch{data.profiles[id].keySuffix='';}}return data;};
+  const view=async(config:ModelConfig|null)=>{const data=publicConfig(config);for(const[id,p]of Object.entries(modelProfiles(config))){if(p?.encryptedKey)try{const key=await decryptKey(p.encryptedKey,secrets.SETTINGS_KEY);data.profiles[id].keySuffix=key.length>4?key.slice(-4):'';}catch{data.profiles[id].keySuffix='';}}return data;};
   if(request.headers.has('Authorization'))return Response.json({error:'设备凭据不能访问管理接口。'},{status:403});
   if(!url.pathname.startsWith('/api/admin/'))return null;
   const json=(value:unknown,status=200,headers:Record<string,string>={})=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers}});

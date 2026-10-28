@@ -20,7 +20,7 @@ export function retryAfterMs(value: string | null, now = Date.now()): number | u
 
 export function createModelThrottle(DB: ModelThrottleDatabase | undefined, config: ModelRuntime) {
   // This gateway explicitly limits each key to 10 requests/minute. Spread
-  // starts across all consumers and admin tests, keeping review concurrency.
+  // starts across all consumers and admin tests; model-capacity separately limits active calls.
   const interval = new URL(config.baseUrl).hostname === 'riffle-api.pages.dev' ? 7000 : 0;
   const key = crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${new URL(config.baseUrl).origin}|${config.apiKey}`))
     .then(bytes => Array.from(new Uint8Array(bytes), byte => byte.toString(16).padStart(2, '0')).join(''));

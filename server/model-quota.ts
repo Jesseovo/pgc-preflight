@@ -10,7 +10,7 @@ export async function modelQuota(store:ConfigStore,secret:string,id:unknown){
   const url=new URL(p.baseUrl);
   if(url.origin!=='https://riffle-api.pages.dev'||!/^claude-opus-5-5$/i.test(p.model))throw new Error('余额查询目前仅支持 Riffle Opus 配置。');
   const key=await decryptKey(p.encryptedKey,secret);
-  const response=await fetch('https://riffle-api.pages.dev/v1/quota',{headers:{Authorization:`Bearer ${key}`,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(15000)}).catch(error=>{console.warn('model-quota',String(error?.name||'Error'),String(error?.message||'连接失败').replaceAll(key,'[redacted]').slice(0,180));throw new Error('余额接口连接失败或超时，请稍后刷新。');});
+  const response=await fetch('https://riffle-api.pages.dev/v1/quota',{headers:{Authorization:`Bearer ${key}`,Accept:'application/json'},redirect:'manual',signal:AbortSignal.timeout(15000)}).catch(()=>{throw new Error('余额接口连接失败或超时，请稍后刷新。');});
   if(!response.ok)throw new Error(`余额接口暂不可用（HTTP ${response.status}），请稍后刷新。`);
   let data:any;try{const text=await response.text();if(text.length>64000)throw new Error();data=JSON.parse(text);}catch{throw new Error('余额接口返回格式异常，请稍后刷新。');}
   if(data?.object!=='key_quota'||data.currency!=='CNY'||!data.daily||!data.total||amount(data.available)===undefined)throw new Error('余额接口缺少预算信息，请稍后刷新。');

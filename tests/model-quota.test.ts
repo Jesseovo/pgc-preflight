@@ -24,6 +24,13 @@ describe('管理员 Opus Key 余额',()=>{
     const response=await s.call(),data=await response!.json();expect(data).toMatchObject({currency:'CNY',available:22,daily:{remaining:97},total:{remaining:900},requestsPerMinute:10});
     expect(fetcher.mock.calls[0][0]).toBe('https://riffle-api.pages.dev/v1/quota');expect(JSON.stringify(data)).not.toMatch(/PRIVATE|private-fixture|encryptedKey|apiKey/);expect(response?.headers.get('Cache-Control')).toBe('no-store');
   });
+  it('管理员配置仅回传 Key 后四位，成员没有配置读取权限',async()=>{
+    const s=await setup(),cookie=`pgc_admin=${await login(s.secrets.ADMIN_PASSWORD,s.secrets)}`;
+    const member:any={};
+    const r=await adminApi(new Request('https://quota.test/api/admin/config',{headers:{Cookie:cookie}}),s.store,s.secrets,member);
+    const data=await r!.json();expect(data.profiles.opus.keySuffix).toBe('-key');expect(JSON.stringify(data)).not.toContain('private-fixture-key');expect(JSON.stringify(data)).not.toContain('encryptedKey');
+    expect((await adminApi(new Request('https://quota.test/api/admin/config',{headers:{Cookie:'pgc_member=fixture'}}),s.store,s.secrets,member))?.status).toBe(401);
+  });
   it('其他地址不能复用 Key 进行余额查询',async()=>{
     const s=await setup('https://riffle-api.pages.dev.attacker.test'),fetcher=vi.fn();vi.stubGlobal('fetch',fetcher);
     await expect(modelQuota(s.store,s.secrets.SETTINGS_KEY,'opus')).rejects.toThrow('仅支持');expect(fetcher).not.toHaveBeenCalled();

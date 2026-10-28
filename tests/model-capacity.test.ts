@@ -44,4 +44,11 @@ describe('多 Key 制作调度',()=>{
   vi.useFakeTimers();const fetcher=vi.fn(async()=>fetcher.mock.calls.length<6?Response.json({error:{code:'KEY_QUEUE_FULL',message:'最多同时运行2个请求'}},{status:503,headers:{'Retry-After':'10'}}):Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'}));vi.stubGlobal('fetch',fetcher);
   const result=modelTransport(runtime,{idempotencyKey:'same-job',totalTimeoutMs:100000})([]);await vi.advanceTimersByTimeAsync(50000);await expect(result).resolves.toBe('READY');expect(fetcher).toHaveBeenCalledTimes(6);
  });
+ it('流内上游429不重放，并给同 Key 留出共享冷却',async()=>{
+  const s=await setup(['fixture-key-a']),at=Date.now();
+  const fetcher=vi.fn(async()=>new Response('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"upstream 429"}}\n\n',{headers:{'Content-Type':'text/event-stream'}}));vi.stubGlobal('fetch',fetcher);
+  await expect(modelTransport(runtime,{DB:s.DB,idempotencyKey:'uncertain-stream'})([])).rejects.toThrow('429');
+  expect(fetcher).toHaveBeenCalledTimes(1);expect(s.sqlite.prepare('SELECT cooldown_until FROM model_throttle').get()).toMatchObject({cooldown_until:expect.any(Number)});
+  expect(Number((s.sqlite.prepare('SELECT cooldown_until FROM model_throttle').get() as any).cooldown_until)).toBeGreaterThanOrEqual(at+30000);
+ });
 });
