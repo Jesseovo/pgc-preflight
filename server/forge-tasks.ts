@@ -76,8 +76,8 @@ export function publicForgeTask(row: ForgeTask) {
 
 export async function recoverForgeTasks(env: ForgeEnv, topicId?: number) {
   const owner=env.ownerId||'admin';
-  const rows: ForgeTask[] = (await env.DB.prepare(`SELECT * FROM forge_tasks WHERE executor='platform' AND (?='admin' OR owner_id=?) AND status IN ('queued','running')${topicId == null ? '' : " AND COALESCE(json_extract(payload,'$.id'),json_extract(payload,'$.ids[0]'))=?"} ORDER BY created_at LIMIT 100`)
-    .bind(owner,owner,...(topicId==null?[]:[topicId])).all()).results;
+  const rows: {id:string}[] = (await env.DB.prepare(`SELECT id FROM forge_tasks WHERE executor='platform' AND (?='admin' OR owner_id=?) AND (status='queued' OR (status='running' AND started_at<?))${topicId == null ? '' : " AND COALESCE(json_extract(payload,'$.id'),json_extract(payload,'$.ids[0]'))=?"} ORDER BY created_at LIMIT 100`)
+    .bind(owner,owner,new Date(Date.now()-FORGE_TASK_LIMIT_MS).toISOString(),...(topicId==null?[]:[topicId])).all()).results;
   for (const row of rows) await readForgeTask(env,row.id);
 }
 

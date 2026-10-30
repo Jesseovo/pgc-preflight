@@ -1,4 +1,7 @@
-import {createIcons,icons} from 'lucide';
+import {createIcons,LayoutDashboard,Gamepad2,Workflow,ClipboardCheck,Users,Settings2,Compass,LogOut,ShieldCheck,Menu} from 'lucide';
+import {createReadCache} from '../../public/forge/experience.js';
+const icons={LayoutDashboard,Gamepad2,Workflow,ClipboardCheck,Users,Settings2,Compass,LogOut,ShieldCheck,Menu};
+const reads=createReadCache();
 import {progressHtml,withProgress} from '../progress';
 import {mountContent} from './content';
 import {mountManagement} from './manage';
@@ -38,7 +41,7 @@ function syncMasterLayout(){
 }
 
 function readMemory():ViewMemory{try{return JSON.parse(sessionStorage.getItem(memoryKey)||'{}');}catch{return {};}}
-function clearMemory(){try{sessionStorage.removeItem(memoryKey);}catch{/* Storage may be unavailable. */}}
+function clearMemory(){reads.clear();try{sessionStorage.removeItem(memoryKey);}catch{/* Storage may be unavailable. */}}
 function remember(){
   history.replaceState({...history.state,scrollY:scrollY,inspectorScroll:detailBody()?.scrollTop||0},'',location.href);
   if(route.id)return;
@@ -49,7 +52,7 @@ function dispose(scope:Slot|undefined){if(!scope)return;scope.controller.abort()
 function closeDialog(){
   const modal=dialog();if(modal?.open)modal.close();
   document.documentElement.classList.remove('admin-inspector-open');
-  app.classList.remove('has-inspector');
+  app.classList.remove('has-inspector','focus-detail');
   syncMasterLayout();
   highlightSelection();
 }
@@ -76,10 +79,19 @@ function destroy(){clearTimeout(pollTimer);dispose(detail);detail=undefined;disp
 function notice(message:string,error=false){const el=document.querySelector<HTMLElement>('#admin-notice');if(!el)return;clearTimeout(toastTimer);el.textContent=message;el.classList.toggle('error',error);el.hidden=false;toastTimer=setTimeout(()=>{el.hidden=true;},error?8000:4000);}
 async function api<T=any>(path:string,method='GET',body?:unknown,scope?:Slot):Promise<T>{
   try{
-    const response=await fetch(path.startsWith('/api/')?path:'/api/admin/'+path,{method,headers:body===undefined?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',signal:scope?.controller.signal});
+    const url=path.startsWith('/api/')?path:'/api/admin/'+path;
+    const load=async()=>{
+    const response=await fetch(url,{method,headers:body===undefined?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',signal:AbortSignal.timeout(30000)});
     const value=await response.json().catch(()=>({error:'服务返回了无法读取的响应，请刷新重试。'}));
+    if(response.status===403)reads.clear();
     if(response.status===401&&path!=='login'){authenticated=false;clearMemory();destroy();renderLogin('登录已过期，请重新登录。');throw new Error('登录已过期。');}
     if(!response.ok)throw new Error(value.error||`请求未完成（${response.status}）`);
+    return value;
+    };
+    const cacheable=method==='GET'&&/^\/api\/admin\/(projects|tasks|dashboard)(?:\?|$|\/(?:topic|game|creation|review)\/[^/]+$)/.test(url);
+    if(method!=='GET')reads.clear();
+    const value=cacheable?await reads.read(url,load,{fresh:!!scope?.busy,signal:scope?.controller.signal}):await load();
+    if(method!=='GET')reads.clear();
     if(method!=='GET'&&scope&&scope===detail){refreshMainAfterClose=true;if(desktop.matches&&main)void refreshScope(main);}
     return value as T;
   }catch(error){if(scope?.busy&&!scope.controller.signal.aborted)scope.pollFailed=true;throw error;}
@@ -176,7 +188,8 @@ function renderInspectorHeader(target:AdminInspector){
   const focused=header.contains(document.activeElement)?['data-inspector-prev','data-inspector-next','data-inspector-back','data-inspector-close'].find(key=>document.activeElement?.hasAttribute(key)):undefined;
   const sequence:AdminProjectSequence=history.state?.projectSequence||projects;
   const index=target.kind==='project'?sequence.findIndex(p=>String(p.id)===target.id&&p.type===target.type):-1;
-  header.innerHTML=`<div class="adm-inspector-path"><nav aria-label="详情路径">${entries.map((e,i)=>`<button type="button" data-trail="${i}">${inspectorLabel(e.target)}</button><span>/</span>`).join('')}<span id="admin-inspector-title">${inspectorLabel(target)}</span></nav>${entries.length?'<button type="button" class="adm-button quiet" data-inspector-back>返回上一层</button>':''}</div><div class="adm-inspector-tools">${index>=0&&!entries.length?`<div class="adm-inspector-sequence"><span>本页 ${index+1} / ${sequence.length}</span><button type="button" class="adm-icon-button" data-inspector-prev aria-label="上一款作品"${index===0?' disabled':''}>←</button><button type="button" class="adm-icon-button" data-inspector-next aria-label="下一款作品"${index===sequence.length-1?' disabled':''}>→</button></div>`:''}<a class="adm-icon-button" href="${esc(routeUrl(inspectorRoute(target)))}" target="_blank" rel="noopener" aria-label="在新标签页打开完整页面" title="打开完整页面">↗</a><button type="button" class="adm-icon-button" data-inspector-close aria-label="关闭详情" title="关闭详情（Esc）">×</button></div>`;
+  header.innerHTML=`<div class="adm-inspector-path"><nav aria-label="详情路径">${entries.map((e,i)=>`<button type="button" data-trail="${i}">${inspectorLabel(e.target)}</button><span>/</span>`).join('')}<span id="admin-inspector-title">${inspectorLabel(target)}</span></nav>${entries.length?'<button type="button" class="adm-button quiet" data-inspector-back>返回上一层</button>':''}</div><div class="adm-inspector-tools"><button class="adm-button quiet" type="button" data-focus-detail aria-pressed="${app.classList.contains('focus-detail')}">专注查看</button>${index>=0&&!entries.length?`<div class="adm-inspector-sequence"><span>本页 ${index+1} / ${sequence.length}</span><button type="button" class="adm-icon-button" data-inspector-prev aria-label="上一款作品"${index===0?' disabled':''}>←</button><button type="button" class="adm-icon-button" data-inspector-next aria-label="下一款作品"${index===sequence.length-1?' disabled':''}>→</button></div>`:''}<a class="adm-icon-button" href="${esc(routeUrl(inspectorRoute(target)))}" target="_blank" rel="noopener" aria-label="在新标签页打开完整页面" title="打开完整页面">↗</a><button type="button" class="adm-icon-button" data-inspector-close aria-label="关闭详情" title="关闭详情（Esc）">×</button></div>`;
+  header.querySelector<HTMLButtonElement>('[data-focus-detail]')!.onclick=()=>{app.classList.toggle('focus-detail');header.querySelector('[data-focus-detail]')!.setAttribute('aria-pressed',String(app.classList.contains('focus-detail')));};
   header.querySelector<HTMLButtonElement>('[data-inspector-close]')!.onclick=closeInspector;
   header.querySelector<HTMLButtonElement>('[data-inspector-back]')?.addEventListener('click',backInspector);
   header.querySelectorAll<HTMLButtonElement>('[data-trail]').forEach(b=>b.onclick=()=>history.go(-(entries.length-Number(b.dataset.trail))));

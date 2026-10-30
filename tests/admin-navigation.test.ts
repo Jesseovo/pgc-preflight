@@ -17,7 +17,7 @@ describe('管理员详情路由',()=>{
   });
   it('拒绝不匹配的详情种类和类型，不接收原型属性作为栏目',()=>{
     for(const query of ['inspect=project&inspectId=1&inspectType=review','inspect=task&inspectId=1&inspectType=game','inspect=unknown&inspectId=1','inspect=report'])expect(readRoute(query).inspector).toBeUndefined();
-    expect(readRoute('view=constructor&page=-3')).toMatchObject({view:'overview',page:1});
+    expect(readRoute('view=constructor&page=-3')).toMatchObject({view:'works',page:1});
     expect(readRoute('inspect=report&inspectId=81&inspectType=game').inspector).toEqual({kind:'report',id:'81',type:undefined,panel:undefined,version:undefined});
   });
   it('跨栏目打开详情时使用目标对象类型，保留当前列表路由',()=>{

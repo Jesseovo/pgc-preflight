@@ -3,7 +3,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,readdirSync} from 'node:fs';
 import {dispatch as dispatchForge} from '../server/forge-api';
 import {executeForgeTask,ForgeRunner} from '../server/forge-runner';
-import {enqueueForgeTask,failForgeTask,readForgeTask} from '../server/forge-tasks';
+import {enqueueForgeTask,failForgeTask,readForgeTask,recoverForgeTasks} from '../server/forge-tasks';
 import {complete} from '../server/forge-llm';
 import {saveConfig} from '../server/settings';
 import {tryModelSlot} from '../server/model-capacity';
@@ -37,6 +37,16 @@ async function setup(){
 const response=(text:string,stop_reason='end_turn')=>Response.json({content:[{type:'text',text}],stop_reason});
 
 describe('后台创作的持久任务',()=>{
+  it('批量状态恢复跳过健康运行任务，保留原编号调度和过期失败',async()=>{
+    const s=await setup(),row=await enqueueForgeTask(s.env,{type:'preview',id:9});
+    s.sqlite.prepare("UPDATE forge_tasks SET status='running',started_at=? WHERE id=?").run(new Date().toISOString(),row.id);
+    const prepare=vi.spyOn(s.env.DB,'prepare');s.dispatch.mockClear();await recoverForgeTasks(s.env);
+    expect(prepare).toHaveBeenCalledTimes(1);expect(s.dispatch).not.toHaveBeenCalled();expect(s.task(row.id).status).toBe('running');
+    s.sqlite.prepare("UPDATE forge_tasks SET started_at=? WHERE id=?").run(new Date(Date.now()-15*60000).toISOString(),row.id);
+    await recoverForgeTasks(s.env);expect(s.task(row.id).status).toBe('error');expect(s.dispatch).not.toHaveBeenCalled();
+    const next=await enqueueForgeTask(s.env,{type:'preview',id:9});s.dispatch.mockClear();await recoverForgeTasks(s.env);
+    expect(s.dispatch).toHaveBeenCalledTimes(1);expect(await (s.dispatch.mock.calls[0] as any)[0].clone().text()).toBe(next.id);
+  });
   it('明确重新制作生成新版本、重复点击只建一任务；失败仍保留已有成品',async()=>{
     const s=await setup();let revision=1,fail=false;
     const html=()=>`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><button>Version ${revision}</button><script>let score=0;</script></body></html>`;

@@ -1,5 +1,5 @@
 import { startTask } from './progress';
-import { createIcons, icons } from 'lucide';
+import { createIcons, Gamepad2, ArrowRight, UserRoundCheck } from 'lucide';
 import './style.css';
 import './admin.css';
 import { catWalk, quietCorner } from './artwork';
@@ -28,7 +28,7 @@ document.querySelector('#app')!.innerHTML = `
     </section>
     <footer><span>PGC Preflight <span class="footer-separator">/</span> 为你的下一款好游戏</span><span>模型检查，人工终审</span></footer>
   </main>`;
-createIcons({ icons, attrs: { 'stroke-width': 1.7 } });
+createIcons({ icons:{Gamepad2,ArrowRight,UserRoundCheck}, attrs: { 'stroke-width': 1.7 } });
 
 document.querySelector('#member-login')!.addEventListener('submit', async event => {
   event.preventDefault();

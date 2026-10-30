@@ -36,3 +36,11 @@
 #rvBatchMeter{margin:12px 0 18px}
 @media(max-width:640px){.pgc-task-tray{right:14px;bottom:max(14px,env(safe-area-inset-bottom));width:310px}.pgc-progress-caption{flex-wrap:wrap;gap:2px 10px}.pgc-task-list{max-height:35vh}}
 @media(prefers-reduced-motion:reduce){.pgc-progress-track.is-indeterminate>span{animation:none;transform:translateX(100%);opacity:.7}.pgc-task-toggle:after{animation:none!important}}
+
+/* Unknown duration is a status, never a simulated percentage. */
+.pgc-progress-track:not(.is-counted){display:none}
+.pgc-task-toggle:after{display:none!important}
+.pgc-progress-heading strong{font-size:14px;font-weight:500}
+.pgc-progress-heading>span,.pgc-progress-caption,.pgc-progress-caption time{font-size:12px}
+.pgc-progress-caption{margin-top:4px}
+.pgc-load-status{min-height:44px}

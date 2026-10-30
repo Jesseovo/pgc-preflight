@@ -7,7 +7,7 @@ export function elapsed(since, until = Date.now()) {
 export function progressHtml({ label = '正在处理', detail = '', value, total, status = 'running', startedAt, finishedAt } = {}) {
   const known = Number.isFinite(value) && Number.isFinite(total) && total > 0;
   const percent = known ? Math.max(0, Math.min(100, value / total * 100)) : 0;
-  const showElapsed = Number.isFinite(startedAt) && ['running', 'waiting'].includes(status);
+  const showElapsed = Number.isFinite(startedAt) && status === 'running';
   const waitedMinutes = showElapsed ? Math.floor((Date.now() - startedAt) / 60000) : 0;
   const elapsedText = waitedMinutes ? `约 ${waitedMinutes} 分钟` : '';
   const elapsedMarkup = showElapsed ? `<time data-progress-since="${startedAt}" aria-label="${elapsedText ? `已等待 ${escape(elapsedText)}` : '任务正在处理中'}">${elapsedText ? `已等待 ${escape(elapsedText)}` : ''}</time>` : '';
@@ -23,6 +23,7 @@ function installStyles(doc) {
 let host = window;
 try { if (parent !== window && parent.location.origin === location.origin) host = parent; } catch {}
 installStyles(document);
+if(!document.querySelector('link[href="/forge/experience.css"]')){const link=document.createElement('link');link.rel='stylesheet';link.href='/forge/experience.css';document.head.append(link);}
 installStyles(host.document);
 
 function createService() {
@@ -30,15 +31,17 @@ function createService() {
   const tasks = new Map();
   const documents = new Map([[doc, null]]);
   let tray;
+  let frameObserver;
   let collapsed = true;
   let userToggled = false;
   const paint = () => {
-    const visibleTasks = [...tasks.values()].filter(task => task.tray !== false);
+    for (const [document, frame] of documents) if (frame && !frame.isConnected) { documents.delete(document); for (const task of tasks.values()) if (task.owner === document) tasks.delete(task.id); }
+    const visibleTasks = [...tasks.values()].filter(task => task.tray === true && !task.views.size);
     if (!tray && !visibleTasks.length) {
       for (const task of tasks.values()) {
         for (const view of task.views) {
           if (!view.isConnected) task.views.delete(view);
-          else view.innerHTML = progressHtml(task);
+          else { const html = progressHtml(task); if (view.__progressHtml !== html) { view.innerHTML = html; view.__progressHtml = html; } }
         }
       }
       return;
@@ -61,21 +64,15 @@ function createService() {
     for (const task of tasks.values()) {
       for (const view of task.views) {
         if (!view.isConnected) task.views.delete(view);
-        else view.innerHTML = progressHtml(task);
+        else { const html = progressHtml(task); if (view.__progressHtml !== html) { view.innerHTML = html; view.__progressHtml = html; } }
       }
     }
   };
-  host.setInterval(() => {
-    for (const [document, frame] of documents) {
-      if (frame && !frame.isConnected) {
-        documents.delete(document);
-        for (const task of tasks.values()) if (task.owner === document) tasks.delete(task.id);
-        paint();
-      }
-    }
-  }, 1000);
   return {
-    register(document) { documents.set(document, document.defaultView?.frameElement || null); },
+    register(document) {
+      const frame=document.defaultView?.frameElement || null;documents.set(document,frame);
+      if(frame&&!frameObserver){frameObserver=new host.MutationObserver(()=>{if([...documents.values()].some(frame=>frame&&!frame.isConnected)){paint();if(![...documents.values()].some(Boolean)){frameObserver.disconnect();frameObserver=null;}}});frameObserver.observe(doc.body,{childList:true,subtree:true});}
+    },
     start(label, options = {}) {
       if (options.compact && !userToggled) collapsed = true;
       const task = { id: host.crypto.randomUUID(), key: options.key || '', label, detail: '请求已发出，请稍候。', status: 'running', startedAt: Date.now(), views: new Set(), ...options };
@@ -88,7 +85,7 @@ function createService() {
         },
         fail(detail) {
           Object.assign(task, { status: 'error', detail, finishedAt: Date.now() }); paint();
-          if (task.tray === false) host.setTimeout(() => { tasks.delete(task.id); paint(); }, 6000);
+          if (task.tray !== true) host.setTimeout(() => { tasks.delete(task.id); paint(); }, 6000);
         },
         dismiss() { tasks.delete(task.id); paint(); },
       };
@@ -101,7 +98,7 @@ const service = host.__pgcProgress || (host.__pgcProgress = createService());
 service.register(document);
 export const startTask = (label, options) => service.start(label, { ...options, owner: document });
 export async function withProgress(label, work, options) {
-  const task = startTask(label, options);
+  const task = startTask(label, { tray: false, ...options });
   try { const result = await work(task); task.done(); return result; }
   catch (error) { task.fail(error?.message || '操作未完成，请重试。'); throw error; }
 }

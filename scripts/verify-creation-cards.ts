@@ -155,7 +155,7 @@ try {
   page.on('pageerror', error => errors.push(String(error)));
   page.on('response', response => { if (response.status() >= 500) errors.push(`HTTP ${response.status()} ${new URL(response.url()).pathname}`); });
   await page.setViewport({ width: 1360, height: 980 });
-  await page.goto(origin + '/test'); await page.waitForSelector('#drawBtn');
+  await page.goto(origin + '/test?tab=draw&layout=cards'); await page.waitForSelector('#drawBtn');
   await page.click('[data-tab=picks]'); await page.waitForSelector('.creation-card');
   assert.equal(await page.$$eval('.creation-card', cards => cards.length), 2);
   assert.equal(await page.$$eval('.creation-main-actions .primary', buttons => buttons.length), 2);
@@ -200,11 +200,11 @@ try {
   await page.click(`${firstCard} [data-act=versions]`); await page.waitForSelector(`${firstCard} [data-viewer-version=game-1]`);
   await page.click(`${firstCard} [data-viewer-version=game-1]`); await page.waitForSelector(`${firstCard} [data-viewer-act=restore]:not(:disabled)`);
   const beforeRestore = posts.length;
-  await page.click(`${firstCard} [data-viewer-act=restore]`); await page.waitForFunction(() => (document.querySelector('#modal') as HTMLDivElement | null)?.hidden);
+  await page.click(`${firstCard} [data-viewer-act=restore]`); await page.waitForSelector('#pickCards'); await page.waitForFunction(() => (document.querySelector('#modal') as HTMLDivElement | null)?.hidden);
   assert.equal(restored, 1); assert.equal(posts.length, beforeRestore, 'Restoring a version must not call a model');
 
   // A failed remake leaves the previous build available to play.
-  await page.click('[data-tab=products]'); await page.waitForSelector('[data-id="1"] [data-act=viewProduct]');
+  await page.click('[data-tab=picks]'); await page.waitForSelector('#pickCards'); await page.click('[data-tab=products]'); await page.waitForSelector('#productCards [data-id="1"] [data-act=viewProduct]');
   await page.click('[data-id="1"] .creation-more summary'); await page.click('[data-id="1"] [data-act=regenerateGame]');
   await waitForPost('game', 1); finish('game', 1, 'error');
   await page.waitForFunction(() => document.querySelector('[data-id="1"] .bad.small')?.textContent?.includes('合成失败'));
@@ -216,7 +216,7 @@ try {
   await page.click('[data-tab=picks]'); await page.waitForSelector('[data-id="2"] [data-act=makeGame]');
   await page.click('[data-id="2"] [data-act=makeGame]'); await waitForPost('game', 2);
   assert.equal(posts.filter(post => post.kind === 'game' && post.id === 2).length, 1);
-  await page.reload(); await page.waitForSelector('#drawBtn'); await page.click('[data-tab=products]');
+  await page.reload(); await page.waitForSelector('#view .card'); await page.click('[data-tab=picks]'); await page.waitForSelector('#pickCards'); await page.click('[data-tab=products]');
   await page.waitForSelector('[data-id="2"] .product-job-progress');
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(posts.filter(post => post.kind === 'game' && post.id === 2).length, 1, 'Reload recovery must not resubmit a running game');
@@ -228,7 +228,7 @@ try {
   // Late material reads must not open an old card after switching sections.
   delayNextTopicRead = 350;
   await page.click('[data-tab=picks]'); await page.waitForSelector('[data-id="1"] [data-act=brief]');
-  await page.click('[data-id="1"] [data-act=brief]'); await page.click('[data-tab=products]');
+  await page.click('[data-id="1"] [data-act=brief]'); await page.click('[data-tab=picks]'); await page.waitForSelector('#pickCards'); await page.click('[data-tab=products]');
   await page.waitForSelector('[data-id="1"] [data-act=viewProduct]'); await new Promise(resolve => setTimeout(resolve, 450));
   assert.equal(await page.$('.creation-viewer'), null, 'A late reply must not reopen a viewer in another section');
 

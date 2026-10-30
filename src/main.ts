@@ -1,4 +1,5 @@
-import { createIcons, icons } from 'lucide';
+import { createIcons, CircleHelp, Plus, ShieldCheck, ArrowUpRight, UserRoundCheck, Pause, Download, ListX, ListChecks, X, FileCode2, RotateCcw, Copy, CheckCheck, Scan, Info, UserRound, LockKeyhole, MonitorCheck, MousePointer2, Smartphone, Play, ChevronRight, CloudOff, CirclePause, Hourglass, CircleAlert, ScanEye, CircleCheck, Check } from 'lucide';
+const icons={CircleHelp,Plus,ShieldCheck,ArrowUpRight,UserRoundCheck,Pause,Download,ListX,ListChecks,X,FileCode2,RotateCcw,Copy,CheckCheck,Scan,Info,UserRound,LockKeyhole,MonitorCheck,MousePointer2,Smartphone,Play,ChevronRight,CloudOff,CirclePause,Hourglass,CircleAlert,ScanEye,CircleCheck,Check};
 import './style.css';
 import {catWalk} from './artwork';
 import type { CheckReport, Status } from './types';

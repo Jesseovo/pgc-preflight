@@ -41,4 +41,4 @@ withProgress('连接审核工作台', () => mountReviewWorkspace({
   view: $('#view'), api, allowUpload: false, alive: () => true, topics: [],
   setProbing: () => {}, probeChecks, copyText, download, openModal,
   checksHtml: checks => `<ul class="checks">${checks.map(check => `<li><span>${check.level === 'ok' ? '✓' : '·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
-}), {compact:true}).catch(error => { $('#view').textContent = error.message; });
+}), {compact:true,tray:false}).catch(error => { $('#view').textContent = error.message; });

@@ -34,6 +34,25 @@ async function setup(){
 }
 
 describe('Star 工作区迁移与所有权',()=>{
+  it('网页明确选择个人 Agent 时不读取平台模型、不调度平台执行，并保持所有权与幂等',async()=>{
+    const s=await setup(),id=s.topic('a','AGENT_CHOICE'),other=s.topic('b','OTHER');
+    delete s.env.FORGE_RUNNER;
+    expect((await s.request('plain','POST',`topics/${id}/game?executor=agent`)).status).toBe(403);
+    expect((await s.request('a','POST',`topics/${other}/game?executor=agent`)).status).toBe(404);
+    const first=await(await s.request('a','POST',`topics/${id}/game?executor=agent`)).json() as any;
+    const repeated=await(await s.request('a','POST',`topics/${id}/game?executor=agent`)).json() as any;
+    expect(first.jobId).toBeTruthy();expect(repeated.jobId).toBe(first.jobId);
+    expect(s.sqlite.prepare('SELECT executor,owner_id FROM forge_tasks WHERE id=?').get(first.jobId)).toMatchObject({executor:'agent',owner_id:'a'});
+    expect(s.env.modelStore.get).not.toHaveBeenCalled();expect(s.dispatch).not.toHaveBeenCalled();
+    expect(s.sqlite.prepare('SELECT product_html FROM topics WHERE id=?').get(id)).toMatchObject({product_html:'AGENT_CHOICE-product'});
+  });
+  it('项目摘要不返回游戏和材料原文，跨成员仍拒绝',async()=>{
+    const s=await setup(),id=s.topic('a','SUMMARY');
+    const response=await s.request('a','GET',`topics/${id}?summary=1`);expect(response.status).toBe(200);
+    const value=await response.json() as any;expect(value).toMatchObject({id,has_product:1,has_brief:1,has_assets:1});
+    expect(value.product_html).toBeUndefined();expect(value.brief_md).toBeUndefined();expect(value.assets_html).toBeUndefined();
+    expect((await s.request('b','GET',`topics/${id}?summary=1`)).status).toBe(404);
+  });
   it('Star 网页制作由平台 Opus 执行，重复提交与跨成员访问被隔离，成品保存版本',async()=>{
     const s=await setup(),id=s.topic('a','A_LIVE_CREATION'),other=s.topic('b','B_PRIVATE_CREATION');
     s.sqlite.prepare("UPDATE topics SET product_html=NULL,assets_html=NULL WHERE id=?").run(id);
@@ -46,6 +65,8 @@ describe('Star 工作区迁移与所有权',()=>{
     const first=await (await s.request('a','POST',`topics/${id}/game`)).json() as any;
     const repeat=await (await s.request('a','POST',`topics/${id}/game`)).json() as any;
     expect(first.taskId).toBe(repeat.taskId);expect(first).toMatchObject({executor:'platform',pending:true});
+    const agentChoice=await(await s.request('a','POST',`topics/${id}/game?executor=agent`)).json() as any;
+    expect(agentChoice.jobId).toBe(first.taskId);expect(agentChoice.tasks[0].executor).toBe('platform');
     expect((await s.request('b','GET',`generation-jobs/${first.taskId}`)).status).toBe(404);
     const html='<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><canvas></canvas><script>let score=0;document.onclick=()=>score++;</script></body></html>';
     const fetcher=vi.fn(async(_url:any,init:any)=>{expect(JSON.parse(init.body).model).toBe('claude-opus-5-5');expect(init.body).not.toContain('B_PRIVATE');return Response.json({content:[{type:'text',text:html}],stop_reason:'end_turn'});});vi.stubGlobal('fetch',fetcher);

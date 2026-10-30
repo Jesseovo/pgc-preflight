@@ -155,8 +155,8 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
   }
   if(env.memberMode && method==='POST' && a==='draw'){const data=await body(request);return reserveDraw(env.DB,ownerId,{...data,request_id:data.request_id||crypto.randomUUID()});}
   // Public vocabulary suggestions and personal tagging retain the Agent path.
-  if(env.memberMode && method==='POST' && (a==='expand'||(a==='topics'&&['brief','preview','assets','game'].includes(c))) && !env.FORGE_RUNNER)throw new HttpError(503,'后台创作服务尚未就绪，请稍后重试。');
-  if(env.memberMode && method==='POST' && ['suggest','tag'].includes(a)){
+
+  if(env.memberMode && method==='POST' && (['suggest','tag'].includes(a)||(new URL(request.url).searchParams.get('executor')==='agent'&&(a==='expand'||(a==='topics'&&['brief','preview','assets','game'].includes(c)))))){
     const data=await body(request).catch(()=>({}));
     const jobs=a==='expand'?(Array.isArray(data.ids)?[...new Set(data.ids)]:[]).map(id=>({type:'expand',ids:[id]})):[a==='topics'?{type:c,id:Number(b)}:a==='suggest'?{type:'suggest',dim:data.dim,n:Math.min(60,Math.max(5,Number(data.n)||30))}:{type:'tag'}];
     if(!jobs.length||jobs.length>40)throw new HttpError(400,'每批 1–40 个任务。');
@@ -164,6 +164,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     const rows=[];for(let i=0;i<jobs.length;i++)rows.push(await createAgentTask(env,ownerId,jobs[i],undefined,snapshots[i]));
     return {pending:true,id:Number(b)||undefined,jobId:rows[0].id,taskId:rows[0].id,status:'pending',tasks:rows.map(publicCreatorTask),...(a==='expand'?{topics:await Promise.all(data.ids.map(id=>getTopic(env,id)))}:{})};
   }
+  if(env.memberMode && method==='POST' && (a==='expand'||(a==='topics'&&['brief','preview','assets','game'].includes(c))) && !env.FORGE_RUNNER)throw new HttpError(503,'后台创作服务尚未就绪，请稍后重试。');
   if(a==='generation-jobs'&&method==='GET'){
     if(b){
       if(env.memberMode&&!await first(env,'SELECT id FROM forge_tasks WHERE id=? AND owner_id=?',b,ownerId))throw new HttpError(404,'生成任务不存在。');
@@ -172,7 +173,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
       return publicForgeTask(row);
     }
     await recoverForgeTasks(env);
-    return (await all(env,"SELECT * FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString(),ownerId,ownerId)).map(publicForgeTask);
+    return (await all(env,"SELECT id,executor,owner_id,kind,scope,status,detail,error,result,created_at,started_at,updated_at FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString(),ownerId,ownerId)).map(publicForgeTask);
   }
   if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
   if(a==='review'&&b==='worker-status'&&!c&&method==='GET')return deviceStatus(env.DB,ownerId);
@@ -224,6 +225,10 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
     case "GET products": return listProducts(env);
     case "GET topics/:id": {
+      if(new URL(request.url).searchParams.get('summary')==='1'){
+        const row=await first(env,`SELECT id,owner_id,subject,medium,gesture,structure,mood,status,data,score,note,updated_at,content_revision,expand_status,expand_error,brief_status,brief_error,assets_status,assets_error,product_status,product_error,brief_md IS NOT NULL AS has_brief,preview_svg IS NOT NULL AS has_preview,assets_html IS NOT NULL AS has_assets,product_html IS NOT NULL AS has_product FROM topics WHERE id=? AND (?='admin' OR owner_id=?)`,id,ownerId,ownerId);
+        if(!row)throw new HttpError(404,'选题不存在');return hydrate(row);
+      }
       if(env.FORGE_RUNNER)await recoverForgeTasks(env,id);
       const topic = await getTopic(env, id);
       return { ...topic, brief_export: composeBrief(topic) };

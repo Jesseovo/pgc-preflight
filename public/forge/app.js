@@ -1,5 +1,8 @@
 // PGC Forge front end. Vanilla JS, no build step.
-import { mountReviewWorkspace } from './review-workspace.js';
+import {createReadCache,waitVisible,patchHtml,createTaskReader} from './experience.js';
+const metadataReads=createReadCache();
+const taskReads=createReadCache({ttl:800});
+const mountReviewWorkspace=async options=>(await import('./review-workspace.js')).mountReviewWorkspace(options);
 import { startTask, withProgress, progressHtml } from './progress.js';
 import { readXlsxRows, listMembers, sheetToWorks } from './review-sheet.js';
 import {briefDocument,versionDocument} from './artifact-view.js';
@@ -16,7 +19,7 @@ const EXPORT_SNIPPET = `(async()=>{const get=u=>fetch(u).then(r=>r.json());const
 const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const memberOnly = document.body.dataset.memberOnly === "true" || location.pathname === "/review";
-const state = { session: null, tab: memberOnly ? "review" : "draw", vocab: null, settings: null, info: null, drawn: [], busy: false, showDup: false, cardNotices: new Map() };
+const state = { session: null, tab: memberOnly ? "review" : "picks", vocab: null, settings: null, info: null, drawn: [], busy: false, showDup: false, cardNotices: new Map() };
 
 // ---------- helpers ----------
 
@@ -38,6 +41,16 @@ function focusCardActivity(root, topicId) {
 }
 
 async function rawApi(method, path, data) {
+  if(method!=='GET'){
+    metadataReads.clear();taskReads.clear();
+    if(state.executor==='agent'&&(path==='expand'||/^topics\/\d+\/(brief|preview|assets|game)(?:\?|$)/.test(path)))path+=(path.includes('?')?'&':'?')+'executor=agent';
+  }
+  const load=()=>fetchApi(method,path,data);
+  if(method==='GET'&&/^(topics\?|products$|state$|settings$|vocab$)/.test(path))return metadataReads.read(path,load);
+  if(method==='GET'&&/^generation-jobs/.test(path))return taskReads.read(path,load);
+  try{return await load();}finally{if(method!=='GET'){metadataReads.clear();taskReads.clear();}}
+}
+async function fetchApi(method, path, data) {
   const options = {signal:AbortSignal.timeout(path === 'review/jobs' && method === 'POST' ? 60000 : 30000)};
   const res = await fetch("/api/forge/" + path, {
     ...options,
@@ -47,7 +60,9 @@ async function rawApi(method, path, data) {
   });
   let out = null;
   try { out = await res.json(); } catch {}
+  if(res.status===403){metadataReads.clear();taskReads.clear();}
   if (res.status === 401) {
+    metadataReads.clear();taskReads.clear();sessionStorage.removeItem("forge-navigation");
     location.replace('/login');
     throw new Error((out && out.error) || "未授权");
   }
@@ -64,6 +79,7 @@ async function api(method,path,data,progress) {
   if(path==='expand')return out;
   return out?.pending && out.jobId ? observeGeneration({id:out.jobId},progress) : out;
 }
+const taskReader=createTaskReader(()=>fetchApi('GET','generation-jobs'),id=>fetchApi('GET',`generation-jobs/${id}`));
 const generationPolls=new Map();
 const GENERATION_LABELS={suggest:'补充词库',tag:'自动打标签'};
 function observeGeneration(row,provided) {
@@ -74,11 +90,11 @@ function observeGeneration(row,provided) {
     try{
       while(true){
         let saved;
-        try{saved=await rawApi('GET',`generation-jobs/${row.id}`);}
+        try{saved=await taskReader.read(row.id);}
         catch(error){
           if(error.status===401||error.status===403||error.status===404)throw error;
           task.update({detail:'正在重新连接，后台生成继续运行…'});
-          await new Promise(resolve=>setTimeout(resolve,3500));continue;
+          continue;
         }
         if(saved.status==='error')throw new Error(saved.error||'生成未完成，请手动重试。');
         if(saved.status==='done'){
@@ -103,12 +119,12 @@ function observeGeneration(row,provided) {
             status:saved.status==='queued'?'waiting':'running',
             detail:saved.detail||(saved.status==='queued'?'等待 Agent 领取任务…':'等待本人的 Agent 回传…'),
           });
-        }else task.update({detail:saved.detail||(saved.executor==='agent'?'等待本人的 Agent 回传…':'等待模型输出…')});
-        await new Promise(resolve=>setTimeout(resolve,3500));
+        }else task.update({status:saved.executor==='agent'?'waiting':'running',detail:(saved.executor==='agent'?'个人 Agent · ':'平台执行 · ')+(saved.detail||(saved.executor==='agent'?'等待本人的 Agent 回传…':'等待模型输出…'))});
+
       }
       throw new Error('后台任务尚未结束，请稍后刷新查看。');
     }catch(error){if(!provided&&!error.versionPending)task.fail(error.message);throw error;}
-    finally{generationPolls.delete(row.id);}
+    finally{generationPolls.delete(row.id);metadataReads.clear();taskReads.clear();}
   })();
   generationPolls.set(row.id,promise);return promise;
 }
@@ -295,8 +311,9 @@ async function openCardArtifact(button, topic, kind, repaint, root) {
 
 function handleCardViewerAction(event, button, card, topic, repaint, root) {
     const versionId=button.dataset.viewerVersion;
-    if(versionId){void guard(button,async()=>{const summary=topic._viewer.versions.find(item=>item.id===versionId);topic._viewer.version={...summary,...await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(versionId)}`)};repaint();},'读取历史版本');return;}
+    if(versionId){void guard(button,async()=>{const summary=topic._viewer.versions.find(item=>item.id===versionId);topic._viewer.version={...summary,...await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(versionId)}`)};if(state.tab==='project'){const url=new URL(location.href);url.searchParams.set('version',versionId);history.replaceState(history.state,'',url);}repaint();},'读取历史版本');return;}
     const action=button.dataset.viewerAct;
+    if(action==='close'&&state.tab==='project'&&state.projectPanel!=='create'){navigateWorkspace({tab:'picks',project:String(topic.id),panel:'create'},true);return;}
     if(action==='close'){closeCardViewer(topic,root,repaint);return;}
     if(action==='back'){topic._viewer.version=null;repaint();return;}
     if(action==='regenerate'){if(topic._viewer.kind==='game')startProductJob(topic,repaint,{regenerate:true});else generateTopicJob(topic._viewer.kind,topic,repaint,true);return;}
@@ -338,13 +355,11 @@ async function refreshStatus() {
 
 // ---------- tabs ----------
 
-$("#tabs").addEventListener("click", (e) => {
+document.addEventListener("click", (e) => {
   const b = e.target.closest("button[data-tab]");
   if (!b || (memberOnly && b.dataset.tab !== "review")) return;
   if (state.reviewProbing) { toast('正在采集游戏画面，采集结束后即可切换。'); return; }
-  state.tab = b.dataset.tab;
-  for (const x of $("#tabs").children) x.classList.toggle("on", x === b);
-  render();
+  navigateWorkspace({tab:b.dataset.tab});
 });
 
 // Each render gets a ticket; a slower render for a tab the user already left
@@ -352,9 +367,11 @@ $("#tabs").addEventListener("click", (e) => {
 let renderSeq = 0;
 function render() {
   const seq = ++renderSeq;
+  for(const button of document.querySelectorAll("#tabs [data-tab]"))button.classList.toggle("on",button.dataset.tab===(state.tab==='project'?'picks':state.tab));
+  document.body.classList.toggle("project-open",state.tab==='project');
   const alive = () => seq === renderSeq;
-  const fn = { draw: renderDraw, picks: renderPicks, products: renderProducts, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings, agent: renderAgent }[state.tab];
-  const label = {draw:"读取选题台",picks:"读取候选选题",products:"读取成品",review:"读取审核工作台",vocab:"读取词库",games:"读取作品库",settings:"读取公共规则",agent:"读取我的 Agent"}[state.tab];
+  const fn = { project: renderProject, draw: renderDraw, picks: renderPicks, products: renderProducts, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings, agent: renderAgent }[state.tab];
+  const label = {project:"读取项目",draw:"读取选题台",picks:"读取候选选题",products:"读取成品",review:"读取审核工作台",vocab:"读取词库",games:"读取作品库",settings:"读取公共规则",agent:"读取我的 Agent"}[state.tab];
   let loading;
   // Let quick tab switches settle before showing a loading affordance.  The
   // workbench keeps long-running progress inside the owning card, so this is
@@ -365,15 +382,64 @@ function render() {
     loading = document.createElement('div');
     loading.className = 'pgc-load-status';
     loading.setAttribute('role', 'status');
-    loading.innerHTML = progressHtml({label,detail:"正在读取最新数据…"});
+    loading.textContent = label+"…";
     view.prepend(loading);
-  }, 420);
+  }, 200);
   withProgress(label, () => fn(alive), {compact:true,tray:false})
-    .then(() => { if (alive() && state.pageNotice) setPageNotice(state.pageNotice); })
+    .then(() => { if(alive()){window.scrollTo({top:history.state?.scrollY||0,behavior:"instant"});if(state.tab==='draw')view.insertAdjacentHTML('afterbegin',executorControl());} if (alive() && state.pageNotice) setPageNotice(state.pageNotice); })
     .catch((e) => { if (alive()) view.innerHTML = `<div class="box bad" role="alert">${esc(e.message)}</div>`; })
     .finally(() => { clearTimeout(loadingTimer); loading?.remove(); });
 }
 
+// ---------- project navigation ----------
+const navigationMemory=new Map();
+history.scrollRestoration='manual';
+let navigationScrollTimer;
+window.addEventListener('scroll',()=>{clearTimeout(navigationScrollTimer);navigationScrollTimer=setTimeout(()=>history.replaceState({...history.state,scrollY},'',location.href),100);},{passive:true});
+function navigateWorkspace({tab='picks',project='',panel='create'},replace=false){
+  clearTimeout(navigationScrollTimer);
+  history.replaceState({...history.state,scrollY},'',location.href);
+  if(!state.projectId)navigationMemory.set(state.tab,{url:location.search,scrollY});
+  const remembered=!project?navigationMemory.get(tab):null;
+  const params=remembered?new URLSearchParams(remembered.url):new URLSearchParams({tab});
+  if(state.projectLayout==='cards')params.set('layout','cards');
+  if(project)params.set('project',project);if(project&&panel!=='create')params.set('panel',panel);
+  history[replace?'replaceState':'pushState']({scrollY:remembered?.scrollY||0},'','?'+params);restoreWorkspace();
+}
+function restoreWorkspace(){
+  const q=new URLSearchParams(location.search),tabs=['draw','picks','products','review','vocab','games','settings','agent'];
+  state.projectId=/^\d+$/.test(q.get('project')||'')?Number(q.get('project')):null;
+  state.projectLayout=q.get('layout')==='cards'?'cards':'list';
+  state.projectSearch=q.get('q')||'';state.projectFilter=['working','product','error'].includes(q.get('filter'))?q.get('filter'):'all';state.projectPage=Math.max(1,parseInt(q.get('page')||'1')||1);
+  state.projectPanel=['create','play','review','versions'].includes(q.get('panel'))?q.get('panel'):'create';
+  state.tab=memberOnly?'review':state.projectId?'project':tabs.includes(q.get('tab'))?q.get('tab'):'picks';
+  render();
+}
+window.addEventListener('popstate',restoreWorkspace);
+document.addEventListener('click',event=>{const button=event.target.closest('[data-open-project]');if(button)navigateWorkspace({tab:'picks',project:button.dataset.openProject,panel:button.dataset.projectPanel||'create'});});
+const executorControl=()=>`<label class="executor-choice">创作方式 <select data-executor aria-label="创作执行方式"><option value="platform" ${state.executor!=='agent'?'selected':''}>平台执行</option><option value="agent" ${state.executor==='agent'?'selected':''}>个人 Agent</option></select></label>`;
+document.addEventListener('change',event=>{if(event.target.matches('[data-executor]')){state.executor=event.target.value;try{sessionStorage.setItem(`forge-executor-${state.session.id}`,state.executor);}catch{}document.querySelectorAll('[data-executor]').forEach(el=>el.value=state.executor);}});
+async function renderProject(alive){
+  const topic=await api('GET',`topics/${state.projectId}?summary=1`);await syncPreviewTasks([topic]);if(!alive())return;
+  const panel=state.projectPanel;
+  view.innerHTML=`<header class="project-heading"><button class="ghost" data-tab="picks">← 我的项目</button><h1>${esc(topic.data?.title||topic.subject||'未命名项目')}</h1><div class="row">${executorControl()}<button class="ghost" data-tab="agent">Agent 接入与任务</button></div><p class="muted">材料和版本保存在当前项目中。生成任务提交后可离开，回来继续查看。</p><nav class="project-tabs" aria-label="项目内容">${[['create','创作'],['play','试玩'],['review','审核'],['versions','版本']].map(([key,label])=>`<button class="ghost" data-project-panel="${key}" aria-current="${panel===key?'page':'false'}">${label}</button>`).join('')}</nav></header><section id="projectContent"></section>`;
+  view.querySelectorAll('[data-project-panel]').forEach(button=>button.onclick=()=>navigateWorkspace({tab:'picks',project:String(topic.id),panel:button.dataset.projectPanel},true));
+  const root=$('#projectContent');
+  if(panel==='review'){
+    root.innerHTML='<p class="muted">正在读取关联报告…</p>';
+    const reports=await api('GET','reviews');if(!alive())return;
+    const related=reports.filter(report=>Number(report.topic_id)===topic.id);
+    const prompt=`请阅读 ${location.origin}/agent.md，审核我下载到本地的项目 ${topic.id}（${topic.data?.title||topic.subject}）的准确游戏版本，完成初评和同模型复核后回传报告。仅在确认作品与版本关联后关联项目，不要按同名猜测。`;
+    root.innerHTML=`<section class="box"><h2>项目审核</h2><p>将下载的 HTML 与下面的指令交给自己的审核 Agent。</p><button class="primary" id="projectReviewPrompt">复制审核指令</button><button class="ghost" data-tab="review">打开我的审核</button><p class="muted">${related.length} 份已明确关联的报告</p>${related.map(r=>`<p>${esc(r.title)} · ${r.score}/9 · ${esc(r.created_at)}</p>`).join('')}</section>`;
+    $('#projectReviewPrompt').onclick=()=>copyText(prompt);return;
+  }
+  if(panel==='play'&&!topic.has_product){root.innerHTML='<section class="box"><h2>还没有成品</h2><p>在创作页准备材料并开始制作，完成后即可在这里试玩。</p></section>';return;}
+  if(panel==='play')topic._viewer={kind:'game'};
+  if(panel==='versions'){const versions=await api('GET',`topics/${topic.id}/versions`);if(!alive())return;topic._viewer={kind:'versions',versions:Array.isArray(versions)?versions:versions.versions||[]};const version=new URLSearchParams(location.search).get('version');if(version){topic._viewer.version=await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(version)}`);if(!alive())return;}}
+  const paint=()=>{if(!alive())return;patchHtml(root,topicCard(topic,'picks'));bindGamePlayers(root);};
+  paint();bindCards(root,()=>[topic],paint);
+  root.classList.toggle('project-materials-only',panel!=='create');
+}
 // ---------- topic cards ----------
 
 function artStyle(d) {
@@ -424,7 +490,7 @@ function topicCard(t, mode) {
   if (mode === "picks" && (t.has_brief || t.brief_status === 'error')) acts.push(`<button class="ghost" data-act="assets" ${!t.has_assets&&t.assets_status === 'running'?'disabled':''}>${!t.has_assets&&t.assets_status === 'running' ? "资产生成中" : t.has_assets ? "看资产" : t.assets_status==='error' ? "重试资产" : "生成资产"}</button>`);
   const working=[['product_status','游戏制作'],['brief_status','简报生成'],['assets_status','资产生成'],['preview_status','样板图生成']].filter(([key])=>['queued','running'].includes(t[key])).map(([,label])=>label);
   return `<article class="card state-${t.status} ${mode==='picks'?'creation-card':''}" data-id="${t.id}">
-    <div class="art" style="${artStyle(d)}"><div class="title">${esc(d.title)}</div><div class="score" title="预估 美学/易玩性/可玩性">${esc(sc)}</div></div>
+    <div class="art" style="${artStyle(d)}"><div class="title"><button class="project-title" data-open-project="${t.id}">${esc(d.title)}</button></div><div class="score" title="预估 美学/易玩性/可玩性">${esc(sc)}</div></div>
     <div class="body">
       ${chipsHtml(t)}
       <p class="creation-logline">${esc(d.logline)}</p>
@@ -483,6 +549,7 @@ function bindCards(root, list, rerender) {
     if (!btn) return;
     const act = btn.dataset.act;
     const repaint = repaintFor(root, rerender);
+    if (!t) return;
     if (act === 'versions') { await openCardArtifact(btn,t,'versions',repaint,root); return; }
     if (act === 'makeGame') {
       if (t.has_product && t.product_status !== 'running') await openCardArtifact(btn, t, 'game', repaint, root);
@@ -569,9 +636,10 @@ function generateTopicJob(kind, topic, repaint = () => {}, regenerate = false, {
   topic[job.error] = '';
   topic._jobProgress = {label:job.label,detail:resume ? '正在恢复后台任务…' : '正在提交后台任务…',startedAt:Date.now()};
   repaint();
-  const update = detail => {
-    topic._jobProgress = {label:job.label,detail,startedAt:topic._jobProgress?.startedAt || Date.now()};
-    entry.task.update({detail});
+  const update = value => {
+    const patch=typeof value==='string'?{detail:value}:value;const detail=patch.detail,status=patch.status||'running';
+    topic._jobProgress = {label:job.label,detail,status,startedAt:status==='waiting'?undefined:topic._jobProgress?.startedAt || Date.now()};
+    entry.task.update({detail,status});
     const card = [...view.querySelectorAll('[data-id]')].find(item => Number(item.dataset.id) === Number(topic.id));
     const slot = card?.querySelector('.creation-job-progress');
     if (slot) slot.innerHTML = progressHtml(topic._jobProgress);
@@ -596,7 +664,7 @@ function generateTopicJob(kind, topic, repaint = () => {}, regenerate = false, {
       topic._jobProgress = null;
       entry.task.fail(error.message);
       entry.repaint();
-    } finally { entry.pending = false; }
+    } finally { entry.pending = false; metadataReads.clear();taskReads.clear();if(jobRequests.get(key)===entry)jobRequests.delete(key); }
   })();
 }
 async function requestTopicJob(kind, id, regenerate = false, update = () => {}, resume = false) {
@@ -605,11 +673,11 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
   if(resume){
     const rows=await rawApi('GET','generation-jobs');
     const latest=rows.find(row=>row.kind===kind&&row.scope?.endsWith(`:${kind}:${id}`));
-    if(latest){const value=await observeGeneration(latest,{update:state=>update(state.detail)});if(value?.[job.result||kind])return value[job.result||kind];}
+    if(latest){const value=await observeGeneration(latest,{update:state=>update(state)});if(value?.[job.result||kind])return value[job.result||kind];}
   }
   if (!resume) try {
     const queued = await rawApi("POST", `topics/${id}/${kind}${regenerate ? '?regenerate=1' : ''}`);
-    const started=queued?.jobId?await observeGeneration({id:queued.jobId},{update:state=>update(state.detail)}):queued;
+    const started=queued?.jobId?await observeGeneration({id:queued.jobId},{update:state=>update(state)}):queued;
     if (started?.[job.result||kind]) return started[job.result||kind];
     update(`任务已保存，后台正在生成${job.noun}。可以继续使用工作台。`);
   } catch (error) {
@@ -622,7 +690,7 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
   }
   const failed = `${job.noun}生成失败`;
   for (let attempt = 0; attempt < 260; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1200 : 3500));
+    await waitVisible(attempt === 0 ? 1200 : 10000);
     try {
       const saved = await api("GET", `topics/${id}`);
       if (saved?.[job.status] === 'error') throw new Error(`${failed}：${saved[job.error] || "请查看错误原因后手动重试。"}`);
@@ -693,7 +761,7 @@ function paintDrawn() {
   if (!box) return;
   const shown = state.drawn.filter((t) => t.status !== "rejected" && (state.showDup || t.status !== "dup"));
   shown.sort((a, b) => (a.status === "drawn") - (b.status === "drawn") || (b.score || 0) - (a.score || 0));
-  box.innerHTML = shown.map((t) => topicCard(t, "draw")).join("") || `<p class="muted">还没有选题，点"抽一批"。</p>`;
+  patchHtml(box,shown.map((t) => topicCard(t, "draw")).join("") || `<p class="muted">还没有选题，点"抽一批"。</p>`);
   const dups = state.drawn.filter((t) => t.status === "dup").length;
   const liked = state.drawn.filter((t) => t.status === "liked").length;
   $("#drawSummary").innerHTML = `${shown.length} 个在看 · ${liked} 个已要` +
@@ -827,10 +895,11 @@ async function expandIds(ids, {resume = false} = {}) {
 
   const poll = async (id) => {
     while (pendingExpandIds.has(id)) {
+      const task=tasks.get(id);
       try {
-        const task=tasks.get(id);
         if(task){
-          const saved=await rawApi('GET',`generation-jobs/${task.id}`);
+          const saved=await taskReader.read(task.id);
+          if(['queued','running'].includes(saved.status))continue;
           if(saved.status==='done'&&saved.result?.disposition==='pending'){
             finishPending(id);paintDrawn();paintProgress();break;
           }
@@ -861,7 +930,7 @@ async function expandIds(ids, {resume = false} = {}) {
           outcomes.set(id,'error');pendingExpandIds.delete(id);paintDrawn();paintProgress();
         }
       }
-      if(pendingExpandIds.has(id))await new Promise(resolve=>setTimeout(resolve,3500));
+      if(pendingExpandIds.has(id)&&!task)await waitVisible(10000);
     }
   };
   for (const id of unique) {
@@ -875,18 +944,39 @@ async function expandIds(ids, {resume = false} = {}) {
 
 // ---------- 候选 ----------
 
+function projectSummary(topic){
+  const active=['product','brief','assets','preview','expand'].some(k=>['queued','running'].includes(topic[k+'_status']));
+  const failed=['product','brief','assets','preview','expand'].some(k=>topic[k+'_status']==='error');
+  const label=active?'进行中':failed?'需处理':topic.has_product?'可试玩':'创作中';
+  return `<article class="project-row" data-id="${topic.id}"><button class="project-row-open" data-open-project="${topic.id}"><span class="project-row-title">${esc(topic.data?.title||topic.subject)}</span><span class="project-row-description">${esc(topic.data?.logline||topic.subject)}</span></button><span class="project-row-state">${label}</span><button class="ghost" data-open-project="${topic.id}" data-project-panel="${topic.has_product?'play':'create'}">${topic.has_product?'试玩':'继续创作'} →</button></article>`;
+}
+
 async function renderPicks(alive) {
-  const list = await api("GET", "topics?status=liked,made&limit=200");
+  const [candidates,products]=await Promise.all([api("GET","topics?status=liked,made&limit=500"),api("GET","products")]);
+  const merged=new Map(candidates.map(t=>[t.id,t]));for(const t of products)merged.set(t.id,{...merged.get(t.id),...t});
+  const list=[...merged.values()].sort((a,b)=>String(b.updated_at).localeCompare(String(a.updated_at)));
   await syncPreviewTasks(list);
   if (!alive()) return;
-  view.innerHTML = `<div class="row section"><h2 class="grow">候选选题</h2><span class="muted small">${list.length} 个</span></div>
-    <p class="muted small section">点击“开始制作”，平台使用 Opus 5.5 生成可试玩的单文件游戏，完成后在“成品”栏目查看。</p>
-    <div class="cards" id="pickCards"></div>`;
+  view.innerHTML = `<div class="row section"><h2 class="grow">我的项目</h2><span class="muted small">${list.length} 个</span></div>
+    <p class="muted small section">点击项目名称进入创作空间，材料、试玩、审核和版本都在一起。</p>
+    <div class="row section">${executorControl()}<button class="ghost" data-tab="products">已有成品</button><button class="ghost" data-tab="games">历史导入作品</button><label class="grow">搜索项目 <input type="search" id="projectSearch" placeholder="名称或题材" value="${esc(state.projectSearch||'')}"></label><label>状态 <select id="projectFilter"><option value="all">全部</option><option value="working">进行中</option><option value="product">已有成品</option><option value="error">需处理</option></select></label></div><div class="row section"><button class="ghost" data-project-layout="list">列表</button><button class="ghost" data-project-layout="cards">卡片</button></div><div class="cards" id="pickCards"></div><div class="row" id="projectPages"></div>`;
   const paint = () => {
-    const shown = list.filter((t) => t.status === "liked" || t.status === "made");
-    $("#pickCards").innerHTML = shown.map((t) => topicCard(t, "picks")).join("") || `<p class="muted">还没有候选，去选题台点"要"。</p>`;
+    if(!alive())return;
+    const query=$('#projectSearch').value.toLowerCase(),filter=$('#projectFilter').value;
+    const matches=list.filter(t=>(t.data?.title+' '+t.subject).toLowerCase().includes(query)&& (filter==='all'||filter==='product'&&t.has_product||filter==='working'&&['product','brief','preview','assets'].some(k=>['queued','running'].includes(t[k+'_status']))||filter==='error'&&['product','brief','preview','assets'].some(k=>t[k+'_status']==='error')));
+    const pages=Math.max(1,Math.ceil(matches.length/24));state.projectPage=Math.min(state.projectPage||1,pages);const shown=matches.slice((state.projectPage-1)*24,state.projectPage*24);
+    state.projectSearch=query;state.projectFilter=filter;const url=new URL(location.href);for(const [key,value]of Object.entries({q:query,filter,page:String(state.projectPage),layout:state.projectLayout})){if(!value||value==='all'||value==='1'||value==='list')url.searchParams.delete(key);else url.searchParams.set(key,value);}history.replaceState(history.state,'',url);
+    $('#projectPages').innerHTML=`<button class="ghost" data-project-page="${state.projectPage-1}" ${state.projectPage===1?'disabled':''}>上一页</button><span>${state.projectPage} / ${pages} · ${matches.length} 个项目</span><button class="ghost" data-project-page="${state.projectPage+1}" ${state.projectPage===pages?'disabled':''}>下一页</button>`;
+    $('#projectPages').querySelectorAll('[data-project-page]').forEach(button=>button.onclick=()=>{state.projectPage=Number(button.dataset.projectPage);paint();});
+    patchHtml($("#pickCards"), shown.map((t) => state.projectLayout==='cards'?topicCard(t,"picks"):projectSummary(t)).join("") || `<p class="muted">还没有项目，到发现选题中选择一个想法。</p>`);
+    $('#pickCards').classList.toggle('project-list',state.projectLayout!=='cards');
     bindGamePlayers($('#pickCards'));
   };
+  $('#projectFilter').value=state.projectFilter||'all';
+  view.querySelectorAll('[data-project-layout]').forEach(button=>button.onclick=()=>{state.projectLayout=button.dataset.projectLayout;paint();});
+  let searchTimer;$('#projectSearch').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{if(alive()){state.projectPage=1;paint();}},250);};
+  $('#projectSearch').onkeydown=event=>{if(event.key==='Enter'){clearTimeout(searchTimer);state.projectPage=1;paint();}};
+  $('#projectFilter').onchange=()=>{state.projectPage=1;paint();};
   bindCards($("#pickCards"), () => list, paint);
   paint();
 }
@@ -900,13 +990,13 @@ async function renderProducts(alive) {
   const list = await api('GET', 'products');
   if (!alive()) return;
   const products = list.filter(topic => topic.has_product || ['queued', 'running', 'error'].includes(topic.product_status));
-  view.innerHTML = `<div class="row section"><h2 class="grow">成品</h2><span class="muted small">${products.length} 款</span></div>
+  view.innerHTML = `<div class="row section"><h2 class="grow">已有成品</h2><button class="ghost" data-tab="picks">全部项目</button><span class="muted small">${products.length} 款</span></div>
     <p class="muted small section">生成的可试玩首版保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
     <div class="cards" id="productCards"></div>`;
   const paint = () => {
     if (!alive()) return;
     const cards = products.map(productCard).join('');
-    $('#productCards').innerHTML = cards || `<p class="muted">还没有成品。到候选栏目选中一款游戏，点击“开始制作”。</p>`;
+    patchHtml($('#productCards'),cards || `<p class="muted">还没有成品。到我的项目中选择一款游戏，开始制作。</p>`);
     bindGamePlayers($('#productCards'));
   };
   bindProductCards($('#productCards'), products, paint);
@@ -919,7 +1009,7 @@ async function renderProducts(alive) {
 function productCard(topic) {
   const data = topic.data || {};
   const active=['queued','running'].includes(topic.product_status);
-  return `<article class="card creation-card" data-id="${topic.id}"><div class="art" style="${artStyle(data)}"><div class="title">${esc(data.title || 'Untitled')}</div><div class="score">${topic.has_product?'可试玩':active?'制作中':'未完成'}</div></div><div class="body">${chipsHtml(topic)}<p>${esc(data.logline || '')}</p>${topic._notice||state.cardNotices.get(topic.id)?`<p class="creation-card-notice small" role="status">${esc(topic._notice||state.cardNotices.get(topic.id))}</p>`:''}${topic._productProgress?`<div class="product-job-progress">${progressHtml(topic._productProgress)}</div>`:active?`<div class="product-job-progress">${progressHtml({label:topic.has_product?'正在制作新版本':'游戏制作中',detail:topic.product_error||'等待后台执行…'})}</div>`:topic.product_status==='error'?`<p class="bad small">${esc(topic.product_error||'制作未完成，可重试。')}${topic.has_product?' 现有成品仍可试玩。':''} <button class="ghost small" data-act="retryProduct">重试制作</button></p>`:''}<p class="muted small">${topic.has_product?'单文件 HTML · '+esc(topic.updated_at||''):'完成后会自动出现在这里。'}</p></div><div class="creation-viewer-slot">${renderCardViewer(topic)}</div>${creationFooter(topic,'products')}</article>`;
+  return `<article class="card creation-card" data-id="${topic.id}"><div class="art" style="${artStyle(data)}"><div class="title"><button class="project-title" data-open-project="${topic.id}">${esc(data.title || 'Untitled')}</button></div><div class="score">${topic.has_product?'可试玩':active?'制作中':'未完成'}</div></div><div class="body">${chipsHtml(topic)}<p>${esc(data.logline || '')}</p>${topic._notice||state.cardNotices.get(topic.id)?`<p class="creation-card-notice small" role="status">${esc(topic._notice||state.cardNotices.get(topic.id))}</p>`:''}${topic._productProgress?`<div class="product-job-progress">${progressHtml(topic._productProgress)}</div>`:active?`<div class="product-job-progress">${progressHtml({label:topic.has_product?'正在制作新版本':'游戏制作中',detail:topic.product_error||'等待后台执行…'})}</div>`:topic.product_status==='error'?`<p class="bad small">${esc(topic.product_error||'制作未完成，可重试。')}${topic.has_product?' 现有成品仍可试玩。':''} <button class="ghost small" data-act="retryProduct">重试制作</button></p>`:''}<p class="muted small">${topic.has_product?'单文件 HTML · '+esc(topic.updated_at||''):'完成后会自动出现在这里。'}</p></div><div class="creation-viewer-slot">${renderCardViewer(topic)}</div>${creationFooter(topic,'products')}</article>`;
 }
 
 function bindProductCards(root, list, paint) {
@@ -956,9 +1046,9 @@ function startProductJob(topic, repaint = () => {}, {resume = false,regenerate=f
   entry.update = state => {
     const patch = typeof state === 'string' ? {detail:state} : state || {};
     entry.task.update(patch);
-    topic._productProgress = {label:'AI 制作',detail:patch.detail || '正在后台制作…',startedAt:topic._productProgress?.startedAt || Date.now()};
+    topic._productProgress = {label:'游戏制作',detail:patch.detail || '正在后台制作…',status:patch.status||'running',startedAt:patch.status==='waiting'?undefined:topic._productProgress?.startedAt || Date.now()};
     const card = [...view.querySelectorAll('[data-id]')].find(item => Number(item.dataset.id) === Number(topic.id));
-    const slot = card?.querySelector('.product-job-progress');
+    const slot = card?.querySelector('.product-job-progress, .creation-job-progress');
     if (slot) slot.innerHTML = progressHtml(topic._productProgress);
   };
   productRequests.set(topic.id, entry);
@@ -982,7 +1072,7 @@ function startProductJob(topic, repaint = () => {}, {resume = false,regenerate=f
       topic._productProgress = null;
       entry.task.fail(error.message);
       entry.repaint();
-    } finally { entry.pending = false; }
+    } finally { entry.pending = false; metadataReads.clear();taskReads.clear();if(productRequests.get(topic.id)===entry)productRequests.delete(topic.id); }
   })();
 }
 
@@ -1005,7 +1095,7 @@ async function requestProductJob(id, entry, resume = false) {
     entry.update({detail:'提交响应中断，正在向后台确认任务状态…'});
   }
   for (let attempt = 0; ; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1200 : 4000));
+    await waitVisible(attempt === 0 ? 1200 : 10000);
     try {
       const saved = await api('GET', `topics/${id}/game`);
       Object.assign(entry.topic, saved);
@@ -1238,7 +1328,7 @@ async function renderAgent(alive) {
   $('#copyAgentInstructions').onclick = () => copyText(prompt);
   $('#createAgentPairing').onclick = event => guard(event.target,async () => {const pairing=await api('POST','agent/pairing',{}); if(!alive())return; $('#agentPairing').innerHTML = `配对码 · 5 分钟内有效 <input class="agent-code" aria-label="创作 Agent 配对码" readonly value="${esc(pairing.code)}"><button class="ghost" id="copyAgentCode">复制配对码</button>`;$('#copyAgentCode').onclick=()=>copyText(pairing.code);setTimeout(()=>{if(alive())$('#agentPairing').textContent='配对码已过期，请重新生成。';},300000);});
   view.querySelectorAll('[data-revoke-agent]').forEach(button=>button.onclick=()=>guard(button,async()=>{await api('POST','agent/revoke',{id:button.dataset.revokeAgent});render();}));
-  const timer=setInterval(()=>{if(!alive()){clearInterval(timer);return;}if(!document.hidden)render();},20000);
+  // Refresh is explicit here: replacing this view would discard an active pairing code.
 }
 
 const VERSION_LABELS={expand:'扩写',brief:'简报',preview:'样板图',assets:'美术资产',game:'游戏成品',product:'游戏成品'};
@@ -1252,14 +1342,14 @@ async function boot() {
     if(state.session.role==='admin'){location.replace('/admin');return;}
     if(!state.session.star&&!memberOnly){location.replace('/');return;}
     if (!memberOnly) {
-      await refreshStatus();
-      state.settings = await api("GET", "settings");
+      const [,settings]=await Promise.all([refreshStatus(),api("GET","settings")]);state.settings=settings;
+      try{state.executor=sessionStorage.getItem(`forge-executor-${state.session.id}`)||"platform";}catch{state.executor="platform";}
       try{const size=localStorage.getItem(`forge-draw-size-${state.session.id}`);if(size)state.settings.draw_size=size;}catch{}
       void rawApi('GET','generation-jobs').then(rows=>{
         for(const row of rows)if(['queued','running'].includes(row.status)&&GENERATION_LABELS[row.kind])void observeGeneration(row).catch(()=>{});
       }).catch(()=>{});
     }
-    render();
+    restoreWorkspace();
   } catch (e) {
     if (!$("#login").hidden) return;
     view.innerHTML = `<div class="box bad">${esc(e.message)}</div>`;

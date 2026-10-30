@@ -1,0 +1,54 @@
+/* Existing sage palette; shared reading rhythm and predictable controls. */
+:root{--space-unit:8px}
+button,input,select,textarea{touch-action:manipulation}
+button:focus-visible,a:focus-visible,summary:focus-visible,select:focus-visible{outline:2px solid #809c80;outline-offset:3px}
+.creator-shell{font-size:15px;background:#f8faf7;color:#344b40}
+.creator-shell .top{position:fixed;inset:0 auto 0 0;width:208px;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:28px;background:#fff;border-right:1px solid #e1e8df;border-bottom:0;padding:28px 16px}
+.creator-shell .brand{display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:15px;text-decoration:none}
+.creator-shell .brand .sub{width:100%;font-size:12px;margin-left:38px}
+.creator-shell #tabs{display:flex;flex-direction:column;overflow:visible;gap:5px}
+.creator-shell #tabs button,.creator-shell #tabs a{text-align:left;padding:11px 14px;border-radius:6px;font-size:14px;color:#536f5c;text-decoration:none}
+.creator-shell #tabs button.on{background:#eaf1e6;box-shadow:none}
+.creator-shell .nav-secondary{display:flex;flex-direction:column;gap:4px;border-top:1px solid #e1e8df;margin-top:20px;padding-top:16px}
+.creator-shell #status{margin: auto 0 0;line-height:1.8;font-size:12px}
+.creator-shell #view{margin-left:208px;max-width:none;padding:36px clamp(20px,4vw,64px);min-height:100vh}
+.creator-shell h1{font-size:27px;letter-spacing:-.6px;font-weight:600;margin:18px 0}
+.creator-shell h2{font-size:21px;font-weight:600}
+.creator-shell .box{box-shadow:none;border-color:#e1e8df;border-radius:8px;padding:24px}
+.creator-shell .cards{grid-template-columns:repeat(auto-fill,minmax(min(100%,310px),1fr));gap:20px}
+.creator-shell .card{box-shadow:none;border:1px solid #e1e8df;border-radius:8px;overflow:hidden}
+.creator-shell .card .body{padding:18px}.creator-shell .card .art{min-height:100px}
+.creator-shell .project-title{border:0;background:none;text-align:left;font:inherit;color:inherit;padding:0;cursor:pointer;text-decoration:underline;text-decoration-color:transparent;text-underline-offset:5px}
+.creator-shell .project-title:hover{text-decoration-color:currentColor}
+.creator-shell .small,.creator-shell .chip,.creator-shell .creation-note-fold>summary,.creator-shell .topic-details>summary,.creator-shell .material-link small{font-size:12px!important}
+.creator-shell .creation-logline,.creator-shell .kv{font-size:14px;line-height:1.75}
+.creator-shell .executor-choice{display:flex;align-items:center;gap:10px;font-size:13px}
+.creator-shell input[type=search]{min-width:160px;width:min(100%,320px)}
+.creator-shell .project-heading{max-width:1100px;margin:0 auto 26px}.creator-shell .project-heading>p{font-size:13px;margin:18px 0}
+.creator-shell .project-tabs{display:flex;gap:20px;border-bottom:1px solid #dce5dc;margin-top:28px}
+.creator-shell .project-tabs button{border:0;border-radius:0;padding:12px 0;background:none}
+.creator-shell .project-tabs [aria-current=page]{box-shadow:0 2px #809c80;color:#344b40;font-weight:600}
+.creator-shell #projectContent{max-width:1100px;margin:auto}
+.creator-shell #projectContent>.card{background:transparent;border:0}
+.creator-shell #projectContent .art{display:none}
+.creator-shell #projectContent .body{padding:12px 0 24px}
+.creator-shell #projectContent .creation-footer{padding:18px 0;border-top:1px solid #dce5dc}
+.creator-shell #projectContent .creation-viewer{margin-top:24px;box-shadow:none;border:0}
+.creator-shell .project-materials-only>.card>.body,.creator-shell .project-materials-only>.card>.creation-footer,.creator-shell .project-materials-only>.card>.acts{display:none}
+.creator-shell .creation-viewer-body{max-height:none}
+.creator-shell .creation-materials{max-width:640px}
+.review-page{font-size:15px}.review-page .review-intro{padding:16px 0 24px;min-height:0;align-items:flex-start}.review-page .review-intro h1{font-size:28px;letter-spacing:-.6px;line-height:1.4}.review-page .review-intro p{font-size:14px;max-width:640px}.review-page .review-mascot,.review-page .review-intro-tags{display:none}
+.review-setup{border:1px solid #dce5dc;border-radius:8px;margin:0 0 24px;background:#fff}.review-setup>summary{cursor:pointer;padding:16px 20px;color:#344b40;font-size:14px}.review-setup .review-workspace{padding:0 20px 20px;margin:0}.review-setup .review-dropzone{padding:18px;min-height:0}.review-setup .review-file-illustration{display:none}.review-setup .review-scope-panel{display:none}.review-setup .review-workspace{grid-template-columns:1fr}
+.review-page .rv-batch-heading h2,.review-page .review-history h2{font-size:21px}.review-page .rr-kicker,.review-page .eyebrow{display:none}
+.review-page .rv-overview,.review-page #rvBatchMeter{display:none}.review-page .rv-job-info>.pgc-progress{display:none}.review-page .rv-job-status .rv-spinner{animation:none;border:0;background:#809c80;width:6px;height:6px}
+.review-page .rr-source-details{margin:14px 0;color:#536f5c;font-size:12px}.review-page .rr-source-details summary{cursor:pointer}.review-page .rr-legacy-note{overflow-wrap:anywhere}
+.review-page .rr-comment{font-size:15px;line-height:1.8}
+@media(max-width:900px){.creator-shell .top{position:sticky;inset:auto;width:auto;flex-direction:row;flex-wrap:wrap;padding:12px 16px;gap:10px;border-right:0;border-bottom:1px solid #e1e8df}.creator-shell .brand .sub{display:none}.creator-shell #tabs{flex-direction:row;flex-wrap:wrap;gap:3px;width:100%}.creator-shell .nav-secondary{flex-direction:row;flex-wrap:wrap;border:0;padding:0;margin:0}.creator-shell #tabs button,.creator-shell #tabs a{padding:8px;font-size:13px}.creator-shell #status{display:none}.creator-shell #view{margin:0;padding:24px 16px}.creator-shell .cards{grid-template-columns:1fr}.creator-shell .project-tabs{gap:24px}.review-page .review-intro h1{font-size:25px}.review-setup .review-workspace{padding:0 12px 12px}}
+@media(prefers-reduced-motion:reduce){.creator-shell *,.review-page *{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+.creator-shell #tabs{align-items:stretch;width:100%}.creator-shell #tabs>button{width:100%;text-align:left}.creator-shell .nav-secondary{align-items:stretch;width:100%}
+.creator-shell #pickCards.project-list{display:flex;flex-direction:column;align-items:stretch;gap:0;border-top:1px solid #dce5dc}
+.creator-shell .project-row{display:flex;align-items:center;gap:24px;border-bottom:1px solid #e1e8df;padding:20px 4px;min-width:0}
+.creator-shell .project-row-open{flex:1;min-width:0;border:0;background:none;padding:0;text-align:left;cursor:pointer;color:#344b40}
+.creator-shell .project-row-title{display:block;font-size:16px;font-weight:600;line-height:1.6}.creator-shell .project-row-description{display:block;font-size:13px;color:#536f5c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.creator-shell .project-row-state{font-size:12px;white-space:nowrap;color:#536f5c}.creator-shell .project-row:hover{background:#f1f6ef}
+.creator-shell input[type=search]{border:1px solid #dce5dc;border-radius:6px;padding:8px 10px;background:#fff}
+@media(max-width:900px){.creator-shell #tabs>button{width:auto}.creator-shell .nav-secondary{width:auto}.creator-shell .project-row{gap:12px;padding:16px 0}.creator-shell .project-row-state{display:none}}

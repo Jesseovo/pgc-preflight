@@ -20,6 +20,7 @@ const server = createServer(async (request, response) => {
     if (url.pathname === '/api/forge/state') return json({ games: 1, vocab: 5, fresh_subjects: 100, providers: { deepseek: true }, provider: 'deepseek', model: 'deepseek-chat' });
     if (url.pathname === '/api/forge/settings') return json({ draw_size: 2 });
     if (url.pathname === '/api/forge/generation-jobs') return json([]);
+    if (url.pathname === '/api/forge/products') return json([]);
     if (url.pathname === '/api/forge/vocab') return json(['subject', 'medium', 'gesture', 'structure', 'mood'].map((dim, i) => ({ id: i, dim, word: '样例', enabled: 1 })));
     if (url.pathname === '/api/forge/topics') return json(url.search.includes('liked') ? topics.filter(t => t.status === 'liked') : topics.filter(t => t.status === 'drawn'));
     if (url.pathname === '/api/forge/draw') {
@@ -70,7 +71,7 @@ try {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(String(error)));
   await page.setViewport({ width: 1360, height: 960 });
-  await page.goto(`${origin}/test`);
+  await page.goto(`${origin}/test?tab=draw&layout=cards`);
   await page.waitForSelector('#drawBtn');
   await page.click('[data-tab="picks"]');
   await page.waitForSelector('[data-id="1"] [data-act="brief"]');
@@ -91,7 +92,8 @@ try {
   complete = true;
   // The first status read deliberately returns 503. Let the client pass its
   // bounded reconnect delay before asserting background completion.
-  await pause(5000);
+  await page.waitForFunction(() => document.querySelector('[data-tab="vocab"]') === document.activeElement);
+  await new Promise<void>((resolve, reject) => { const deadline=Date.now()+30000;const check=()=>topics[0].has_brief?resolve():Date.now()>deadline?reject(new Error('Background brief did not finish')):setTimeout(check,100);check(); });
   assert.equal(topics[0].has_brief, 1, 'The background generation must finish while another tab is active');
   assert.equal(await page.$eval(':focus', el => el.getAttribute('data-tab')), 'vocab', 'Background completion must not steal keyboard focus');
   assert.equal(await page.evaluate(() => { const tray = document.querySelector('.pgc-task-tray'); return !tray || getComputedStyle(tray).display === 'none'; }), true, 'Background completion must not show a global task tray');
@@ -130,7 +132,7 @@ try {
   await mobile.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
   await mobile.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   const beforeResume = requests;
-  await mobile.goto(`${origin}/test`); await mobile.waitForSelector('#drawBtn');
+  await mobile.goto(`${origin}/test?tab=draw&layout=cards`); await mobile.waitForSelector('#drawBtn');
   await mobile.click('[data-tab="picks"]');
   await mobile.waitForSelector('[data-id="1"] .creation-job-progress [role="progressbar"]');
   assert.equal(requests, beforeResume, 'Refreshing must observe an existing job without a new POST');
@@ -139,7 +141,7 @@ try {
   assert(await mobile.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile progress feedback must not overflow');
   const animation = await mobile.evaluate(async () => {
     const { startTask } = await import('/forge/progress.js' as string);
-    startTask('减少动态效果测试');
+    startTask('减少动态效果测试',{tray:true});
     return getComputedStyle(document.querySelector('.is-indeterminate > span')!).animationName;
   });
   assert.equal(animation, 'none');
@@ -148,7 +150,7 @@ try {
   await mobile.close(); topics[0].brief_status = ''; complete = true;
 
   const batch = await browser.newPage();
-  await batch.goto(`${origin}/test`); await batch.waitForSelector('#drawBtn'); await batch.click('#drawBtn');
+  await batch.goto(`${origin}/test?tab=draw&layout=cards`); await batch.waitForSelector('#drawBtn'); await batch.click('#drawBtn');
   await batch.waitForFunction('document.querySelector("#progress [role=progressbar]")?.getAttribute("aria-valuenow") === "1"');
   assert.equal(await batch.$eval('#progress [role="progressbar"]', el => el.getAttribute('aria-valuemax')), '2');
   expansionFinished = true;
@@ -161,11 +163,11 @@ try {
 
   const host = await browser.newPage();
   await host.goto(`${origin}/host`);
-  await host.waitForFunction('document.querySelector("iframe").contentDocument.querySelector("#drawBtn")');
+  await host.waitForFunction('document.querySelector("iframe").contentDocument.querySelector("#pickCards")');
   const frame = host.frames().find(f => f.url().includes('/test'))!;
   await frame.evaluate(async () => {
     const { startTask } = await import('/forge/progress.js' as string);
-    startTask('嵌入任务',{key:'embedded-test'});
+    startTask('嵌入任务',{key:'embedded-test',tray:true});
   });
   await host.waitForSelector('[data-task-key="embedded-test"]');
   assert.equal(await frame.$('.pgc-task-tray'), null, 'Embedded tasks must appear in parent viewport, not below iframe fold');
@@ -180,7 +182,7 @@ try {
   await admin.type('#admin-password', 'synthetic-admin'); await admin.click('#login-form button');
   await admin.waitForSelector('#tab-settings'); await admin.click('#tab-settings');
   await admin.waitForSelector('[data-settings="model"]'); await admin.click('[data-settings="model"]');
-  await admin.click('[data-profile="deepseek"]');
+  await admin.waitForSelector('[data-profile="deepseek"]');await admin.click('[data-profile="deepseek"]');
   await admin.click('#test-model');
   await admin.waitForFunction('document.querySelector("#config-message").textContent.includes("连接成功")');
   assert(modelTest);
@@ -189,7 +191,8 @@ try {
   await login.goto(`${origin}/login`); await login.waitForSelector('#username');
   await login.type('#username', 'progress-test'); await login.type('#password', 'synthetic-password');
   await login.click('#member-login button');
-  await login.waitForSelector('.pgc-task [data-progress-since]');
+  await login.waitForSelector('#member-login button:disabled');
+  assert.equal(await login.$eval('#login-message',node=>node.textContent),'正在登录…');
   await login.waitForFunction('document.querySelector("#login-message").textContent.includes("合成登录错误")');
   console.log('PASS 生产构建的管理页模型测试、成员登录等待与失败反馈。');
 } finally { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve())); }

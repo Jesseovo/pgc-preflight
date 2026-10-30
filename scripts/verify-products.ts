@@ -43,22 +43,22 @@ try {
   const page=await browser.newPage(); const errors:string[]=[];
   page.on('pageerror',error=>errors.push(String(error)));
   await page.setViewport({width:1360,height:960});
-  await page.goto(`${origin}/test`); await page.waitForSelector('#drawBtn');
+  await page.goto(`${origin}/test?tab=draw&layout=cards`); await page.waitForSelector('#drawBtn');
   await page.click('[data-tab="picks"]'); await page.waitForSelector('[data-act="makeGame"]');
-  await page.click('[data-act="makeGame"]'); await page.waitForSelector('#productProgress [role="progressbar"]');
-  await page.waitForFunction('document.querySelector("#productProgress").textContent.includes("后台已接收")');
+  await page.click('[data-act="makeGame"]'); await page.waitForSelector('.creation-job-progress [role="progressbar"]');
+  await page.waitForFunction('document.querySelector(".creation-job-progress").textContent.includes("后台已接收")');
   assert.equal(requests,1);
-  assert.equal(await page.$eval('#productProgress [role="progressbar"]',el=>el.hasAttribute('aria-valuenow')),false);
-  await page.click('#modalClose'); await page.click('[data-act="makeGame"]'); assert.equal(requests,1);
-  await page.click('#modalClose'); await page.click('[data-tab="products"]'); await page.waitForSelector('[data-act="resumeProduct"]');
+  assert.equal(await page.$eval('.creation-job-progress [role="progressbar"]',el=>el.hasAttribute('aria-valuenow')),false);
+  assert.equal(await page.$eval('#modal',el=>(el as HTMLElement).hidden),true);
+  assert.equal(await page.$eval('[data-act="makeGame"]',el=>(el as HTMLButtonElement).disabled),true);assert.equal(requests,1);
+  await page.click('[data-tab="products"]'); await page.waitForSelector('#productCards [data-act="resumeProduct"]');
   await page.screenshot({path:'artifacts/products-pending.png',fullPage:true});
   // New browser document must resume the same persisted job without POST.
-  await page.reload(); await page.waitForSelector('#drawBtn'); await page.click('[data-tab="products"]');
-  await page.waitForSelector('[data-task-key="product-1"][data-task-state="running"]');
+  await page.reload(); await page.waitForSelector('#productCards .product-job-progress');
   assert.equal(requests,1); offline=true;
-  await page.waitForFunction('document.querySelector("[data-task-key=product-1]").textContent.includes("重新连接")');
+  await page.waitForFunction('document.querySelector(".product-job-progress").textContent.includes("重新连接")');
   topic.product_status='running'; topic.product_error='Opus 正在编写完整 HTML 游戏…';
-  await page.waitForFunction('document.querySelector("[data-task-key=product-1]").textContent.includes("编写完整")');
+  await page.waitForFunction('document.querySelector(".product-job-progress").textContent.includes("编写完整")');
   topic.product_status='';topic.product_error='';topic.has_product=1;topic.status='made';
   await page.waitForSelector('[data-act="viewProduct"]');
   assert.equal(await page.$eval('#modal',el=>(el as HTMLElement).hidden),true);
@@ -72,18 +72,19 @@ try {
   assert.match(downloaded.headers.get('Content-Disposition')!,/attachment/); assert.equal(await downloaded.text(),html);
   await page.screenshot({path:'artifacts/products-complete.png',fullPage:true});
   await page.setViewport({width:390,height:844,isMobile:true,hasTouch:true});
-  await page.waitForSelector('#drawBtn'); await page.click('[data-tab="products"]');
-  await page.waitForSelector('[data-act="viewProduct"]');await page.click('[data-act="viewProduct"]');
+  await page.waitForSelector('[data-act="viewProduct"]');
+  // Changing mobile emulation reloads Chromium's document.
+  await page.click('[data-act="viewProduct"]');
   await page.waitForSelector('iframe.product-frame');
   assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'),'Mobile page must not overflow');
   await page.screenshot({path:'artifacts/products-mobile.png',fullPage:true});
-  await page.click('#modalClose');
+  await page.click('[data-viewer-act="close"]');assert.equal(await page.$('iframe.product-frame'),null);
   topic.has_product=0;topic.status='liked';topic.product_status='error';topic.product_error='合成模型错误，请重试';
-  await page.click('[data-tab="picks"]');await page.click('[data-tab="products"]');
+  await page.reload();await page.waitForSelector('#productCards');
   await page.waitForSelector('[data-act="retryProduct"]'); await page.click('[data-act="retryProduct"]');
-  await page.waitForFunction('document.querySelector("#productProgress").textContent.includes("后台已接收")');
+  await page.waitForFunction('document.querySelector(".product-job-progress").textContent.includes("后台已接收")');
   assert.equal(requests,2);topic.product_status='error';topic.product_error='合成模型错误，请重试';
-  await page.waitForSelector('[data-task-key="product-1"][data-task-state="error"]');
+  await page.waitForSelector('#productCards .bad.small');
   assert.equal(errors.length,0,errors.join('\n'));assert(statusReads>=4);
   console.log('PASS 开始制作一次提交、阶段进度、跨栏目/刷新恢复、断线重连、完成不抢焦点、隔离试玩、下载、失败重试和手机布局。');
 } finally {await browser.close();server.close();}

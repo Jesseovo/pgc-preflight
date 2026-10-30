@@ -4,6 +4,7 @@ import type { AppSecrets } from './settings';
 
 // 成员审核页只加载这些共享资源，其余工作台资源需要管理员会话。
 const reviewAssets = new Set([
+  '/forge/experience.js', '/forge/experience.css',
   '/forge/member-review.js', '/forge/review-workspace.js', '/forge/review-workspace.css',
   '/forge/review-capture.js', '/forge/style.css', '/forge/progress.js', '/forge/progress.css',
 ]);

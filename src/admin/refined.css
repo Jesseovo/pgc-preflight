@@ -355,3 +355,12 @@
 }
 @media(max-width:480px){.admin-app .adm-product-grid,.admin-app .content-projects-grid{grid-template-columns:1fr}.admin-app .adm-product-cover{height:180px}.admin-app .adm-inspector-path nav{max-width:150px}}
 @media(prefers-reduced-motion:reduce){.admin-app *{transition:none!important;animation:none!important;scroll-behavior:auto!important}}
+
+/* Quiet navigation: stable local placeholders, no shimmering or pulsing. */
+.admin-app .adm-skeleton>div,.admin-app .content-dot{animation:none!important}
+.admin-app .content-loading,.admin-app .adm-skeleton{animation:reveal-wait .2s step-end both;min-height:80px}
+@keyframes reveal-wait{from{visibility:hidden}to{visibility:visible}}
+.admin-app{font-size:15px}
+.admin-app .content-intro,.admin-app .content-detail-meta{font-size:13px}
+@media(min-width:1024px){.admin-app.focus-detail .adm-sidebar,.admin-app.focus-detail #admin-view{display:none}.admin-app.focus-detail #admin-inspector{left:0;width:100%;max-width:none}.admin-app.focus-detail #admin-inspector-body{max-width:1100px;margin:auto;width:100%}}
+@media(prefers-reduced-motion:reduce){.admin-app *{animation:none!important;scroll-behavior:auto!important}}
