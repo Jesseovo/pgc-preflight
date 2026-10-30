@@ -161,3 +161,4 @@
 - 普通读取不显示全局进度托盘，页面读取超过 200ms 才显示局部提示；未知时长显示真实阶段文字，不显示扫描条或虚假百分比。已知批次保留真实完成数。接入页不再定时整页重绘配对码。
 - 图标按实际使用导入；生成任务列表只读公开状态字段，恢复扫描只读取需重新调度或已过期的任务编号，健康运行任务不再逐条读取快照。无数据库迁移。
 - 本地 38 个测试文件 / 300 项通过；管理员流程、创作材料和版本、审核 20 任务等待、输入焦点保留、项目直达、移动布局、执行方式记忆均有浏览器回归。`scripts/verify-workbench-experience.ts` 以 60 个合成项目、100ms 接口延迟比较旧版和新版，读取从 26 次降至 8 次；这是受控样本，不是生产 P95、INP 或模型生成速度保证。基线可用 `git archive 3732282 public` 解包至 ignored 的 `artifacts/experience-baseline` 后执行 `--baseline`。全屏 API 在当前 Chromium 环境未通过，需支持的浏览器复验。
+- 功能提交 `292f93c` 已推送 main，保留线上变量部署为 Worker `3560f40b-290d-4788-a612-f66bf178cb45`，承接 100% 流量。生产管理员真实登录、资源字节一致、双栏与专注查看、历史版、手机详情及退出销毁通过；临时 Star 与普通成员真实登录、默认入口、执行方式记忆、审核接入、创作权限隔离和手机布局通过。没有新建生成或审核任务，没有模型质量或生产性能分位数结论。两个临时成员已删除，原 9 个成员全部字段与平台设置哈希不变。备份和脱敏证据在 ignored 的 `artifacts/d1-before-workbench-experience-20261030.sql`、`admin-release-live-evidence.json`、`experience-live-role-evidence.json`；构建与部署 dry-run 通过，GitHub combined status 未返回检查记录，不能据此声称 GitHub CI 通过。
