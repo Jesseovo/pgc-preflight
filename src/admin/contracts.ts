@@ -33,11 +33,17 @@ export interface AdminDashboard {
 export interface AdminRoute {
   view:AdminView;range:AdminRange;owner:string;q:string;status:string;type:string;page:number;
   id?:string;panel?:string;version?:string;layout?:'grid'|'list';section?:string;
+  inspector?:AdminInspector;
 }
+export interface AdminInspector {
+  kind:'project'|'task'|'report';id:string;type?:'topic'|'game'|'creation'|'review';panel?:string;version?:string;
+}
+export type AdminProjectSequence=Array<Pick<AdminProject,'id'|'type'|'title'> & {hasGame:boolean}>;
 export interface AdminContext {
   root:HTMLElement;route:AdminRoute;signal:AbortSignal;
   api<T=any>(path:string,method?:string,body?:unknown):Promise<T>;
   navigate(changes:Partial<AdminRoute>,replace?:boolean):void;
   setRefresh(callback:(()=>Promise<void>)|null,mode?:'active'|'agent'|'idle'):void;
   notice(message:string,error?:boolean):void;
+  setProjects?(projects:AdminProject[]):void;
 }

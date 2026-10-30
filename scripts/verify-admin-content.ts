@@ -56,6 +56,12 @@ await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 const address = server.address(); if (!address || typeof address === 'string') throw Error('server address');
 const browser = await launchLocalBrowser();
 const checks: string[] = [];
+async function choosePanel(page:any,panel:string){
+  const direct=await page.$(`[data-panel="${panel}"]`);
+  if(direct){await direct.click();return;}
+  if(!await page.$('[data-material-select]')){await page.click('[data-project-section=materials]');await page.waitForSelector('[data-material-select]');}
+  await page.select('[data-material-select]',panel);
+}
 try {
   const page = await browser.newPage(); const errors: string[] = [];
   page.on('pageerror', error => errors.push(String(error)));
@@ -71,8 +77,8 @@ try {
   const box = await page.$eval('.game-player-stage', node => { const r = node.getBoundingClientRect(); return { width: r.width, height: r.height }; }); assert(Math.abs(box.width / box.height - 9 / 16) < .002); checks.push('游戏使用共享播放器、9:16 舞台与无同源权限 sandbox');
   await page.screenshot({ path: path.join(artifacts, 'admin-content-game-desktop.png'), fullPage: true });
   assert(!requests.some(r => r.includes('raw=1'))); await page.click('.content-source summary'); await page.waitForSelector('.content-source pre'); assert(requests.some(r => r.includes('raw=1'))); checks.push('HTML 源码仅在主动展开时读取');
-  await page.click('[data-panel=history]'); await page.waitForSelector('[data-version="immutable-old-41"]'); assert.equal(await page.$$eval('iframe', nodes => nodes.length), 0); await page.click('[data-version="immutable-old-41"]'); await page.waitForSelector('iframe'); assert((await page.$eval('iframe', node => node.getAttribute('src')))!.includes('version=immutable-old-41')); checks.push('切换移除 iframe；历史预览固定不可变版本编号');
-  await page.click('[data-panel=brief]'); await page.waitForSelector('.brief-document'); assert.equal(await page.$$eval('iframe', nodes => nodes.length), 0); assert.equal(await page.evaluate(() => (window as any).__unsafe), undefined); checks.push('简报转义 HTML，不执行文档脚本');
+  await choosePanel(page, 'history'); await page.waitForSelector('[data-version="immutable-old-41"]'); assert.equal(await page.$$eval('iframe', nodes => nodes.length), 0); await page.click('[data-version="immutable-old-41"]'); await page.waitForSelector('iframe'); assert((await page.$eval('iframe', node => node.getAttribute('src')))!.includes('version=immutable-old-41')); checks.push('切换移除 iframe；历史预览固定不可变版本编号');
+  await choosePanel(page, 'brief'); await page.waitForSelector('.brief-document'); assert.equal(await page.$$eval('iframe', nodes => nodes.length), 0); assert.equal(await page.evaluate(() => (window as any).__unsafe), undefined); checks.push('简报转义 HTML，不执行文档脚本');
   await page.evaluate(() => (window as any).__mount({ view: 'tasks', id: undefined, type: 'all', panel: undefined, version: undefined })); await page.waitForSelector('.content-task-row'); assert((await page.$eval('[data-task-counts]', node => node.textContent))!.includes('1 平台执行中')); assert((await page.$eval('[data-task-counts]', node => node.textContent))!.includes('1 等待 Agent')); checks.push('平台执行与等待 Agent 数量独立显示');
   await page.setViewport({ width: 390, height: 844 }); await page.screenshot({ path: path.join(artifacts, 'admin-content-tasks-mobile.png'), fullPage: true }); assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   await page.click('[data-task-id="task-failed-43"]'); await page.waitForSelector('[data-show-retry]'); assert(!requests.some(r => r.startsWith('POST '))); await page.click('[data-show-retry]'); assert(!requests.some(r => r.startsWith('POST '))); await page.click('[data-cancel-retry]'); assert(!requests.some(r => r.startsWith('POST '))); await page.click('[data-show-retry]'); await page.click('[data-confirm-retry]'); await page.waitForFunction(() => (window as any).__route.id === 'retry-new-44'); assert.equal(requests.filter(r => r.startsWith('POST ')).length, 1); checks.push('重试需内联确认，取消零请求，确认仅创建一次新任务');
