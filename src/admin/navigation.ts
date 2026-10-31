@@ -4,7 +4,7 @@ export const viewLabels:Record<AdminView,string>={overview:'总览',works:'作�
 export function readRoute(search:string):AdminRoute{
   const q=new URLSearchParams(search),view=(Object.hasOwn(viewLabels,q.get('view')||'')?q.get('view'):'works') as AdminView;
   const range=q.get('range');
-  const route:AdminRoute={view,range:(['today','7d','30d','all'].includes(range||'')?range:view==='overview'?'today':'all') as AdminRoute['range'],owner:q.get('owner')||'',q:q.get('q')||'',status:q.get('status')||'all',type:q.get('type')||'all',page:Math.max(1,Number.parseInt(q.get('page')||'1',10)||1),id:q.get('id')||undefined,panel:q.get('panel')||undefined,version:q.get('version')||undefined,layout:q.get('layout')==='grid'?'grid':'list',section:q.get('section')||undefined};
+  const route:AdminRoute={view,range:(['today','7d','30d','all'].includes(range||'')?range:view==='overview'?'7d':'all') as AdminRoute['range'],from:q.get('from')||undefined,to:q.get('to')||undefined,owner:q.get('owner')||'',q:q.get('q')||'',status:q.get('status')||'all',type:q.get('type')||'all',page:Math.max(1,Number.parseInt(q.get('page')||'1',10)||1),id:q.get('id')||undefined,panel:q.get('panel')||undefined,version:q.get('version')||undefined,layout:q.get('layout')==='grid'?'grid':'list',section:q.get('section')||undefined};
   const kind=q.get('inspect'),id=q.get('inspectId'),type=q.get('inspectType');
   if(id&&((kind==='project'&&(type==='topic'||type==='game'))||(kind==='task'&&(type==='creation'||type==='review'))||kind==='report')){
     route.inspector={kind:kind as AdminInspector['kind'],id,type:kind==='report'?undefined:type as AdminInspector['type'],panel:q.get('inspectPanel')||undefined,version:q.get('inspectVersion')||undefined};

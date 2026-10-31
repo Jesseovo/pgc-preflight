@@ -1,3 +1,4 @@
+import {mountMemberShell} from './member-shell.js';
 // PGC Forge front end. Vanilla JS, no build step.
 import {createReadCache,waitVisible,patchHtml,createTaskReader} from './experience.js';
 const metadataReads=createReadCache();
@@ -367,7 +368,7 @@ document.addEventListener("click", (e) => {
 let renderSeq = 0;
 function render() {
   const seq = ++renderSeq;
-  for(const button of document.querySelectorAll("#tabs [data-tab]"))button.classList.toggle("on",button.dataset.tab===(state.tab==='project'?'picks':state.tab));
+  for(const button of document.querySelectorAll("#tabs [data-tab]")){button.classList.toggle("on",button.dataset.tab===(state.tab==='project'?'picks':state.tab));if(button.classList.contains("on")&&button.closest("details"))button.closest("details").open=true;}
   document.body.classList.toggle("project-open",state.tab==='project');
   const alive = () => seq === renderSeq;
   const fn = { project: renderProject, draw: renderDraw, picks: renderPicks, products: renderProducts, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings, agent: renderAgent }[state.tab];
@@ -1339,6 +1340,7 @@ async function boot() {
     const response=await fetch('/api/auth/me',{cache:'no-store'});
     if(!response.ok){location.replace('/login');return;}
     state.session=await response.json();
+    mountMemberShell(state.session,new URLSearchParams(location.search).get("tab")||"picks",{localTabs:true});
     if(state.session.role==='admin'){location.replace('/admin');return;}
     if(!state.session.star&&!memberOnly){location.replace('/');return;}
     if (!memberOnly) {

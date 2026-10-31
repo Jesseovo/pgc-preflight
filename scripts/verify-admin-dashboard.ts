@@ -110,6 +110,14 @@ try {
   assert(!requests.some(request => /\/material\/(game|brief|assets|expand)(?:\?|$)/.test(request.path)));
   checks.push('真实后台首页只读取概览和缩略图，不请求模型配置、余额或材料源代码');
   await page.screenshot({ path: path.join(output, 'admin-dashboard-desktop.png'), fullPage: true });
+  await wait(page,'.adm-chart svg');assert(await page.$eval('.adm-chart svg',node=>node.getBoundingClientRect().height)>=140);assert.equal(await page.$$eval('.adm-chart svg',nodes=>nodes.length),2);
+  const chartLink=await page.$eval('.adm-chart svg a',node=>node.getAttribute('href'));assert(chartLink?.includes('from='));
+  await page.click('.adm-chart svg a');await wait(page,'.content-filters');assert(new URL(page.url()).searchParams.has('from'));
+  await page.goBack();await wait(page,'.adm-chart');await page.select('[data-chart-metric]','reviews');
+  await page.click('.chart-bar-row');await wait(page,'[data-review-records]');assert.equal(new URL(page.url()).searchParams.get('status'),'done');assert(new URL(page.url()).searchParams.has('from'));
+  await page.goBack();await wait(page,'.adm-chart');await page.screenshot({path:path.join(output,'admin-charts-desktop.png'),fullPage:true});
+  await page.setViewport({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));await page.screenshot({path:path.join(output,'admin-charts-mobile.png'),fullPage:true});await page.setViewport({width:1440,height:1000});
+  checks.push('产出趋势与成员贡献图可点击下钻，精确时间和完成状态保留，后退恢复且手机无溢出');
   await page.click('[data-project]');await wait(page,'#admin-inspector iframe');assert.equal(new URL(page.url()).searchParams.get('view'),'works');assert.equal(new URL(page.url()).searchParams.get('status'),'product');assert(await page.$('#admin-view [data-project-id][aria-current=true]'));await page.goBack();await page.waitForFunction(()=>!document.querySelector('#admin-inspector[open]'));await page.goBack();await wait(page,'.adm-metrics');checks.push('从总览试玩进入可试玩作品列表，当前作品明确选中，不在总览上叠加详情');
   await page.click('[data-metric=members]'); await wait(page, '.adm-manage'); await page.waitForFunction(() => new URL(location.href).searchParams.get('view') === 'members' && document.querySelector('#admin-view h1')?.textContent === '成员管理');
   assert(requests.some(request => request.path === '/api/admin/members')); checks.push('总览指标可进入真实成员管理页');

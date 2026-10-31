@@ -1,3 +1,4 @@
+import {mountMemberShell} from '/forge/member-shell.js';
 import { startTask } from '/forge/progress.js';
 
 const $ = selector => document.querySelector(selector);
@@ -215,7 +216,7 @@ async function toggleVisibility(game, button) {
   try {
     await api(`/api/square/games/${encodeURIComponent(game.id)}/visibility`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hidden: !game.hidden }) });
     notify(game.hidden ? '已取消手动下架，公开状态以当前终审结论为准。' : '游戏已下架。');
-    await loadGames();
+    await loadGames();shell?.restore();
   } catch (error) { notify(error.message); }
   finally { task.dismiss(); button.disabled = false; }
 }
@@ -255,11 +256,12 @@ async function boot() {
     state.user = await api('/api/auth/me');
     $('#workspace-link').href = state.user.role === 'admin' ? '/admin' : state.user.star ? '/forge/' : '/';
     $('#member-name').textContent = state.user.displayName || state.user.display_name || state.user.username || '团队成员';
+    const shell=mountMemberShell(state.user,'square');
     $('#manage-toggle').hidden = state.user.role !== 'admin';
     $('#search').value = state.query;
     $('#session-state').hidden = true;
     $('#catalog').hidden = false;
-    await loadGames();
+    await loadGames();shell?.restore();
   } catch (error) {
     $('#session-state').innerHTML = errorState('暂时无法进入广场', error.message, 'boot');
   } finally { task.dismiss(); }

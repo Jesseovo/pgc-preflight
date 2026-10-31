@@ -1,3 +1,4 @@
+import {explicitWindow} from './admin-time-window';
 import {withHumanReviews} from './human-review';
 // Metadata only: the quota and administrator ledger never retain game source.
 export const reviewDay = (time = Date.now()) => new Date(time + 8 * 3600000).toISOString().slice(0, 10);
@@ -15,16 +16,19 @@ export async function reviewActivity(DB:any, params:URLSearchParams) {
   if(member&&member!=='admin'&&!/^[a-f0-9-]{36}$/.test(member))throw new Error('成员标识不正确。');
   const scope=params.get('scope')||'members';if(!['all','members','admin'].includes(scope))throw new Error('审核范围不正确。');
   const page=Math.max(1,Math.min(100000,Number.parseInt(params.get('page')||'1',10)||1)),size=50;
-  const where="COALESCE(j.usage_day,date(j.created_at,'+8 hours')) = ?"+(scope==='members'?" AND j.owner_id <> 'admin'":scope==='admin'?" AND j.owner_id = 'admin'":'')+(member?' AND j.owner_id = ?':'');
-  const args=member?[day,member]:[day];
+  const window=explicitWindow(params),completed=params.get('status')==='done';
+  const timeWhere=window?"j.updated_at>=? AND j.updated_at<?":"COALESCE(j.usage_day,date(j.created_at,'+8 hours')) = ?";
+  const timeArgs=window||[day];
+  const where=timeWhere+(completed?" AND j.status='done'":"")+(scope==='members'?" AND j.owner_id <> 'admin'":scope==='admin'?" AND j.owner_id = 'admin'":'')+(member?' AND j.owner_id = ?':'');
+  const args=member?[...timeArgs,member]:timeArgs;
   const [rows,total,summary]=await Promise.all([
     DB.prepare(`SELECT j.id,j.owner_id,j.title,j.filename,j.status,j.stage,j.model_executor,j.error,j.result_id,j.created_at,j.updated_at,j.quota_charged,CASE WHEN j.owner_id='admin' THEN 'admin' ELSE m.username END AS username,CASE WHEN j.owner_id='admin' THEN '超级管理员' ELSE m.display_name END AS display_name,r.score FROM review_jobs j LEFT JOIN members m ON m.id=j.owner_id LEFT JOIN reviews r ON r.id=j.result_id WHERE ${where} ORDER BY j.created_at DESC,j.id DESC LIMIT ? OFFSET ?`).bind(...args,size,(page-1)*size).all(),
     DB.prepare(`SELECT COUNT(*) AS n FROM review_jobs j WHERE ${where}`).bind(...args).first(),
-    DB.prepare("SELECT m.id,m.username,m.display_name,m.daily_review_limit,COUNT(j.id) AS submitted,COALESCE(SUM(j.quota_charged),0) AS used,COALESCE(SUM(j.status='done'),0) AS completed,COALESCE(SUM(j.status='error'),0) AS failed,COALESCE(SUM(j.status IN ('queued','running')),0) AS active FROM members m LEFT JOIN review_jobs j ON j.owner_id=m.id AND COALESCE(j.usage_day,date(j.created_at,'+8 hours'))=? GROUP BY m.id ORDER BY m.created_at DESC").bind(day).all(),
+    DB.prepare(`SELECT m.id,m.username,m.display_name,m.daily_review_limit,COUNT(j.id) AS submitted,COALESCE(SUM(j.quota_charged),0) AS used,COALESCE(SUM(j.status='done'),0) AS completed,COALESCE(SUM(j.status='error'),0) AS failed,COALESCE(SUM(j.status IN ('queued','running')),0) AS active FROM members m LEFT JOIN review_jobs j ON j.owner_id=m.id AND ${timeWhere}${completed?" AND j.status='done'":''} GROUP BY m.id ORDER BY m.created_at DESC`).bind(...timeArgs).all(),
   ]);
   const people=scope==='admin'?[]:summary.results||[];
   if(scope!=='members'){
-    const admin=await DB.prepare("SELECT 'admin' AS id,'admin' AS username,'超级管理员' AS display_name,NULL AS daily_review_limit,COUNT(id) AS submitted,COALESCE(SUM(quota_charged),0) AS used,COALESCE(SUM(status='done'),0) AS completed,COALESCE(SUM(status='error'),0) AS failed,COALESCE(SUM(status IN ('queued','running')),0) AS active FROM review_jobs WHERE owner_id='admin' AND COALESCE(usage_day,date(created_at,'+8 hours'))=?").bind(day).first();people.unshift(admin);
+    const admin=await DB.prepare(`SELECT 'admin' AS id,'admin' AS username,'超级管理员' AS display_name,NULL AS daily_review_limit,COUNT(id) AS submitted,COALESCE(SUM(quota_charged),0) AS used,COALESCE(SUM(status='done'),0) AS completed,COALESCE(SUM(status='error'),0) AS failed,COALESCE(SUM(status IN ('queued','running')),0) AS active FROM review_jobs j WHERE owner_id='admin' AND ${timeWhere}${completed?" AND j.status='done'":''}`).bind(...timeArgs).first();people.unshift(admin);
   }
-  return {day,timeZone:'Asia/Shanghai',scope,page,pageSize:size,total:Number(total?.n||0),records:await withHumanReviews(DB,rows.results||[],true),members:people};
+  return {window,day,timeZone:'Asia/Shanghai',scope,page,pageSize:size,total:Number(total?.n||0),records:await withHumanReviews(DB,rows.results||[],true),members:people};
 }

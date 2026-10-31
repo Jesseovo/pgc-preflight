@@ -1,3 +1,4 @@
+import {mountMemberShell} from './member-shell.js';
 import { mountReviewWorkspace } from './review-workspace.js';
 import { probeChecks } from './review-capture.js';
 import { withProgress, progressHtml } from './progress.js';
@@ -37,8 +38,9 @@ $('#modalClose').onclick = () => { $('#modal').hidden = true; };
 $('#modal').onclick = event => { if (event.target === $('#modal')) $('#modal').hidden = true; };
 $('#loginForm').onsubmit = event => { event.preventDefault(); location.replace('/login'); };
 $('#view').innerHTML = progressHtml({ label: '正在连接审核工作台', detail: '正在读取本人的审核记录…' });
-withProgress('连接审核工作台', () => mountReviewWorkspace({
+let shell;
+withProgress('连接审核工作台', async () => {const response=await fetch('/api/auth/me');if(!response.ok){location.replace('/login');return;}const user=await response.json();shell=mountMemberShell(user,'review');return mountReviewWorkspace({
   view: $('#view'), api, allowUpload: false, alive: () => true, topics: [],
   setProbing: () => {}, probeChecks, copyText, download, openModal,
   checksHtml: checks => `<ul class="checks">${checks.map(check => `<li><span>${check.level === 'ok' ? '✓' : '·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
-}), {compact:true,tray:false}).catch(error => { $('#view').textContent = error.message; });
+});}, {compact:true,tray:false}).then(()=>shell?.restore()).catch(error => { $('#view').textContent = error.message; });

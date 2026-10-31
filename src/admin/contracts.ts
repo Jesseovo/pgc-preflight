@@ -25,6 +25,8 @@ export interface AdminTask {
 export interface AdminTaskDetail {task:AdminTask;retryTaskId:string|null;sourceAvailable:boolean;continuePrompt:string|null}
 export interface AdminPage<T> {items:T[];total:number;page:number;pageSize:number;members:AdminMemberOption[];updatedAt:string;activeCount:number;waitingAgentCount:number}
 export interface AdminDashboard {
+  trend:Array<{from:string;to:string;products:number;reviews:number}>;
+  taskGroups:Array<{key:string;count:number}>;window:{from:string;to:string};
   range:AdminRange;timeZone:'Asia/Shanghai';updatedAt:string;members:AdminMemberOption[];
   metrics:{productiveMembers:number;newProducts:number;failedTasks:number;activeTasks:number};
   progress:Array<{id:string;displayName:string;username:string;star:boolean;enabled:boolean;creations:number;reviews:number;products:number;activeTasks:number;currentTask:string|null;lastActivity:string|null}>;
@@ -32,7 +34,7 @@ export interface AdminDashboard {
 }
 export interface AdminRoute {
   view:AdminView;range:AdminRange;owner:string;q:string;status:string;type:string;page:number;
-  id?:string;panel?:string;version?:string;layout?:'grid'|'list';section?:string;
+  from?:string;to?:string;id?:string;panel?:string;version?:string;layout?:'grid'|'list';section?:string;
   inspector?:AdminInspector;
 }
 export interface AdminInspector {

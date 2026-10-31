@@ -1,3 +1,4 @@
+import {reviewActivity} from '../server/review-usage';
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,readdirSync} from 'node:fs';
@@ -235,6 +236,21 @@ describe('管理员概览、作品及任务专用接口',()=>{
     expect((await s.data('projects?range=today&status=product')).total).toBe(3);
     expect((await s.data('projects?range=today&firstProducts=1&owner=b')).total).toBe(0);
     expect((await s.data('projects?range=all&firstProducts=1')).total).toBe(2);
+  });
+
+  it('图表补零、半开时段下钻、首次成品去重与当前任务分组保持一致',async()=>{
+    const s=await setup();s.topic(1,'a',today,{product_html:'PRIVATE'});
+    for(const [id,time] of [['first','2026-10-28T03:00:00.000Z'],['rewrite',today]])s.sqlite.prepare("INSERT INTO artifact_versions(id,owner_id,topic_id,kind,content,input_revision,executor,disposition,created_at) VALUES(?,'a',1,'game','PRIVATE',0,'platform','current',?)").run(id,time);
+    s.sqlite.prepare("INSERT INTO review_jobs(id,owner_id,title,filename,status,created_at,updated_at) VALUES('done','a','Test','test.html','done',?,?)").run('2026-10-27T01:00:00.000Z','2026-10-28T03:59:59.000Z');
+    s.task('pq',1,'a','queued','platform');s.task('ar',2,'a','running','agent');
+    const data=await s.data('dashboard?range=today');expect(data.trend).toHaveLength(24);expect(data.trend.reduce((n:number,r:any)=>n+r.products,0)).toBe(1);expect(data.trend.reduce((n:number,r:any)=>n+r.reviews,0)).toBe(1);
+    const bin=data.trend.find((r:any)=>r.products);expect(bin).toMatchObject({from:'2026-10-28T03:00:00.000Z',to:'2026-10-28T04:00:00.000Z',reviews:1});
+    const query=new URLSearchParams({from:bin.from,to:bin.to});expect((await s.data('projects?firstProducts=1&'+query)).total).toBe(1);
+    expect((await reviewActivity(s.DB,new URLSearchParams({from:bin.from,to:bin.to,status:'done',scope:'all'}))).total).toBe(1);
+    for(const group of data.taskGroups)expect((await s.data('tasks?status='+group.key)).total).toBe(group.count);
+    expect((await s.data('dashboard?range=7d&owner=b')).trend.every((r:any)=>!r.products&&!r.reviews)).toBe(true);
+    expect((await s.call('projects?from=invalid&to=invalid')).status).toBe(400);
+    const plan=s.sqlite.prepare("EXPLAIN QUERY PLAN SELECT updated_at,count(*) FROM review_jobs WHERE status='done' AND updated_at>=? AND updated_at<? GROUP BY updated_at").all(bin.from,bin.to);expect(plan.some((r:any)=>String(r.detail).includes('INDEX'))).toBe(true);
   });
 
   it('真实Worker和控制面路径传递Runner，重试沿用旧输入且上游修改后的结果保持pending',async()=>{

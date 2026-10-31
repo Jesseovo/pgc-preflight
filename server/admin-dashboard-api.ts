@@ -1,3 +1,4 @@
+import {explicitWindow} from './admin-time-window';
 import {identity} from './members';
 import {memberStore} from './storage';
 import {problem} from './review-device-state';
@@ -40,7 +41,7 @@ function paging(p:URLSearchParams){
   return {page:parse(p.get('page'),1,1000000),pageSize:parse(p.get('pageSize'),24,100)};
 }
 function filters(p:URLSearchParams,column='updated_at',allowAll=true){
-  const clauses:string[]=[],params:any[]=[],owner=p.get('owner')||'',bounds=adminDateBounds(rangeValue(p.get('range'),allowAll));
+  const clauses:string[]=[],params:any[]=[],owner=p.get('owner')||'',bounds=explicitWindow(p)||adminDateBounds(rangeValue(p.get('range'),allowAll));
   if(owner){clauses.push('owner_id=?');params.push(owner);}
   if(bounds){clauses.push(`${column}>=? AND ${column}<?`);params.push(...bounds);}
   return {clauses,params};
@@ -107,10 +108,10 @@ async function projectRow(DB:any,type:string,id:number){
   if(!row)throw problem('作品不存在。',404);return row;
 }
 async function projectPage(DB:any,p:URLSearchParams):Promise<AdminPage<AdminProject>> {
-  const firstProducts=p.get('firstProducts')==='1',dateFilters=new URLSearchParams(p);if(firstProducts)dateFilters.set('range','all');
+  const firstProducts=p.get('firstProducts')==='1',dateFilters=new URLSearchParams(p);if(firstProducts){dateFilters.set('range','all');dateFilters.delete('from');dateFilters.delete('to');}
   const {clauses,params}=filters(dateFilters),{page,pageSize}=paging(p),status=p.get('status')||'all',type=p.get('type')||'all',q=(p.get('q')||'').trim().slice(0,200);
   if(firstProducts){
-    const bounds=adminDateBounds(rangeValue(p.get('range')));
+    const bounds=explicitWindow(p)||adminDateBounds(rangeValue(p.get('range')));
     clauses.push("type='topic' AND has_game=1 AND EXISTS(SELECT 1 FROM artifact_versions v WHERE v.owner_id=projects.owner_id AND v.topic_id=projects.id AND v.kind='game' AND v.disposition<>'pending')");
     if(bounds){clauses.push("(SELECT min(v.created_at) FROM artifact_versions v WHERE v.owner_id=projects.owner_id AND v.topic_id=projects.id AND v.kind='game' AND v.disposition<>'pending')>=? AND (SELECT min(v.created_at) FROM artifact_versions v WHERE v.owner_id=projects.owner_id AND v.topic_id=projects.id AND v.kind='game' AND v.disposition<>'pending')<?");params.push(...bounds);}
   }
@@ -125,7 +126,8 @@ async function projectPage(DB:any,p:URLSearchParams):Promise<AdminPage<AdminProj
 function taskWhere(p:URLSearchParams){
   const f=filters(p,'updated_at'),status=p.get('status')||'all',type=p.get('type')||'all',q=(p.get('q')||'').trim().slice(0,200),project=p.get('project');
   if(!['all','creation','review'].includes(type))throw problem('任务类型不正确。');if(type!=='all'){f.clauses.push('type=?');f.params.push(type);}
-  if(status==='active')f.clauses.push(`executor='platform' AND ${activeSql}`);
+  if(['platform-queued','platform-running','agent-queued','agent-running'].includes(status)){const [executor,stage]=status.split('-');f.clauses.push(`executor=? AND ${activeSql} AND status ${stage==='queued'?'IN':'NOT IN'} ('queued','pending')`);f.params.push(executor);}
+  else if(status==='active')f.clauses.push(`executor='platform' AND ${activeSql}`);
   else if(['waiting-agent','waiting_agent','agent'].includes(status))f.clauses.push(`executor='agent' AND ${activeSql}`);
   else if(status!=='all'){if(!['queued','running','pending','capture','review','verify','done','error','failed','expired','cancelled'].includes(status))throw problem('任务状态不正确。');f.clauses.push('status=?');f.params.push(status);}
   if(project){if(!/^\d+$/.test(project))throw problem('作品编号不正确。');f.clauses.push("project_type='topic' AND project_id=?");f.params.push(Number(project));}
@@ -222,12 +224,20 @@ async function dashboard(DB:any,p:URLSearchParams):Promise<AdminDashboard> {
     all(DB,`${taskProjection} SELECT * FROM task_meta WHERE status='error' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?) ORDER BY updated_at DESC LIMIT 8`,...params),
     all(DB,`${projectProjection}, first_products AS (SELECT owner_id,topic_id,min(created_at) first_at FROM artifact_versions WHERE kind='game' AND disposition<>'pending' GROUP BY owner_id,topic_id) SELECT p.* FROM projects p JOIN first_products f ON p.type='topic' AND f.topic_id=p.id AND f.owner_id=p.owner_id WHERE p.has_game=1 AND f.first_at>=? AND f.first_at<? AND (?='' OR p.owner_id=?) ORDER BY f.first_at DESC,p.id DESC LIMIT 6`,...params),
   ]);
+  const step=range==='today'?3600000:86400000,start=Date.parse(bounds[0]);
+  const [productTrend,reviewTrend,taskStates]=await Promise.all([
+    all(DB,`SELECT CAST((CAST(strftime('%s',first_at) AS INTEGER)*1000-?)/? AS INTEGER) bucket,count(*) n FROM (SELECT v.owner_id,v.topic_id,min(v.created_at) first_at FROM artifact_versions v JOIN topics t ON t.id=v.topic_id AND t.owner_id=v.owner_id AND t.product_html IS NOT NULL AND trim(t.product_html)<>'' WHERE v.kind='game' AND v.disposition<>'pending' GROUP BY v.owner_id,v.topic_id) WHERE first_at>=? AND first_at<? AND (?='' OR owner_id=?) GROUP BY bucket`,start,step,...params),
+    all(DB,`SELECT CAST((CAST(strftime('%s',updated_at) AS INTEGER)*1000-?)/? AS INTEGER) bucket,count(*) n FROM review_jobs WHERE status='done' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?) GROUP BY bucket`,start,step,...params),
+    all(DB,`${activeTaskProjection} SELECT executor,CASE WHEN status IN ('queued','pending') THEN 'queued' ELSE 'running' END stage,count(*) n FROM active_tasks WHERE (?='' OR owner_id=?) GROUP BY executor,stage`,owner,owner),
+  ]);
+  const trend=Array.from({length:Math.round((Date.parse(bounds[1])-start)/step)},(_,i)=>({from:new Date(start+i*step).toISOString(),to:new Date(start+(i+1)*step).toISOString(),products:productTrend.find(r=>r.bucket===i)?.n||0,reviews:reviewTrend.find(r=>r.bucket===i)?.n||0}));
+  const taskGroups=['platform-queued','platform-running','agent-queued','agent-running'].map(key=>({key,count:taskStates.find(r=>r.executor+'-'+r.stage===key)?.n||0}));
   const failures=await first(DB,`${taskProjection} SELECT count(*) n FROM task_meta WHERE status='error' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?)`,...params);
   const byOwner=(rows:any[],id:string)=>rows.find(r=>r.owner_id===id),progress=members.filter(m=>!owner||m.id===owner).map(m=>{
     const creations=byOwner(creationCounts,m.id),reviews=byOwner(reviewCounts,m.id),counts=byOwner(activeCounts,m.id),current=active.find(t=>t.owner_id===m.id),last=[creations?.last_activity,reviews?.last_activity,current?.updated_at].filter(Boolean).sort().at(-1)||null;
     return {id:m.id,displayName:m.displayName,username:m.username,star:m.star,enabled:m.enabled,creations:creations?.n||0,reviews:reviews?.n||0,products:byOwner(productCounts,m.id)?.n||0,activeTasks:counts?.platform_count||0,currentTask:current?`${kindLabels[current.kind]||current.kind} · ${taskStatusLabel(current)}`:null,lastActivity:last};
   });
-  return {range,timeZone:'Asia/Shanghai',updatedAt:at(),members,metrics:{productiveMembers:progress.filter(m=>m.creations+m.reviews+m.products>0).length,newProducts:productCounts.reduce((n,r)=>n+r.n,0),failedTasks:failures.n,activeTasks:activeCounts.reduce((n,r)=>n+r.platform_count,0)},progress,latestProducts:products.map(projectDto),attention:attention.map(taskDto),waitingAgentCount:activeCounts.reduce((n,r)=>n+r.agent_count,0)};
+  return {trend,taskGroups,window:{from:bounds[0],to:bounds[1]},range,timeZone:'Asia/Shanghai',updatedAt:at(),members,metrics:{productiveMembers:progress.filter(m=>m.creations+m.reviews+m.products>0).length,newProducts:productCounts.reduce((n,r)=>n+r.n,0),failedTasks:failures.n,activeTasks:activeCounts.reduce((n,r)=>n+r.platform_count,0)},progress,latestProducts:products.map(projectDto),attention:attention.map(taskDto),waitingAgentCount:activeCounts.reduce((n,r)=>n+r.agent_count,0)};
 }
 
 export async function adminDashboardApi(request:Request,env:any):Promise<Response|null> {
