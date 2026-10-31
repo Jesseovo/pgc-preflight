@@ -3,20 +3,6 @@ import { createReadCache } from '/forge/experience.js';
 // Only gallery metadata lives in memory; preview authorization remains a live request.
 const lists = createReadCache({ttl:15000,capacity:20});
 
-export function mountSquare({root,user,alive=()=>true}){
-const nodes = new Map();
-const $ = selector => { if(!nodes.has(selector))nodes.set(selector,root.querySelector(selector));return nodes.get(selector); };
-let disposed=false;
-const current=()=>!disposed&&alive();
-const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const playIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="M5 3 13 8 5 13Z"></path></svg>';
-const scoreIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="m8 1.5 2 4.1 4.5.6-3.2 3.2.7 4.6-4-2.2-4 2.2.7-4.6L1.5 6.2l4.5-.6Z"></path></svg>';
-const url = new URL(location.href);
-const state = { user, query: (url.searchParams.get('q') || '').slice(0, 200), page: Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1), manage: false, items: [], listController: null, listTask: null };
-const player = $('#player');
-let playerController, playerTask, currentGame, playerTrigger, toastTimer;
-let previousOverflow = '';
-
 async function api(path, options = {}) {
   const load=()=>fetch(path,{credentials:'same-origin',cache:'no-store',...options});
   const response = await load();
@@ -33,6 +19,27 @@ async function api(path, options = {}) {
   if (!data) throw new Error('服务返回了无效内容，请重试。');
   return data;
 }
+
+export async function prepareSquareList(user,href=location.href){
+  const url=new URL(href),query=new URLSearchParams({q:(url.searchParams.get('q')||'').slice(0,200),page:String(Math.max(1,Number.parseInt(url.searchParams.get('page')||'1',10)||1))});
+  const path=`/api/square/games?${query}`;
+  return lists.read(`${user.id||user.role}:${path}`,()=>api(path,{signal:AbortSignal.timeout(30000)}));
+}
+
+export function mountSquare({root,user,alive=()=>true,initialData}){
+const nodes = new Map();
+const $ = selector => { if(!nodes.has(selector))nodes.set(selector,root.querySelector(selector));return nodes.get(selector); };
+let disposed=false;
+const current=()=>!disposed&&alive();
+const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const playIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="M5 3 13 8 5 13Z"></path></svg>';
+const scoreIcon = '<svg aria-hidden="true" viewBox="0 0 16 16"><path d="m8 1.5 2 4.1 4.5.6-3.2 3.2.7 4.6-4-2.2-4 2.2.7-4.6L1.5 6.2l4.5-.6Z"></path></svg>';
+const url = new URL(location.href);
+const state = { user, query: (url.searchParams.get('q') || '').slice(0, 200), page: Math.max(1, Number.parseInt(url.searchParams.get('page') || '1', 10) || 1), manage: false, items: [], listController: null, listTask: null };
+const player = $('#player');
+let playerController, playerTask, currentGame, playerTrigger, toastTimer;
+let previousOverflow = '';
+
 
 function dateLabel(value) {
   if (!value) return '时间未提供';
@@ -261,6 +268,6 @@ const leave=()=>{clearPlayerWork();if(player.open)player.close();};window.addEve
 
 $('#manage-toggle').hidden = user.role !== 'admin';
 $('#search').value=state.query;$('#session-state').hidden=true;$('#catalog').hidden=false;
-void loadGames();
+if(initialData){renderGames(initialData);$('#results').setAttribute('aria-busy','false');}else void loadGames();
 return ()=>{disposed=true;state.listController?.abort();state.listTask?.dismiss();clearTimeout(toastTimer);leave();document.body.style.overflow=previousOverflow;window.removeEventListener('pagehide',leave);};
 }

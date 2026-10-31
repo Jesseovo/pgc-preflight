@@ -1,10 +1,10 @@
+import {createPageNavigation,prepareReviewReads} from './navigation.js';
 import {renderSquare,prepareSquare} from './square-route.js';
 import {mountMemberShell} from './member-shell.js';
 // PGC Forge front end. Vanilla JS, no build step.
 import {createReadCache,waitVisible,patchHtml,createTaskReader} from './experience.js';
 const metadataReads=createReadCache();
 const taskReads=createReadCache({ttl:800});
-const mountReviewWorkspace=async options=>(await import('./review-workspace.js')).mountReviewWorkspace(options);
 import { startTask, withProgress, progressHtml } from './progress.js';
 import { readXlsxRows, listMembers, sheetToWorks } from './review-sheet.js';
 import {briefDocument,versionDocument} from './artifact-view.js';
@@ -366,45 +366,38 @@ document.addEventListener("click", (e) => {
 
 // Each render gets a ticket; a slower render for a tab the user already left
 // must not overwrite the current view.
-let renderSeq = 0;let viewCleanup;
+let renderSeq=0,viewCleanup;
+const pageNavigation=createPageNavigation(view);
 function render() {
-  const seq = ++renderSeq;viewCleanup?.();viewCleanup=undefined;
-  view.inert=true;
+  const seq=++renderSeq,tab=state.tab;
+  const alive=()=>seq===renderSeq;
+  const label={square:'游戏广场',project:'项目',draw:'发现选题',picks:'我的项目',products:'已有成品',review:'我的审核',vocab:'词库',games:'历史导入作品',settings:'规则与偏好',agent:'我的 Agent'}[tab];
+  const navigation=pageNavigation.begin({alive,scrollTop:history.state?.scrollY||0,label:'正在打开'+label,onCommit(){
+    for(const button of document.querySelectorAll('#tabs [data-tab]')){const selected=button.dataset.tab===(tab==='project'?'picks':tab);button.classList.toggle('on',selected);button.setAttribute('aria-current',selected?'page':'false');if(selected&&button.closest('details'))button.closest('details').open=true;}
+    document.querySelector('.member-square')?.setAttribute('aria-current',tab==='square'?'page':'false');
+    document.body.classList.toggle('project-open',tab==='project');document.title=label+' · PGC Preflight';
+    view.dataset.page=tab;
+  }});
+  alive.commit=navigation.commit;
+  viewCleanup?.();viewCleanup=undefined;
   view.querySelectorAll('iframe').forEach(frame=>frame.remove());
   if(!$('#modal').hidden)closeModal();
-  for(const button of document.querySelectorAll("#tabs [data-tab]")){button.classList.toggle("on",button.dataset.tab===(state.tab==='project'?'picks':state.tab));if(button.classList.contains("on")&&button.closest("details"))button.closest("details").open=true;}
-  document.body.classList.toggle("project-open",state.tab==='project');
-  const alive = () => seq === renderSeq;
-  const fn = { square: async alive=>{const cleanup=await renderSquare(view,state.session,alive);if(alive())viewCleanup=cleanup;else cleanup?.();}, project: renderProject, draw: renderDraw, picks: renderPicks, products: renderProducts, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings, agent: renderAgent }[state.tab];
-  const label = {square:"读取游戏广场",project:"读取项目",draw:"读取选题台",picks:"读取候选选题",products:"读取成品",review:"读取审核工作台",vocab:"读取词库",games:"读取作品库",settings:"读取公共规则",agent:"读取我的 Agent"}[state.tab];
-  let loading;
-  // Let quick tab switches settle before showing a loading affordance.  The
-  // workbench keeps long-running progress inside the owning card, so this is
-  // only a fallback for genuinely slow list reads and should not flash during
-  // ordinary navigation.
-  const loadingTimer = setTimeout(() => {
-    if (!alive()) return;
-    loading = document.createElement('div');
-    loading.className = 'pgc-load-status';
-    loading.setAttribute('role', 'status');
-    loading.textContent = label+"…";
-    view.prepend(loading);
-  }, 200);
-  withProgress(label, () => fn(alive), {compact:true,tray:false})
-    .then(() => { if(alive()){window.scrollTo({top:history.state?.scrollY||0,behavior:"instant"});if(state.tab==='draw')view.insertAdjacentHTML('afterbegin',executorControl());} if (alive() && state.pageNotice) setPageNotice(state.pageNotice); })
-    .catch((e) => { if (alive()) view.innerHTML = `<div class="box bad" role="alert">${esc(e.message)}</div>`; })
-    .finally(() => { clearTimeout(loadingTimer); loading?.remove();if(alive())view.inert=false; });
+  const fn={square:async alive=>{const cleanup=await renderSquare(view,state.session,alive,alive.commit);if(alive())viewCleanup=cleanup;else cleanup?.();},project:renderProject,draw:renderDraw,picks:renderPicks,products:renderProducts,review:renderReview,vocab:renderVocab,games:renderGames,settings:renderSettings,agent:renderAgent}[tab];
+  Promise.resolve().then(()=>fn(alive))
+    .then(()=>{if(alive()&&state.pageNotice)setPageNotice(state.pageNotice);})
+    .catch(error=>{if(alive())return navigation.commit(()=>{view.innerHTML=`<div class="box bad" role="alert"><p>${esc(error.message)}</p><button class="ghost" data-route-retry>重新读取</button></div>`;view.querySelector('[data-route-retry]').onclick=()=>render();});})
+    .finally(()=>navigation.finish());
 }
 
 // ---------- project navigation ----------
 const navigationMemory=new Map();
 history.scrollRestoration='manual';
 let navigationScrollTimer;
-window.addEventListener('scroll',()=>{clearTimeout(navigationScrollTimer);navigationScrollTimer=setTimeout(()=>history.replaceState({...history.state,scrollY},'',location.href),100);},{passive:true});
+window.addEventListener('scroll',()=>{if(pageNavigation.pending)return;clearTimeout(navigationScrollTimer);const url=location.href;navigationScrollTimer=setTimeout(()=>{if(!pageNavigation.pending&&location.href===url)history.replaceState({...history.state,scrollY},'',url);},100);},{passive:true});
 function navigateWorkspace({tab='picks',project='',panel='create'},replace=false){
+  if(!project&&!state.projectId&&state.tab===tab)return;
   clearTimeout(navigationScrollTimer);
-  history.replaceState({...history.state,scrollY},'',location.href);
-  if(!state.projectId)navigationMemory.set(state.tab,{url:location.search,scrollY});
+  if(!pageNavigation.pending){history.replaceState({...history.state,scrollY},'',location.href);if(!state.projectId)navigationMemory.set(state.tab,{url:location.search,scrollY});}
   const remembered=!project?navigationMemory.get(tab):null;
   const params=remembered?new URLSearchParams(remembered.url):new URLSearchParams({tab});
   if(state.projectLayout==='cards')params.set('layout','cards');
@@ -418,7 +411,6 @@ function restoreWorkspace(){
   state.projectSearch=q.get('q')||'';state.projectFilter=['working','product','error'].includes(q.get('filter'))?q.get('filter'):'all';state.projectPage=Math.max(1,parseInt(q.get('page')||'1')||1);
   state.projectPanel=['create','play','review','versions'].includes(q.get('panel'))?q.get('panel'):'create';
   state.tab=location.pathname.startsWith('/square')?'square':memberOnly?'review':state.projectId?'project':tabs.includes(q.get('tab'))?q.get('tab'):'picks';
-  document.querySelector('.member-square')?.setAttribute('aria-current',state.tab==='square'?'page':'false');
   render();
 }
 window.addEventListener('popstate',restoreWorkspace);
@@ -428,12 +420,14 @@ document.addEventListener('change',event=>{if(event.target.matches('[data-execut
 async function renderProject(alive){
   const [topic,rows]=await Promise.all([api('GET',`topics/${state.projectId}?summary=1`),rawApi('GET','generation-jobs').catch(()=>[])]);await syncPreviewTasks([topic],rows);if(!alive())return;
   const panel=state.projectPanel;
+  const reports=panel==='review'?await api('GET','reviews'):[];
+  if(panel==='versions'){const versions=await api('GET',`topics/${topic.id}/versions`);if(!alive())return;topic._viewer={kind:'versions',versions:Array.isArray(versions)?versions:versions.versions||[]};const version=new URLSearchParams(location.search).get('version');if(version){topic._viewer.version=await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(version)}`);if(!alive())return;}}
+  if(!alive())return;
+  return alive.commit(async()=>{
   view.innerHTML=`<header class="project-heading"><button class="ghost" data-tab="picks">← 我的项目</button><h1>${esc(topic.data?.title||topic.subject||'未命名项目')}</h1><div class="row">${executorControl()}<button class="ghost" data-tab="agent">Agent 接入与任务</button></div><p class="muted">材料和版本保存在当前项目中。生成任务提交后可离开，回来继续查看。</p><nav class="project-tabs" aria-label="项目内容">${[['create','创作'],['play','试玩'],['review','审核'],['versions','版本']].map(([key,label])=>`<button class="ghost" data-project-panel="${key}" aria-current="${panel===key?'page':'false'}">${label}</button>`).join('')}</nav></header><section id="projectContent"></section>`;
   view.querySelectorAll('[data-project-panel]').forEach(button=>button.onclick=()=>navigateWorkspace({tab:'picks',project:String(topic.id),panel:button.dataset.projectPanel},true));
   const root=$('#projectContent');
   if(panel==='review'){
-    root.innerHTML='<p class="muted">正在读取关联报告…</p>';
-    const reports=await api('GET','reviews');if(!alive())return;
     const related=reports.filter(report=>Number(report.topic_id)===topic.id);
     const prompt=`请阅读 ${location.origin}/agent.md，审核我下载到本地的项目 ${topic.id}（${topic.data?.title||topic.subject}）的准确游戏版本，完成初评和同模型复核后回传报告。仅在确认作品与版本关联后关联项目，不要按同名猜测。`;
     root.innerHTML=`<section class="box"><h2>项目审核</h2><p>将下载的 HTML 与下面的指令交给自己的审核 Agent。</p><button class="primary" id="projectReviewPrompt">复制审核指令</button><button class="ghost" data-tab="review">打开我的审核</button><p class="muted">${related.length} 份已明确关联的报告</p>${related.map(r=>`<p>${esc(r.title)} · ${r.score}/9 · ${esc(r.created_at)}</p>`).join('')}</section>`;
@@ -441,10 +435,10 @@ async function renderProject(alive){
   }
   if(panel==='play'&&!topic.has_product){root.innerHTML='<section class="box"><h2>还没有成品</h2><p>在创作页准备材料并开始制作，完成后即可在这里试玩。</p></section>';return;}
   if(panel==='play')topic._viewer={kind:'game'};
-  if(panel==='versions'){const versions=await api('GET',`topics/${topic.id}/versions`);if(!alive())return;topic._viewer={kind:'versions',versions:Array.isArray(versions)?versions:versions.versions||[]};const version=new URLSearchParams(location.search).get('version');if(version){topic._viewer.version=await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(version)}`);if(!alive())return;}}
   const paint=()=>{if(!alive())return;patchHtml(root,topicCard(topic,'picks'));bindGamePlayers(root);};
   paint();bindCards(root,()=>[topic],paint);
   root.classList.toggle('project-materials-only',panel!=='create');
+  });
 }
 // ---------- topic cards ----------
 
@@ -718,16 +712,21 @@ async function renderDraw(alive) {
   await refreshStatus();
   if (!alive()) return;
   if (!state.info.vocab) {
-    view.innerHTML = `<div class="box section"><h2>公共词库尚未准备好</h2><p>请联系管理员维护公共词库后再开始抽签。</p></div>`;
-    return;
+    return alive.commit(()=>{view.innerHTML = `<div class="box section"><h2>公共词库尚未准备好</h2><p>请联系管理员维护公共词库后再开始抽签。</p></div>`;});
   }
   const vocab = await loadVocab();
   if (!state.drawn.length) state.drawn = await api("GET", "topics?status=drawn,new,dup&limit=60");
   await syncPreviewTasks(state.drawn);
   if (!alive()) return;
+  for(const t of state.drawn)if(t.expand_status==='error')t._error=t.expand_error||'扩写未完成，请重试。';
+  await Promise.all(state.drawn.filter(t=>t.status==='drawn'&&t.expand_status!=='running'&&!t._error).map(async topic=>{
+    try{const versions=await rawApi('GET',`topics/${topic.id}/versions`);topic._pendingVersion=(Array.isArray(versions)?versions:versions.versions||[]).some(version=>version.kind==='expand'&&version.disposition==='pending');}catch{}
+  }));
+  if (!alive()) return;
   const opts = (d) => vocab.filter((v) => v.dim === d && v.enabled && !v.used)
     .map((v) => `<option value="${esc(v.word)}">${esc(v.word)}</option>`).join("");
-  view.innerHTML = `<div class="box section">
+  return alive.commit(async()=>{
+  view.innerHTML = executorControl()+`<div class="box section">
       <div class="row"><h2 class="grow">抽签</h2>
         <label class="small muted">数量 <input type="number" id="drawN" min="1" max="40" value="${esc(state.settings?.draw_size || 12)}" style="width:64px"></label>
         <button class="primary" id="drawBtn">抽一批</button></div>
@@ -752,15 +751,11 @@ async function renderDraw(alive) {
     paintDrawn();
   });
   bindCards($("#cards"), () => state.drawn, paintDrawn);
-  for(const t of state.drawn)if(t.expand_status==='error')t._error=t.expand_error||'扩写未完成，请重试。';
-  await Promise.all(state.drawn.filter(t=>t.status==='drawn'&&t.expand_status!=='running'&&!t._error).map(async topic=>{
-    try{const versions=await rawApi('GET',`topics/${topic.id}/versions`);topic._pendingVersion=(Array.isArray(versions)?versions:versions.versions||[]).some(version=>version.kind==='expand'&&version.disposition==='pending');}catch{}
-  }));
-  if (!alive()) return;
   paintDrawn();
   paintLowStock();
   const stuck = state.drawn.filter((t) => t.status === "drawn" && t.expand_status === 'running' && !t._inflight && !t._error).map((t) => t.id);
   if (stuck.length) expandIds(stuck,{resume:true});
+  });
 }
 
 function paintDrawn() {
@@ -964,6 +959,7 @@ async function renderPicks(alive) {
   const list=[...merged.values()].sort((a,b)=>String(b.updated_at).localeCompare(String(a.updated_at)));
   await syncPreviewTasks(list,rows);
   if (!alive()) return;
+  return alive.commit(async()=>{
   view.innerHTML = `<div class="row section"><h2 class="grow">我的项目</h2><span class="muted small">${list.length} 个</span></div>
     <p class="muted small section">点击项目名称进入创作空间，材料、试玩、审核和版本都在一起。</p>
     <div class="row section">${executorControl()}<button class="ghost" data-tab="products">已有成品</button><button class="ghost" data-tab="games">历史导入作品</button><label class="grow">搜索项目 <input type="search" id="projectSearch" placeholder="名称或题材" value="${esc(state.projectSearch||'')}"></label><label>状态 <select id="projectFilter"><option value="all">全部</option><option value="working">进行中</option><option value="product">已有成品</option><option value="error">需处理</option></select></label></div><div class="row section"><button class="ghost" data-project-layout="list">列表</button><button class="ghost" data-project-layout="cards">卡片</button></div><div class="cards" id="pickCards"></div><div class="row" id="projectPages"></div>`;
@@ -986,6 +982,7 @@ async function renderPicks(alive) {
   $('#projectFilter').onchange=()=>{state.projectPage=1;paint();};
   bindCards($("#pickCards"), () => list, paint);
   paint();
+  });
 }
 
 async function syncPreviewTasks(topics,loaded){
@@ -997,6 +994,7 @@ async function renderProducts(alive) {
   const list = await api('GET', 'products');
   if (!alive()) return;
   const products = list.filter(topic => topic.has_product || ['queued', 'running', 'error'].includes(topic.product_status));
+  return alive.commit(async()=>{
   view.innerHTML = `<div class="row section"><h2 class="grow">已有成品</h2><button class="ghost" data-tab="picks">全部项目</button><span class="muted small">${products.length} 款</span></div>
     <p class="muted small section">生成的可试玩首版保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
     <div class="cards" id="productCards"></div>`;
@@ -1011,6 +1009,7 @@ async function renderProducts(alive) {
   for (const topic of products) if (['queued', 'running'].includes(topic.product_status)) {
     startProductJob(topic, paint, {show:false, resume:true});
   }
+  });
 }
 
 function productCard(topic) {
@@ -1131,13 +1130,11 @@ function checksHtml(checks) {
 }
 
 async function renderReview(alive) {
-  // Member reviews are Agent-only; the upload-only topic selector is absent.
-  const topics = [];
-  if (!alive()) return;
-  const cleanup=await mountReviewWorkspace({ view, api, alive, topics, probeGame, checksHtml, probeChecks, copyText, download, openModal,
-    setProbing: value => { state.reviewProbing = value; },
+  const [prepared,{mountReviewWorkspace:mountReview}]=await Promise.all([prepareReviewReads(api),import('./review-workspace.js')]);if(!alive())return;
+  await alive.commit(async()=>{
+    const cleanup=await mountReview({view,api:prepared,alive,topics:[],awaitInitial:true,probeGame,checksHtml,probeChecks,copyText,download,openModal,setProbing:value=>{state.reviewProbing=value;}});
+    if(alive())viewCleanup=cleanup;else cleanup?.();
   });
-  if(alive())viewCleanup=cleanup;else cleanup?.();
 }
 
 // ---------- 词库 ----------
@@ -1147,9 +1144,11 @@ async function renderVocab(alive) {
   if (!alive()) return;
   const dim = state.vocabDim || "subject";
   const rows = vocab.filter(v => v.dim === dim);
+  return alive.commit(async()=>{
   view.innerHTML = `<div class="row section"><h2 class="grow">公共词库</h2><button class="ghost" id="suggestBtn">让我的 Agent 提出 30 个建议</button></div><div id="suggestProgress" class="section" role="status" aria-live="polite"></div><p class="muted small section">公共词库由管理员维护。个人喜好和已使用记录仅影响自己的抽签；Agent 的补词建议经管理员批准后才进入公共词库。</p><div class="row section">${DIMS.map(d => `<button class="${d === dim ? 'primary' : 'ghost'}" data-dim="${d}">${DIM_LABEL[d]} (${vocab.filter(v => v.dim === d).length})</button>`).join('')}</div><div class="tablewrap box"><table><thead><tr><th>词</th><th>备注</th><th>公共权重</th><th>个人学习系数</th><th>状态</th></tr></thead><tbody>${rows.map(v => `<tr><td class="${v.used ? 'used' : ''}">${esc(v.word)}</td><td>${esc(v.note)}</td><td>${esc(v.base)}</td><td>×${Number(v.factor || 1).toFixed(2)}</td><td>${v.enabled ? v.used ? '本人已使用' : '可抽取' : '已停用'}</td></tr>`).join('')}</tbody></table></div>`;
   view.querySelectorAll('[data-dim]').forEach(button => button.onclick = () => { state.vocabDim = button.dataset.dim; render(); });
   $('#suggestBtn').onclick = event => guard(event.target, progress => suggestWords(dim,progress));
+  });
 }
 
 // ---------- 作品库 ----------
@@ -1162,6 +1161,7 @@ async function renderGames(alive) {
   const filtered = games.filter((g) =>
     (!f.source || g.source === f.source) && (!f.status || g.status === f.status) &&
     (!f.q || (g.title + g.descr + g.feedback + DIMS.map((d) => g[d]).join("")).toLowerCase().includes(f.q.toLowerCase())));
+  return alive.commit(async()=>{
   view.innerHTML = `<details class="box section"><summary><b>导入个人作品历史表格</b>（.xlsx）</summary>
       <p class="small muted">总审核导出的「版本审核记录」表格：每行一条初审或终审记录。同名游戏会合并更新分数和意见，保留已有的简介和标签。组员姓名只在这台电脑上用来区分"我的"和"他人"，不会上传。</p>
       <div class="locks">
@@ -1309,6 +1309,7 @@ async function renderGames(alive) {
     if (!confirm("从作品库删除？删除后这个题材可能再次被抽到。")) return;
     guard(e.target, async () => { await api("DELETE", `games/${e.target.closest("tr").dataset.id}`); await refreshStatus(); render(); });
   });
+  });
 }
 
 // ---------- 设置 ----------
@@ -1316,6 +1317,7 @@ async function renderGames(alive) {
 async function renderSettings(alive) {
   const s = await api('GET', 'settings');
   if (!alive()) return;
+  return alive.commit(async()=>{
   view.innerHTML = `<div class="box section"><h2>我的工作台</h2><p class="muted small">网页创作使用平台模型，游戏制作固定 Opus 5.5。审核由自己的 Agent 完成，也可独立接入创作 Agent。结果保存在个人空间。</p><form id="drawPrefs" class="row"><label class="field">每次抽几个<input id="drawSizePref" type="number" min="1" max="40" value="${Number(state.settings?.draw_size || 12)}"></label><button class="ghost">保存抽签偏好</button></form></div><div class="box section"><h2>公共选题规律与雷区</h2><pre class="md">${esc(s.redlines || '暂无规则')}</pre></div><div class="box section"><h2>公共制作模板</h2><pre class="md">${esc(s.template || '暂无模板')}</pre></div><div class="box section"><h2>F 部分骨架</h2><pre class="md">${esc(s.template_f || '暂无骨架')}</pre></div><div class="row section"><button class="ghost" id="exportBtn">导出我的数据</button><button class="ghost" id="changePassword">修改密码</button><button class="ghost" id="logoutBtn">退出登录</button></div>`;
   $('#drawPrefs').onsubmit = event => { event.preventDefault(); const value = Math.min(40,Math.max(1,Number($('#drawSizePref').value) || 12)); state.settings.draw_size = String(value); try {localStorage.setItem(`forge-draw-size-${state.session.id}`, String(value));} catch {} toast('个人抽签偏好已保存'); };
   $('#exportBtn').onclick = event => guard(event.target,async () => download(`pgc-personal-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(await api('GET','export'),null,2),'application/json'));
@@ -1324,6 +1326,7 @@ async function renderSettings(alive) {
     $('#personalPassword').onsubmit = event => { event.preventDefault(); guard(event.submitter, async () => { const response=await fetch('/api/auth/password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});const data=await response.json();if(!response.ok)throw new Error(data.error||'修改失败');location.replace('/login'); }); };
   };
   $('#logoutBtn').onclick = () => guard($('#logoutBtn'), async () => { await fetch('/api/auth/logout',{method:'POST'});location.replace('/login'); });
+  });
 }
 
 async function renderAgent(alive) {
@@ -1332,12 +1335,14 @@ async function renderAgent(alive) {
   const devices = data.devices || [];
   const tasks = data.tasks || [];
   const prompt = `请阅读 ${location.origin}/forge-agent.md，使用你自己的模型连接我的 PGC 个人创作空间。首次连接时请让我生成一次性配对码并直接在本对话中询问我，收到后由你自行完成配对，不要让我打开命令窗口。领取我明确开始的任务并回传结果；不要自动筛选选题或继续下一环节。审核接入请另读 ${location.origin}/agent.md。`;
+  return alive.commit(async()=>{
   view.innerHTML = `<div class="box section personal-agent"><div class="row"><h2 class="grow">我的创作 Agent</h2><button class="ghost" id="agentRefresh">刷新状态</button></div><p class="muted small">把接入指令交给自己的智能助手。它使用自己的模型完成扩写、简报、样板图、资产、制作、标签与词库建议。任务各自保存，其他成员无法领取。</p><pre class="md">${esc(prompt)}</pre><div class="row"><button class="primary" id="copyAgentInstructions">复制接入指令</button><button class="ghost" id="createAgentPairing">生成一次性配对码</button><a class="btn" href="/forge-agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p id="agentPairing" role="status"></p><div class="agent-device-list">${devices.map(device=>`<div class="agent-device"><span><b>${esc(device.name)}</b><small>${device.revoked?'已撤销':device.online?'最近连接':'已授权'} · 最近连接 ${esc(device.last_seen || '尚未连接')} · 到期 ${esc(device.expires_at)}</small></span>${device.revoked?'':`<button class="ghost" data-revoke-agent="${esc(device.id)}">撤销授权</button>`}</div>`).join('')||'<p class="muted small">尚未授权 Agent。生成配对码后，按接入说明完成授权。</p>'}</div></div><div class="box section"><h2>我的任务</h2><p class="muted small">${tasks.filter(task=>task.status==='queued').length} 个等待接取 · ${tasks.filter(task=>task.status==='running').length} 个执行中</p><div class="tablewrap"><table><thead><tr><th>任务</th><th>状态</th><th>进度 / 结果</th><th>更新时间</th></tr></thead><tbody>${tasks.map(task=>`<tr><td>${esc(task.type||task.kind)} · ${esc(task.topic_id||task.id)}</td><td>${esc(task.status)}</td><td>${esc(task.detail||task.error||'等待本人的 Agent')}</td><td>${esc(task.updated_at||task.created_at)}</td></tr>`).join('')||'<tr><td colspan="4">尚无任务。到选题台开始，或在候选选题上选择下一步。</td></tr>'}</tbody></table></div></div>`;
   $('#agentRefresh').onclick = () => render();
   $('#copyAgentInstructions').onclick = () => copyText(prompt);
   $('#createAgentPairing').onclick = event => guard(event.target,async () => {const pairing=await api('POST','agent/pairing',{}); if(!alive())return; $('#agentPairing').innerHTML = `配对码 · 5 分钟内有效 <input class="agent-code" aria-label="创作 Agent 配对码" readonly value="${esc(pairing.code)}"><button class="ghost" id="copyAgentCode">复制配对码</button>`;$('#copyAgentCode').onclick=()=>copyText(pairing.code);setTimeout(()=>{if(alive())$('#agentPairing').textContent='配对码已过期，请重新生成。';},300000);});
   view.querySelectorAll('[data-revoke-agent]').forEach(button=>button.onclick=()=>guard(button,async()=>{await api('POST','agent/revoke',{id:button.dataset.revokeAgent});render();}));
   // Refresh is explicit here: replacing this view would discard an active pairing code.
+  });
 }
 
 const VERSION_LABELS={expand:'扩写',brief:'简报',preview:'样板图',assets:'美术资产',game:'游戏成品',product:'游戏成品'};

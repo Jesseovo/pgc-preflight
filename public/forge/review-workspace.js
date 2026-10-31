@@ -474,12 +474,12 @@ export async function mountReviewWorkspace(options) {
     catch{if(current())$('#rvWorkerStatus').textContent='智能助手授权状态暂时无法读取';}
   };
   $('#rvDevices').onclick=async event=>{const button=event.target.closest('[data-revoke]');if(!button)return;button.disabled=true;try{await withReviewProgress('撤销智能助手授权',()=>api('POST','review/device/revoke',{id:button.dataset.revoke}));await workerStatus();}catch(error){dependencies.feedback(error.message,true);button.disabled=false;}};
-  void workerStatus();
+  const workerReady=workerStatus();
   const workerTimer=setInterval(()=>{if(!current()){clearInterval(workerTimer);return;}if(!document.hidden)void workerStatus();},60000);
   refresh();
   void dependencies.updateUsage();
-  void history();
-  void (async()=>{try {
+  const historyReady=history();
+  const jobsReady=(async()=>{try {
     const remote = await withReviewProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
     if(!current())return;
     for (const item of remote) {
@@ -498,5 +498,6 @@ export async function mountReviewWorkspace(options) {
   // Returning from another workbench tab must restart the shared observer.
   if(current())for(const job of jobs.filter(active))void pollJob(job);
   })();
+  if(options.awaitInitial)await Promise.allSettled([workerReady,historyReady,jobsReady]);
   return ()=>{disposed=true;clearInterval(workerTimer);wakePolls();};
 }

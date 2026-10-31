@@ -1,3 +1,4 @@
+import {createPageNavigation,prepareReviewReads} from './navigation.js';
 import {renderSquare,prepareSquare} from './square-route.js';
 import {mountMemberShell} from './member-shell.js';
 import { mountReviewWorkspace } from './review-workspace.js';
@@ -39,23 +40,31 @@ $('#modalClose').onclick = () => { $('#modal').hidden = true; };
 $('#modal').onclick = event => { if (event.target === $('#modal')) $('#modal').hidden = true; };
 $('#loginForm').onsubmit = event => { event.preventDefault(); location.replace('/login'); };
 let shell,user,sequence=0,cleanup;
-const positions=new Map();
+const positions=new Map(),pageNavigation=createPageNavigation($('#view'));
+history.scrollRestoration='manual';let scrollTimer;
+window.addEventListener('scroll',()=>{if(pageNavigation.pending)return;clearTimeout(scrollTimer);const url=location.href;scrollTimer=setTimeout(()=>{if(!pageNavigation.pending&&url===location.href)history.replaceState({...history.state,scrollY},'',url);},100);},{passive:true});
 async function render(){
- const ticket=++sequence;cleanup?.();cleanup=undefined;
- $('#view').inert=true;$('#modal').hidden=true;$('#modalBody').replaceChildren();
- const alive=()=>ticket===sequence,square=location.pathname.startsWith('/square');
- document.querySelector('.member-square')?.setAttribute('aria-current',square?'page':'false');document.querySelector('.member-nav a[href="/"]')?.setAttribute('aria-current',square?'false':'page');
+ const ticket=++sequence,alive=()=>ticket===sequence,square=location.pathname.startsWith('/square');
+ const navigation=pageNavigation.begin({alive,scrollTop:history.state?.scrollY||0,label:square?'正在打开游戏广场':'正在打开我的审核',onCommit(){
+  document.querySelector('.member-square')?.setAttribute('aria-current',square?'page':'false');document.querySelector('.member-nav a[href="/"]')?.setAttribute('aria-current',square?'false':'page');
+  document.title=(square?'游戏广场':'我的审核')+' · PGC Preflight';$('#view').dataset.page=square?'square':'review';
+ }});
+ cleanup?.();cleanup=undefined;$('#modal').hidden=true;$('#modalBody').replaceChildren();
  try{
-  const dispose=square?await renderSquare($('#view'),user,alive):await mountReviewWorkspace({
-   view:$('#view'),api,allowUpload:false,alive,topics:[],setProbing:()=>{},probeChecks,copyText,download,openModal,
-   checksHtml:checks=>`<ul class="checks">${checks.map(check=>`<li><span>${check.level==='ok'?'✓':'·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
-  });
-  if(!alive()){dispose?.();return;}cleanup=dispose;scrollTo(0,history.state?.scrollY||0);
- }catch(error){if(alive())$('#view').textContent=error.message;}
- finally{if(alive())$('#view').inert=false;}
+  if(square){const dispose=await renderSquare($('#view'),user,alive,navigation.commit);if(alive())cleanup=dispose;else dispose?.();}
+  else{
+   const prepared=await prepareReviewReads(api);if(!alive())return;
+   await navigation.commit(async()=>{const dispose=await mountReviewWorkspace({
+    view:$('#view'),api:prepared,allowUpload:false,alive,awaitInitial:true,topics:[],setProbing:()=>{},probeChecks,copyText,download,openModal,
+    checksHtml:checks=>`<ul class="checks">${checks.map(check=>`<li><span>${check.level==='ok'?'✓':'·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
+   });if(alive())cleanup=dispose;else dispose?.();});
+  }
+ }catch(error){if(alive())await navigation.commit(()=>{$('#view').innerHTML=`<div class="box bad" role="alert"><p>${escape(error.message)}</p><button class="ghost" data-route-retry>重新读取</button></div>`;$('#view [data-route-retry]').onclick=()=>void render();});}
+ finally{navigation.finish();}
 }
 function navigate(square){
- const section=location.pathname.startsWith('/square')?'square':'review';positions.set(section,{url:location.pathname+location.search,scrollY});history.replaceState({...history.state,scrollY},'',location.href);
+ const section=location.pathname.startsWith('/square')?'square':'review';if(square===(section==='square'))return;
+ clearTimeout(scrollTimer);if(!pageNavigation.pending){positions.set(section,{url:location.pathname+location.search,scrollY});history.replaceState({...history.state,scrollY},'',location.href);}
  const remembered=positions.get(square?'square':'review');history.pushState({scrollY:remembered?.scrollY||0},'',remembered?.url||(square?'/square':'/'));void render();
 }
 window.addEventListener('popstate',()=>void render());

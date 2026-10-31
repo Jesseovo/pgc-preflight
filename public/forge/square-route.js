@@ -13,12 +13,18 @@ export function prepareSquare() {
   }
   return modules;
 }
-export async function renderSquare(root, user, alive) {
-  const [workspace, template] = await prepareSquare();
-  if (!alive()) return;
-  const surface = document.createElement('section');
-  surface.className = 'square-surface'; surface.innerHTML = template.squareTemplate;
-  root.replaceChildren(surface);
-  const cleanup = workspace.mountSquare({root:surface,user,alive});
-  return () => { cleanup(); surface.remove(); };
+export async function renderSquare(root,user,alive,commit=async update=>update()) {
+  const [workspace,template]=await prepareSquare();
+  if(!alive())return;
+  const initialData=await workspace.prepareSquareList(user);
+  if(!alive())return;
+  let cleanup;
+  await commit(()=>{
+    const surface=document.createElement('section');
+    surface.className='square-surface';surface.innerHTML=template.squareTemplate;
+    root.replaceChildren(surface);
+    cleanup=workspace.mountSquare({root:surface,user,alive,initialData});
+  });
+  // Stop active work immediately, retaining the old layout until replacement.
+  return ()=>cleanup?.();
 }
