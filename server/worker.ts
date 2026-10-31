@@ -113,7 +113,9 @@ const app = {
     if(privateAsset)return privateAsset;
     if(['/square','/square/','/square.html','/square/index.html'].includes(decodeURIComponent(url.pathname))){
       if(url.pathname!=='/square')return new Response(null,{status:302,headers:{Location:'/square','Cache-Control':'private, no-store',Vary:'Cookie'}});
-      const response=await env.ASSETS.fetch(new Request(new URL('/square',url),request));
+      const user=await identity(request.headers.get('Cookie'),members,env);
+      const documentPath=user?.role==='member'?(user.star?'/forge/':'/review'):'/square';
+      const response=await env.ASSETS.fetch(new Request(new URL(documentPath,url),request));
       const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
       return new Response(response.body,{status:response.status,headers});
     }

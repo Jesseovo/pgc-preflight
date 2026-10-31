@@ -1,9 +1,10 @@
+import {renderSquare,prepareSquare} from './square-route.js';
 import {mountMemberShell} from './member-shell.js';
 import { mountReviewWorkspace } from './review-workspace.js';
 import { probeChecks } from './review-capture.js';
-import { withProgress, progressHtml } from './progress.js';
+import { withProgress } from './progress.js';
 
-// 成员专用入口，只包含本人的审核工作台。
+// 普通成员共用审核与广场外壳，路由切换不重新建立会话。
 const $ = selector => document.querySelector(selector);
 const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 async function api(method, path, data) {
@@ -37,10 +38,25 @@ function openModal(title, html) {
 $('#modalClose').onclick = () => { $('#modal').hidden = true; };
 $('#modal').onclick = event => { if (event.target === $('#modal')) $('#modal').hidden = true; };
 $('#loginForm').onsubmit = event => { event.preventDefault(); location.replace('/login'); };
-$('#view').innerHTML = progressHtml({ label: '正在连接审核工作台', detail: '正在读取本人的审核记录…' });
-let shell;
-withProgress('连接审核工作台', async () => {const response=await fetch('/api/auth/me');if(!response.ok){location.replace('/login');return;}const user=await response.json();shell=mountMemberShell(user,'review');return mountReviewWorkspace({
-  view: $('#view'), api, allowUpload: false, alive: () => true, topics: [],
-  setProbing: () => {}, probeChecks, copyText, download, openModal,
-  checksHtml: checks => `<ul class="checks">${checks.map(check => `<li><span>${check.level === 'ok' ? '✓' : '·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
-});}, {compact:true,tray:false}).then(()=>shell?.restore()).catch(error => { $('#view').textContent = error.message; });
+let shell,user,sequence=0,cleanup;
+const positions=new Map();
+async function render(){
+ const ticket=++sequence;cleanup?.();cleanup=undefined;
+ $('#view').inert=true;$('#modal').hidden=true;$('#modalBody').replaceChildren();
+ const alive=()=>ticket===sequence,square=location.pathname.startsWith('/square');
+ document.querySelector('.member-square')?.setAttribute('aria-current',square?'page':'false');document.querySelector('.member-nav a[href="/"]')?.setAttribute('aria-current',square?'false':'page');
+ try{
+  const dispose=square?await renderSquare($('#view'),user,alive):await mountReviewWorkspace({
+   view:$('#view'),api,allowUpload:false,alive,topics:[],setProbing:()=>{},probeChecks,copyText,download,openModal,
+   checksHtml:checks=>`<ul class="checks">${checks.map(check=>`<li><span>${check.level==='ok'?'✓':'·'}</span><span>${escape(check.text)}</span></li>`).join('')}</ul>`,
+  });
+  if(!alive()){dispose?.();return;}cleanup=dispose;scrollTo(0,history.state?.scrollY||0);
+ }catch(error){if(alive())$('#view').textContent=error.message;}
+ finally{if(alive())$('#view').inert=false;}
+}
+function navigate(square){
+ const section=location.pathname.startsWith('/square')?'square':'review';positions.set(section,{url:location.pathname+location.search,scrollY});history.replaceState({...history.state,scrollY},'',location.href);
+ const remembered=positions.get(square?'square':'review');history.pushState({scrollY:remembered?.scrollY||0},'',remembered?.url||(square?'/square':'/'));void render();
+}
+window.addEventListener('popstate',()=>void render());
+withProgress('连接审核工作台',async()=>{const response=await fetch('/api/auth/me');if(!response.ok){location.replace('/login');return;}user=await response.json();shell=mountMemberShell(user,location.pathname.startsWith('/square')?'square':'review',{onSquare:()=>navigate(true),onReview:()=>navigate(false),prepareSquare});await render();shell?.restore();},{compact:true,tray:false}).catch(error=>{$('#view').textContent=error.message;});

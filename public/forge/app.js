@@ -1,3 +1,4 @@
+import {renderSquare,prepareSquare} from './square-route.js';
 import {mountMemberShell} from './member-shell.js';
 // PGC Forge front end. Vanilla JS, no build step.
 import {createReadCache,waitVisible,patchHtml,createTaskReader} from './experience.js';
@@ -47,7 +48,7 @@ async function rawApi(method, path, data) {
     if(state.executor==='agent'&&(path==='expand'||/^topics\/\d+\/(brief|preview|assets|game)(?:\?|$)/.test(path)))path+=(path.includes('?')?'&':'?')+'executor=agent';
   }
   const load=()=>fetchApi(method,path,data);
-  if(method==='GET'&&/^(topics\?|products$|state$|settings$|vocab$)/.test(path))return metadataReads.read(path,load);
+  if(method==='GET'&&/^(topics\?|topics\/\d+\?summary=1$|products$|state$|settings$|vocab$)/.test(path))return metadataReads.read(path,load);
   if(method==='GET'&&/^generation-jobs/.test(path))return taskReads.read(path,load);
   try{return await load();}finally{if(method!=='GET'){metadataReads.clear();taskReads.clear();}}
 }
@@ -365,14 +366,17 @@ document.addEventListener("click", (e) => {
 
 // Each render gets a ticket; a slower render for a tab the user already left
 // must not overwrite the current view.
-let renderSeq = 0;
+let renderSeq = 0;let viewCleanup;
 function render() {
-  const seq = ++renderSeq;
+  const seq = ++renderSeq;viewCleanup?.();viewCleanup=undefined;
+  view.inert=true;
+  view.querySelectorAll('iframe').forEach(frame=>frame.remove());
+  if(!$('#modal').hidden)closeModal();
   for(const button of document.querySelectorAll("#tabs [data-tab]")){button.classList.toggle("on",button.dataset.tab===(state.tab==='project'?'picks':state.tab));if(button.classList.contains("on")&&button.closest("details"))button.closest("details").open=true;}
   document.body.classList.toggle("project-open",state.tab==='project');
   const alive = () => seq === renderSeq;
-  const fn = { project: renderProject, draw: renderDraw, picks: renderPicks, products: renderProducts, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings, agent: renderAgent }[state.tab];
-  const label = {project:"读取项目",draw:"读取选题台",picks:"读取候选选题",products:"读取成品",review:"读取审核工作台",vocab:"读取词库",games:"读取作品库",settings:"读取公共规则",agent:"读取我的 Agent"}[state.tab];
+  const fn = { square: async alive=>{const cleanup=await renderSquare(view,state.session,alive);if(alive())viewCleanup=cleanup;else cleanup?.();}, project: renderProject, draw: renderDraw, picks: renderPicks, products: renderProducts, review: renderReview, vocab: renderVocab, games: renderGames, settings: renderSettings, agent: renderAgent }[state.tab];
+  const label = {square:"读取游戏广场",project:"读取项目",draw:"读取选题台",picks:"读取候选选题",products:"读取成品",review:"读取审核工作台",vocab:"读取词库",games:"读取作品库",settings:"读取公共规则",agent:"读取我的 Agent"}[state.tab];
   let loading;
   // Let quick tab switches settle before showing a loading affordance.  The
   // workbench keeps long-running progress inside the owning card, so this is
@@ -389,7 +393,7 @@ function render() {
   withProgress(label, () => fn(alive), {compact:true,tray:false})
     .then(() => { if(alive()){window.scrollTo({top:history.state?.scrollY||0,behavior:"instant"});if(state.tab==='draw')view.insertAdjacentHTML('afterbegin',executorControl());} if (alive() && state.pageNotice) setPageNotice(state.pageNotice); })
     .catch((e) => { if (alive()) view.innerHTML = `<div class="box bad" role="alert">${esc(e.message)}</div>`; })
-    .finally(() => { clearTimeout(loadingTimer); loading?.remove(); });
+    .finally(() => { clearTimeout(loadingTimer); loading?.remove();if(alive())view.inert=false; });
 }
 
 // ---------- project navigation ----------
@@ -405,7 +409,7 @@ function navigateWorkspace({tab='picks',project='',panel='create'},replace=false
   const params=remembered?new URLSearchParams(remembered.url):new URLSearchParams({tab});
   if(state.projectLayout==='cards')params.set('layout','cards');
   if(project)params.set('project',project);if(project&&panel!=='create')params.set('panel',panel);
-  history[replace?'replaceState':'pushState']({scrollY:remembered?.scrollY||0},'','?'+params);restoreWorkspace();
+  history[replace?'replaceState':'pushState']({scrollY:remembered?.scrollY||0},'',tab==='square'?'/square'+(remembered?.url||''):'/forge/?'+params);restoreWorkspace();
 }
 function restoreWorkspace(){
   const q=new URLSearchParams(location.search),tabs=['draw','picks','products','review','vocab','games','settings','agent'];
@@ -413,7 +417,8 @@ function restoreWorkspace(){
   state.projectLayout=q.get('layout')==='cards'?'cards':'list';
   state.projectSearch=q.get('q')||'';state.projectFilter=['working','product','error'].includes(q.get('filter'))?q.get('filter'):'all';state.projectPage=Math.max(1,parseInt(q.get('page')||'1')||1);
   state.projectPanel=['create','play','review','versions'].includes(q.get('panel'))?q.get('panel'):'create';
-  state.tab=memberOnly?'review':state.projectId?'project':tabs.includes(q.get('tab'))?q.get('tab'):'picks';
+  state.tab=location.pathname.startsWith('/square')?'square':memberOnly?'review':state.projectId?'project':tabs.includes(q.get('tab'))?q.get('tab'):'picks';
+  document.querySelector('.member-square')?.setAttribute('aria-current',state.tab==='square'?'page':'false');
   render();
 }
 window.addEventListener('popstate',restoreWorkspace);
@@ -421,7 +426,7 @@ document.addEventListener('click',event=>{const button=event.target.closest('[da
 const executorControl=()=>`<label class="executor-choice">创作方式 <select data-executor aria-label="创作执行方式"><option value="platform" ${state.executor!=='agent'?'selected':''}>平台执行</option><option value="agent" ${state.executor==='agent'?'selected':''}>个人 Agent</option></select></label>`;
 document.addEventListener('change',event=>{if(event.target.matches('[data-executor]')){state.executor=event.target.value;try{sessionStorage.setItem(`forge-executor-${state.session.id}`,state.executor);}catch{}document.querySelectorAll('[data-executor]').forEach(el=>el.value=state.executor);}});
 async function renderProject(alive){
-  const topic=await api('GET',`topics/${state.projectId}?summary=1`);await syncPreviewTasks([topic]);if(!alive())return;
+  const [topic,rows]=await Promise.all([api('GET',`topics/${state.projectId}?summary=1`),rawApi('GET','generation-jobs').catch(()=>[])]);await syncPreviewTasks([topic],rows);if(!alive())return;
   const panel=state.projectPanel;
   view.innerHTML=`<header class="project-heading"><button class="ghost" data-tab="picks">← 我的项目</button><h1>${esc(topic.data?.title||topic.subject||'未命名项目')}</h1><div class="row">${executorControl()}<button class="ghost" data-tab="agent">Agent 接入与任务</button></div><p class="muted">材料和版本保存在当前项目中。生成任务提交后可离开，回来继续查看。</p><nav class="project-tabs" aria-label="项目内容">${[['create','创作'],['play','试玩'],['review','审核'],['versions','版本']].map(([key,label])=>`<button class="ghost" data-project-panel="${key}" aria-current="${panel===key?'page':'false'}">${label}</button>`).join('')}</nav></header><section id="projectContent"></section>`;
   view.querySelectorAll('[data-project-panel]').forEach(button=>button.onclick=()=>navigateWorkspace({tab:'picks',project:String(topic.id),panel:button.dataset.projectPanel},true));
@@ -708,6 +713,7 @@ async function requestTopicJob(kind, id, regenerate = false, update = () => {}, 
 // ---------- 选题台 ----------
 
 async function renderDraw(alive) {
+  await settingsReady;if(!alive())return;
   // Another device may have seeded or drawn since this page loaded.
   await refreshStatus();
   if (!alive()) return;
@@ -953,10 +959,10 @@ function projectSummary(topic){
 }
 
 async function renderPicks(alive) {
-  const [candidates,products]=await Promise.all([api("GET","topics?status=liked,made&limit=500"),api("GET","products")]);
+  const [candidates,products,rows]=await Promise.all([api("GET","topics?status=liked,made&limit=500"),api("GET","products"),rawApi('GET','generation-jobs').catch(()=>[])]);
   const merged=new Map(candidates.map(t=>[t.id,t]));for(const t of products)merged.set(t.id,{...merged.get(t.id),...t});
   const list=[...merged.values()].sort((a,b)=>String(b.updated_at).localeCompare(String(a.updated_at)));
-  await syncPreviewTasks(list);
+  await syncPreviewTasks(list,rows);
   if (!alive()) return;
   view.innerHTML = `<div class="row section"><h2 class="grow">我的项目</h2><span class="muted small">${list.length} 个</span></div>
     <p class="muted small section">点击项目名称进入创作空间，材料、试玩、审核和版本都在一起。</p>
@@ -982,8 +988,8 @@ async function renderPicks(alive) {
   paint();
 }
 
-async function syncPreviewTasks(topics){
-  try{const rows=await rawApi('GET','generation-jobs');for(const topic of topics){const latest=rows.find(row=>row.kind==='preview'&&row.scope?.endsWith(`:preview:${topic.id}`));if(latest)topic.preview_status=['queued','running'].includes(latest.status)?'running':latest.status==='error'?'error':'';}}
+async function syncPreviewTasks(topics,loaded){
+  try{const rows=loaded||await rawApi('GET','generation-jobs');for(const topic of topics){const latest=rows.find(row=>row.kind==='preview'&&row.scope?.endsWith(`:preview:${topic.id}`));if(latest)topic.preview_status=['queued','running'].includes(latest.status)?'running':latest.status==='error'?'error':'';}}
   catch{} // Listing materials remains usable if task status is temporarily unavailable.
 }
 
@@ -1125,11 +1131,13 @@ function checksHtml(checks) {
 }
 
 async function renderReview(alive) {
-  const topics = memberOnly ? [] : await api("GET", "topics?status=liked,made&limit=200");
+  // Member reviews are Agent-only; the upload-only topic selector is absent.
+  const topics = [];
   if (!alive()) return;
-  await mountReviewWorkspace({ view, api, alive, topics, probeGame, checksHtml, probeChecks, copyText, download, openModal,
+  const cleanup=await mountReviewWorkspace({ view, api, alive, topics, probeGame, checksHtml, probeChecks, copyText, download, openModal,
     setProbing: value => { state.reviewProbing = value; },
   });
+  if(alive())viewCleanup=cleanup;else cleanup?.();
 }
 
 // ---------- 词库 ----------
@@ -1335,16 +1343,20 @@ async function renderAgent(alive) {
 const VERSION_LABELS={expand:'扩写',brief:'简报',preview:'样板图',assets:'美术资产',game:'游戏成品',product:'游戏成品'};
 // ---------- boot ----------
 
+let settingsReady=Promise.resolve();
 async function boot() {
   try {
     const response=await fetch('/api/auth/me',{cache:'no-store'});
     if(!response.ok){location.replace('/login');return;}
     state.session=await response.json();
-    mountMemberShell(state.session,new URLSearchParams(location.search).get("tab")||"picks",{localTabs:true});
+    mountMemberShell(state.session,new URLSearchParams(location.search).get("tab")||"picks",{localTabs:true,onSquare:()=>navigateWorkspace({tab:'square'}),prepareSquare});
     if(state.session.role==='admin'){location.replace('/admin');return;}
     if(!state.session.star&&!memberOnly){location.replace('/');return;}
     if (!memberOnly) {
-      const [,settings]=await Promise.all([refreshStatus(),api("GET","settings")]);state.settings=settings;
+      // Settings and account counters must not delay the first useful page.
+      state.settings={};
+      void refreshStatus().catch(()=>{});
+      settingsReady=api("GET","settings").then(settings=>{state.settings={...settings,...state.settings};}).catch(()=>{});
       try{state.executor=sessionStorage.getItem(`forge-executor-${state.session.id}`)||"platform";}catch{state.executor="platform";}
       try{const size=localStorage.getItem(`forge-draw-size-${state.session.id}`);if(size)state.settings.draw_size=size;}catch{}
       void rawApi('GET','generation-jobs').then(rows=>{

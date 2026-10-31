@@ -115,7 +115,7 @@ const server = createServer(async (req, res) => {
     }
 
     const publicRoot = resolve('public');
-    const file = resolve(publicRoot, '.' + (url.pathname === '/test' ? '/forge/index.html' : url.pathname));
+    const file = resolve(publicRoot, '.' + (['/test','/forge/'].includes(url.pathname) ? '/forge/index.html' : url.pathname));
     if (!file.startsWith(publicRoot + sep)) throw new Error('path');
     const bytes = await readFile(file);
     res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.html') ? 'text/html' : file.endsWith('.png') ? 'image/png' : 'application/octet-stream');

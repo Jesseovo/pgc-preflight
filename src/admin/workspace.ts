@@ -3,7 +3,7 @@ import {createReadCache} from '../../public/forge/experience.js';
 const icons={LayoutDashboard,Gamepad2,Workflow,ClipboardCheck,Users,Settings2,Compass,LogOut,ShieldCheck,Menu};
 const reads=createReadCache();
 import {progressHtml,withProgress} from '../progress';
-import {mountContent} from './content';
+import {mountContent,contentListRequest} from './content';
 import {mountManagement} from './manage';
 import {mountOverview} from './overview';
 import {baseRoute,detailTarget,inspectorRoute,readRoute,routeUrl,viewLabels} from './navigation';
@@ -88,7 +88,7 @@ async function api<T=any>(path:string,method='GET',body?:unknown,scope?:Slot):Pr
     if(!response.ok)throw new Error(value.error||`请求未完成（${response.status}）`);
     return value;
     };
-    const cacheable=method==='GET'&&/^\/api\/admin\/(projects|tasks|dashboard)(?:\?|$|\/(?:topic|game|creation|review)\/[^/]+$)/.test(url);
+    const cacheable=method==='GET'&&/^\/api\/admin\/(projects|tasks|dashboard|members)(?:\?|$|\/(?:topic|game|creation|review)\/[^/]+$)/.test(url);
     if(method!=='GET')reads.clear();
     const value=cacheable?await reads.read(url,load,{fresh:!!scope?.busy,signal:scope?.controller.signal}):await load();
     if(method!=='GET')reads.clear();
@@ -149,6 +149,17 @@ function navigate(changes:Partial<AdminRoute>,replace=false){
 function switchView(view:AdminView){
   remember();const saved=readMemory()[view];const next=saved?readRoute(saved.url.split('?')[1]||''):readRoute('?view='+view);
   history.pushState({scrollY:saved?.scrollY||0},'',routeUrl({...next,view,id:undefined,panel:undefined,version:undefined,inspector:undefined}));void renderLocation(true);
+}
+function initialRead(next:AdminRoute){
+  if(next.view==='overview')return 'dashboard?'+new URLSearchParams({range:next.range==='all'?'7d':next.range,owner:next.owner});
+  if(next.view==='members')return 'members';
+  return contentListRequest(next);
+}
+function prepareView(view:AdminView){
+  const saved=readMemory()[view];
+  const next=saved?readRoute(saved.url.split('?')[1]||''):readRoute('?view='+view);
+  const path=initialRead({...next,view,id:undefined});
+  if(path)void api(path).catch(()=>{});
 }
 function openInspector(target:AdminInspector,replace=false,restoreTop=0,fromList=false){
   remember();const previous=route.inspector;
@@ -234,7 +245,12 @@ async function renderInspector(){
 function renderShell(){
   authenticated=true;app.className='admin-app';
   app.innerHTML=`<div class="adm-shell"><aside class="adm-sidebar"><a class="adm-brand" href="/admin"><img src="/artwork/pixel-cat.png" width="32" height="32" alt=""><span>PGC <b>OverFlow</b><small>团队工作台</small></span></a><div class="adm-nav-caption">工作空间</div><nav aria-label="管理导航">${Object.entries(viewLabels).map(([key,label])=>`<button type="button" data-admin-view="${key}" id="tab-${key}"><i data-lucide="${navIcons[key as AdminView]}"></i><span>${label}</span>${key==='tasks'?'<b class="adm-nav-count" id="admin-task-count" hidden></b>':''}</button>`).join('')}</nav><div class="adm-sidebar-bottom"><a href="/square"><i data-lucide="compass"></i>游戏广场</a><button type="button" id="admin-logout"><i data-lucide="log-out"></i>退出登录</button><div class="adm-user"><span>J</span><div>超级管理员<small>团队管理权限</small></div><i data-lucide="shield-check"></i></div></div></aside><main class="adm-main"><header class="adm-topbar"><button class="adm-mobile-toggle" id="admin-menu" aria-label="展开导航" aria-expanded="false"><i data-lucide="menu"></i></button><div class="adm-breadcrumb">工作空间 <span>/</span> <b id="admin-location">总览</b></div><div class="adm-topbar-right"><span id="admin-poll-state"></span><time>${new Date().toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai',month:'long',day:'numeric',weekday:'short'})}</time><span class="adm-admin-dot" title="管理员会话">J</span></div></header><div class="adm-view" id="admin-view"></div></main></div><section id="admin-empty-detail" class="adm-empty-detail" aria-label="详情" hidden></section><dialog id="admin-inspector" class="adm-inspector" aria-labelledby="admin-inspector-title"><header id="admin-inspector-header"></header><div id="admin-inspector-body" class="adm-inspector-body"></div></dialog><div id="admin-notice" class="adm-notice" role="status" hidden></div>`;
-  for(const button of app.querySelectorAll<HTMLButtonElement>('[data-admin-view]'))button.onclick=()=>switchView(button.dataset.adminView as AdminView);
+  for(const button of app.querySelectorAll<HTMLButtonElement>('[data-admin-view]')){
+    const view=button.dataset.adminView as AdminView;
+    button.onclick=()=>switchView(view);
+    button.onpointerenter=()=>prepareView(view);
+    button.onfocus=()=>prepareView(view);
+  }
   app.querySelector<HTMLButtonElement>('#admin-menu')!.onclick=()=>{const open=app.classList.toggle('nav-open');app.querySelector('#admin-menu')!.setAttribute('aria-expanded',String(open));};
   app.querySelector<HTMLButtonElement>('#admin-logout')!.onclick=async()=>{try{await api('logout','POST');clearMemory();destroy();authenticated=false;renderLogin();}catch(e){notice(String(e),true);}};
   const modal=dialog()!;modal.addEventListener('cancel',event=>{event.preventDefault();closeInspector();});
@@ -251,13 +267,20 @@ async function renderLocation(restoreScroll=false){
   app.classList.remove('nav-open');document.querySelector('#admin-menu')?.setAttribute('aria-expanded','false');
   document.querySelector('#admin-location')!.textContent=viewLabels[route.view];document.title=`${viewLabels[route.view]} · PGC OverFlow`;
   for(const button of app.querySelectorAll<HTMLButtonElement>('[data-admin-view]')){const selected=button.dataset.adminView===route.view;button.classList.toggle('active',selected);button.setAttribute('aria-current',selected?'page':'false');}
-  document.querySelector('#admin-poll-state')!.textContent='';root.innerHTML='<div class="adm-skeleton" role="status" aria-label="正在读取页面"><div></div><div></div></div>';
+  const status=document.querySelector('#admin-poll-state')!;status.textContent='';
+  root.inert=true;root.setAttribute('aria-busy','true');
+  const loading=setTimeout(()=>{if(!own.controller.signal.aborted)status.textContent=`正在读取${viewLabels[next.view]}…`;},200);
   try{
+    // Keep the previous layout until the next list is ready. The mount shares
+    // this cached read, so fast navigation never paints an empty skeleton.
+    const path=initialRead(baseRoute(next));if(path)await api(path,'GET',undefined,own);
+    if(own.controller.signal.aborted)return;
     const cleanup=await mount(context(own,root,baseRoute(route)));
     if(own.controller.signal.aborted){cleanup?.();return;}own.cleanup=cleanup;
     restoringScroll=true;window.scrollTo({top:restoreScroll?history.state?.scrollY||0:0,behavior:'instant'});requestAnimationFrame(()=>{restoringScroll=false;});
     await renderInspector();
   }catch(error){if(own.controller.signal.aborted)return;root.innerHTML=`<section class="adm-error"><h2>暂时无法读取${viewLabels[route.view]}</h2><p>${esc(error instanceof Error?error.message:error)}</p><button class="adm-button" id="admin-view-retry">重新读取</button></section>`;root.querySelector<HTMLButtonElement>('button')!.onclick=()=>{mainUrl='';void renderLocation(true);};}
+  finally{clearTimeout(loading);if(main===own){root.inert=false;root.removeAttribute('aria-busy');status.textContent='';}}
 }
 function renderLogin(message=''){
   app.className='admin-app';app.innerHTML=`<main class="adm-login"><a class="adm-brand" href="/admin"><img src="/artwork/pixel-cat.png" width="32" height="32" alt=""><span>PGC <b>OverFlow</b></span></a><section><h1>欢迎回来</h1><p>登录后查看团队进展与作品。</p><form id="login-form"><label class="adm-field">管理员密码<input id="admin-password" type="password" required autocomplete="current-password" maxlength="500"></label><button class="adm-button primary" type="submit">进入工作台 <span>→</span></button><p id="login-message" role="status">${esc(message)}</p></form></section></main>`;

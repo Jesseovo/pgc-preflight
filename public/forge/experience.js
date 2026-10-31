@@ -40,11 +40,13 @@ export function patchHtml(root, html) {
   const template = root.ownerDocument.createElement('template'); template.innerHTML = html;
   const key = node => node.nodeType === 1 ? node.id || node.getAttribute('data-id') || node.getAttribute('data-job') : null;
   const sync = (parent, desired) => {
+    const keyed = new Map();
+    for (const node of parent.childNodes) { const id = key(node); if (id) keyed.set(node.nodeName + ':' + id, node); }
     let cursor = parent.firstChild;
     for (const next of [...desired.childNodes]) {
       let current = cursor;
       const id = key(next);
-      if (id) current = [...parent.childNodes].find(node => key(node) === id && node.nodeName === next.nodeName) || null;
+      if (id) { const lookup = next.nodeName + ':' + id; current = keyed.get(lookup) || null; keyed.delete(lookup); }
       if (!current || current.nodeType !== next.nodeType || current.nodeName !== next.nodeName || (key(current) && key(current) !== id)) {
         current = next.cloneNode(true); parent.insertBefore(current, cursor);
       } else {

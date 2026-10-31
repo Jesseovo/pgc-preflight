@@ -299,7 +299,7 @@ export async function mountReviewWorkspace(options) {
     <section class="review-history"><div class="rr-section-heading"><div><span class="rr-kicker">历史审核记录</span><h2>审核记录</h2></div><button type="button" class="rr-button" id="rvRefreshHistory">刷新记录</button></div><div class="rv-history-tools"><label><span>搜索记录</span><input type="search" id="rvHistorySearch" placeholder="搜索游戏名称" autocomplete="off"></label><label><span>审核结果</span><select id="rvHistoryFilter"><option value="all">全部结果</option><option value="pass">模拟通过 · ≥ 7 分</option><option value="revise">建议修改 · &lt; 7 分</option></select></label><span id="rvHistoryCount" role="status"></span></div><div id="rvHistory"><p class="rr-empty-note">正在读取审核记录…</p></div></section></div>`;
   const root = view.querySelector('.review-page');
   const $ = selector => root.querySelector(selector);
-  const current = () => alive() && root.isConnected;
+  let disposed=false;const current = () => !disposed && alive() && root.isConnected;
   if(!allowUpload){
     $('#rvDropzone').innerHTML='<div class="review-file-illustration" aria-hidden="true"><div class="review-monitor"><span></span><span></span><span></span></div><div class="review-check">✓</div></div><h2>让你的 Agent 来审核。</h2><p>把本地 HTML 游戏交给自己的智能助手。Agent 使用自己的模型，完成画面采集、初评与复核，再将报告回传到这里。</p>';
     $('.review-upload-panel .section-label').innerHTML='<span><i class="step-number">01</i>连接自己的 Agent</span><b>本机执行</b>';
@@ -479,8 +479,9 @@ export async function mountReviewWorkspace(options) {
   refresh();
   void dependencies.updateUsage();
   void history();
-  try {
+  void (async()=>{try {
     const remote = await withReviewProgress('恢复后台审核任务', () => api('GET', 'review/jobs'));
+    if(!current())return;
     for (const item of remote) {
       if (!['queued', 'running', 'error'].includes(item.status) || jobs.some(job => job.requestId === item.id)) continue;
       const job = { id: item.id, requestId: item.id, title: item.title, filename:item.filename, stage:item.stage, status: item.status,modelExecutor:item.model_executor,updatedAt:Date.parse(item.updated_at)||Date.now(),error:reviewError(item.error),remoteFailed:item.status==='error',note: '正在读取原任务的最新状态' };
@@ -495,5 +496,7 @@ export async function mountReviewWorkspace(options) {
     refresh();
   } catch { /* Older history still renders if job recovery is temporarily unavailable. */ }
   // Returning from another workbench tab must restart the shared observer.
-  for(const job of jobs.filter(active))void pollJob(job);
+  if(current())for(const job of jobs.filter(active))void pollJob(job);
+  })();
+  return ()=>{disposed=true;clearInterval(workerTimer);wakePolls();};
 }

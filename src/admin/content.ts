@@ -48,6 +48,13 @@ function query(route: AdminRoute, pageSize: number) {
   for (const key of ['owner', 'status', 'type', 'q'] as const) if (route[key] && route[key] !== 'all') params.set(key, route[key]);
   return params;
 }
+export function contentListRequest(route: AdminRoute): string | undefined {
+  if (route.id || !['works', 'tasks'].includes(route.view)) return;
+  const params = query(route, route.view === 'works' ? 24 : 25);
+  const project = route.section?.match(/^project:(topic|game):(\d+)$/);
+  if (route.view === 'tasks' && project) params.set('project', project[2]);
+  return `${route.view === 'works' ? 'projects' : 'tasks'}?${params}`;
+}
 function empty(title: string, description: string) { return `<div class="content-empty">${icons.game}<h3>${esc(title)}</h3><p>${esc(description)}</p></div>`; }
 function errorPanel(message: string, retry = true) { return `<div class="content-error" role="alert"><strong>暂时无法加载</strong><p>${esc(message)}</p>${retry ? '<button class="adm-button" type="button" data-content-retry>重新加载</button>' : ''}</div>`; }
 function loading(message = '正在加载') { return `<div class="content-loading" role="status"><span class="content-dot"></span>${esc(message)}…</div>`; }
@@ -118,7 +125,7 @@ async function mountWorksList(scope: ContentScope) {
   let hasData = false;
   const load = async () => {
     try {
-      const data = await ctx.api<AdminPage<AdminProject>>(`projects?${query(ctx.route, 24)}`);
+      const data = await ctx.api<AdminPage<AdminProject>>(contentListRequest(ctx.route)!);
       if (!scope.alive()) return;
       hasData = true; updateMembers(ctx, data.members); updated(ctx.root, data.updatedAt);
       ctx.setProjects?.(data.items);
@@ -152,8 +159,7 @@ async function mountTasksList(scope: ContentScope) {
   let hasData = false;
   const load = async () => {
     try {
-      const params = query(ctx.route, 25); if (projectFilter) params.set('project', projectFilter[2]);
-      const data = await ctx.api<AdminPage<AdminTask>>(`tasks?${params}`);
+      const data = await ctx.api<AdminPage<AdminTask>>(contentListRequest(ctx.route)!);
       if (!scope.alive()) return;
       hasData = true; updateMembers(ctx, data.members); updated(ctx.root, data.updatedAt);
       ctx.root.querySelector('[data-content-total]')!.textContent = `${data.total} 项任务`;

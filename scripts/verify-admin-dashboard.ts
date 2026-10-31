@@ -92,7 +92,7 @@ const address = server.address(); assert(address && typeof address !== 'string')
 const base = `http://127.0.0.1:${address.port}`, fixtureUrl = `${base}/__fixture`;
 console.log(`LOCAL_ADMIN_FIXTURE_URL=${fixtureUrl}`);
 const browser = await launchLocalBrowser(), checks: string[] = [], limitations:string[]=[];
-const wait = (page: any, selector: string) => page.waitForSelector(selector, { timeout: 15000 });
+const wait = async (page: any, selector: string) => { await page.waitForFunction(() => !document.querySelector('#admin-view[aria-busy="true"]')); return page.waitForSelector(selector, { timeout: 15000 }); };
 async function choosePanel(page:any,panel:string){
   const direct=await page.$(`[data-panel="${panel}"]`);
   if(direct){await direct.click();return;}

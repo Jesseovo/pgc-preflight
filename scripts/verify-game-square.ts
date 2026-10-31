@@ -73,7 +73,7 @@ try{
   for(const cookie of ['',accounts.disabled.cookie])await status('/api/square/games',401,{cookie});
   check('anonymous and disabled sessions cannot read square documents or APIs');
   for(const cookie of [accounts.plain.cookie,accounts.reviewer.cookie,accounts.star.cookie,admin]){
-    await status('/square',200,{cookie});const list=await json('/api/square/games',{cookie});assert.equal(list.total,0);
+    const document=await status('/square',200,{cookie});const html=await document.text();assert(html.includes(cookie===admin?'/square/app.js':cookie===accounts.star.cookie?'/forge/app.js':'/forge/member-review.js'));const list=await json('/api/square/games',{cookie});assert.equal(list.total,0);
   }
   check('every enabled login can enter square without canReview, Star or admin role');
   await status('/api/square/games?scope=manage',403,{cookie:accounts.plain.cookie});

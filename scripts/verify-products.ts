@@ -28,7 +28,7 @@ const server = createServer(async (request, response) => {
   if (url.pathname === '/api/forge/topics/1/product-preview') { response.writeHead(200,{'Content-Type':'text/html','Content-Security-Policy':"sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'"}); return response.end(html); }
   try {
     const root=resolve('public');
-    const file=resolve(root, `.${url.pathname === '/test' ? '/forge/index.html' : url.pathname}`);
+    const file=resolve(root, `.${['/test','/forge/'].includes(url.pathname) ? '/forge/index.html' : url.pathname}`);
     if (!file.startsWith(root+sep)) throw new Error('path');
     const bytes=await readFile(file);
     response.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':file.endsWith('.html')?'text/html':'image/png');

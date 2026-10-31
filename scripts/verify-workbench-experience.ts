@@ -120,7 +120,7 @@ const server = createServer(async (req, res) => {
     }
 
     const publicRoot = resolve(before?'artifacts/experience-baseline/public':'public');
-    const file = resolve(publicRoot, '.' + (url.pathname === '/test' ? '/forge/index.html' : url.pathname));
+    const file = resolve(publicRoot, '.' + (['/test','/forge/'].includes(url.pathname) ? '/forge/index.html' : url.pathname));
     if (!file.startsWith(publicRoot + sep)) throw new Error('path');
     const bytes = await readFile(file);
     res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.html') ? 'text/html' : file.endsWith('.png') ? 'image/png' : 'application/octet-stream');
@@ -158,7 +158,12 @@ try {
       patchHtml(root,'<input id="typing" value="initial"><iframe id="stable-game" src="about:blank"></iframe><p>waiting</p>');
       const input=root.querySelector('input')!,frame=root.querySelector('iframe')!;input.value='unsaved text';input.focus();
       patchHtml(root,'<input id="typing" value="initial"><iframe id="stable-game" src="about:blank"></iframe><p>done</p>');
-      const result=input===root.querySelector('input')&&input.value==='unsaved text'&&document.activeElement===input&&frame===root.querySelector('iframe');root.remove();return result;
+      const result=input===root.querySelector('input')&&input.value==='unsaved text'&&document.activeElement===input&&frame===root.querySelector('iframe');
+      const rows=Array.from({length:1000},(_,i)=>`<p data-id="${i}">Row ${i}</p>`);patchHtml(root,rows.join(''));
+      const identities=new Map([...root.children].map(node=>[node.getAttribute('data-id'),node]));
+      patchHtml(root,rows.reverse().join(''));
+      const reordered=[...root.children].every((node,index)=>identities.get(String(999-index))===node);
+      root.remove();return result&&reordered;
     });assert(stability,'Background updates retain input, focus and iframe identity');
     await page.click('[data-open-project="1"]');await page.waitForSelector('#projectContent');
     assert.equal(new URL(page.url()).searchParams.get('project'),'1');
