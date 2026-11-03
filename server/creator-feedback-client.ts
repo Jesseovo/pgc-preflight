@@ -135,7 +135,8 @@ export class CreatorFeedbackClient {
   #token: string; #fetcher: typeof fetch; #timeoutMs: number; #maxBytes: number;
   constructor(token: string, options: { fetcher?: typeof fetch; timeoutMs?: number; maxBytes?: number } = {}) {
     if (typeof token !== 'string' || !token || token.length > 4096 || /[\s\x00-\x1f\x7f]/.test(token)) input();
-    this.#token = token; this.#fetcher = options.fetcher ?? fetch;
+    // Do not call workerd's native fetch with this client as its receiver.
+    this.#token = token; this.#fetcher = options.fetcher ?? ((input,init)=>fetch(input,init));
     this.#timeoutMs = options.timeoutMs ?? 30_000; this.#maxBytes = options.maxBytes ?? 8 * 1024 * 1024;
     if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs < 1 || !Number.isSafeInteger(this.#maxBytes) || this.#maxBytes < 1) input();
   }
@@ -148,7 +149,10 @@ export class CreatorFeedbackClient {
     const operation = async () => {
       const response = await this.#fetcher(`${API}${path}`, {
         method: key ? 'POST' : 'GET', headers: { Authorization: `Bearer ${this.#token}`, Accept: 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
-        redirect: 'error', credentials: 'omit', cache: 'no-store', signal: controller.signal,
+        // workerd supports manual/follow only. Never follow a redirect carrying
+        // this bearer; reject every 3xx below. This server-only client has no
+        // cookie jar and never forwards incoming headers or browser credentials.
+        redirect: 'manual', cache: 'no-store', signal: controller.signal,
       });
       if (expired) { void response.body?.cancel().catch(() => {}); throw new FeedbackProviderError('timeout'); }
       if (response.url && (!response.url.startsWith(`${API}/`) || new URL(response.url).origin !== new URL(API).origin)) { void response.body?.cancel().catch(() => {}); invalid(); }

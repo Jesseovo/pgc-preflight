@@ -17,7 +17,8 @@ describe('CreatorFeedbackClient', () => {
     const { client, fetcher } = clientWith(contract); expect(await client.contract()).toEqual(contract);
     const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('https://creator-hub-7mi.pages.dev/api/integrations/feedback/v1/contract');
-    expect(init).toMatchObject({ redirect: 'error', credentials: 'omit', cache: 'no-store', method: 'GET', headers: { Authorization: 'Bearer synthetic-token' } });
+    expect(init).toMatchObject({ redirect: 'manual', cache: 'no-store', method: 'GET', headers: { Authorization: 'Bearer synthetic-token' } });
+    expect(init).not.toHaveProperty('credentials');expect(new Headers(init.headers).has('Cookie')).toBe(false);
     expect(JSON.stringify(client)).not.toContain('synthetic-token');
   });
   it('preserves explicit zero, null, empty strings, legacy times and stage without inventing a final decision', async () => {
