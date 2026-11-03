@@ -9,6 +9,7 @@ import {adminWorkspaceApi} from './admin-workspace-api';
 import {reviewActivity} from './review-usage';
 import {modelQuota} from './model-quota';
 import {adminDashboardApi} from './admin-dashboard-api';
+import {creatorFeedbackAdminApi} from './creator-feedback-api';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
@@ -29,6 +30,9 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json({ok:true},200,{'Set-Cookie':sessionCookie(token,8*60*60)});
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
+    const feedback=await creatorFeedbackAdminApi(request,{...secrets,DB,...runtime} as any);if(feedback)return feedback;
+    {const {CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_RUNNER,...ordinarySecrets}=secrets as AppSecrets&Record<string,unknown>;secrets=ordinarySecrets;}
+    if(runtime){const {CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_RUNNER,...otherRuntime}=runtime;runtime=otherRuntime;}
     const dashboard=await adminDashboardApi(request,{...secrets,DB,modelStore:store,...runtime});if(dashboard)return dashboard;
     const workspace=await adminWorkspaceApi(request,{...secrets,DB,modelStore:store,...runtime});if(workspace)return workspace;
     if(url.pathname==='/api/admin/logout'&&request.method==='POST')return json({ok:true},200,{'Set-Cookie':sessionCookie('',0)});

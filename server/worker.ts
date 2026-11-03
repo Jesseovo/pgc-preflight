@@ -17,12 +17,14 @@ import {forgeAgentApi,forgeAgentWeb} from './forge-agent-api';
 import {reviewDeviceApi,reviewDeviceWeb,deviceStatus} from './review-device-api';
 import {galleryApi} from './gallery';
 import {enqueueForgeTask,purgeOldForgeTasks,recoverForgeTasks,type ForgeRunnerBinding} from './forge-tasks';
+import {scheduleCreatorFeedback,type CreatorFeedbackEnv} from './creator-feedback-runner';
 export {ReviewRunner} from './review-runner';
 export {ForgeRunner} from './forge-runner';
+export {CreatorFeedbackRunner} from './creator-feedback-runner';
 
 interface QueueMessage<T> { id: string; body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
-interface Env { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
+interface Env extends CreatorFeedbackEnv { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 
@@ -59,7 +61,7 @@ const app = {
     }
     if(url.pathname.startsWith('/api/admin/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`admin:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
-      return (await adminApi(request,store,env,members,env.DB,{captureReview:captureFor(env),FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE}))!;
+      return (await adminApi(request,store,env,members,env.DB,{captureReview:captureFor(env),FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,CREATOR_FEEDBACK_ENABLED:env.CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_TOKEN:env.CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_RUNNER:env.CREATOR_FEEDBACK_RUNNER}))!;
     }
     if(url.pathname.startsWith('/api/auth/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`auth:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'登录操作较频繁，请稍后重试。'},429);}
@@ -143,7 +145,8 @@ const app = {
     }
     return response;
   },
-  async scheduled(_event: unknown, env: Env): Promise<void> {
+  async scheduled(event: unknown, env: Env): Promise<void> {
+    if((event as {cron?:string})?.cron==='*/2 * * * *'){await scheduleCreatorFeedback(env);return;}
     if((env as any).CONTROL_PLANE){
       const binding=(env as any).CONTROL_PLANE;
       const response=await binding.get(binding.idFromName('review-control-v1')).fetch(new Request('https://internal/__maintenance',{method:'POST'}));
