@@ -135,7 +135,8 @@ export async function runFeedbackSync(env:FeedbackSyncEnv,options:{client?:Clien
   }else{
    const limited=error instanceof FeedbackProviderError&&error.status===429;
    const delay=limited?Math.max(60_000,(error.retryAfterSeconds||0)*1000):Math.min(30*60_000,30_000*2**Math.min(s.failures,6));
-   await errorUpdate(`status='backoff',next_run_at=?,failures=failures+1,error_code=?,lease_token=NULL,lease_until=0`,[clock()+delay,limited?'rate_limited':error instanceof FeedbackProviderError&&error.status>=500?'provider_unavailable':error instanceof FeedbackProviderError?'provider_rejected':'sync_interrupted']).run();
+   const errorCode=limited?'rate_limited':error instanceof FeedbackProviderError&&error.status>=500?'provider_unavailable':error instanceof FeedbackProviderError?`provider_${error.code}${error.status?'_'+error.status:''}`:'sync_interrupted';
+   await errorUpdate(`status='backoff',next_run_at=?,failures=failures+1,error_code=?,lease_token=NULL,lease_until=0`,[clock()+delay,errorCode]).run();
   }
  }
  return readFeedbackStatus(DB);

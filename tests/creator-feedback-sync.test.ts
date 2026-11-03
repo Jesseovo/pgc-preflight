@@ -119,6 +119,10 @@ describe('private resumable provider feedback cache',()=>{
   s.client.changes.mockImplementationOnce(async()=>{spy.mockReturnValue(real+91_000);throw new FeedbackProviderError('http_error',code);});
   const result=await s.step();expect(result.status).toBe(code===401?'auth_revoked':'ready');expect(result.errorCode).toBe(code===401?'authorization_revoked':'scope_changed');expect(result.nextRunAt).toEqual(code===401?null:expect.any(Number));expect(await readFeedbackGame(s.DB,'game_one')).toBeNull();expect(s.row().cursor).toBeNull();expect(s.row().lease_token).toBeNull();
  });
+ it.each([['http_error',403,'provider_http_error_403'],['invalid_response',0,'provider_invalid_response'],['transport',0,'provider_transport'],['timeout',0,'provider_timeout']] as const)('records safe provider diagnostics for %s without response text',async(code,status,expected)=>{
+  const s=setup();await bootstrap(s);s.client.changes.mockRejectedValueOnce(new FeedbackProviderError(code,status));
+  const result=await s.step();expect(result.errorCode).toBe(expected);expect(result.status).toBe('backoff');expect(JSON.stringify(result)).not.toContain(s.env.CREATOR_FEEDBACK_TOKEN);expect(s.row().cursor).toBe('1:10');
+ });
  it.each([429,503])('persists %s backoff after its lease expires without losing committed cache',async code=>{
   const s=setup();await bootstrap(s);const real=Date.now(),spy=vi.spyOn(Date,'now').mockReturnValue(real);
   s.client.changes.mockImplementationOnce(async()=>{spy.mockReturnValue(real+91_000);throw new FeedbackProviderError('http_error',code,90);});
