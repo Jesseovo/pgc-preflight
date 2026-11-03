@@ -373,7 +373,7 @@ function render() {
   const alive=()=>seq===renderSeq;
   const label={square:'游戏广场',project:'项目',draw:'发现选题',picks:'我的项目',products:'已有成品',review:'我的审核',vocab:'词库',games:'历史导入作品',settings:'规则与偏好',agent:'我的 Agent'}[tab];
   const navigation=pageNavigation.begin({alive,scrollTop:history.state?.scrollY||0,label:'正在打开'+label,onCommit(){
-    for(const button of document.querySelectorAll('#tabs [data-tab]')){const selected=button.dataset.tab===(tab==='project'?'picks':tab);button.classList.toggle('on',selected);button.setAttribute('aria-current',selected?'page':'false');if(selected&&button.closest('details'))button.closest('details').open=true;}
+    for(const button of document.querySelectorAll('#tabs [data-tab]')){const selected=button.dataset.tab===(tab==='project'?'picks':tab);button.classList.toggle('on',selected);button.setAttribute('aria-current',selected?'page':'false');if(selected&&button.closest('details')&&!matchMedia('(max-width:900px)').matches)button.closest('details').open=true;}
     document.querySelector('.member-square')?.setAttribute('aria-current',tab==='square'?'page':'false');
     document.body.classList.toggle('project-open',tab==='project');document.title=label+' · PGC Preflight';
     view.dataset.page=tab;
@@ -946,11 +946,14 @@ async function expandIds(ids, {resume = false} = {}) {
 
 // ---------- 候选 ----------
 
-function projectSummary(topic){
+function projectActivity(topic){
   const active=['product','brief','assets','preview','expand'].some(k=>['queued','running'].includes(topic[k+'_status']));
   const failed=['product','brief','assets','preview','expand'].some(k=>topic[k+'_status']==='error');
-  const label=active?'进行中':failed?'需处理':topic.has_product?'可试玩':'创作中';
-  return `<article class="project-row" data-id="${topic.id}"><button class="project-row-open" data-open-project="${topic.id}"><span class="project-row-title">${esc(topic.data?.title||topic.subject)}</span><span class="project-row-description">${esc(topic.data?.logline||topic.subject)}</span></button><span class="project-row-state">${label}</span><button class="ghost" data-open-project="${topic.id}" data-project-panel="${topic.has_product?'play':'create'}">${topic.has_product?'试玩':'继续创作'} →</button></article>`;
+  return {active,failed};
+}
+function projectSummary(topic){
+  const {active,failed}=projectActivity(topic),label=active?'进行中':failed?'需处理':topic.has_product?'可试玩':'创作中';
+  return `<article class="project-row" data-id="${topic.id}"><button class="project-row-open" data-open-project="${topic.id}" title="${esc(topic.data?.title||topic.subject)}"><span class="project-row-title">${esc(topic.data?.title||topic.subject)}</span><span class="project-row-description">${esc(topic.data?.logline||topic.subject)}</span></button><span class="project-row-state" data-state="${active?'working':failed?'error':topic.has_product?'product':'draft'}">${label}</span><button class="ghost project-row-action" data-open-project="${topic.id}" data-project-panel="${topic.has_product?'play':'create'}">${topic.has_product?'试玩':'继续创作'} →</button></article>`;
 }
 
 async function renderPicks(alive) {
@@ -960,19 +963,21 @@ async function renderPicks(alive) {
   await syncPreviewTasks(list,rows);
   if (!alive()) return;
   return alive.commit(async()=>{
-  view.innerHTML = `<div class="row section"><h2 class="grow">我的项目</h2><span class="muted small">${list.length} 个</span></div>
-    <p class="muted small section">点击项目名称进入创作空间，材料、试玩、审核和版本都在一起。</p>
-    <div class="row section">${executorControl()}<button class="ghost" data-tab="products">已有成品</button><button class="ghost" data-tab="games">历史导入作品</button><label class="grow">搜索项目 <input type="search" id="projectSearch" placeholder="名称或题材" value="${esc(state.projectSearch||'')}"></label><label>状态 <select id="projectFilter"><option value="all">全部</option><option value="working">进行中</option><option value="product">已有成品</option><option value="error">需处理</option></select></label></div><div class="row section"><button class="ghost" data-project-layout="list">列表</button><button class="ghost" data-project-layout="cards">卡片</button></div><div class="cards" id="pickCards"></div><div class="row" id="projectPages"></div>`;
+  view.innerHTML = `<header class="projects-heading"><div><h1>我的项目 <span>${list.length}</span></h1><p>从想法到成品，在项目中查看材料、试玩和版本。</p></div><button class="primary" data-tab="draw">发现新选题 →</button></header>
+    <div class="project-library-links"><button class="ghost" data-tab="products">已有成品</button><button class="ghost" data-tab="games">历史导入作品</button></div>
+    <div class="project-toolbar"><label class="project-search">搜索项目<input type="search" id="projectSearch" placeholder="搜索名称或题材" value="${esc(state.projectSearch||'')}"></label><label class="project-filter">项目状态<select id="projectFilter"><option value="all">全部状态</option><option value="working">进行中</option><option value="product">已有成品</option><option value="error">需处理</option></select></label><div class="project-layout" role="group" aria-label="项目显示方式"><button class="ghost" data-project-layout="list" aria-pressed="true">列表</button><button class="ghost" data-project-layout="cards" aria-pressed="false">卡片</button></div></div><div class="cards" id="pickCards"></div><div class="row project-pagination" id="projectPages" aria-label="项目分页"></div>`;
   const paint = () => {
     if(!alive())return;
     const query=$('#projectSearch').value.toLowerCase(),filter=$('#projectFilter').value;
-    const matches=list.filter(t=>(t.data?.title+' '+t.subject).toLowerCase().includes(query)&& (filter==='all'||filter==='product'&&t.has_product||filter==='working'&&['product','brief','preview','assets'].some(k=>['queued','running'].includes(t[k+'_status']))||filter==='error'&&['product','brief','preview','assets'].some(k=>t[k+'_status']==='error')));
+    const matches=list.filter(t=>(t.data?.title+' '+t.subject).toLowerCase().includes(query)&& (filter==='all'||filter==='product'&&t.has_product||filter==='working'&&projectActivity(t).active||filter==='error'&&projectActivity(t).failed));
     const pages=Math.max(1,Math.ceil(matches.length/24));state.projectPage=Math.min(state.projectPage||1,pages);const shown=matches.slice((state.projectPage-1)*24,state.projectPage*24);
     state.projectSearch=query;state.projectFilter=filter;const url=new URL(location.href);for(const [key,value]of Object.entries({q:query,filter,page:String(state.projectPage),layout:state.projectLayout})){if(!value||value==='all'||value==='1'||value==='list')url.searchParams.delete(key);else url.searchParams.set(key,value);}history.replaceState(history.state,'',url);
     $('#projectPages').innerHTML=`<button class="ghost" data-project-page="${state.projectPage-1}" ${state.projectPage===1?'disabled':''}>上一页</button><span>${state.projectPage} / ${pages} · ${matches.length} 个项目</span><button class="ghost" data-project-page="${state.projectPage+1}" ${state.projectPage===pages?'disabled':''}>下一页</button>`;
     $('#projectPages').querySelectorAll('[data-project-page]').forEach(button=>button.onclick=()=>{state.projectPage=Number(button.dataset.projectPage);paint();});
-    patchHtml($("#pickCards"), shown.map((t) => state.projectLayout==='cards'?topicCard(t,"picks"):projectSummary(t)).join("") || `<p class="muted">还没有项目，到发现选题中选择一个想法。</p>`);
+    patchHtml($("#pickCards"), shown.map((t) => state.projectLayout==='cards'?topicCard(t,"picks"):projectSummary(t)).join("") || (list.length?'<div class="project-empty"><h2>没有匹配的项目</h2><p>试试其他名称，或清除搜索与状态筛选。</p><button class="ghost" id="projectReset">清除筛选</button></div>':'<div class="project-empty"><h2>从一个想法开始</h2><p>选择感兴趣的选题，材料与成品会保存在这里。</p><button class="primary" data-tab="draw">发现选题</button></div>'));
     $('#pickCards').classList.toggle('project-list',state.projectLayout!=='cards');
+    view.querySelectorAll('[data-project-layout]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.projectLayout===state.projectLayout)));
+    const reset=$('#projectReset');if(reset)reset.onclick=()=>{$('#projectSearch').value='';$('#projectFilter').value='all';state.projectPage=1;paint();$('#projectSearch').focus();};
     bindGamePlayers($('#pickCards'));
   };
   $('#projectFilter').value=state.projectFilter||'all';

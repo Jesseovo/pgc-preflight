@@ -10,6 +10,11 @@ export function mountMemberShell(user,current='review',{localTabs=false,onSquare
   const item=([tab,label])=>localTabs?`<button data-tab="${tab}" class="${current===tab?'on':''}">${label}</button>`:`<a href="${href(tab)}" ${current===tab?'aria-current="page"':''}>${label}</a>`;
   header.className='top member-sidebar';
   header.innerHTML=`<a class="brand" href="${user.star?'/forge/':'/'}"><img src="/artwork/pixel-cat.png" alt="" width="30" height="30"><span>PGC <b>Preflight</b></span></a><span class="member-caption">个人工作台</span><nav id="tabs" class="member-nav" aria-label="工作台功能">${items.map(item).join('')}<a class="member-square" href="/square" ${current==='square'?'aria-current="page"':''}>游戏广场</a>${user.star?`<details class="member-tools" open><summary>更多功能</summary>${[['agent','我的 Agent'],['vocab','词库'],['settings','规则与偏好'],['games','历史导入作品']].map(item).join('')}</details>`:''}</nav><div class="member-account"><div><b>${esc(user.displayName||user.username||'我的空间')}</b><small>${user.star?'Star 创作者':'审核成员'}</small></div><div class="member-account-actions"><button data-account-password>修改密码</button><button data-account-logout>退出登录</button></div><span id="status"></span></div>`;
+  const compact=matchMedia('(max-width:900px)'),tools=header.querySelector('.member-tools');
+  if(tools){
+    const resize=()=>{tools.open=!compact.matches;};resize();compact.addEventListener('change',resize);
+    header.addEventListener('click',event=>{if(compact.matches&&event.target.closest('.member-tools a,.member-tools button')){tools.open=false;tools.querySelector('summary').focus({preventScroll:true});}});
+  }
   if(onReview)header.querySelector('.member-nav a[href="/"]')?.addEventListener('click',event=>{if(event.button||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;event.preventDefault();onReview();});
   if(onSquare)header.querySelector('.member-square').addEventListener('click',event=>{if(event.button||event.metaKey||event.ctrlKey||event.shiftKey||event.altKey)return;event.preventDefault();onSquare();});
   if(prepareSquare)for(const event of ['pointerenter','focus'])header.querySelector('.member-square').addEventListener(event,()=>void prepareSquare().catch(()=>{}),{once:true});

@@ -48,6 +48,7 @@ const server=createServer(async(request,response)=>{
     if(url.pathname==='/api/forge/reviews/1')return json(report);
     if(url.pathname==='/api/admin/config')return json({activeProfile:'opus',profiles:{opus:{name:'合成模型',model:'claude-opus-5-5',baseUrl:'https://riffle-api.pages.dev/v1',protocol:'anthropic',enabled:true,hasKey:true,keySuffix:'abcd',updatedAt:'',effort:'low',maxOutputTokens:0}},routes:{review:'opus',create:'opus'},effective:{review:'opus',create:'opus'}});
     if(url.pathname==='/api/admin/quota')return json({error:'合成余额查询失败'},502);
+    if(url.pathname==='/api/admin/review-rules'&&request.method==='GET')return json({active:null,candidate:null,diff:[],history:[]});
     if(url.pathname==='/api/admin/public-data'&&request.method==='GET'){
       if(delayPublic){delayPublic=false;await new Promise<void>(resolve=>{releasePublic=resolve;onPublicStarted?.();});}
       return json({settings:{redlines:'合成规则',template:'合成模板',template_f:'合成骨架',draw_size:'10',expand_batch:'5'},vocab:[{id:1,dim:'subject',word:'森林',note:'合成备注',base:0,enabled:1}],games:[{id:1,title:'既有案例',is_public:1}],publishableGames:[{id:1,title:'既有案例',owner_id:'admin',is_public:1},{id:2,title:'私有作品',owner_id:member.id,is_public:0}],suggestions:[{id:'suggestion',dim:'subject',owner_id:member.id,ownerName:member.displayName,words:[{word:'水晶',note:'合成补词'}],created_at:report.created_at,status:'pending'}]});
@@ -133,9 +134,10 @@ try{
   await render({view:'reviews',id:undefined,panel:undefined,type:'all',section:'2026-10-28'});await page.waitForSelector('[data-report]');
   assert(await page.evaluate(()=>(window as any).calls.some((c:any)=>c.path.startsWith('review-activity?')&&c.path.includes('scope=all'))));
   assert((await page.$eval('[data-review-records]',el=>(el as HTMLElement).innerText)).includes('8 / 9'));
+  await page.click('.adm-review-members>summary');
   assert((await page.$eval('[data-review-member=admin]',el=>(el as HTMLElement).innerText)).includes('管理员不占成员额度'),'Null administrator limit must not display as zero');
   await page.select('[name=scope]','admin');await page.waitForFunction(()=>(window as any).route.type==='admin');await page.waitForSelector('[data-review-member=admin]');
-  await page.click('[data-review-member=admin]');await page.waitForFunction(()=>(window as any).calls.some((c:any)=>c.path.includes('scope=admin')&&c.path.includes('member=admin')));
+  await page.click('.adm-review-members>summary');await page.click('[data-review-member=admin]');await page.waitForFunction(()=>(window as any).calls.some((c:any)=>c.path.includes('scope=admin')&&c.path.includes('member=admin')));
   await render({view:'reviews',owner:'',type:'all'});await page.waitForSelector('[data-report]');await page.click('[data-report]');await page.waitForSelector('.rr-reasons');
   assert(await page.evaluate(()=>(window as any).calls.some((c:any)=>c.path==='/api/forge/reviews/1')),'Read reports using the Forge detail route');
   assert((await page.$eval('.rr-human-review',el=>(el as HTMLElement).innerText)).includes('真人反馈'));
@@ -146,7 +148,7 @@ try{
   assert.equal(await page.$eval('.model-library',el=>(el as HTMLElement).hidden),true);await page.click('[data-profile]');
   assert.equal(await page.$eval('.model-library',el=>(el as HTMLElement).hidden),false);assert((await page.$eval('.model-editor-heading',el=>(el as HTMLElement).innerText)).includes('abcd'));
   await render({view:'settings',section:'public',id:undefined});await page.waitForSelector('[data-rule]');
-  assert.equal(await page.$('textarea'),null,'Public rule editor opens explicitly');assert((await page.$eval('[data-vocab-list]',el=>(el as HTMLElement).innerText)).includes('森林'));
+  assert.equal(await page.$('[data-rule-editor] textarea'),null,'Public rule editor opens explicitly');assert(await page.$('[data-rules-import]'),'Rule snapshot form loads using only synthetic fixture data');assert((await page.$eval('[data-vocab-list]',el=>(el as HTMLElement).innerText)).includes('森林'));
   await page.click('[data-rule=redlines]');await page.waitForSelector('textarea');await setValue('[data-rule-editor] textarea','更新规则');await page.click('[data-rule-editor] button[type=submit]');
   await page.waitForFunction(()=>!document.querySelector('[data-rule-editor] textarea'));assert.deepEqual(lastBody(),{action:'settings',settings:{redlines:'更新规则'}});
   await page.click('[data-vocab-edit]');await page.waitForSelector('dialog[open]');assert.equal(await page.$eval('dialog [name=base]',el=>(el as HTMLInputElement).value),'0','Zero vocabulary weights remain zero');await page.click('dialog [data-close]');

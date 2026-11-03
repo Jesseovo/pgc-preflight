@@ -176,7 +176,8 @@ try {
     await page.click('[data-project-panel=versions]');await page.waitForSelector('[data-viewer-version]');
     assert.equal(await page.$$eval('#projectContent iframe',nodes=>nodes.length),0);
     await page.click('[data-viewer-version=game-1]');await page.waitForSelector('#projectContent iframe');
-    await page.click('[data-tab=review]');await page.waitForSelector('.review-setup');await page.waitForSelector('.review-setup[open]');
+    await page.click('[data-tab=review]');await page.waitForSelector('.review-setup');
+    assert(!await page.$eval('.review-setup',node=>(node as HTMLDetailsElement).open),'Connection help is collapsed until requested');
     assert.equal(await page.$$eval('#rvChoose',nodes=>nodes.length),0);
     await page.screenshot({path:'artifacts/experience-review-desktop.png'});
     await page.setViewport({width:390,height:844});
@@ -184,8 +185,40 @@ try {
     await page.screenshot({path:'artifacts/experience-review-mobile.png'});
     await page.click('[data-tab=picks]');await page.waitForSelector('#pickCards');
     assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),true);
+    topics.get(1)!.data.title='LongProjectTitle'.repeat(12)+' · 长标题测试';
+    topics.get(3)!.expand_status='running';topics.get(4)!.expand_status='error';
+    await page.reload();await page.waitForSelector('#pickCards');
+    for(const width of [360,390,768,1024,1280]){
+      await page.setViewport({width,height:844});
+      assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),`Project list fits at ${width}px`);
+      const fits=await page.$$eval('.project-toolbar input,.project-toolbar select,.project-layout,.project-row-state,.project-row-action',nodes=>nodes.every(node=>{const r=node.getBoundingClientRect();return r.width>0&&r.left>=0&&r.right<=innerWidth;}));
+      assert(fits,`Search, filters and project actions remain visible at ${width}px`);
+    }
+    await page.setViewport({width:390,height:844});
+    await page.screenshot({path:'artifacts/experience-projects-mobile.png',fullPage:true});
+    await page.click('[data-project-layout=cards]');
+    assert.equal(await page.$eval('[data-project-layout=cards]',node=>node.getAttribute('aria-pressed')),'true');
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'Cards with long names fit mobile');
+    await page.type('#projectSearch','no-such-project');await page.keyboard.press('Enter');await page.waitForSelector('#projectReset');
+    assert.match(await page.$eval('#pickCards',node=>node.textContent!),/没有匹配/);
+    await page.click('#projectReset');assert.equal(await page.$$eval('#pickCards .card',nodes=>nodes.length),24);
+    assert.equal(await page.$eval('#projectSearch',node=>node===document.activeElement),true,'Reset returns focus to search');
+    await page.click('[data-project-layout=list]');
+    await page.select('#projectFilter','working');
+    assert.equal(await page.$$eval('#pickCards [data-id]',nodes=>nodes.map(node=>(node as HTMLElement).dataset.id).join(',')),'3','In-progress filtering includes expansion tasks');
+    await page.select('#projectFilter','error');
+    assert.equal(await page.$$eval('#pickCards [data-id]',nodes=>nodes.map(node=>(node as HTMLElement).dataset.id).join(',')),'4','Needs-attention filtering includes failed expansion tasks');
+    await page.setViewport({width:360,height:640});
+    await page.click('.member-tools>summary');await page.click('.member-tools [data-tab=settings]');await page.waitForSelector('#changePassword');
+    assert(!await page.$eval('.member-tools',node=>(node as HTMLDetailsElement).open),'Selecting a secondary page closes compact navigation');
+    await page.click('#changePassword');await page.waitForSelector('#modal:not([hidden])');
+    await page.$eval('#modalTitle',node=>node.textContent='LongDialogTitle'.repeat(16));
+    assert(await page.$eval('#modalClose',node=>{const r=node.getBoundingClientRect();return r.right<=innerWidth&&r.left>=0&&r.bottom<=innerHeight&&r.top>=0;}),'A long dialog title cannot push the close button off-screen');
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'Open dialog cannot overflow the page');
+    await page.keyboard.press('Escape');
+    assert(await page.$eval('#changePassword',node=>node===document.activeElement),'Closing a dialog restores focus');
     assert.equal(posts.length,0);assert.equal(errors.length,0,errors.join('\n'));
-    result.checks=['24-item bounded list','input, focus and player DOM retained across updates','project deep link and refresh','executor preference restored','actual playable sandbox','immutable version preview','leaving game destroys iframe','review onboarding without invalid upload','mobile layouts','zero generation POSTs','no browser errors'];
+    result.checks=['24-item bounded list','input, focus and player DOM retained across updates','project deep link and refresh','executor preference restored','actual playable sandbox','immutable version preview','leaving game destroys iframe','review onboarding without invalid upload','360–1280px long-title list, controls and cards','filter reset and selected view state','expansion task status filters','compact secondary navigation and long modal title','zero generation POSTs','no browser errors'];
   }
   await writeFile(`artifacts/experience-${before?'before':'after'}.json`,JSON.stringify(result,null,2));
   console.log(JSON.stringify(result,null,2));

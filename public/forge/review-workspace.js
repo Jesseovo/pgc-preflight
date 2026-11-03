@@ -332,10 +332,15 @@ export async function mountReviewWorkspace(options) {
     $('#rvRetryAll').remove();
   }
   if(!allowUpload){
+    root.classList.add('member-review');
     const workspace=$('.review-workspace');const setup=document.createElement('details');setup.className='review-setup';
-    setup.innerHTML='<summary>开始新审核 · Agent 接入与设备</summary>';workspace.before(setup);setup.append(workspace);
+    setup.innerHTML='<summary>首次接入与设备管理</summary>';workspace.before(setup);setup.append(workspace);
+    setup.insertAdjacentHTML('beforebegin','<section class="review-start"><div><h2>开始新审核</h2><p id="rvWorkerStatus" role="status">正在读取智能助手授权状态…</p></div><button type="button" class="rr-button rr-button-dark" id="rvCopyAgent">复制审核指令</button></section>');
     $('.review-intro p').textContent='查看执行进度与修改建议，继续尚未完成的审核。';
-    $('#rvDropzone').innerHTML='<h2>开始一次审核</h2><ol><li>复制接入指令，交给自己的 Agent。</li><li>首次使用时生成配对码，在 Agent 对话中完成授权。</li><li>把本地 HTML 交给 Agent，完成后回到这里查看报告。</li></ol>';
+    $('.review-upload-panel .section-label').remove();
+    $('#rvDropzone').innerHTML='<ol class="review-connect-steps"><li><b>复制审核指令</b><span>发送给自己的智能助手。</span></li><li><b>首次授权</b><span>生成配对码，在助手对话中完成连接。</span></li><li><b>交给助手审核</b><span>提供本地 HTML，完成后在这里查看报告。</span></li></ol>';
+    $('#rvQuota').hidden=true;
+    $('#rvFeedback').textContent='';setup.after($('#rvFeedback'));
   }
   let renderedId = '';
   let renderedResult;
@@ -484,8 +489,12 @@ export async function mountReviewWorkspace(options) {
   $('#rvRefreshHistory').onclick = () => void history();
   dependencies.updateHistory = history;
   dependencies.updateUsage = async () => {if(current())$('#rvQuota').textContent='审核由自己的 Agent 与模型执行';};
-  $('#rvQuota').insertAdjacentHTML('afterend','<span id="rvWorkerStatus" class="rv-quota" role="status">正在读取智能助手授权状态…</span>');
-  $('#rvDropzone').closest('.review-upload-panel').insertAdjacentHTML('beforeend',`<details class="rv-device"><summary>智能助手接入</summary><div class="rv-agent-prompt"><b>复制给智能助手</b><p id="rvAgentText">请阅读 ${location.origin}/agent.md，连接我的审核账号。首次连接时请让我生成一次性配对码并直接在本对话中询问我，收到后由你自行完成配对，不要让我打开命令窗口。使用你自己的模型采集并审核指定的本地 HTML 游戏，完成初评和同模型复核后提交中文报告。提交游戏时，使用你已有的 creator-hub 授权查询本人准确作品和投稿版本的真人分数与意见；没有结果时照常完成 AI 审核，有结果后再回填。</p><button class="rr-button" id="rvCopyAgent">复制接入指令</button></div><div class="rv-device-actions"><button class="rr-button" id="rvPair">生成一次性配对码</button><a class="rr-button" href="/agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p>首次使用需授权，配对码 5 分钟内有效。</p><div id="rvPairCode" role="status"></div><div id="rvDevices"></div></details>`);
+  if(allowUpload)$('#rvQuota').insertAdjacentHTML('afterend','<span id="rvWorkerStatus" class="rv-quota" role="status">正在读取智能助手授权状态…</span>');
+  const agentInstructions=`<p id="rvAgentText">请阅读 ${location.origin}/agent.md，连接我的审核账号。首次连接时请让我生成一次性配对码并直接在本对话中询问我，收到后由你自行完成配对，不要让我打开命令窗口。使用你自己的模型采集并审核指定的本地 HTML 游戏，完成初评和同模型复核后提交中文报告。提交游戏时，使用你已有的 creator-hub 授权查询本人准确作品和投稿版本的真人分数与意见；没有结果时照常完成 AI 审核，有结果后再回填。</p>`;
+  const deviceControls=`<div class="rv-device-actions"><button class="rr-button" id="rvPair">生成一次性配对码</button><a class="rr-button" href="/agent.md" target="_blank" rel="noopener">查看接入说明 ↗</a></div><p>配对码 5 分钟内有效，仅需在首次连接时授权。</p><div id="rvPairCode" role="status"></div><div id="rvDevices"></div>`;
+  $('#rvDropzone').closest('.review-upload-panel').insertAdjacentHTML('beforeend',allowUpload
+    ? `<details class="rv-device"><summary>智能助手接入</summary><div class="rv-agent-prompt"><b>复制给智能助手</b>${agentInstructions}<button class="rr-button" id="rvCopyAgent">复制接入指令</button></div>${deviceControls}</details>`
+    : `<div class="rv-device">${deviceControls}<details class="rv-agent-instructions"><summary>查看完整审核指令</summary>${agentInstructions}</details></div>`);
   $('#rvPair').onclick=async()=>{
     const button=$('#rvPair');button.disabled=true;
     try{const value=await withReviewProgress('生成本机配对码',()=>api('POST','review/device/pairing',{}));if(!current())return;$('#rvPairCode').innerHTML=`<label>配对码 · 5 分钟内一次有效<input type="text" readonly value="${esc(value.code)}" aria-label="配对码"></label><button class="rr-button" id="rvCopyCode">复制配对码</button>`;$('#rvCopyCode').onclick=()=>copyText(value.code);setTimeout(()=>{if(current())$('#rvPairCode').replaceChildren();},300000);}
@@ -494,7 +503,7 @@ export async function mountReviewWorkspace(options) {
   $('#rvCopyAgent').onclick=()=>copyText($('#rvAgentText').textContent);
   const workerStatus=async()=>{
     if(!current())return;
-    try{const status=await api('GET','review/worker-status');if(!current())return;const authorized=status.devices.filter(d=>!d.revoked&&Date.parse(d.expires_at)>Date.now());const setup=$('.review-setup');if(setup&&!setup.dataset.initialized){setup.open=!authorized.length;setup.dataset.initialized='true';if(!authorized.length)$('.rv-device').open=true;}$('#rvWorkerStatus').textContent=status.online?'智能助手最近已连接 · 本机采集与模型审核':authorized.length?'智能助手已授权 · 按需执行即可':'尚未授权智能助手 · 展开下方接入';$('#rvDevices').innerHTML=authorized.map(d=>`<div class="rv-device-row"><span><b>${esc(d.name)}</b> · ${d.online?'最近已连接':'已授权'}<small>授权至 ${esc(date(d.expires_at))}${d.last_seen?' · 最近连接 '+esc(date(d.last_seen)):''}</small></span><button class="rr-button" data-revoke="${esc(d.id)}">撤销授权</button></div>`).join('')||'<p>尚未授权设备，让智能助手按接入说明完成一次配对。</p>';}
+    try{const status=await api('GET','review/worker-status');if(!current())return;const authorized=status.devices.filter(d=>!d.revoked&&Date.parse(d.expires_at)>Date.now());$('#rvWorkerStatus').textContent=status.online?'智能助手最近已连接 · 将游戏交给助手即可开始':authorized.length?'智能助手已授权 · 将游戏和审核指令交给助手':'尚未连接智能助手 · 复制指令后，展开下方完成首次授权';$('#rvDevices').innerHTML=authorized.map(d=>`<div class="rv-device-row"><span><b>${esc(d.name)}</b> · ${d.online?'最近已连接':'已授权'}<small>授权至 ${esc(date(d.expires_at))}${d.last_seen?' · 最近连接 '+esc(date(d.last_seen)):''}</small></span><button class="rr-button" data-revoke="${esc(d.id)}">撤销授权</button></div>`).join('')||'<p>尚未授权设备。</p>';}
     catch{if(current())$('#rvWorkerStatus').textContent='智能助手授权状态暂时无法读取';}
   };
   $('#rvDevices').onclick=async event=>{const button=event.target.closest('[data-revoke]');if(!button)return;button.disabled=true;try{await withReviewProgress('撤销智能助手授权',()=>api('POST','review/device/revoke',{id:button.dataset.revoke}));await workerStatus();}catch(error){dependencies.feedback(error.message,true);button.disabled=false;}};

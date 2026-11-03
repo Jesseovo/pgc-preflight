@@ -32,12 +32,35 @@ try{
   await page.setViewport({width:1440,height:1000});await page.goto(origin+(star?'/forge/':'/'));await page.waitForSelector('.member-sidebar .member-square');await page.waitForSelector(star?'#pickCards':'.review-setup');
   assert.equal(await page.$('[data-tab=draw]')!==null,star);const rect=await page.$eval('.member-sidebar',el=>el.getBoundingClientRect().width);assert.equal(rect,208);
   await page.click('[data-account-password]');await page.waitForSelector('.member-password[open]');await page.click('[data-close]');await page.waitForFunction(()=>!document.querySelector('.member-password'));assert.equal(await page.$('.member-password'),null);
+  // A short desktop must scroll its own navigation, never wrap links into the workspace.
+  await page.setViewport({width:1024,height:420});
+  await page.$eval('[data-account-logout]',node=>node.scrollIntoView({block:'end'}));
+  assert(await page.$eval('[data-account-logout]',node=>{const r=node.getBoundingClientRect();return r.left>=0&&r.right<=208&&r.top>=0&&r.bottom<=innerHeight;}),'Account controls remain reachable in a short sidebar');
+  assert(await page.$eval('.member-sidebar',node=>getComputedStyle(node).flexWrap==='nowrap'),'Sidebar cannot inherit horizontal navigation wrapping');
+  await page.setViewport({width:1440,height:1000});
   await page.screenshot({path:`artifacts/member-shell-${star?'star':'review'}.png`});
   await page.click('.member-square');await page.waitForSelector('#results .empty-state');assert.equal(await page.$eval('.member-square',el=>el.getAttribute('aria-current')),'page');assert.equal(await page.$eval('.member-sidebar',el=>el.getBoundingClientRect().width),rect);
   await page.type('#search','纸间花园');await page.click('#search-form button');await page.waitForFunction(()=>new URL(location.href).searchParams.get('q')==='纸间花园');
   await page.click('.member-nav [data-tab=review],.member-nav a[href="/"]');await page.waitForSelector('.review-setup');await page.click('.member-square');await page.waitForSelector('#results .empty-state');assert.equal(await page.$eval('#search',el=>(el as HTMLInputElement).value),'纸间花园');
   await page.setViewport({width:390,height:844});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));await page.screenshot({path:`artifacts/member-square-${star?'star':'review'}-mobile.png`,fullPage:true});
   await page.click('.member-nav [data-tab=review],.member-nav a[href="/"]');await page.waitForSelector('.review-setup');assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));await page.screenshot({path:`artifacts/member-review-${star?'star':'review'}-mobile.png`,fullPage:true});
+  for(const width of [360,390,768,1024]){
+    await page.setViewport({width,height:844});
+    await page.evaluate(()=>scrollTo(0,0));
+    await page.waitForFunction(()=>document.querySelector('#rvWorkerStatus')?.textContent?.includes('尚未连接'));
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),`Review fits at ${width}px`);
+    assert(await page.$eval('.review-history',node=>node.getBoundingClientRect().top<innerHeight-80),`Reports are discoverable in the first viewport at ${width}px`);
+    assert(!await page.$eval('.review-setup',node=>(node as HTMLDetailsElement).open),'Help does not automatically push reports down');
+    if(star&&width<=900)assert(!await page.$eval('.member-tools',node=>(node as HTMLDetailsElement).open),'Secondary navigation is collapsed on compact screens');
+    await page.click('.review-setup>summary');
+    assert(await page.$eval('#rvPair',node=>node.getClientRects().length>0),'Pairing is reachable by expanding help');
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'Expanded connection help fits');
+    await page.click('.review-setup>summary');
+  }
+  await page.setViewport({width:390,height:844});
+  await page.click('[data-account-password]');
+  assert(await page.$eval('.member-password',node=>{const r=node.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth&&r.top>=0&&r.bottom<=innerHeight;}),'Password dialog stays inside a phone viewport');
+  await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.querySelector('.member-password'));
   // Rapid route changes must retain the document and reject late responses.
   await page.evaluate(()=>{(window as any).__navigationMarker=crypto.randomUUID();});
   const marker=await page.evaluate(()=>(window as any).__navigationMarker);

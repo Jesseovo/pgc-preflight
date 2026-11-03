@@ -333,3 +333,52 @@
 .rr-issue-kind { color: #667063; font-size: 11px; white-space: nowrap; }
 .rr-issue-title { flex-wrap: wrap; }
 .admin-app .adm-manage-report .rr-total.is-pending strong { font-size: 24px; letter-spacing: 0; }
+
+/* Member review starts with tasks and reports; connection help is available on demand. */
+.member-review { container-type: inline-size; }
+.member-review .review-start { display:flex;align-items:center;justify-content:space-between;gap:20px;padding:20px;background:#fff;border:1px solid var(--rv-line);border-radius:8px 8px 0 0; }
+.member-review .review-start>div { min-width:0; }
+.member-review .review-start h2 { margin:0;font-size:16px;font-weight:600; }
+.member-review .review-start p { margin:6px 0 0;color:#637168;font-size:13px;line-height:1.7;overflow-wrap:anywhere; }
+.member-review .review-start>.rr-button { flex-shrink:0;font-size:13px;min-height:40px; }
+.member-review .review-setup { margin:0 0 24px;border:1px solid var(--rv-line);border-top:0;border-radius:0 0 8px 8px;background:#fff; }
+.member-review .review-setup>summary { padding:12px 20px;font-size:13px;cursor:pointer; }
+.member-review .review-setup .review-workspace { display:block;margin:0;padding:0 20px 20px;border:0;background:none;border-radius:0; }
+.member-review .review-setup .review-upload-panel { padding:0;min-width:0; }
+.member-review .review-setup .review-dropzone { display:block;padding:0;margin:0;border:0;border-radius:0;background:none;min-height:0;text-align:left; }
+.member-review .review-setup .review-scope-panel { display:none; }
+.review-connect-steps { display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;padding:16px 0 8px;margin:0;list-style:none;counter-reset:connect; }
+.review-connect-steps li { counter-increment:connect;position:relative;padding-left:28px;font-size:12px;line-height:1.7;min-width:0; }
+.review-connect-steps li::before { content:counter(connect);position:absolute;left:0;top:0;display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:#edf3e9;color:#53725e; }
+.review-connect-steps b,.review-connect-steps span { display:block; }
+.review-connect-steps span { margin-top:4px;color:#637168; }
+.member-review .review-action-row:has(>#rvQuota[hidden]:only-child) { display:none; }
+.member-review .rv-feedback:empty { display:none; }
+.member-review .rv-feedback { font-size:13px;margin:0 0 16px; }
+.member-review .rv-device { margin-top:12px; }
+.member-review .rv-device-actions .rr-button { font-size:12px;min-height:38px; }
+.member-review .rv-device-row { flex-wrap:wrap; }
+.member-review .rv-device-row>span { flex:1 1 200px;min-width:0;overflow-wrap:anywhere; }
+.rv-agent-instructions { margin-top:16px;padding-top:12px;border-top:1px solid var(--rv-line); }
+.rv-agent-instructions p { font-size:13px;line-height:1.8;overflow-wrap:anywhere; }
+.member-review .review-intro>div { min-width:0; }
+.member-review .review-history { padding:20px;margin-top:24px; }
+.member-review .rv-history-item>b { font-size:14px; }
+.member-review .rv-history-tools label { font-size:12px; }
+.member-review .rv-history-tools input { max-width:none; }
+.member-review .rr-section-heading { flex-wrap:wrap;gap:12px; }
+.member-review .rr-header>div:first-child { min-width:0; }
+.member-review .rr-meta { flex-wrap:wrap; }
+.member-review .rr-button { max-width:100%; }
+.member-review .rv-batch-actions { gap:12px; }
+.member-review .rv-batch-actions .rr-button { padding:8px;font-size:12px; }
+@container (max-width:760px) {
+  .member-review .rv-results-grid { grid-template-columns:minmax(0,1fr); }
+  .member-review .rv-job-list { display:flex;position:static;overflow-x:auto;max-height:none;padding:2px 2px 6px; }
+  .member-review .rv-job { flex:0 0 220px; }
+  .member-review .rv-batch-heading { flex-wrap:wrap;align-items:start; }
+  .member-review .review-start { flex-wrap:wrap;gap:12px;padding:16px; }
+  .member-review .review-setup>summary { padding:12px 16px; }
+  .member-review .review-setup .review-workspace { padding:0 16px 16px; }
+  .review-connect-steps { grid-template-columns:1fr;gap:12px; }
+}

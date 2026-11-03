@@ -214,6 +214,34 @@ try {
   sqlite.prepare("UPDATE forge_tasks SET detail='BOTH_PANES_UPDATED',updated_at=? WHERE id='platform-active'").run(new Date().toISOString());
   await page.waitForFunction(()=>document.querySelector('#admin-view .content-task-list')?.textContent?.includes('BOTH_PANES_UPDATED')&&document.querySelector('#admin-inspector .content-task-status')?.textContent?.includes('BOTH_PANES_UPDATED'),{timeout:18000});
   assert.equal(await page.$eval('#admin-view [name=q]',node=>(node as HTMLInputElement).value),'尚未提交');assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-poll-focus')),'retained');assert(await page.$('#admin-view [data-task-id="platform-active"][aria-current=true]'));await page.click('[data-inspector-close]');await page.waitForFunction(()=>!document.querySelector('#admin-inspector[open]'));checks.push('桌面两栏共享一个定时器独立更新，保留左侧未提交搜索、焦点及当前任务选中状态');
+  // Real narrow panes and short windows: viewport breakpoints alone miss these.
+  await page.setViewport({width:1024,height:420});
+  await page.goto(`${base}/admin?view=reviews`); await wait(page,'[data-review-records] tbody tr');
+  const sidebarReachable=await page.$eval('.adm-sidebar',node=>{const logout=node.querySelector('#admin-logout')!;logout.scrollIntoView({block:'nearest'});const box=logout.getBoundingClientRect();return box.top>=0&&box.bottom<=innerHeight+1;});
+  assert(sidebarReachable,'Short-screen sidebar must make logout reachable');
+  checks.push('420px短屏侧栏可滚动到退出登录，导航和账号区域均可达');
+  for(const width of [1024,1280,390]){
+    await page.setViewport({width,height:844});
+    await page.goto(`${base}/admin?view=reviews`); await wait(page,'[data-review-records] tbody tr');
+    for(const column of [4,5])assert(await page.$eval(`[data-review-records] tbody tr td:nth-child(${column})`,node=>node.getBoundingClientRect().height>0),'AI and human review scores must remain visible');
+    await page.$eval('[name=owner]',node=>{const option=document.createElement('option');option.textContent='用于检查长成员名称与用户名的筛选选项 · @long-member-name';option.value='layout-only';node.append(option);(node as HTMLSelectElement).value=option.value;});
+    await page.$eval('.adm-review-title',node=>{node.textContent='用于检查超长游戏标题的合成作品 LongTitleWithoutSpaces'.repeat(4);node.setAttribute('title',node.textContent);});
+    assert(await page.$eval('.adm-review-title',node=>node.getBoundingClientRect().height<=parseFloat(getComputedStyle(node).lineHeight)*2+1&&node.getAttribute('title')===node.textContent),'Long titles keep the full name and occupy at most two lines');
+    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+    assert(await page.$eval('[data-review-records]',node=>node.scrollWidth<=node.clientWidth+1),'Review summary should fit without hidden columns');
+    await page.screenshot({path:path.join(output,`admin-reviews-responsive-${width}.png`),fullPage:true});
+  }
+  checks.push('390/1024/1280px审核列表始终展示AI与真人结果，长标题及长成员筛选无横向溢出');
+  await page.setViewport({width:1024,height:768});
+  await page.goto(`${base}/admin?view=works&inspect=project&inspectType=topic&inspectId=1&inspectPanel=overview`);await wait(page,'#admin-inspector .content-overview');
+  assert(await page.$eval('#admin-inspector .content-overview',node=>getComputedStyle(node).gridTemplateColumns.split(' ').length===1),'Narrow inspector must stack overview facts');
+  assert(await page.$eval('#admin-inspector-body',node=>node.scrollWidth<=node.clientWidth+1));
+  await page.screenshot({path:path.join(output,'admin-inspector-narrow-desktop.png')});
+  await page.setViewport({width:390,height:540});
+  assert(await page.$eval('[data-inspector-close]',node=>{const r=node.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth&&r.top>=0;}));
+  assert(await page.$eval('#admin-inspector-header',node=>node.scrollWidth<=node.clientWidth+1));
+  await page.screenshot({path:path.join(output,'admin-inspector-short-mobile.png')});
+  checks.push('1024px详情按自身宽度折为单列，390px短屏详情关闭按钮始终可达且标题工具不相撞');
   await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true }); await page.goto(`${base}/admin?view=overview`); await wait(page, '.adm-metrics'); await page.click('#admin-menu'); assert.equal(await page.$eval('#admin-menu', node => node.getAttribute('aria-expanded')), 'true'); await page.click('[data-admin-view=works]'); await wait(page, '.content-project-card'); assert.equal(await page.$eval('#admin-menu', node => node.getAttribute('aria-expanded')), 'false'); assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   await page.screenshot({ path: path.join(output, 'admin-dashboard-works-mobile.png'), fullPage: true }); await page.goto(`${base}/admin?view=works&type=topic&id=1`); await wait(page, '.game-player iframe'); const mobileFrame = await (await page.$('iframe'))!.contentFrame(); assert(mobileFrame); await mobileFrame.waitForSelector('#tap'); await (await mobileFrame.$('#tap'))!.tap(); assert.equal(await mobileFrame.$eval('#score', node => node.textContent), '1'); stage = await page.$eval('.game-player-stage', node => { const r = node.getBoundingClientRect(); return r.width / r.height; }); assert(Math.abs(stage - 9 / 16) < .002); assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)); await page.screenshot({ path: path.join(output, 'admin-dashboard-game-mobile.png'), fullPage: true }); checks.push('手机导航可开关，作品无横向溢出，真实触摸在9:16游戏中生效');
   await page.goto(`${base}/admin?view=works&status=product`); await wait(page, '.content-project-card'); await page.click('[data-project-id="1"][data-project-type="topic"]'); await wait(page, '#admin-inspector[open] iframe');
