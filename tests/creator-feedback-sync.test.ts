@@ -114,4 +114,25 @@ describe('private resumable provider feedback cache',()=>{
   s.client.contract.mockRejectedValueOnce(new FeedbackProviderError('http_error',401));await s.step();expect(await readFeedbackContract(s.DB)).toBeNull();
  });
 
+ it.each([401,409])('persists %s authorization withdrawal after its lease expires',async code=>{
+  const s=setup();await bootstrap(s);const real=Date.now(),spy=vi.spyOn(Date,'now').mockReturnValue(real);
+  s.client.changes.mockImplementationOnce(async()=>{spy.mockReturnValue(real+91_000);throw new FeedbackProviderError('http_error',code);});
+  const result=await s.step();expect(result.status).toBe(code===401?'auth_revoked':'ready');expect(result.errorCode).toBe(code===401?'authorization_revoked':'scope_changed');expect(result.nextRunAt).toEqual(code===401?null:expect.any(Number));expect(await readFeedbackGame(s.DB,'game_one')).toBeNull();expect(s.row().cursor).toBeNull();expect(s.row().lease_token).toBeNull();
+ });
+ it.each([429,503])('persists %s backoff after its lease expires without losing committed cache',async code=>{
+  const s=setup();await bootstrap(s);const real=Date.now(),spy=vi.spyOn(Date,'now').mockReturnValue(real);
+  s.client.changes.mockImplementationOnce(async()=>{spy.mockReturnValue(real+91_000);throw new FeedbackProviderError('http_error',code,90);});
+  const result=await s.step();expect(result.status).toBe('backoff');expect(result.errorCode).toBe(code===429?'rate_limited':'provider_unavailable');expect(result.nextRunAt!-result.lastAttemptAt!).toBeGreaterThanOrEqual(91_000+(code===429?90_000:30_000));expect(s.row().cursor).toBe('1:10');expect(await readFeedbackGame(s.DB,'game_one')).not.toBeNull();expect(s.row().lease_token).toBeNull();
+ });
+ it.each([401,409,429,503])('ignores an expired predecessor %s error after a new lease takes over',async code=>{
+  const s=setup();await bootstrap(s);const before=s.row(),real=Date.now(),spy=vi.spyOn(Date,'now').mockReturnValue(real);
+  s.client.changes.mockImplementationOnce(async()=>{
+   spy.mockReturnValue(real+91_000);
+   // Same generation, but another invocation has acquired the expired lease.
+   s.sql.prepare("UPDATE creator_feedback_state SET lease_token='successor',lease_until=?,status='backoff',next_run_at=?,failures=7,error_code='rate_limited' WHERE id=1").run(before.lease_until+1_000_000,9_000_000);
+   throw new FeedbackProviderError('http_error',code,90);
+  });
+  const result=await s.step();expect(result.status).toBe('backoff');expect(result.errorCode).toBe('rate_limited');expect(result.nextRunAt).toBe(9_000_000);expect(result.failures).toBe(7);expect(s.row().lease_token).toBe('successor');expect(s.row().generation).toBe(before.generation);expect(s.row().cursor).toBe('1:10');expect(await readFeedbackGame(s.DB,'game_one')).not.toBeNull();
+ });
+
 });

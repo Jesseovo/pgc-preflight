@@ -59,9 +59,14 @@ export async function runFeedbackSync(env:FeedbackSyncEnv,options:{client?:Clien
  const guard='EXISTS(SELECT 1 FROM creator_feedback_state WHERE id=1 AND generation=? AND lease_token=? AND lease_until>=?)';
  const guarded=(sql:string,params:any[]=[])=>DB.prepare(sql).bind(...params,generation,lease,fenceTime);
  const update=(set:string,params:any[]=[])=>guarded(`UPDATE creator_feedback_state SET ${set} WHERE id=1 AND ${guard}`,params);
- const purge=()=>tables.map(t=>guarded(`DELETE FROM ${t} WHERE ${guard}`));
+ // An observed error must survive expiry of its own lease. A successor's
+ // different lease token (or generation) still fences this handler out.
+ const errorGuard='EXISTS(SELECT 1 FROM creator_feedback_state WHERE id=1 AND generation=? AND lease_token=?)';
+ const errorStatement=(sql:string,params:any[]=[])=>DB.prepare(sql).bind(...params,generation,lease);
+ const errorUpdate=(set:string,params:any[]=[])=>errorStatement(`UPDATE creator_feedback_state SET ${set} WHERE id=1 AND ${errorGuard}`,params);
+ const purge=()=>tables.map(t=>errorStatement(`DELETE FROM ${t} WHERE ${errorGuard}`));
  const reset=async(status:string,error:string|null,next:number|null,scope:number|null=null)=>{
-  await DB.batch([...purge(),update(`generation=generation+1,status=?,phase='snapshot',pending_key=NULL,snapshot_id=NULL,snapshot_cursor=NULL,snapshot_after=NULL,snapshot_expires_at=NULL,cursor=NULL,scope_revision=?,lease_token=NULL,lease_until=0,next_run_at=?,failures=0,error_code=?,last_success_at=NULL`,[status,scope,next,error])]);
+  await DB.batch([...purge(),errorUpdate(`generation=generation+1,status=?,phase='snapshot',pending_key=NULL,snapshot_id=NULL,snapshot_cursor=NULL,snapshot_after=NULL,snapshot_expires_at=NULL,cursor=NULL,scope_revision=?,lease_token=NULL,lease_until=0,next_run_at=?,failures=0,error_code=?,last_success_at=NULL`,[status,scope,next,error])]);
  };
  const finish=(phase:string,next:number)=>update(`phase=?,status='ready',next_run_at=?,last_success_at=?,failures=0,error_code=NULL,lease_token=NULL,lease_until=0`,[phase,next,clock()]);
  const chunks=(kind:string,id:string,gameId:string|null,value:unknown)=>{
@@ -130,7 +135,7 @@ export async function runFeedbackSync(env:FeedbackSyncEnv,options:{client?:Clien
   }else{
    const limited=error instanceof FeedbackProviderError&&error.status===429;
    const delay=limited?Math.max(60_000,(error.retryAfterSeconds||0)*1000):Math.min(30*60_000,30_000*2**Math.min(s.failures,6));
-   await update(`status='backoff',next_run_at=?,failures=failures+1,error_code=?,lease_token=NULL,lease_until=0`,[clock()+delay,limited?'rate_limited':error instanceof FeedbackProviderError&&error.status>=500?'provider_unavailable':error instanceof FeedbackProviderError?'provider_rejected':'sync_interrupted']).run();
+   await errorUpdate(`status='backoff',next_run_at=?,failures=failures+1,error_code=?,lease_token=NULL,lease_until=0`,[clock()+delay,limited?'rate_limited':error instanceof FeedbackProviderError&&error.status>=500?'provider_unavailable':error instanceof FeedbackProviderError?'provider_rejected':'sync_interrupted']).run();
   }
  }
  return readFeedbackStatus(DB);
