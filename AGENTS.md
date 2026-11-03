@@ -79,15 +79,17 @@
 - 管理员审核 UI 保留批次数量/阶段、仍有原文件时独立失败重试、批量导出、可搜索筛选历史。管理员平台审核重试重新采集并建立新任务；刷新后临时源码已删，需重新上传。成员页面仅提供 Agent 接入、任务、报告、导出与搜索，不提供网页上传或平台执行。失败停止计时，明确未完成，展示原因和操作。审核进度托盘默认紧凑，不能挡住批量操作，尊重用户主动开关。
 - 所有异步等待使用 `public/forge/progress.js`（`src/progress.ts` 共享）：已知完成数用真实计数，模型调用用不定进度条、阶段和耗时，不能从时间伪造完成百分比。嵌入工作台的任务显示在父后台视口。
 
-## Creator Hub 专用反馈集成（本地实现，默认关闭）
+## Creator Hub 专用反馈集成（已授权上线）
 
-- 本轮仅本地实现与验证，未迁移生产、配置生产 Secret、部署或启用。`CREATOR_FEEDBACK_ENABLED` 默认字符串 `"false"`；专用 `CREATOR_FEEDBACK_TOKEN` 仅放服务端 Secret，与成员个人 Creator Hub、模型及 Agent 设备凭据独立，不得写入命令参数、日志或仓库。细节见 [专用反馈集成](docs/creator-feedback-integration.md)。
+- 2026-11-03 用户已明确授权合并 main、上线并启用服务端自动同步；生产迁移、专用 Secret、DO 与两分钟 Cron 已配置。`CREATOR_FEEDBACK_ENABLED` 在部署配置中为字符串 `"true"`，无 Secret 的本地环境仍不外呼；发布继续使用 `--keep-vars` 保留原配置。专用 `CREATOR_FEEDBACK_TOKEN` 仅放服务端 Secret，与成员个人 Creator Hub、模型及 Agent 设备凭据独立，不得写入命令参数、日志或仓库。细节见 [专用反馈集成](docs/creator-feedback-integration.md)，实际回流验收以本地私有发布证据为准。
 - 固定读取 Creator Hub `/api/integrations/feedback/v1` 的授权普通游戏反馈与候选规则。全站脱敏研究资料不等于团队完整明细，不按匿名作者、标题或分数猜关联。`decision_review` 不等于真人终审；原 0/null/空分数、历史角色、规则及时间未知值保留，不补造、不自动判断缺陷已复现。
 - 需要 `0026_creator_feedback.sql` 的独立 `creator_feedback_*` 表、`CREATOR_FEEDBACK_RUNNER` 绑定和 `v3-creator-feedback` DO 迁移。两分钟 cron 仅调度单例 Runner，原小时维护独立；正常增量 120 秒、连续分页至少 5 秒。快照幂等键先持久化，空页也推进原始游标；事件允许序号间隔，携带查询时当前状态，不冒充事件时快照。
 - 仅超级管理员 Cookie 可访问 `/api/admin/creator-feedback` 状态、缓存 contract、作品、候选规则查询、同步唤醒和准确投稿关联 API；`GET /contract` 不发新上游请求，当前没有对应管理 UI。任何 Authorization 请求头即使带管理员 Cookie 也拒绝；POST 校验同源 Origin。状态不含凭据、摘要或来源原文，正文仅通过管理员详情读取。客户端固定来源、禁止跳转、限制流式字节与全程超时，错误不回显私密内容。
 - `/link` 从已有审核任务获取 owner，不接受指定所有者；验证 contract 范围版本、准确投稿 identity 与作品详情、本地已同步版本，拒绝旧真人关联冲突和换绑。generation、凭据和当前作品存在性约束写入与读取；不按同名关联。
 - `removed` 清除该作品的正文、修订和关联；401 清库并停止，同一凭据不能通过重新唤醒恢复。范围变化/409、快照过期/410、凭据轮换均清除旧缓存与关联并重建快照；429 遵守至少 60 秒与 Retry-After，其他失败保留检查点退避。关闭或缺少 Secret 时拒绝资料读取，已有 Runner 下次唤醒/alarm 清理缓存；清理失败保留恢复 alarm，旧响应不能恢复已清数据。
-- 集成只保存来源判断与候选规则，不改写 AI 报告、旧 `review_human_reviews` 或广场，不调用模型、不下载文件，不自动发布规则或校准案例。案例发布仍需人工脱敏复核和明确发布。后续部署需另行授权，先备份与迁移，再核对 DO/cron/Secret/开关及线上权限和原数据保留；不能把本地测试或构建成功写成生产已上线。
+- 集成只保存来源判断与候选规则，不改写 AI 报告、旧 `review_human_reviews` 或广场，不调用模型、不下载文件，不自动发布规则或校准案例。案例发布仍需人工脱敏复核和明确发布。发布先备份与迁移，再核对 DO/cron/Secret/开关及线上权限和原数据保留；不能只凭本地测试或构建成功判断回流已完成。
+- workerd 出站请求必须使用 `redirect:manual` 后拒绝 3xx，不传不支持的 `credentials`，默认 fetch 用独立函数调用避免错误 this；真实 workerd 本地隔离回归不得外呼。撤权和错误退避以 generation+原 lease token 控制，不因自身租约过期而丢弃；成功数据写入仍检查租约有效期。诊断仅保存受控错误代码和 HTTP 状态，不输出上游正文。
+- 2026-11-03 发布：运行代码 `43be86c`、启用配置 `c6537df` 已推送 `origin/main`，Worker `23c328d3-16f6-4ba1-a16d-85abe22962bc` 承接全部流量；520 项测试（含 7 项真实 workerd 隔离回归）通过。验收时回流 1255 款/2402 版/2985 条审核记录，随后自动增量间隔 122814ms、游标从 `3:3133` 到 `3:3136`，未手动触发同步。数字随来源变化，不是准确率或普遍时效证明。备份和私有 JSON 证据在 ignored 的 `artifacts/creator-feedback-release-20261103/`；管理 API 成功读取已做本地回归，线上通过 Cloudflare 管理接口核对状态，未重新登录管理员浏览器验证。
 
 ## 模型传输与诊断
 
