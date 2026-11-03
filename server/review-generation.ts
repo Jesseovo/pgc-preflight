@@ -1,9 +1,9 @@
 import { complete, routedModel } from './forge-llm';
-import { REVIEW_SCHEMA, REVIEW_VERIFICATION } from './forge/prompts.js';
+import { REVIEW_SCHEMA, REVIEW_VERIFICATION, REVIEW_SCHEMA_V2, REVIEW_VERIFICATION_V2 } from './forge/prompts.js';
 import { reviewReportErrors,normalizeReviewOutput } from './review-report';
 
 type Environment = Parameters<typeof complete>[0];
-type Request = Pick<Parameters<typeof complete>[2], 'system' | 'user' | 'maxTokens' | 'idempotencyKey' | 'onWait' | 'onStart' | 'deadline'>;
+type Request = Pick<Parameters<typeof complete>[2], 'system' | 'user' | 'maxTokens' | 'idempotencyKey' | 'onWait' | 'onStart' | 'deadline'> & { reportSchemaVersion?: 1 | 2 };
 
 // Both stages use the same evidence and the AI review model. Only the model may revise
 // its scores; a failed verification must never publish the unchecked draft.
@@ -26,8 +26,11 @@ export async function generateReviewStage(env: Environment, cfg: Record<string, 
   // Keep the entire standard + original evidence prefix identical in both
   // stages, so provider prefix caching can reuse it. Verification instructions
   // remain system instructions; untrusted source cannot select the stage.
-  const system = `${request.system}\n\n初评阶段没有平台附加的草稿，按原始证据输出初评。仅复核阶段在原始证据之后附上待复核草稿，并适用以下复核规则：\n${REVIEW_VERIFICATION}`;
-  const options = { ...request, system, schema: REVIEW_SCHEMA, normalize:normalizeReviewOutput, validate: reviewReportErrors, purpose, maxTokens, timeoutMs: 300000, deadline, onWait };
+  const version = request.reportSchemaVersion ?? 1;
+  const verification = version === 2 ? REVIEW_VERIFICATION_V2 : REVIEW_VERIFICATION;
+  const schema = version === 2 ? REVIEW_SCHEMA_V2 : REVIEW_SCHEMA;
+  const system = `${request.system}\n\n初评阶段没有平台附加的草稿，按原始证据输出初评。仅复核阶段在原始证据之后附上待复核草稿，并适用以下复核规则：\n${verification}`;
+  const options = { ...request, system, schema, normalize:normalizeReviewOutput, validate: (value: unknown) => reviewReportErrors(value, {schemaVersion: version}), purpose, maxTokens, timeoutMs: 300000, deadline, onWait };
   await onWait('');
   if (purpose === 'review') return complete(env, cfg, options);
   if (!draft) throw new Error('初评结果缺失，不能开始复核。');

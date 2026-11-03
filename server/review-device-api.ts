@@ -4,8 +4,10 @@ import { activeModelProfile } from './settings';
 import {digest,canonicalJson,stamp,problem,inputChunks,readReviewInput,failDeviceReview,recoverDeviceReviews} from './review-device-state';
 import {enqueueReview,getReviewJob,listReviewJobs} from './review-jobs';
 import {prepareReview} from './forge-api';
-import {REVIEW_SCHEMA,REVIEW_VERIFICATION} from './forge/prompts.js';
-import {reviewReportErrors} from './review-report';
+import {REVIEW_SCHEMA,REVIEW_SCHEMA_V2,REVIEW_VERIFICATION,REVIEW_VERIFICATION_V2} from './forge/prompts.js';
+import {reviewReportErrors,reportScore} from './review-report';
+import {parseReviewRulesSnapshot} from './review-rules';
+import {validateReviewEvidence} from './review-evidence';
 import {currentHumanReview,saveHumanReview} from './human-review';
 import {publishGalleryGame} from './gallery';
 
@@ -14,11 +16,12 @@ type Env={DB:any;SETTINGS_KEY:string;ADMIN_PASSWORD:string;modelStore:{get():Pro
 const validId=(value:any)=>typeof value==='string'&&/^[a-f0-9-]{36}$/.test(value);
 const reviewActions=new Set(['submit','jobs','job','report','heartbeat','claim','evidence','material','draft','complete','fail','human-review','gallery']);
 const localModel=(value:unknown)=>{if(typeof value!=='string'||!value.trim()||value.length>200)throw problem('请填写实际执行初评与复核的本地模型标识。');return value.trim();};
-function validatedReport(value:any){
-  const report=structuredClone(value),errors=reviewReportErrors(report);
+function validatedReport(value:any,schemaVersion:1|2){
+  const schema=schemaVersion===2?REVIEW_SCHEMA_V2:REVIEW_SCHEMA;
+  const report=structuredClone(value),errors=reviewReportErrors(report,{schemaVersion});
   if(errors.length)throw problem(`审核报告缺少或不符合字段：${errors.join(', ')}`);
   // Match REVIEW_SCHEMA without injecting scores or conclusions.
-  if(Object.keys(report).some(key=>!Object.hasOwn(REVIEW_SCHEMA.properties,key))||Object.keys(report.score_reasons).some(key=>!['aes','ease','play'].includes(key))||report.issues.some((issue:any)=>Object.keys(issue).some(key=>!['severity','area','problem','evidence','fix'].includes(key))))throw problem('审核报告包含结构以外的字段。');
+  if(Object.keys(report).some(key=>!Object.hasOwn(schema.properties,key))||Object.keys(report.score_reasons).some(key=>!['aes','ease','play'].includes(key))||report.issues.some((issue:any)=>Object.keys(issue).some(key=>!['severity','area','problem','evidence','fix',...(schemaVersion===2?['kind','evidence_refs']:[])].includes(key))))throw problem('审核报告包含结构以外的字段。');
   return report;
 }
 async function version(env:Env,owner:string){
@@ -117,7 +120,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
       if(job.status!=='done'||!job.result_id)throw problem('审核尚未完成，请先查询进度。',409);
       const report=await DB.prepare('SELECT * FROM reviews WHERE id=? AND owner_id=?').bind(job.result_id,device.owner_id).first();
       if(!report)throw problem('审核报告不存在。',404);
-      for(const key of ['result','probe','shots'])report[key]=JSON.parse(report[key]||'null');
+      for(const key of ['result','probe','shots','rules_snapshot'])report[key]=JSON.parse(report[key]||'null');
       report.human_review=await currentHumanReview(DB,job.id,device.owner_id);
       return json(report);
     }
@@ -145,13 +148,13 @@ export async function reviewDeviceApi(request:Request,env:Env){
       if(!row)return json(null);
       await DB.prepare("UPDATE review_jobs SET updated_at=? WHERE id=? AND worker_id=? AND status='running' AND model_executor='agent'").bind(stamp(),row.id,device.id).run();
       const input=await readReviewInput(DB,row.id);
-      return json({id:row.id,lease:row.lease,title:row.title,html:input.html,...(row.model_executor==='agent'?{model_executor:'agent',stage:row.stage,evidenceHash:row.evidence_hash}: {})});
+      return json({id:row.id,lease:row.lease,title:row.title,html:input.html,...(row.report_schema_version===2?{review_mode:row.review_mode,report_schema_version:2,rules_snapshot:parseReviewRulesSnapshot(row.rules_snapshot)}:{}),...(row.model_executor==='agent'?{model_executor:'agent',stage:row.stage,evidenceHash:row.evidence_hash}: {})});
     }
     const row=await leased(env,device,b);
     if(action==='evidence'){
       if(row.status==='error')throw problem('任务已中断，请在网页手动重试。',409);
       const evidence={probe:b.probe,shots:b.shots};
-      if(b.probe?.captureMethod!=='browser-viewport-v1'||!Array.isArray(b.shots)||b.shots.length!==4||b.shots.some((s:any)=>typeof s.label!=='string'||typeof s.data!=='string'||!/^data:image\/jpeg;base64,[a-zA-Z0-9+/=]+$/.test(s.data)))throw problem('需要四张完整浏览器视口截图及采集记录。');
+      await validateReviewEvidence(row,b.probe,b.shots);
       if(row.model_executor==='platform'&&!env.REVIEW_RUNNER)throw problem('云端模型执行器尚未就绪。',503);
       const hash=await digest(JSON.stringify(evidence));
       if(row.evidence_ready&&row.evidence_hash!==hash)throw problem('这次任务的证据已经锁定，不能替换。',409);
@@ -182,9 +185,9 @@ export async function reviewDeviceApi(request:Request,env:Env){
         const evidence=await readReviewInput(DB,row.id,'review_evidence');
         if(!row.local_material_hash){
           const input=await readReviewInput(DB,row.id);
-          const {images,...request}=await prepareReview({...env,ownerId:device.owner_id,modelExecutor:'agent'}, {...input,...evidence});
+          const {images,...request}=await prepareReview({...env,ownerId:device.owner_id,modelExecutor:'agent'}, {...input,...evidence,rulesSnapshot:row.rules_snapshot?parseReviewRulesSnapshot(row.rules_snapshot):null,reportSchemaVersion:row.report_schema_version===2?2:1});
           let imageIndex=0;
-          const snapshot={...request,user:request.user.map((part:any)=>part.type==='image'?{type:'image',index:imageIndex++}:part),schema:REVIEW_SCHEMA,verification:REVIEW_VERIFICATION};
+          const snapshot={...request,user:request.user.map((part:any)=>part.type==='image'?{type:'image',index:imageIndex++}:part),schema:row.report_schema_version===2?REVIEW_SCHEMA_V2:REVIEW_SCHEMA,verification:row.report_schema_version===2?REVIEW_VERIFICATION_V2:REVIEW_VERIFICATION};
           const hash=await digest(canonicalJson(snapshot));
           await DB.batch([
             DB.prepare("UPDATE review_jobs SET local_material_hash=?,updated_at=? WHERE id=? AND lease=? AND worker_id=? AND owner_id=? AND model_executor='agent' AND status='running' AND local_material_hash IS NULL").bind(hash,stamp(),row.id,row.lease,device.id,device.owner_id),
@@ -204,7 +207,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
           draft,draftHash,model:current.local_model||null,next:draft?'complete':'draft'});
       }
       if(b.evidenceHash!==row.evidence_hash)throw problem('审核证据哈希不一致，请使用同一份锁定材料。',409);
-      const model=localModel(b.model),report=validatedReport(b.report),reportJson=canonicalJson(report);
+      const model=localModel(b.model),report=validatedReport(b.report,row.report_schema_version===2?2:1),reportJson=canonicalJson(report);
       if(action==='draft'){
         if(row.local_draft){
           if(row.local_draft!==reportJson||row.local_model!==model)throw problem('初评草稿已经锁定，不能替换或切换模型。',409);
@@ -240,7 +243,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
         // Reserve one immutable result hash in the same transaction as the
         // report. A concurrent different report cannot adopt an existing row.
         DB.prepare("UPDATE review_jobs SET local_result_hash=? WHERE id=? AND lease=? AND worker_id=? AND owner_id=? AND model_executor='agent' AND status='running' AND local_model=? AND local_draft=? AND evidence_hash=? AND (local_result_hash IS NULL OR local_result_hash=?)").bind(resultHash,row.id,row.lease,device.id,device.owner_id,model,row.local_draft,row.evidence_hash,resultHash),
-        DB.prepare(`INSERT OR IGNORE INTO reviews(owner_id,title,topic_id,score,result,probe,shots,created_at,job_id,model_executor,agent_id,model,evidence_hash) SELECT owner_id,title,?,?,?,?,?,?,id,'agent',?,?,? FROM review_jobs WHERE id=? AND status='running' AND local_result_hash=? AND local_model=? AND evidence_hash=?`).bind(input.topic_id||null,report.aes+report.ease+report.play,reportJson,JSON.stringify({...evidence.probe,evidenceOrigin:'member-device',modelExecutor:'agent'}),JSON.stringify(evidence.shots),stamp(),device.id,model,row.evidence_hash,row.id,resultHash,model,row.evidence_hash),
+        DB.prepare(`INSERT OR IGNORE INTO reviews(owner_id,title,topic_id,score,result,probe,shots,created_at,job_id,model_executor,agent_id,model,evidence_hash,rules_snapshot) SELECT owner_id,title,?,?,?,?,?,?,id,'agent',?,?,?,rules_snapshot FROM review_jobs WHERE id=? AND status='running' AND local_result_hash=? AND local_model=? AND evidence_hash=?`).bind(input.topic_id||null,reportScore(report),reportJson,JSON.stringify({...evidence.probe,evidenceOrigin:'member-device',modelExecutor:'agent'}),JSON.stringify(evidence.shots),stamp(),device.id,model,row.evidence_hash,row.id,resultHash,model,row.evidence_hash),
         DB.prepare("UPDATE review_jobs SET status='done',stage='done',result_id=(SELECT id FROM reviews WHERE job_id=?),quota_charged=0,error='',updated_at=? WHERE id=? AND status='running' AND local_result_hash=? AND EXISTS(SELECT 1 FROM reviews WHERE job_id=? AND owner_id=? AND model_executor='agent' AND agent_id=? AND model=? AND evidence_hash=? AND result=?)").bind(row.id,stamp(),row.id,resultHash,row.id,device.owner_id,device.id,model,row.evidence_hash,reportJson),
         ...['review_inputs','review_evidence','review_material'].map(table=>DB.prepare(`DELETE FROM ${table} WHERE job_id=? AND EXISTS(SELECT 1 FROM review_jobs WHERE id=? AND status='done')`).bind(row.id,row.id)),
       ]);

@@ -1,3 +1,5 @@
+import {parseReviewRulesSnapshot} from './review-rules';
+import {reportScore} from './review-report';
 import { activeModelProfile } from './settings';
 import { prepareReview, consistentVerdict } from './forge-api';
 import { generateReviewStage } from './review-generation';
@@ -72,10 +74,10 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
   // only this idempotent transaction, never either model call.
   if (phase === 'final-ready') {
     const data = await load(storage), result = data.result;
-    const score = result.aes + result.ease + result.play;
-    result.verdict = consistentVerdict(result.verdict, score);
+    const score = reportScore(result);
+    if ((data.request.reportSchemaVersion ?? 1) === 1 && score !== null) result.verdict = consistentVerdict(result.verdict, score);
     await DB.batch([
-      DB.prepare(`INSERT OR IGNORE INTO reviews(owner_id,title,topic_id,score,result,probe,shots,created_at,job_id) SELECT owner_id,title,?,?,?,?,?,?,id FROM review_jobs WHERE id=? AND status='running' AND model_executor='platform'`).bind(data.topic_id, score, JSON.stringify(result), JSON.stringify({...data.probe,evidenceOrigin:'admin-upload'}), JSON.stringify(data.images), stamp(), id),
+      DB.prepare(`INSERT OR IGNORE INTO reviews(owner_id,title,topic_id,score,result,probe,shots,created_at,job_id,rules_snapshot) SELECT owner_id,title,?,?,?,?,?,?,id,rules_snapshot FROM review_jobs WHERE id=? AND status='running' AND model_executor='platform'`).bind(data.topic_id, score, JSON.stringify(result), JSON.stringify({...data.probe,evidenceOrigin:'admin-upload'}), JSON.stringify(data.images), stamp(), id),
       DB.prepare("UPDATE review_jobs SET status='done',stage='done',result_id=(SELECT id FROM reviews WHERE job_id=?),error='',updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM reviews WHERE job_id=?)").bind(id, stamp(), id, id),
       ...['review_inputs', 'review_evidence', 'review_material'].map(t => DB.prepare(`DELETE FROM ${t} WHERE job_id=? AND EXISTS(SELECT 1 FROM review_jobs WHERE id=? AND status='done')`).bind(id,id)),
     ]);
@@ -100,7 +102,9 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
       const config = { ...selected.profile, activeProfile:selected.id, profiles:{[selected.id]:selected.profile}, routes:{review:selected.id} };
       const runtime = { ...env, ownerId:row.owner_id, modelStore:{get:async()=>config} };
       const evidence = await (env.captureReview || captureFor(env))(input.html, (message:string)=>updateReviewProgress(env,id,message));
-      const {images,...request} = await prepareReview(runtime,{...input,...evidence});
+      const reportSchemaVersion:1|2=row.report_schema_version===2?2:1;
+      const {images,...preparedRequest} = await prepareReview(runtime,{...input,...evidence,rulesSnapshot:row.rules_snapshot?parseReviewRulesSnapshot(row.rules_snapshot):null,reportSchemaVersion});
+      const request={...preparedRequest,reportSchemaVersion};
       await updateReviewProgress(env,id,'画面采集已完成，准备模型初评。');
       await save(storage,'prepared',{deadline,config,request,images,probe:evidence.probe,title:input.title,topic_id:input.topic_id||null});
       return true;

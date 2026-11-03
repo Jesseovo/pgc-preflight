@@ -430,7 +430,7 @@ async function renderProject(alive){
   if(panel==='review'){
     const related=reports.filter(report=>Number(report.topic_id)===topic.id);
     const prompt=`请阅读 ${location.origin}/agent.md，审核我下载到本地的项目 ${topic.id}（${topic.data?.title||topic.subject}）的准确游戏版本，完成初评和同模型复核后回传报告。仅在确认作品与版本关联后关联项目，不要按同名猜测。`;
-    root.innerHTML=`<section class="box"><h2>项目审核</h2><p>将下载的 HTML 与下面的指令交给自己的审核 Agent。</p><button class="primary" id="projectReviewPrompt">复制审核指令</button><button class="ghost" data-tab="review">打开我的审核</button><p class="muted">${related.length} 份已明确关联的报告</p>${related.map(r=>`<p>${esc(r.title)} · ${r.score}/9 · ${esc(r.created_at)}</p>`).join('')}</section>`;
+    root.innerHTML=`<section class="box"><h2>项目审核</h2><p>将下载的 HTML 与下面的指令交给自己的审核 Agent。</p><button class="primary" id="projectReviewPrompt">复制审核指令</button><button class="ghost" data-tab="review">打开我的审核</button><p class="muted">${related.length} 份已明确关联的报告</p>${related.map(r=>`<p>${esc(r.title)} · ${r.score == null ? '待复核' : `${r.score}/9`} · ${esc(r.created_at)}</p>`).join('')}</section>`;
     $('#projectReviewPrompt').onclick=()=>copyText(prompt);return;
   }
   if(panel==='play'&&!topic.has_product){root.innerHTML='<section class="box"><h2>还没有成品</h2><p>在创作页准备材料并开始制作，完成后即可在这里试玩。</p></section>';return;}

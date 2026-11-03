@@ -16,6 +16,7 @@ import {dispatch} from '../server/forge-api';
 import {adminWorkspaceApi} from '../server/admin-workspace-api';
 import {login} from '../server/settings';
 import {REVIEW_SCHEMA,REVIEW_VERIFICATION} from '../server/forge/prompts.js';
+import {reviewRulesAdmin} from '../server/review-rules';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.restoreAllMocks();});
@@ -50,6 +51,51 @@ async function setup(){
 }
 
 describe('成员 Agent 本地模型审核协议',()=>{
+  it('规则发布不改变在途任务；v2未知评分、零分、原证据和同模型复核持久化',async()=>{
+    const s=await setup(),legacy=await s.submit();
+    const publish=async(marker:string,previous:string|null)=>{
+      const candidate=await reviewRulesAdmin(new Request('https://fixture.test/api/admin/review-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'import',snapshot:{sourceUrl:'https://creator-hub-7mi.pages.dev/#/',capturedAt:new Date().toISOString(),rawDirection:marker,rawScoring:'美学、易玩性、可玩性各 0–3 分，总分 7 分参考通过。',calibrationCases:[]}})}),s.DB);
+      return (await reviewRulesAdmin(new Request('https://fixture.test/api/admin/review-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'publish',id:candidate.candidate!.id,expectedActiveId:previous})}),s.DB)).active!;
+    };
+    const rules=await publish('FIRST_RULE',null),submitted=await s.submit();
+    await publish('LATER_RULE',rules.id);
+    const old=await s.claim(legacy.id);await s.ok('evidence',s.evidence(old));
+    expect((await s.ok('material',old)).schema).toEqual(REVIEW_SCHEMA);
+    await s.ok('fail',{...old,message:'old fixture cleanup'});
+    const job=await s.claim(submitted.id),accepted=await s.ok('evidence',s.evidence(job));job.evidenceHash=accepted.evidenceHash;
+    const material=await s.ok('material',job);
+    expect(material.system).toContain('FIRST_RULE');expect(material.system).not.toContain('LATER_RULE');
+    expect(job.rules_snapshot.id).toBe(rules.id);
+    const v2={...report(),schema_version:2,assessment_status:'needs_review',aes:0,ease:2,play:null,verdict:'待复核：核心循环未确认',optional_suggestions:[]};
+    expect((await s.call('draft',{...s.draftBody(job),report:report()})).status).toBe(400);
+    const body={...s.draftBody(job),report:v2},draft=await s.ok('draft',body);
+    const verification={confirmed:true,model:body.model,evidenceHash:job.evidenceHash,draftHash:draft.draftHash};
+    expect((await s.call('complete',{...body,verification:{...verification,model:'different'}})).status).toBe(409);
+    const verify=await s.ok('material',job);expect(verify.system).toContain('FIRST_RULE');expect(verify.user.slice(0,material.user.length)).toEqual(material.user);
+    await s.ok('complete',{...body,verification});
+    const saved=await s.ok('report',job);expect(saved.score).toBe(null);expect(saved.result).toEqual(v2);expect(saved.rules_snapshot.id).toBe(rules.id);
+    expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();expect(s.send).not.toHaveBeenCalled();
+  });
+  it('增强取证由新规则显式启用，拒绝超限、错图和锁定后替换，断线保留原租约',async()=>{
+    const s=await setup(),payload={request_id:crypto.randomUUID(),html:'<html>fixture</html>',review_mode:'enhanced'};
+    expect((await s.call('submit',payload)).status).toBe(400);
+    const rule={sourceUrl:'https://creator-hub-7mi.pages.dev/#/',capturedAt:new Date().toISOString(),rawDirection:'fixture direction',rawScoring:'fixture 0–3',scoreMin:0,scoreMax:3,passScore:7,notes:'',calibrationCases:[]};
+    s.sqlite.prepare('INSERT INTO review_rule_versions VALUES(?,?,?,?,?)').run('rule-fixture',await digest(canonicalJson(rule)),canonicalJson(rule),'2026-11-02T00:00:00Z','2026-11-02T00:00:00Z');
+    s.sqlite.exec("UPDATE review_rule_head SET version_id='rule-fixture' WHERE id=1");
+    const submitted=await s.ok('submit',payload),job=await s.claim(submitted.id),evidence=s.evidence(job) as any;
+    evidence.probe={captureMethod:'browser-viewport-v2',adaptive:{firstLook:{imageSha256:await digest('a'),observations:'仅画面观察，未披露源码',uncertainties:[],sourceBlind:true,recordedAt:new Date().toISOString()},rounds:0,actionCount:0,playMs:0,modelWaitMs:0,actions:[]}};
+    evidence.shots=evidence.shots.map((shot:any,i:number)=>({...shot,id:`baseline-${i+1}`,capturedAt:new Date().toISOString(),source:'isolated-chromium',actionRefs:[]}));
+    evidence.shots.push({id:'supplemental-1',capturedAt:new Date().toISOString(),source:'member-device',actionRefs:[],label:'supplemental-1',data:'data:image/jpeg;base64,YQ=='});
+    expect((await s.call('material',job)).status).toBe(409);
+    for(const patch of [{rounds:7},{actionCount:25},{playMs:180001}])expect((await s.call('evidence',{...evidence,probe:{...evidence.probe,adaptive:{...evidence.probe.adaptive,...patch}}})).status).toBe(400);
+    expect((await s.call('evidence',{...evidence,shots:[...evidence.shots,...Array(12).fill(evidence.shots[4])]})).status).toBe(400);
+    const accepted=await s.ok('evidence',evidence);expect(accepted.evidenceHash).toBeTruthy();
+    const restored=await s.claim(submitted.id);expect(restored.lease).toBe(job.lease);expect(restored.review_mode).toBe('enhanced');
+    expect((await s.call('evidence',{...evidence,probe:{...evidence.probe,changed:true}})).status).toBe(409);
+    expect((await s.ok('material',job)).user.filter((p:any)=>p.type==='image')).toHaveLength(5);
+    expect((await s.call('material',job,'b')).status).toBe(409);
+    expect(s.modelGet).not.toHaveBeenCalled();
+  });
   it('读取新鲜任务不写库或全站清理，成员轮询不清理其他成员的过期任务',async()=>{
     const s=await setup(),a=await s.ready(),b=await s.submit('b'),old=new Date(Date.now()-25*3600000).toISOString();
     s.sqlite.prepare('UPDATE review_jobs SET updated_at=? WHERE id=?').run(old,b.id);

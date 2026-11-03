@@ -44,6 +44,7 @@ export async function captureReview(browser: Browser, html: string) {
   const sources = [...RESOURCE_HOSTS].map(host => `https://${host}`).join(' ');
   try {
     const frames = [];
+    let shotNumber=0;
     // Chromium touch gestures share browser input state. Run viewports in order
     // so simultaneous touchStart/touchEnd sequences cannot interfere.
     for (const spec of FRAMES) {
@@ -83,14 +84,15 @@ export async function captureReview(browser: Browser, html: string) {
       try { await page.goto(`${origin}/index.html`, { waitUntil: 'load', timeout: 12000 }); }
       catch (error) { loadError = String(error instanceof Error ? error.message : error).slice(0, 180); }
       await pause(1000);
-      const shots: { label: string; data: string }[] = [];
+      const shots: { label: string; data: string;id:string;capturedAt:string;source:string;actionRefs:string[] }[] = [];
       const observations: any[] = [];
       const capture = async (stage: string, elapsedMs: number) => {
         const label = `${spec.ratio} ${stage}`;
         const data = await page.screenshot({ type: 'jpeg', quality: 80, encoding: 'base64' });
         const observation = await page.evaluate(() => (window as any).__reviewObservation());
-        shots.push({ label, data: `data:image/jpeg;base64,${data}` });
-        observations.push({ label, elapsedMs, ...observation });
+        const capturedAt=new Date().toISOString(),id=`baseline-${++shotNumber}`,actionRefs=stage==='首次触摸前'?[]:[`baseline-${spec.ratio}-tap`];
+        shots.push({id,capturedAt,source:'isolated-chromium',actionRefs,label,data:`data:image/jpeg;base64,${data}`});
+        observations.push({id,label,capturedAt,actionRefs,elapsedMs,...observation});
       };
       if (spec.ratio === '9:19.5') await capture('首次触摸前', 0);
       const point = { x: spec.width / 2, y: Math.round(spec.height * 0.6) };
@@ -104,7 +106,7 @@ export async function captureReview(browser: Browser, html: string) {
       else { await pause(10000); await capture('首次触摸后约 10 秒', Date.now() - tappedAt); }
       const final = await page.evaluate(() => (window as any).__reviewObservation());
       frames.push({ spec, shots, observations, final, loadError, resources: Object.fromEntries(Object.entries(resources).map(([key, values]) => [key, [...new Set(values)].slice(0, 12)])),
-        action: { ratio: spec.ratio, type: 'tap', ...point, target, count: 1, note: '浏览器触摸事件；仅记录执行动作，未确认游戏已开局。此后未再操作。' } });
+        action: { id:`baseline-${spec.ratio}-tap`,startedAt:new Date(tappedAt).toISOString(),ratio: spec.ratio, type: 'tap', ...point, target, count: 1, note: '浏览器触摸事件；仅记录执行动作，未确认游戏已开局。此后未再操作。' } });
       await page.close();
     }
     return {

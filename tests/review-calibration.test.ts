@@ -1,5 +1,5 @@
 import {describe,expect,it} from 'vitest';
-import {reviewSystem} from '../server/forge/prompts.js';
+import {reviewSystemLegacy as reviewSystem} from '../server/forge/prompts.js';
 import {exampleSets} from '../server/forge/logic.js';
 import {consistentVerdict} from '../server/forge-api';
 

@@ -220,6 +220,35 @@ describe('Star 工作区迁移与所有权',()=>{
     const foreign=await prepareReview(s.env,{...input,topic_id:other},'a');expect(JSON.stringify(foreign)).not.toContain('B_PRIVATE_DESIGN');
   });
 
+  it('v2 只用发布快照校准，不读取游戏库，全部保留16图且拒绝多图或无效图',async()=>{
+    const s=await setup();s.env.modelExecutor='agent';
+    s.game('a','OWN_HISTORY_MUST_NOT_APPEAR');s.game('admin','PUBLIC_HISTORY_MUST_NOT_APPEAR',1);
+    const permitted={id:'case-a',title:'Allowed case',evidence:'Synthetic screenshot',score:{aes:0,ease:2,play:3},rationale:'Synthetic explanation'};
+    const rules={schemaVersion:2 as const,id:'pinned-v2',contentHash:'a'.repeat(64),sourceUrl:'https://creator-hub-7mi.pages.dev/#/',capturedAt:'2026-11-02T10:00:00Z',publishedAt:'2026-11-02T10:01:00Z',rawDirection:'Current MUST and preference text',rawScoring:'Current 0–3 scoring',scoreMin:0 as const,scoreMax:3 as const,passScore:7 as const,notes:'',calibrationCases:[permitted,{...permitted,id:'same-game',title:'Current game',evidence:'SAME_GAME_PAST_ANSWER'}]};
+    const original=s.DB.prepare.bind(s.DB);s.DB.prepare=(sql:string)=>{if(/FROM games/i.test(sql))throw new Error('v2 must not query game history');return original(sql);};
+    const shots=Array.from({length:16},(_,i)=>({label:`synthetic-${i}`,data:'data:image/png;base64,YQ=='}));
+    const input={title:'Current game',html:'<!doctype html><canvas></canvas>',shots,probe:{captureMethod:'browser-viewport-v1'},reportSchemaVersion:2 as const,rulesSnapshot:rules};
+    const prepared=await prepareReview(s.env,input,'a');expect(prepared.reportSchemaVersion).toBe(2);expect(prepared.images).toHaveLength(16);
+    expect(prepared.user.filter((p:any)=>p.type==='image')).toHaveLength(16);expect(prepared.system).toContain(permitted.title);expect(prepared.system).toContain(rules.rawScoring);
+    for(const privateText of ['OWN_HISTORY_MUST_NOT_APPEAR','PUBLIC_HISTORY_MUST_NOT_APPEAR','SAME_GAME_PAST_ANSWER'])expect(prepared.system).not.toContain(privateText);
+    expect(s.env.modelStore.get).not.toHaveBeenCalled();
+    await expect(prepareReview(s.env,{...input,shots:[...shots,shots[0]]},'a')).rejects.toThrow('最多 16 张');
+    await expect(prepareReview(s.env,{...input,shots:[{label:'invalid',data:'broken'}]},'a')).rejects.toThrow('不能截断或丢图');
+    await expect(prepareReview(s.env,{...input,rulesSnapshot:null},'a')).rejects.toThrow('规则快照');
+  });
+
+  it('本人v2报告与历史列表保留null和锁定规则来源，不把未知显示为不可用',async()=>{
+    const s=await setup(),id=s.review('a','Synthetic pending report');
+    const result={schema_version:2,assessment_status:'needs_review',aes:null,ease:3,play:3,verdict:'待复核：合成证据不足'};
+    const rules={id:'pinned-rules',passScore:7,sourceUrl:'https://creator-hub-7mi.pages.dev/#/'};
+    s.sqlite.prepare('UPDATE reviews SET score=NULL,result=?,rules_snapshot=? WHERE id=?').run(JSON.stringify(result),JSON.stringify(rules),id);
+    const detail=await(await s.request('a','GET',`reviews/${id}`)).json() as any;
+    expect(detail).toMatchObject({score:null,result,rules_snapshot:rules});expect(detail.rules_snapshot).not.toBeTypeOf('string');
+    const list=await(await s.request('a','GET','reviews')).json() as any[];
+    expect(list.find(r=>r.id===id)).toMatchObject({score:null,report_schema_version:2,assessment_status:'needs_review',verdict:result.verdict});
+    expect((await s.request('b','GET',`reviews/${id}`)).status).toBe(404);
+  });
+
   it('撤销 Star 不撤销原会话；停用或改密码使会话版本失效',async()=>{
     const s=await setup(),before=await s.members.byId('a');
     await updateMember('a',{star:false},s.members);

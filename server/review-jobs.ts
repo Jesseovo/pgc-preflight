@@ -4,6 +4,7 @@ import { reviewDay, reviewUsage } from './review-usage';
 import { recoverDeviceReviews, failDeviceReview } from './review-device-state';
 import {digest} from './review-device-state';
 import {withHumanReviews} from './human-review';
+import {getActiveReviewRules} from './review-rules';
 
 type ReviewJob = { type: 'review'; id: string };
 export interface ReviewJobEnv {
@@ -17,7 +18,7 @@ export interface ReviewJobEnv {
 }
 const stamp = () => new Date().toISOString();
 const fail = (message: string, status = 400) => Object.assign(new Error(message), { status });
-const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, human_review=null }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
+const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, review_mode,report_schema_version,rules_snapshot, human_review=null }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,...(report_schema_version===2?{review_mode,report_schema_version,rules_snapshot:JSON.parse(rules_snapshot)}:{}),human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
   const local = env.modelExecutor !== 'platform';
@@ -50,20 +51,26 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   const title = String(payload.title || '未命名').slice(0, 120);
   const filename = String(payload.filename || '').slice(0, 200);
   const inputHash=await digest(payload.html);
+  const rules=await getActiveReviewRules(env.DB);
+  const rulesSnapshot=rules?JSON.stringify(rules):null;
+  const reportSchemaVersion=rules?2:1;
+  const reviewMode=payload.review_mode==='enhanced'?'enhanced':'basic';
+  if(payload.review_mode!==undefined&&!['basic','enhanced'].includes(payload.review_mode))throw fail('审核模式无效。');
+  if(reviewMode==='enhanced'&&(!local||!rules))throw fail('增强试玩仅用于成员 Agent，且需要管理员先发布现行规则版本。');
   const now = stamp();
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
-  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,topic_id,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash)
-    SELECT ?,?,?,?,?,'capture',?,?,?,'device',0,'agent',0,? WHERE
+  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,topic_id,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash,rules_snapshot,report_schema_version,review_mode)
+    SELECT ?,?,?,?,?,'capture',?,?,?,'device',0,'agent',0,?,?,?,? WHERE
     (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))`)
-    .bind(id,ownerId,title,filename,payload.topic_id||null,day,now,now,inputHash,ownerId,ownerId).run()
-    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, topic_id, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash)
-    SELECT ?, ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',? WHERE
+    .bind(id,ownerId,title,filename,payload.topic_id||null,day,now,now,inputHash,rulesSnapshot,reportSchemaVersion,reviewMode,ownerId,ownerId).run()
+    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, topic_id, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash,rules_snapshot,report_schema_version,review_mode)
+    SELECT ?, ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',?,?,?,? WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
-    .bind(id, ownerId, title, filename, payload.topic_id||null, day, now, now,env.reviewExecutor||'cloud',inputHash, ownerId, ownerId, ownerId, ownerId, day).run();
+    .bind(id, ownerId, title, filename, payload.topic_id||null, day, now, now,env.reviewExecutor||'cloud',inputHash,rulesSnapshot,reportSchemaVersion,reviewMode, ownerId, ownerId, ownerId, ownerId, day).run();
   if (!inserted.meta.changes) {
     const duplicate = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
     if (duplicate) return publicJob((await withHumanReviews(env.DB,[duplicate],true))[0]);
@@ -101,7 +108,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
       throw fail(`后台调度未确认，任务 ${id} 已保留，请使用原编号重试。`,503);
     }
   }
-  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform' };
+  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform',...(reportSchemaVersion===2?{review_mode:reviewMode,report_schema_version:2,rules_snapshot:rules}:{}) };
 }
 
 export async function scheduleCloudReview(env: Pick<ReviewJobEnv,'REVIEW_RUNNER'|'REVIEW_QUEUE'>, id:string) {

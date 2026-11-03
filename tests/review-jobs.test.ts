@@ -18,9 +18,10 @@ function setup() {
   sqlite.exec(readFileSync('migrations/0019_review_visibility.sql','utf8'));
   sqlite.exec(readFileSync('migrations/0020_human_review.sql','utf8'));
   sqlite.exec('ALTER TABLE review_jobs ADD COLUMN topic_id INTEGER;');
+  sqlite.exec(readFileSync('migrations/0025_review_rules.sql','utf8'));
   const DB = {
     prepare(sql: string) {
-      return { bind(...params: any[]) {
+      const prepared={ bind(...params: any[]) {
         const statement = sqlite.prepare(sql);
         return {
           first: async () => statement.get(...params) || null,
@@ -28,7 +29,8 @@ function setup() {
           run: async () => { const result = statement.run(...params); return { meta: { changes: Number(result.changes), last_row_id: Number(result.lastInsertRowid) } }; },
           execute: () => statement.run(...params),
         };
-      } };
+      },first:async()=>sqlite.prepare(sql).get()||null };
+      return prepared;
     },
     async batch(statements: any[]) { sqlite.exec('BEGIN'); try { const results = statements.map(statement => statement.execute()); sqlite.exec('COMMIT'); return results; } catch (error) { sqlite.exec('ROLLBACK'); throw error; } },
   };

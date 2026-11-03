@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict';
+import {mkdir,writeFile} from 'node:fs/promises';
+import {resolve} from 'node:path';
+import {AdaptivePlay} from './review-adaptive';
+import {launchLocalBrowser} from '../server/local-browser';
+import {captureReview} from '../server/review-probe';
+
+// Synthetic fixture only: verifies trusted input, viewport capture, durability
+// across command rounds and isolation. It is not a real-model scoring test.
+const html=`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;background:#daf0d8;touch-action:none}button{width:360px;height:250px}canvas{display:block}</style><button id="start">START</button><canvas width="360" height="400"></canvas><script>window.touchLog=[];window.pressed=false;for(const type of ['touchstart','touchmove','touchend'])document.addEventListener(type,e=>{window.pressed=type!=='touchend';window.touchLog.push({type,trusted:e.isTrusted,touches:e.touches.length,x:e.changedTouches[0]?.clientX,y:e.changedTouches[0]?.clientY,at:performance.now()});document.body.style.background=window.pressed?'#00aa00':'#daf0d8';});let ticks=0;setInterval(()=>document.title=String(++ticks),50);let n=0;document.addEventListener('touchstart',e=>{if(e.isTrusted){n++;document.querySelector('button').textContent='TRUSTED '+n;document.querySelector('canvas').getContext('2d').fillRect(n*20,20,10,10)}});fetch('https://example.invalid/private').catch(()=>{});</script>`;
+const browser=await launchLocalBrowser();
+try{
+  const play=new AdaptivePlay(browser,html);
+  const initial=await play.start();assert.equal(initial.width,360);assert.equal(initial.height,780);
+  assert(play.playMs>=1000,'initial load and screenshot interval count toward active runtime');assert.equal(play.loadAttempts.length,1);
+  await play.act({hypothesis:'tap starts game',actions:[{type:'tap',x:100,y:100}]});
+  assert.equal(play.actions[0].error,'');
+  play.recordFirstLook({imageSha256:initial.imageSha256,observations:'START above a canvas on green background; attempted one visible button touch.',uncertainties:['Source remains undisclosed.']});
+  assert.equal(play.summary().firstLook.preDisclosureActionCount,1);
+  const doc=await play.cdp!.send('DOM.getDocument');
+  const frozenBefore=await play.cdp!.send('DOM.getOuterHTML',{nodeId:doc.root.nodeId});
+  const activeBeforeWait=play.playMs;
+  await new Promise(r=>setTimeout(r,500));
+  const frozenAfter=await play.cdp!.send('DOM.getOuterHTML',{nodeId:doc.root.nodeId});
+  assert.equal(frozenBefore.outerHTML,frozenAfter.outerHTML,'model waiting must not keep running timer game code');
+  assert.equal(play.playMs,activeBeforeWait,'paused model wait is separate from active renderer budget');
+  await play.act({hypothesis:'another touch remains in same session',actions:[{type:'hold',x:100,y:100,durationMs:20}]});
+  assert.equal(play.actions[1].error,'');
+  await play.cdp!.send('Debugger.disable');
+  assert.equal(await play.page!.evaluate(()=>document.querySelector('button')!.textContent),'TRUSTED 2');
+  assert(play.resources.some(x=>x.includes('example.invalid')));
+  const logBefore=await play.page!.evaluate(()=>(window as any).touchLog.length);
+  let heldCaptures=0;const screenshot=play.page!.screenshot.bind(play.page!);
+  play.page!.screenshot=(async(options:any)=>{if(play.actions.length===3&&play.shots.length<5){assert.equal(await play.page!.evaluate(()=>(window as any).pressed),true,'intermediate viewport must capture while touch is pressed');heldCaptures++;}return screenshot(options);}) as any;
+  await play.act({hypothesis:'one curved touch remains held through intermediate viewport captures',actions:[{type:'drag',path:[{x:50,y:100,atMs:0},{x:100,y:150,atMs:200,capture:true},{x:200,y:200,atMs:400},{x:150,y:250,atMs:600,capture:true},{x:50,y:300,atMs:800}]}]});
+  await play.cdp!.send('Debugger.disable');
+  const log=await play.page!.evaluate((offset)=>(window as any).touchLog.slice(offset),logBefore);
+  assert.equal(log.filter((e:any)=>e.type==='touchstart').length,1);assert.equal(log.filter((e:any)=>e.type==='touchend').length,1);assert(log.filter((e:any)=>e.type==='touchmove').length>=3);assert(log.every((e:any)=>e.trusted));assert.equal(heldCaptures,2);
+  assert(log.some((e:any)=>e.type==='touchmove'&&e.x>50&&e.x<100&&e.y>100&&e.y<150),'curved path must emit interpolated positions between its original control points');
+  assert.equal(play.actions[2].error,'');assert.equal(play.actions[2].afterImageId,'supplemental-6');assert.deepEqual(play.shots[3].actionRefs,[3]);assert.equal(play.shots[3].requestedOffsetMs,200);assert.equal(play.shots[4].requestedOffsetMs,600);
+  const longLogBefore=await play.page!.evaluate(()=>(window as any).touchLog.length);
+  const longGesture=play.act({hypothesis:'two-point ten-second drag moves during the interval, rather than holding then jumping',actions:[{type:'drag',path:[{x:20,y:100,atMs:0},{x:320,y:700,atMs:10000}]}]});
+  await new Promise(r=>setTimeout(r,500));
+  const earlyLog=await play.page!.evaluate((offset)=>(window as any).touchLog.slice(offset),longLogBefore);
+  assert(earlyLog.some((e:any)=>e.type==='touchmove'&&e.x>20&&e.x<320&&e.y>100&&e.y<700),'at 500ms the long two-point path must already have moved between endpoints');
+  assert(!earlyLog.some((e:any)=>e.type==='touchend'),'long trajectory must still be pressed at 500ms');
+  await longGesture;await play.cdp!.send('Debugger.disable');
+  const longLog=await play.page!.evaluate((offset)=>(window as any).touchLog.slice(offset),longLogBefore);
+  assert.equal(longLog.filter((e:any)=>e.type==='touchstart').length,1);assert.equal(longLog.filter((e:any)=>e.type==='touchend').length,1);assert(longLog.every((e:any)=>e.trusted));
+  const lastMove=longLog.filter((e:any)=>e.type==='touchmove').at(-1);assert.equal(lastMove.x,320);assert.equal(lastMove.y,700);assert.equal(play.actions[3].error,'');
+  assert.equal(play.actions.length,4);assert.equal(play.rounds,4);assert.equal(play.shots.length,7);
+  assert(play.actions.reduce((sum,x)=>sum+x.elapsedMs,0)<play.playMs);
+  const context=play.context!;await play.close();assert(!browser.browserContexts().includes(context));
+  const baseline=await captureReview(browser,html);assert.equal(baseline.shots.length,4);assert.equal(baseline.probe.captureMethod,'browser-viewport-v1');
+  const artifacts=resolve('artifacts/adaptive-runtime-linear');await mkdir(artifacts,{recursive:true});
+  for(const [index,shot] of [...baseline.shots,...play.shots].entries())await writeFile(resolve(artifacts,`viewport-${index+1}.jpg`),Buffer.from(shot.data.split(',')[1],'base64'),{mode:0o600});
+  await writeFile(resolve(artifacts,'summary.json'),JSON.stringify(play.summary(),null,2),{mode:0o600});
+  await writeFile(resolve(artifacts,'touch-events.json'),JSON.stringify({curved:log,twoPointAt500ms:earlyLog,twoPoint:longLog},null,2),{mode:0o600});
+  console.log(JSON.stringify({ok:true,synthetic:true,baselineShots:4,supplementalShots:7,continuousTouch:true,linearInterpolation:true,twoPointMovedAt500ms:true,heldCaptures:2,trustedTouch:true,isolatedContextClosed:true}));
+}finally{await browser.close();}

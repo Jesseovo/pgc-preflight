@@ -9,6 +9,8 @@ import { activeModelProfile } from './settings';
 import { identity } from './members';
 import { enqueueReview, getReviewJob, listReviewJobs, processReviewJob, updateReviewProgress } from './review-jobs';
 import { generateReview } from './review-generation';
+import { reportScore } from './review-report';
+import { parseReviewRulesSnapshot, type ReviewRulesSnapshot } from './review-rules';
 import { reviewUsage } from './review-usage';
 import { deviceStatus } from './review-device-api';
 import type { MemberStore } from './members';
@@ -16,7 +18,7 @@ import type { AppSecrets, ConfigStore } from './settings';
 import {
   expandSystem, expandUser, EXPAND_SCHEMA, PREVIEW_SYSTEM, previewUser,
   briefSystem, briefUser, ASSETS_SYSTEM, assetsUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
-  reviewSystem, GAME_SYSTEM, gameUser,
+  reviewSystem, reviewSystemLegacy, GAME_SYSTEM, gameUser,
 } from "./forge/prompts.js";
 import {createAgentTask,publicCreatorTask,validateAgentTask} from './forge-agent-api';
 import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnapshot,prepareArtifact} from './forge-workspace';
@@ -766,11 +768,18 @@ async function readReviewBody(request) {
   return input;
 }
 
-export async function prepareReview(env, { title, topic_id, html, probe, shots },ownerId=env.ownerId||'admin') {
+export async function prepareReview(env, { title, topic_id, html, probe, shots, rulesSnapshot = null, reportSchemaVersion = 1 }: {title?: string;topic_id?:number;html:string;probe?:any;shots?:any[];rulesSnapshot?:ReviewRulesSnapshot|null;reportSchemaVersion?:1|2},ownerId=env.ownerId||'admin') {
   env={...env,ownerId};
   if (!html || typeof html !== "string") throw new HttpError(400, "缺少游戏源码");
-  const images = (Array.isArray(shots) ? shots : []).filter((s) => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data)).slice(0, 6);
-  const [cfg, games] = await Promise.all([getSettings(env), visibleGames(env)]);
+  if (![1,2].includes(reportSchemaVersion)) throw new HttpError(400, '审核报告版本无效。');
+  const v2 = reportSchemaVersion === 2;
+  const validImage = s => s && /^data:image\/(jpeg|png|webp);base64,/.test(s.data);
+  if (v2 && (!Array.isArray(shots) || shots.length > 16 || shots.some(s => !validImage(s)))) throw new HttpError(400, '新版审核必须保留全部有效截图，最多 16 张，不能截断或丢图。');
+  if (v2 && !rulesSnapshot) throw new HttpError(409, '当前任务缺少锁定的审核规则快照。');
+  const rules = v2 ? parseReviewRulesSnapshot(rulesSnapshot) : null;
+  const images = v2 ? shots.slice() : (Array.isArray(shots) ? shots : []).filter(validImage).slice(0, 6);
+  // New reviews never query the games table for automatic historical anchors.
+  const [cfg, games] = v2 ? [null, []] : await Promise.all([getSettings(env), visibleGames(env)]);
   // The calibration set is for the scoring scale, not for recalling this
   // game's own past result: a known score would anchor (or leak) the verdict.
   const { positives, borderline, negatives } = exampleSets(games.filter((g) => !sameGame(g.title, title)));
@@ -788,16 +797,19 @@ export async function prepareReview(env, { title, topic_id, html, probe, shots }
   // Keep the source bounded; thinking and report tokens share an output budget.
   const reviewConfig = env.modelExecutor==='agent'?null:await env.modelStore.get();
   const smallModel = ['review', 'review_verify'].some(purpose => /deepseek/i.test(routedModel(reviewConfig, purpose)));
-  const captureNote = probe?.captureMethod === 'browser-viewport-v1'
+  const captureNote = ['browser-viewport-v1','browser-viewport-v2'].includes(probe?.captureMethod)
     ? '图片是浏览器完整视口截图；操作范围以采集记录为准。'
     : '警告：这是旧版采集。截图可能只包含最大 Canvas，漏掉 DOM/CSS 和其他图层，不能用白屏、画布覆盖率或色块占比判定作品画面缺陷。音频和机器人数字不是实际听感或完整试玩证据。';
-  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${reviewSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
-  return {system:reviewSystem({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives }),user:parts,maxTokens:16000,images};
+  parts.push({ type: "text", text: `游戏名：${title || "未命名"}\n${design}\n【采集方法与限制】\n${captureNote}${probe?.captureMethod==='browser-viewport-v2'?'\n增强试玩图与四张基础图来自独立隔离上下文，不能当成连续时间线。模型等待期间渲染器冻结；恢复后的时钟跳变可能影响状态，不能单凭此判断难度、死亡或输入缺陷。首次上手仅使用画面与提示，源码披露时点见 sourceDisclosure；sourceBlind 为成员设备声明，不是服务端独立证明。':''}\n【运行采集记录】\n${JSON.stringify(probe || {}, null, 1)}\n\n【源码】\n${reviewSource(html, smallModel ? 120000 : MAX_SOURCE)}` });
+  const system = v2
+    ? reviewSystem({rules:{...rules,calibrationCases:rules.calibrationCases.filter(c => !sameGame(c.title,title))}})
+    : reviewSystemLegacy({ redlines: cfg.redlines, positives, borderline, negatives: supportedNegatives });
+  return {system,user:parts,maxTokens:16000,images,...(v2?{reportSchemaVersion:2 as const}:{})};
 }
 
 async function review(env, payload, ownerId, jobId = null) {
   const {title,topic_id,probe,deadline}=payload;
-  const {images,...request}=await prepareReview(env,payload);
+  const {images,...request}=await prepareReview(env,payload,ownerId);
   // Count only jobs that actually reach the model stage. Captures and queue
   // failures are refunded without erasing the administrator's audit record.
   const result = await generateReview(env, {}, {
@@ -807,10 +819,10 @@ async function review(env, payload, ownerId, jobId = null) {
     idempotencyKey: `pgc-review-${jobId || crypto.randomUUID()}`,
     onWait: jobId ? message => updateReviewProgress(env, jobId, message) : undefined,
   });
-  const score = result.aes + result.ease + result.play;
-  result.verdict = consistentVerdict(result.verdict, score);
-  const r = await run(env, "INSERT OR IGNORE INTO reviews (owner_id, title, topic_id, score, result, probe, shots, created_at, job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    ownerId || 'admin', String(title || "未命名").slice(0, 120), topic_id || null, score, JSON.stringify(result), JSON.stringify(probe || {}), JSON.stringify(images), now(), jobId);
+  const score = reportScore(result);
+  if (result.schema_version !== 2) result.verdict = consistentVerdict(result.verdict, score);
+  const r = await run(env, "INSERT OR IGNORE INTO reviews (owner_id, title, topic_id, score, result, probe, shots, created_at, job_id, rules_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ownerId || 'admin', String(title || "未命名").slice(0, 120), topic_id || null, score, JSON.stringify(result), JSON.stringify(probe || {}), JSON.stringify(images), now(), jobId, payload.rulesSnapshot ? JSON.stringify(payload.rulesSnapshot) : null);
   const persisted = jobId ? await first(env, 'SELECT id FROM reviews WHERE job_id = ?', jobId) : null;
   return getReview(env, persisted?.id || r.meta.last_row_id, ownerId);
 }
@@ -836,8 +848,8 @@ export function sameGame(a, b) {
 async function listReviews(env, ownerId) {
   const isAdmin = ownerId === 'admin';
   const rows = isAdmin
-    ? await all(env, "SELECT id,owner_id,job_id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews ORDER BY id DESC LIMIT 100")
-    : await all(env, "SELECT id,owner_id,job_id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, created_at FROM reviews WHERE owner_id = ? AND owner_hidden=0 ORDER BY id DESC LIMIT 100", ownerId);
+    ? await all(env, "SELECT id,owner_id,job_id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, json_extract(result, '$.schema_version') AS report_schema_version, json_extract(result, '$.assessment_status') AS assessment_status, created_at FROM reviews ORDER BY id DESC LIMIT 100")
+    : await all(env, "SELECT id,owner_id,job_id, title, topic_id, score,model_executor,agent_id,model,evidence_hash, json_extract(result, '$.verdict') AS verdict, json_extract(result, '$.schema_version') AS report_schema_version, json_extract(result, '$.assessment_status') AS assessment_status, created_at FROM reviews WHERE owner_id = ? AND owner_hidden=0 ORDER BY id DESC LIMIT 100", ownerId);
   return withHumanReviews(env.DB,rows);
 }
 
@@ -846,7 +858,7 @@ async function getReview(env, id, ownerId = 'admin') {
     ? await first(env, "SELECT * FROM reviews WHERE id = ?", id)
     : await first(env, "SELECT * FROM reviews WHERE id = ? AND owner_id = ? AND owner_hidden=0", id, ownerId);
   if (!r) throw new HttpError(404, "审核记录不存在");
-  return { ...r, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots),human_review:await currentHumanReview(env.DB,r.job_id,r.owner_id) };
+  return { ...r, rules_snapshot:r.rules_snapshot?JSON.parse(r.rules_snapshot):null, result: JSON.parse(r.result), probe: JSON.parse(r.probe), shots: JSON.parse(r.shots),human_review:await currentHumanReview(env.DB,r.job_id,r.owner_id) };
 }
 
 function brief(env, id, ctx, regenerate = false) {

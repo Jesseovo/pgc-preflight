@@ -1,14 +1,15 @@
+import {reviewRulesAdmin,resolvePublishedReviewRulesSnapshot} from './review-rules';
 import {identity,publicMember} from './members';
 import {memberStore} from './storage';
 import {digest,canonicalJson,problem,stamp} from './review-device-state';
 import {publicSettings} from './forge-workspace';
 import {publicCreatorTask} from './forge-agent-api';
-import {reviewReportErrors} from './review-report';
+import {reviewReportErrors,reportScore} from './review-report';
 import {enqueueReview,recoverInterruptedReviews} from './review-jobs';
 import {withHumanReviews} from './human-review';
 import {reviewDay} from './review-usage';
 
-const paths=new Set(['/api/admin/workspace','/api/admin/public-data','/api/admin/review-upload','/api/admin/review-import']);
+const paths=new Set(['/api/admin/review-rules','/api/admin/workspace','/api/admin/public-data','/api/admin/review-upload','/api/admin/review-import']);
 const json=(v:any,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
 const all=async(DB:any,sql:string,...p:any[])=>(await DB.prepare(sql).bind(...p).all()).results||[];
 async function body(request:Request){
@@ -24,6 +25,7 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
     const store=memberStore(env.DB),user=await identity(request.headers.get('Cookie'),store,env),DB=env.DB;
     if(user?.role!=='admin')throw problem('仅超级管理员可操作。',403);
     if(request.method!=='GET'&&request.headers.get('Origin')!==url.origin)throw problem('请求来源不匹配。',403);
+    if(url.pathname.endsWith('/review-rules'))return json(await reviewRulesAdmin(request,DB));
     if(url.pathname.endsWith('/workspace')&&request.method==='GET'){
       const owner=url.searchParams.get('owner')||'';
       await recoverInterruptedReviews(env,owner||undefined);
@@ -76,15 +78,21 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
     if(url.pathname.endsWith('/review-upload'))return json(await enqueueReview({...env,reviewExecutor:undefined,modelExecutor:'platform'},b,'admin'),202);
     // Manual imports carry their source; they cannot masquerade as Agent or platform execution.
     if(!/^[a-f0-9-]{36}$/.test(b.request_id||''))throw problem('导入需要 request_id UUID。');
-    const errors=reviewReportErrors(b.result);if(errors.length)throw problem(`报告格式不完整：${errors.join(', ')}`);
+    const schemaVersion:1|2=b.result?.schema_version===2?2:1;
+    if(b.report_schema_version!==undefined&&b.report_schema_version!==schemaVersion)throw problem('报告 schema 版本声明不匹配。');
+    if(b.model_executor!==undefined&&b.model_executor!=='manual-admin')throw problem('手动导入只能声明 manual-admin 来源。');
+    const rules=schemaVersion===2?await resolvePublishedReviewRulesSnapshot(DB,b.rules_snapshot):null;
+    if(schemaVersion===1&&b.rules_snapshot!=null)throw problem('旧版报告不能附加新版规则归属。');
+    const rulesText=rules?canonicalJson(rules):null;
+    const errors=reviewReportErrors(b.result,{schemaVersion});if(errors.length)throw problem(`报告格式不完整：${errors.join(', ')}`);
     const owner=b.owner_id||'admin';if(owner!=='admin'&&!await store.byId(owner))throw problem('成员不存在。',404);
-    const hash=await digest(canonicalJson({owner,title:b.title||'管理员导入',filename:b.filename||'',result:b.result,probe:b.probe||{},shots:b.shots||[]}));
+    const hash=await digest(canonicalJson({owner,title:b.title||'管理员导入',filename:b.filename||'',result:b.result,probe:b.probe||{},shots:b.shots||[],...(rules?{rules_snapshot:rules}:{})}));
     const prior=await DB.prepare('SELECT * FROM review_jobs WHERE id=?').bind(b.request_id).first();
     if(prior){if(prior.model_executor!=='manual-admin'||prior.local_result_hash!==hash)throw problem('请求编号已用于其他内容。',409);return json({id:prior.result_id,job_id:prior.id});}
     const at=stamp();
     await DB.batch([
-      DB.prepare("INSERT OR IGNORE INTO review_jobs(id,owner_id,title,filename,status,stage,usage_day,created_at,updated_at,quota_charged,input_ready,model_executor,local_result_hash) VALUES(?,?,?,?,'done','done',?,?,?,0,0,'manual-admin',?)").bind(b.request_id,owner,String(b.title||'管理员导入').slice(0,120),String(b.filename||'').slice(0,200),reviewDay(),at,at,hash),
-      DB.prepare("INSERT OR IGNORE INTO reviews(owner_id,title,score,result,probe,shots,created_at,job_id,model_executor) SELECT owner_id,title,?,?,?,?,?,id,'manual-admin' FROM review_jobs WHERE id=? AND local_result_hash=? AND model_executor='manual-admin'").bind(b.result.aes+b.result.ease+b.result.play,canonicalJson(b.result),JSON.stringify({...b.probe,evidenceOrigin:'admin-upload',modelExecutor:'manual-admin'}),JSON.stringify(b.shots||[]),at,b.request_id,hash),
+      DB.prepare("INSERT OR IGNORE INTO review_jobs(id,owner_id,title,filename,status,stage,usage_day,created_at,updated_at,quota_charged,input_ready,model_executor,local_result_hash,rules_snapshot,report_schema_version,review_mode) VALUES(?,?,?,?,'done','done',?,?,?,0,0,'manual-admin',?,?,?,?)").bind(b.request_id,owner,String(b.title||'管理员导入').slice(0,120),String(b.filename||'').slice(0,200),reviewDay(),at,at,hash,rulesText,schemaVersion,schemaVersion===2?'full':'basic'),
+      DB.prepare("INSERT OR IGNORE INTO reviews(owner_id,title,score,result,probe,shots,created_at,job_id,model_executor,rules_snapshot) SELECT owner_id,title,?,?,?,?,?,id,'manual-admin',rules_snapshot FROM review_jobs WHERE id=? AND local_result_hash=? AND model_executor='manual-admin'").bind(reportScore(b.result),canonicalJson(b.result),JSON.stringify({...b.probe,evidenceOrigin:'admin-upload',modelExecutor:'manual-admin'}),JSON.stringify(b.shots||[]),at,b.request_id,hash),
       DB.prepare('UPDATE review_jobs SET result_id=(SELECT id FROM reviews WHERE job_id=?) WHERE id=? AND local_result_hash=?').bind(b.request_id,b.request_id,hash),
     ]);
     const done=await DB.prepare('SELECT * FROM review_jobs WHERE id=?').bind(b.request_id).first();if(done.local_result_hash!==hash)throw problem('请求编号冲突。',409);
