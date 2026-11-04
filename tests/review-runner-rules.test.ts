@@ -5,7 +5,7 @@ import {advanceCloudReview} from '../server/cloud-review-runner';
 import {executeDeviceReview} from '../server/review-runner';
 import {prepareReview,consistentVerdict} from '../server/forge-api';
 import {generateReview,generateReviewStage} from '../server/review-generation';
-vi.mock('../server/forge-api',()=>({prepareReview:vi.fn(async(_env,input)=>({system:'PINNED RULES '+input.rulesSnapshot?.id,user:[],images:[],reportSchemaVersion:input.reportSchemaVersion})),consistentVerdict:vi.fn(()=> 'LEGACY_NORMALIZED')}));
+vi.mock('../server/forge-api',()=>({prepareReview:vi.fn(async(_env,input)=>({system:'PINNED RULES '+input.rulesSnapshot?.id,user:[...(input.shots||[]).map((image:any)=>({type:'image',data:image.data})),{type:'text',text:input.html}],images:input.shots||[],reportSchemaVersion:input.reportSchemaVersion})),consistentVerdict:vi.fn(()=> 'LEGACY_NORMALIZED')}));
 vi.mock('../server/review-generation',()=>({generateReview:vi.fn(),generateReviewStage:vi.fn()}));
 const databases:DatabaseSync[]=[];
 afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.clearAllMocks();});
@@ -20,24 +20,37 @@ function setup(version=2){
   const profile={enabled:true,encryptedKey:'synthetic-encrypted-key',model:'synthetic-model',baseUrl:'https://fixture.invalid',protocol:'openai'};
   sqlite.prepare("INSERT INTO review_jobs(id,owner_id,title,status,executor,model_executor,created_at,updated_at,rules_snapshot,report_schema_version,model_snapshot) VALUES(?,'admin','SYNTHETIC','queued','cloud','platform','now','now',?,?,?)").run(id,text,version,JSON.stringify({id:'synthetic',profile}));
   sqlite.prepare("INSERT INTO review_inputs(job_id,part,data,created_at) VALUES(?,0,?,'now')").run(id,JSON.stringify({html:'<!doctype html><canvas></canvas>',title:'SYNTHETIC'}));
-  const env={DB,modelStore:{get:async()=>profile},captureReview:async()=>({probe:{captureMethod:'browser-viewport-v1'},shots:[]})};
+  const evidence={probe:{captureMethod:'browser-viewport-v1'},shots:Array.from({length:4},(_,i)=>({id:`baseline-${i+1}`,label:`SYNTHETIC ${i+1}`,data:`data:image/jpeg;base64,${Buffer.from(`SYNTHETIC ${i+1}`).toString('base64')}`}))};
+  const env={DB,modelStore:{get:async()=>profile},captureReview:async()=>evidence};
   const tick=()=>advanceCloudReview({storage},env,id);
   const saved=()=>sqlite.prepare('SELECT * FROM reviews WHERE job_id=?').get(id) as any;
   const result={schema_version:2,assessment_status:'needs_review',aes:3,ease:null,play:2,verdict:'待复核：操作证据不足',score_reasons:{aes:'截图',ease:'缺操作证据',play:'源码'},uncertainties:['操作效果未验证'],optional_suggestions:[],issues:[],strengths:[],reviewer_comment:'MODEL_RESULT',fix_prompt:''};
-  return {DB,sqlite,env,storage,values,rules,text,id,tick,saved,result};
+  return {DB,sqlite,env,storage,values,rules,text,id,tick,saved,result,evidence};
 }
 describe('runner rule/version provenance and unknown scoring',()=>{
   it('pins rule and report schema into cloud checkpoint and persists null score without rewriting v2 model verdict',async()=>{
     const s=setup();vi.mocked(generateReviewStage).mockResolvedValue(s.result);
     await s.tick();expect(prepareReview).toHaveBeenCalledWith(expect.anything(),expect.objectContaining({rulesSnapshot:s.rules,reportSchemaVersion:2}));
-    const checkpoint=JSON.parse(Array.from(s.values).filter(([k])=>k.startsWith('cloud:')).sort().map(([,v])=>v).join(''));
+    const readParts=(prefix:string)=>JSON.parse(Array.from({length:s.values.get(`${prefix}Parts`)},(_,i)=>s.values.get(`${prefix}:${i}`)).join(''));
+    const preparedState=readParts('cloudState');expect(preparedState).toMatchObject({version:2,materialRef:expect.any(String)});expect(preparedState.draft).toBeUndefined();expect(preparedState.result).toBeUndefined();
+    const materialPrefix=`cloudImmutable:${preparedState.materialRef}`,checkpoint=readParts(materialPrefix);
     expect(checkpoint.request).toMatchObject({reportSchemaVersion:2,system:'PINNED RULES '+s.rules.id});
-    // Changing platform settings after preparation cannot change the checkpointed request.
+    expect(checkpoint.images).toEqual(s.evidence.shots);expect(checkpoint.probe).toEqual(s.evidence.probe);
+    const restoredRequest={...checkpoint.request,user:checkpoint.request.user.map((part:any)=>{if(part.type!=='image')return part;const {imageIndex,...metadata}=part;expect(part.data).toBeUndefined();return {...metadata,data:checkpoint.images[imageIndex].data};})};
+    expect(restoredRequest.user.filter((part:any)=>part.type==='image').map((part:any)=>part.data)).toEqual(s.evidence.shots.map(shot=>shot.data));
+    // Changing platform settings/model after preparation cannot change either
+    // the immutable evidence or the task's locked rule/model identities.
     s.sqlite.prepare("INSERT INTO settings(id,value,updated_at) VALUES('redlines','NEW_GLOBAL_RULES','now')").run();
-    await s.tick();await s.tick();await s.tick();
+    const originalProfile=await s.env.modelStore.get();s.env.modelStore.get=async()=>({...originalProfile,model:'different-model'});
+    await s.tick();const draftState=readParts('cloudState');expect(draftState).toMatchObject({version:2,materialRef:preparedState.materialRef,draft:s.result});expect(readParts(materialPrefix)).toEqual(checkpoint);
+    await s.tick();expect(readParts('cloudState')).toMatchObject({version:2,materialRef:preparedState.materialRef,result:s.result});expect(readParts(materialPrefix)).toEqual(checkpoint);
+    await s.tick();
     expect(s.saved()).toMatchObject({score:null,rules_snapshot:s.text});
     expect(JSON.parse(s.saved().result).verdict).toBe(s.result.verdict);expect(consistentVerdict).not.toHaveBeenCalled();
-    for(const call of vi.mocked(generateReviewStage).mock.calls)expect(call[2]).toMatchObject(checkpoint.request);
+    expect(JSON.parse(s.saved().shots)).toEqual(s.evidence.shots);
+    const calls=vi.mocked(generateReviewStage).mock.calls;expect(calls.map(call=>call[3])).toEqual(['review','review_verify']);
+    for(const call of calls){expect(call[2]).toMatchObject(restoredRequest);expect(await call[0].modelStore.get()).toMatchObject({model:originalProfile.model});}
+    expect(calls[1][4]).toEqual(s.result);
   });
   it('device platform compatibility passes locked snapshot and also keeps genuine zero score distinct from unknown',async()=>{
     const s=setup();s.sqlite.prepare("UPDATE review_jobs SET status='running',executor='device',evidence_ready=1 WHERE id=?").run(s.id);

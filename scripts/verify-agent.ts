@@ -56,24 +56,39 @@ try{
   assert.equal(submitted.find(e=>e.event==='human-review').human_review.status,'pending');
   const result=await cli(['review',a,b,'--out',join(root,'reports')]);
   const ids=result.filter(e=>e.event==='submitted').map(e=>e.job.id);assert.equal(ids.length,2);
-  const materials=result.filter(e=>e.event==='material');assert.equal(materials.length,2);
-  for(const material of materials){
+  const materials=result.filter(e=>e.event==='material');assert.equal(materials.length,1);
+  const remaining=result.find(e=>e.event==='remaining');assert.deepEqual(remaining.remaining,[ids[1]]);assert.deepEqual(remaining.continueCommands,[['continue',ids[1]]]);
+  assert.equal(sqlite.prepare('SELECT status FROM review_jobs WHERE id=?').get(ids[1])!.status,'queued');
+  assert.equal(sqlite.prepare('SELECT evidence_ready FROM review_jobs WHERE id=?').get(ids[1])!.evidence_ready,0);
+  for(let index=0;index<ids.length;index++){
+    const material=index===0?materials[0]:(await cli(['continue',ids[index],'--out',join(root,'reports')])).find(e=>e.event==='material');
+    assert.equal(material.jobId,ids[index]);
     const data=JSON.parse(await readFile(material.materialPath,'utf8'));
     assert.match(JSON.stringify(data),/AGENT_FIXTURE/);assert.equal(material.screenshots.length,4);
     for(const shot of material.screenshots)assert.ok((await readFile(shot.path)).length>1000);
     const draftPath=join(root,`${material.jobId}-draft.json`),verifiedPath=join(root,`${material.jobId}-verified.json`);
-    const draft={model:'scripted-agent-fixture',evidenceHash:data.evidenceHash,report};
+    const draft={model:'scripted-agent-fixture',modelConfiguration:{effort:'scripted-none'},evidenceHash:data.evidenceHash,report};
     await writeFile(draftPath,JSON.stringify(draft));
     const drafted=(await cli(['draft',material.jobId,'--json',draftPath])).find(e=>e.event==='draft');
     const verification=(await cli(['material',material.jobId,'--out',join(root,'verification')])).find(e=>e.event==='material');
     const verifiedMaterial=JSON.parse(await readFile(verification.materialPath,'utf8'));
-    assert.equal(verifiedMaterial.draftHash,drafted.draftHash);assert.equal(verifiedMaterial.stage,'verify');
+    assert.equal(verifiedMaterial.draftHash,drafted.draftHash);assert.equal(verifiedMaterial.stage,'verify');assert.equal(verifiedMaterial.mode,'delta');assert.deepEqual(verifiedMaterial.modelConfiguration,draft.modelConfiguration);
+    assert.match(verifiedMaterial.draftBoundary,/不是标准答案/);assert.match(verifiedMaterial.instruction,/不可信/);assert.match(verifiedMaterial.instruction,/指令不生效/);
+    assert.ok(verifiedMaterial.materialReference);assert.equal(verifiedMaterial.user,undefined);
+    const original=JSON.parse(await readFile(verifiedMaterial.materialReference,'utf8'));
+    assert.equal(original.evidenceHash,data.evidenceHash);assert.equal(original.materialHash,data.materialHash);assert.equal(original.system,data.system);assert.deepEqual(original.schema,data.schema);
+    assert.deepEqual(original.user,data.user);assert.deepEqual(verification.screenshots,material.screenshots);
+    for(const shot of verification.screenshots)assert.equal(createHash('sha256').update(await readFile(shot.path)).digest('hex'),shot.sha256);
     await writeFile(verifiedPath,JSON.stringify({...draft,verification:{confirmed:true,model:draft.model,evidenceHash:data.evidenceHash,draftHash:drafted.draftHash}}));
     const done=await cli(['complete',material.jobId,'--json',verifiedPath,'--out',join(root,'reports')]);
-    assert.equal(done.find(e=>e.event==='report').report.model_executor,'agent');
+    const saved=done.find(e=>e.event==='report').report;assert.equal(saved.model_executor,'agent');assert.equal(saved.shots.length,4);
+    await assert.rejects(readFile(verifiedMaterial.materialReference,'utf8'),{code:'ENOENT'});
+    assert.ok(await readFile(material.materialPath,'utf8'));assert.ok(await readFile(index===0?a:b,'utf8'));
     await cli(['complete',material.jobId,'--json',verifiedPath]);
+    assert.equal((await cli(['report',material.jobId]))[0].report.id,saved.id);
   }
   assert.equal(calls,0);assert.equal((await reviewUsage(DB,'fixture')).used,0);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM review_execution_timing WHERE effort='scripted-none' AND config_origin='member-device'").get()!.n,2);
   const rerun=await cli(['review',a,'--out',join(root,'reports')]);assert.equal(rerun.find(e=>e.event==='submitted').job.id,ids[0]);assert.equal(calls,0);
   assert.equal((await cli(['report',ids[1]]))[0].report.probe.evidenceOrigin,'member-device');
   const aiResult=sqlite.prepare('SELECT result FROM reviews WHERE job_id=?').get(ids[0])!.result;
@@ -85,5 +100,5 @@ try{
   assert.equal(sqlite.prepare('SELECT COUNT(*) n FROM review_human_reviews').get()!.n,2);
   assert.equal(sqlite.prepare('SELECT result FROM reviews WHERE job_id=?').get(ids[0])!.result,aiResult);
   assert.equal(sqlite.prepare('SELECT COUNT(*) n FROM review_inputs').get()!.n,0);assert.equal(sqlite.prepare('SELECT COUNT(*) n FROM review_evidence').get()!.n,0);
-  console.log('PASS Agent bundle → stdin/DPAPI pair → 2 local games → 8 real viewport images → local draft/verification → queued and completed human-feedback sync/idempotency → immutable AI reports; zero platform calls/quota. Scripted judgments only.');
+  console.log('PASS Agent bundle → stdin/DPAPI pair → first-game immediate material + queued remainder → explicit continue after completion → 8 real viewport images → same-image delta verification + terminal cache cleanup + report reread → queued and completed human-feedback sync/idempotency → immutable AI reports; zero platform calls/quota. Scripted judgments only.');
 }finally{await new Promise<void>(r=>server.close(()=>r()));sqlite.close();const target=resolve(root),parent=resolve('artifacts');assert.ok(target.startsWith(parent+'\\')||target.startsWith(parent+'/'));assert.ok(target.split(/[\\/]/).at(-1)?.startsWith('agent-verify-'));await rm(target,{recursive:true,force:true});}

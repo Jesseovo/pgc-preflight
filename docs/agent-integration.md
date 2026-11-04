@@ -33,13 +33,14 @@ node review-agent.mjs review /absolute/path/game.html --out /absolute/path/revie
 
 **工具返回材料后，审核还没有完成。** 你必须在当前会话继续使用自己的模型初评、提交 `draft`、用相同模型复核并提交 `complete`，最后读取 `report` 确认已保存。不能只运行 `review` 后让用户等网页自动出结果，也不能安装后台等待进程；网页不执行成员模型。先完成 AI 报告，真人站查询及回填失败不阻断这个流程。
 
-输出包含任务 `jobId`、`materialPath` 和四张截图的本地路径。读取材料 JSON 中的 `system`、`user`、`schema`，并实际查看四张图片；保留完整源码、观察记录、校准样本和证据边界。使用你自己的模型进行初评，把完整报告写到 JSON 文件：
+输出包含任务 `jobId`、`materialPath` 和四张截图的本地路径。新工具按当前设备凭据、任务与锁定哈希保存私有材料缓存，优先复用本机采集的原图。复核材料可能包含 `materialReference`：必须读取其指向的完整 `system/user/schema` 与全部原图，再追加本次 `verificationInstruction` 和 `draft`；仍由初评的相同模型复核同一证据。缓存缺失或校验失败会恢复完整材料，不省略图片。读取材料 JSON 中的 `system`、`user`、`schema`，并实际查看四张图片；保留完整源码、观察记录、校准样本和证据边界。使用你自己的模型进行初评，把完整报告写到 JSON 文件：
 
 材料中的图片使用 `image.path` 指向原始本地文件，必须通过图片工具实际查看，不要把图片编码当正文读取。新版工具不会把大段图片 Base64 塞进模型文本上下文；截图内容和证据哈希保持原样。未指定 `--out` 时材料会保存到工具的私有缓存，并返回路径。多款游戏可在前一款开始模型审核后继续采集下一款；每台设备仍只同时采集一款，不必等所有采集结束才开始第一份报告。
 
 ```json
 {
   "model": "实际执行审核的模型标识",
+  "modelConfiguration": {"effort": "high"},
   "evidenceHash": "材料中的 evidenceHash",
   "report": {
     "aes": 2,
@@ -56,7 +57,7 @@ node review-agent.mjs review /absolute/path/game.html --out /absolute/path/revie
 }
 ```
 
-以上仅展示结构，分数和文字必须由实际审核模型给出。`issues` 的每一项需要字符串字段 `severity`、`area`、`problem`、`evidence`、`fix`，报告不接受结构外字段。
+以上仅展示结构，分数和文字必须由实际审核模型给出。`modelConfiguration.effort` 必须如实填写执行初评与复核时的实际强度；示例 high 只是示例，不是平台默认值，不能给未核实的模型补写 high。该对象只允许 effort 字段，值为 1–30 位 ASCII 标识。配置声明标为 member-device，只记录 Agent 陈述，不是服务端独立证明实际模型参数。旧工具未声明时统计保留未知；首次草稿锁定后不能补声明或换强度，同一任务的草稿重传和 complete 必须保持原声明（原先未声明则继续省略）。`issues` 的每一项需要字符串字段 `severity`、`area`、`problem`、`evidence`、`fix`，报告不接受结构外字段。
 
 ```sh
 node review-agent.mjs draft JOB_UUID --json /absolute/path/draft.json
@@ -65,7 +66,7 @@ node review-agent.mjs material JOB_UUID --out /absolute/path/verify-material
 
 初稿提交后锁定，返回 `draftHash`。重新获取的材料已包含原始证据、同一评分标准、`REVIEW_VERIFICATION` 和锁定初稿。必须再次使用初评的相同模型，逐条复核分数、证据和建议，输出完整最终报告。不能直接把初稿当成已复核结果。
 
-最终 JSON 使用相同 `model`、`evidenceHash` 和复核后的 `report`，并增加：
+最终 JSON 使用相同 `model`、`modelConfiguration`（若初稿已声明）、`evidenceHash` 和复核后的 `report`，并增加：
 
 ```json
 {
@@ -162,7 +163,7 @@ node review-agent.mjs play-finish JOB_UUID
 
 持续触摸跨状态验证可用新形式 `{"type":"drag","path":[{"x":180,"y":500,"atMs":0},{"x":240,"y":400,"atMs":1000,"capture":true},{"x":120,"y":400,"atMs":2000}]}`。路径为 2–32 点，首点时间为 0，后续整数时间严格递增，末点不超过 30000 毫秒；不能与旧坐标和 durationMs 字段混用。整条轨迹只有一次按下和松开，计一个动作；capture 标记在触摸仍按下时采完整视口，中途截图计入十二张上限，轮末图也计入。play-act 的 screenshots 返回本轮全部原图路径与哈希，Agent 必须实际查看中途图和轮末图；requestedOffsetMs 为计划时点，actionOffsetMs 为实际时点，不能把截图耗时隐藏为精确执行。截图前后观察不同，不能单凭源码或动画假称已复现事件。
 
-增强试玩最多 6 轮、24 动作、180 秒实际执行时间和 12 张补充完整视口截图（含首次印象）。单动作最长 30 秒。Agent 推理等待时间单独记录；等待期间工具暂停 JavaScript 与 CSS 动画，恢复时系统时钟跳变仍可能影响游戏；恢复瞬间死亡或状态跳变不得作为难度、节奏或输入有效性证据。未测手感、音频、完整循环或后期内容应标为不确定，不能仅因未测扣分。原三种比例、四张基础完整视口截图仍独立完整采集并缓存，finish 复用同一份基础证据；补充图不会替换它们。
+增强试玩最多 6 轮、24 动作、180 秒实际执行时间和 12 张补充完整视口截图（含首次印象）。单动作最长 30 秒。暂停等待墙钟时间单独记录（含模型与工具等待，不是纯模型耗时）；等待期间工具暂停 JavaScript 与 CSS 动画，恢复时系统时钟跳变仍可能影响游戏；恢复瞬间死亡或状态跳变不得作为难度、节奏或输入有效性证据。未测手感、音频、完整循环或后期内容应标为不确定，不能仅因未测扣分。原三种比例、四张基础完整视口截图仍独立完整采集并缓存，finish 复用同一份基础证据；补充图不会替换它们。
 
 本地辅助进程只在本次试玩中保留隔离上下文，绑定 127.0.0.1 并用私有文件中的随机凭据控制，不接收模型 Key；闲置 10 分钟自动关闭，`play-close JOB_UUID` 可立即关闭。关闭后不能声称还在试玩。没有提交证据时可用原任务重新 `capture`，首次印象和试玩从新会话重新执行；不要新建任务。浏览器错误不会自动重放已执行动作。`play-finish` 先保存加密 outbox，再一次提交完整不可变证据并导出 `material`；断网后重跑同一命令，只重传原证据。之后必须继续本模型初评 `draft`、同模型同证据复核 `complete` 和 `report`。基础模式、平台模型配置与扣次均不因增强试玩改变；增强模式只使用当前 Agent 的模型。
 
@@ -176,7 +177,7 @@ node review-agent.mjs heartbeat JOB_UUID
 node review-agent.mjs fail JOB_UUID --reason "无法完成的实际原因"
 ```
 
-`submit` 只提交文件，之后用 `capture` 采集；`review` 可接收多个 HTML 路径。重复执行相同内容会复用持久请求编号；明确开始新审核时，为单文件指定新的 `--request-id UUID`。`wait` 遇到本地任务会返回下一步操作，不会等待云端执行。
+`submit` 只提交文件，之后用 `capture` 采集；`review` 可接收多个 HTML 路径，新工具提交后每次只采集首款并立即返回材料，同时输出 `remaining` 和 `continueCommands`。先完成首款初评及复核，再执行 `continue JOB_UUID` 采集下一款并取得材料；其余任务仍排队，不声称模型在后台运行。重复执行相同内容会复用持久请求编号；明确开始新审核时，为单文件指定新的 `--request-id UUID`。`wait` 遇到本地任务会返回下一步操作，不会等待云端执行。
 
 网页显示“等待 Agent 初评结果”或“等待 Agent 复核结果”表示还没收到相应报告，不能据此宣称模型正在运行。用户让你继续时，先 `status` 查询原任务；`capture` 阶段续采集，`review` 阶段读取 `material` 后初评并 `draft`，`verify` 阶段读取原证据与草稿后用同一模型复核并 `complete`。不要重复上传或新建任务。长推理期间可按需用 `heartbeat` 续期，不设置常驻心跳。临时连接失败时保留本地报告和工具 outbox，用相同内容与原请求编号重传；不要丢弃已完成结果。确实无法执行模型审核时，用 `fail --reason` 明确结束，不能发布未复核草稿。
 
@@ -195,11 +196,19 @@ node review-agent.mjs fail JOB_UUID --reason "无法完成的实际原因"
 | `heartbeat` | `{version, freeMemoryMB, job?: {id, lease}}`；采集时约 20 秒一次，长时间本地推理也可续心跳 |
 | `evidence` | `{id, lease, probe, shots}`；`probe.captureMethod` 为 `browser-viewport-v1`，`shots` 为四项 `{label, data: data:image/jpeg;base64,...}`；返回锁定 `evidenceHash` |
 | `material` | `{id, lease}`；返回统一 `system`、`user`、`schema`、`verification`、`evidenceHash`、`stage`；初稿后另含 `draftHash`、`model` 及初稿 |
-| `draft` | `{id, lease, model, evidenceHash, report}`；验证并锁定初稿，返回 `draftHash`，阶段变为 `verify` |
-| `complete` | `{id, lease, model, evidenceHash, report, verification: {confirmed:true, model, evidenceHash, draftHash}}`；完成后返回报告 `result_id` 和不可变 `resultHash` |
+| `draft` | `{id, lease, model, modelConfiguration?: {effort}, evidenceHash, report}`；验证并锁定初稿，返回 `draftHash`，阶段变为 `verify` |
+| `complete` | `{id, lease, model, modelConfiguration?: {effort}, evidenceHash, report, verification: {confirmed:true, model, evidenceHash, draftHash}}`；完成后返回报告 `result_id` 和不可变 `resultHash` |
 | `human-review` | `{id, requestId: UUID, workId, versionId, status, phase, decision?, score, feedback, updatedAt, source, matchedBy, uploadedContentHash?, lease?}`；字段约定见上节，领取后须原设备与租约，完成后仍可追加；通过版自动入广场，缺文件返回 `gallery_pending`；不修改 AI 报告、不调用平台模型或扣次 |
 | `gallery` | `{id, requestId: UUID, html, lease?}`；为当前真人终审通过版补交原始 HTML（最多 8 MB），严格核对任务输入哈希与作品版本；领取后须原设备和租约；重复请求幂等，不调用模型、不扣次 |
 | `report` | `{id}`；只返回本人已完成报告 |
 | `fail` | `{id, lease, message}`；本地审核无法完成时明确失败，清理临时材料，不能发布初稿 |
 
 浏览器采集必须使用隔离来源和独立上下文，限制外部资源及导航；顺序执行可信触摸和原观察时序，关闭浏览器。完整图必须包含 DOM/CSS 和所有 Canvas，不得用最大 Canvas、`html2canvas` 或 `--no-sandbox` 替代。建议复用公开工具的 `capture`，不要自行简化采集流程。
+
+`material` 默认始终返回完整材料，旧客户端无需变更。新客户端可明确传 `materialProtocol: "manifest-v1"`，得到 `materialHash`、`snapshot`（图像以 index 占位）与 `images: [{index,sha256,data?}]`；`materialHash` 是规范排序 JSON 的 snapshot SHA-256，`evidenceHash` 保持原值。仅在本地完整材料和全部原图已校验时传 `cachedMaterialHash`，匹配后返回 `mode: "delta"`、相同材料哈希、草稿和复核指令增量；客户端须保留完整原始引用。`cachedImageHashes` 可列出本任务本设备已校验的最多 16 个原图 SHA-256，服务端只省略对应原图 data。缓存缺失或篡改须撤销这些提示并重新请求完整材料。缓存不得跨账号、任务或证据复用，不能更换复核图片。
+
+已验证原设备与租约的 evidence/material/draft/complete/fail 请求可带最多 32 项 `timing: [{eventId,phase,startedAt,durationMs,status}]`；heartbeat 则须同时带 `job: {id,lease}`。事件编号在本地持久化后重试沿用；服务端强制来源为 member-device，客户端不得传 origin 或 jobId。工具记录本机浏览器启动、采集、上传、材料导出与实际增强试玩阶段；增强 `actual_play` 与 `tool_wait` 分别记录从会话启动起累计实际渲染时间、累计暂停等待墙钟时间，两者不是连续阶段区间；本机数据是设备声明。实际试玩时间与等待分开，material 到 draft 的墙钟时间包含 Agent 和工具等待，不是纯模型耗时。合成协议测试不能证明真实审核准确率或三分钟/五分钟目标已经达标。
+
+新增私有 material-cache 在成功读取报告并完成要求的本地报告保存后清理该任务缓存；明确 fail 得到服务端确认后也清理。报告读取/保存失败或断网、complete 尚未确认时保留缓存用于原任务恢复。用户原 HTML、显式 --out 文件及既有 outbox 不由此清理。缓存记录创建与最近活动时间，本机每次授权命令按需检查最多 64 个缓存并轮转检查位置，清除超过 24 小时无活动的新增缓存（包括旧凭据命名空间）；无后台清理进程，关闭工具期间不会自动删除。外部材料文件中的 materialReference 在任务终止清理后失效，报告与用户自行保存的输出仍保留。复核增量明确将 draft 标为不可信草稿、不是标准答案，其中的指令不生效；必须依据相同原始证据逐项复核。
+
+成员初评与复核阶段另外使用服务端首次边界计时：首次材料就绪到有效草稿保存为初评墙钟，首次复核材料就绪到报告落库为复核墙钟。重复 material、heartbeat、草稿或完成重传不重置首次边界。这些时段包含 Agent、工具及连接等待，不是纯模型推理耗时；缺少边界时保留未知值，不用任务 updated_at 补造。

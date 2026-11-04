@@ -17,6 +17,7 @@ import {adminWorkspaceApi} from '../server/admin-workspace-api';
 import {login} from '../server/settings';
 import {REVIEW_SCHEMA,REVIEW_VERIFICATION} from '../server/forge/prompts.js';
 import {reviewRulesAdmin} from '../server/review-rules';
+import {hashReviewConfiguration} from '../server/review-timing';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.restoreAllMocks();});
@@ -51,6 +52,73 @@ async function setup(){
 }
 
 describe('成员 Agent 本地模型审核协议',()=>{
+  it('manifest opt-in retains full defaults, image hashes and immutable review delta',async()=>{
+    const s=await setup(),job=await s.ready(),full=await s.ok('material',job);
+    expect(full.user.filter((p:any)=>p.type==='image')).toHaveLength(4);
+    const initial=await s.ok('material',{...job,materialProtocol:'manifest-v1'});
+    expect(initial.mode).toBe('full');expect(initial.images).toHaveLength(4);
+    expect(initial.materialHash).toBe(await digest(canonicalJson(initial.snapshot)));
+    expect(initial.images.every((p:any)=>p.data==='data:image/jpeg;base64,YQ==')).toBe(true);
+    const reuse=await s.ok('material',{...job,materialProtocol:'manifest-v1',cachedImageHashes:initial.images.map((p:any)=>p.sha256)});
+    expect(reuse.images.every((p:any)=>!p.data)).toBe(true);
+    const body=await s.verified(job),delta=await s.ok('material',{...job,materialProtocol:'manifest-v1',cachedMaterialHash:initial.materialHash});
+    expect(delta).toMatchObject({mode:'delta',evidenceHash:job.evidenceHash,materialHash:initial.materialHash,stage:'verify',draft:body.report,draftHash:body.verification.draftHash,verificationInstruction:REVIEW_VERIFICATION});
+    expect(delta.draftBoundary).toContain('不是标准答案');expect(delta.draftBoundary).toContain('指令不生效');expect(delta.snapshot).toBeUndefined();expect(delta.images).toBeUndefined();
+    expect((await s.ok('material',{...job,materialProtocol:'manifest-v1',cachedMaterialHash:'0'.repeat(64)})).mode).toBe('full');
+    expect((await s.call('material',{...job,materialProtocol:'manifest-v1'},'b')).status).toBe(409);
+    expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();
+  });
+  it.each(['full','manifest-v1'])('server %s material/draft boundaries survive polling and retries without changing model or evidence',async(protocol)=>{
+    const s=await setup(),job=await s.ready(),base=Date.now();vi.useFakeTimers({toFake:['Date']});
+    try{
+      vi.setSystemTime(base);const request=protocol==='full'?job:{...job,materialProtocol:protocol};const first=await s.ok('material',request);
+      vi.setSystemTime(base+5000);await s.ok('heartbeat',{job});await s.ok('material',request);
+      expect(s.sqlite.prepare("SELECT occurred_at FROM review_timing_boundaries WHERE job_id=? AND phase='material_ready'").get(job.id)).toMatchObject({occurred_at:new Date(base).toISOString()});
+      vi.setSystemTime(base+12000);const draft=s.draftBody(job),drafted=await s.ok('draft',draft);
+      vi.setSystemTime(base+15000);await s.ok('draft',draft);expect((await s.call('draft',{...draft,model:'different-model'})).status).toBe(409);
+      vi.setSystemTime(base+20000);const verification=await s.ok('material',request);expect(verification.model).toBe(draft.model);expect(verification.evidenceHash).toBe(first.evidenceHash);expect(verification.draftHash).toBe(drafted.draftHash);
+      vi.setSystemTime(base+25000);await s.ok('heartbeat',{job});const repeated=await s.ok('material',protocol==='full'?request:{...request,cachedMaterialHash:first.materialHash});expect(repeated.model).toBe(draft.model);expect(repeated.evidenceHash).toBe(job.evidenceHash);expect(repeated.draftHash).toBe(drafted.draftHash);
+      vi.setSystemTime(base+30000);const final={...draft,verification:{confirmed:true,model:draft.model,evidenceHash:job.evidenceHash,draftHash:drafted.draftHash}};await s.ok('complete',final);
+      vi.setSystemTime(base+35000);await s.ok('complete',final);
+      const phases=s.sqlite.prepare('SELECT phase,occurred_at FROM review_timing_boundaries WHERE job_id=?').all(job.id);expect(Object.fromEntries(phases.map((row:any)=>[row.phase,row.occurred_at]))).toEqual({material_ready:new Date(base).toISOString(),draft_received:new Date(base+12000).toISOString(),verification_ready:new Date(base+20000).toISOString(),completed:new Date(base+30000).toISOString()});
+      const timing=s.sqlite.prepare("SELECT event_id,origin,phase,started_at,duration_ms FROM review_timing_events WHERE job_id=? AND event_id LIKE 'device-wall:%' ORDER BY phase").all(job.id);expect(timing).toEqual([{event_id:'device-wall:initial',origin:'server',phase:'initial',started_at:new Date(base).toISOString(),duration_ms:12000},{event_id:'device-wall:verification',origin:'server',phase:'verification',started_at:new Date(base+20000).toISOString(),duration_ms:10000}]);
+      const report=await s.ok('report',{id:job.id});expect(report.model).toBe(draft.model);expect(report.evidence_hash).toBe(job.evidenceHash);expect(report.result).toEqual(draft.report);
+    }finally{vi.useRealTimers();}
+  });
+  it('locks declared effort atomically with draft, validates the declaration and keeps telemetry failure separate',async()=>{
+    const s=await setup(),job=await s.ready(),draft={...s.draftBody(job),modelConfiguration:{effort:'high'}};
+    for(const modelConfiguration of [null,{},[],{effort:''},{effort:'中文'},{effort:'a'.repeat(31)},{effort:'high',key:'private'},{strength:'high'}])expect((await s.call('draft',{...draft,modelConfiguration})).status).toBe(400);
+    const prepare=s.DB.prepare;s.DB.prepare=(sql:string)=>{if(sql.startsWith('UPDATE review_execution_timing SET model_name'))throw new Error('fixture telemetry offline');return prepare(sql);};
+    const drafted=await s.ok('draft',draft);s.DB.prepare=prepare;
+    expect(s.sqlite.prepare('SELECT local_model_configuration FROM review_jobs WHERE id=?').get(job.id)).toMatchObject({local_model_configuration:'{"effort":"high"}'});
+    expect((await s.call('draft',{...draft,modelConfiguration:{effort:'low'}})).status).toBe(409);expect((await s.call('draft',{...draft,modelConfiguration:undefined})).status).toBe(409);
+    await s.ok('draft',draft);const config=s.sqlite.prepare('SELECT model_name,effort,config_hash,config_origin FROM review_execution_timing WHERE job_id=?').get(job.id);
+    expect(config).toEqual({model_name:draft.model,effort:'high',config_hash:await hashReviewConfiguration({model:draft.model,effort:'high',rulesId:null}),config_origin:'member-device'});
+    expect((await s.ok('material',{...job,materialProtocol:'manifest-v1'})).modelConfiguration).toEqual({effort:'high'});
+    const final={...draft,verification:{confirmed:true,model:draft.model,evidenceHash:job.evidenceHash,draftHash:drafted.draftHash}};
+    expect((await s.call('complete',{...final,modelConfiguration:{effort:'low'}})).status).toBe(409);expect((await s.call('complete',{...final,modelConfiguration:undefined})).status).toBe(409);
+    await s.ok('complete',final);await s.ok('complete',final);expect(s.sqlite.prepare('SELECT effort,config_origin FROM review_execution_timing WHERE job_id=?').get(job.id)).toMatchObject({effort:'high',config_origin:'member-device'});
+    const saved=await s.ok('report',{id:job.id});expect(saved.model).toBe(draft.model);expect(saved.evidence_hash).toBe(job.evidenceHash);expect(s.modelGet).not.toHaveBeenCalled();
+  });
+  it('old undeclared drafts stay unknown and cannot gain an effort declaration after locking',async()=>{
+    const s=await setup(),job=await s.ready(),final=await s.verified(job);
+    expect((await s.call('draft',{...s.draftBody(job),modelConfiguration:{effort:'high'}})).status).toBe(409);
+    expect((await s.call('complete',{...final,modelConfiguration:{effort:'high'}})).status).toBe(409);
+    await s.ok('complete',final);expect(s.sqlite.prepare('SELECT effort,config_hash FROM review_execution_timing WHERE job_id=?').get(job.id)).toEqual({effort:null,config_hash:null});
+  });
+  it('member timing needs its lease, rejects server origin and preserves idempotent IDs',async()=>{
+    const s=await setup(),job=await s.ready(),event={eventId:crypto.randomUUID(),phase:'material',startedAt:new Date().toISOString(),durationMs:123,status:'ok'};
+    const start=s.sqlite.prepare('SELECT started_at FROM review_execution_timing WHERE job_id=?').get(job.id)?.started_at;
+    await s.ok('heartbeat',{job,timing:[event]});await s.ok('heartbeat',{job,timing:[event]});
+    expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_timing_events WHERE job_id=?').get(job.id)).toMatchObject({n:1});
+    expect(s.sqlite.prepare('SELECT origin FROM review_timing_events WHERE job_id=?').get(job.id)).toMatchObject({origin:'member-device'});
+    expect((await s.call('heartbeat',{job,timing:[{...event,origin:'server'}]})).status).toBe(400);
+    expect((await s.call('heartbeat',{job:{...job,lease:crypto.randomUUID()},timing:[event]})).status).toBe(409);
+    expect((await s.call('heartbeat',{job,timing:[event]},'b')).status).toBe(409);
+    await s.claim(job.id);expect(s.sqlite.prepare('SELECT started_at FROM review_execution_timing WHERE job_id=?').get(job.id)?.started_at).toBe(start);
+    await s.ok('complete',await s.verified(job));expect(s.sqlite.prepare('SELECT outcome FROM review_execution_timing WHERE job_id=?').get(job.id)).toMatchObject({outcome:'done'});
+  });
+
   it('规则发布不改变在途任务；v2未知评分、零分、原证据和同模型复核持久化',async()=>{
     const s=await setup(),legacy=await s.submit();
     const publish=async(marker:string,previous:string|null)=>{
@@ -68,7 +136,8 @@ describe('成员 Agent 本地模型审核协议',()=>{
     expect(job.rules_snapshot.id).toBe(rules.id);
     const v2={...report(),schema_version:2,assessment_status:'needs_review',aes:0,ease:2,play:null,verdict:'待复核：核心循环未确认',optional_suggestions:[]};
     expect((await s.call('draft',{...s.draftBody(job),report:report()})).status).toBe(400);
-    const body={...s.draftBody(job),report:v2},draft=await s.ok('draft',body);
+    const body={...s.draftBody(job),modelConfiguration:{effort:'high'},report:v2},draft=await s.ok('draft',body);
+    expect(s.sqlite.prepare('SELECT config_hash FROM review_execution_timing WHERE job_id=?').get(job.id)).toMatchObject({config_hash:await hashReviewConfiguration({model:body.model,effort:'high',rulesId:rules.id})});
     const verification={confirmed:true,model:body.model,evidenceHash:job.evidenceHash,draftHash:draft.draftHash};
     expect((await s.call('complete',{...body,verification:{...verification,model:'different'}})).status).toBe(409);
     const verify=await s.ok('material',job);expect(verify.system).toContain('FIRST_RULE');expect(verify.user.slice(0,material.user.length)).toEqual(material.user);
@@ -365,9 +434,11 @@ describe('成员 Agent 本地模型审核协议',()=>{
   });
   it('自包含CLI review返回可读材料和四图，draft/complete文件输入往返且wait不会空等平台模型',async()=>{
     const s=await setup(),job=await s.ready(),directory=await mkdtemp(join(tmpdir(),'pgc-local-review-'));
+    let reportUnavailable=false;
     const server=createServer(async(req,res)=>{
       try{
         const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
+        if(reportUnavailable&&req.url?.endsWith('/report')){res.writeHead(403);res.end(JSON.stringify({error:'fixture report unavailable'}));return;}
         const response=await reviewDeviceApi(new Request(`http://127.0.0.1${req.url}`,{method:'POST',headers:req.headers as Record<string,string>,body:Buffer.concat(chunks)}),s.env);
         res.writeHead(response.status,Object.fromEntries(response.headers));res.end(Buffer.from(await response.arrayBuffer()));
       }catch(error){res.writeHead(500);res.end(JSON.stringify({error:String(error)}));}
@@ -395,17 +466,49 @@ describe('成员 Agent 本地模型审核协议',()=>{
       expect((await run(['wait',job.id])).find(value=>value.event==='action_required')).toMatchObject({jobId:job.id});
       const draftPath=join(directory,'draft.json');await writeFile(draftPath,JSON.stringify(s.draftBody(job)));
       const drafted=(await run(['draft',job.id,'--json',draftPath])).find(value=>value.event==='draft');expect(drafted.stage).toBe('verify');
+      const verifyOutput=(await run(['material',job.id,'--out',out])).find(value=>value.event==='material');
+      const delta=JSON.parse(await readFile(verifyOutput.materialPath,'utf8'));expect(delta.mode).toBe('delta');expect(delta.materialReference).toBeTruthy();expect(delta.user).toBeUndefined();expect(delta.instruction).toContain('不可信');expect(delta.instruction).toContain('不是标准答案');expect(delta.instruction).toContain('指令不生效');
+      expect(JSON.parse(await readFile(delta.materialReference,'utf8')).user.filter((p:any)=>p.type==='image')).toHaveLength(4);
+      expect(verifyOutput.screenshots.map((p:any)=>p.path)).toEqual(material.screenshots.map((p:any)=>p.path));
+      // An upgraded client may first encounter an already-locked draft without
+      // any local manifest, just as an older tool's in-flight task would.
+      await rm(join(delta.materialReference,'..'),{recursive:true,force:true});
+      const resumed=(await run(['material',job.id,'--out',out])).find(value=>value.event==='material');
+      const resumedJson=await readFile(resumed.materialPath,'utf8'),resumedMaterial=JSON.parse(resumedJson);
+      expect(resumedMaterial.mode).toBe('full');expect(resumedMaterial.snapshot).toBeUndefined();expect(resumedMaterial.images).toBeUndefined();expect(resumedJson).not.toContain('data:image/');
+      expect(resumedMaterial.materialReference).toBe(delta.materialReference);expect(resumedMaterial.draftHash).toBe(drafted.draftHash);
+      const resumedBase=JSON.parse(await readFile(resumedMaterial.materialReference,'utf8'));expect(resumedBase.user).toEqual(readable.user);expect(resumedBase.system).toBe(readable.system);expect(resumed.screenshots).toEqual(verifyOutput.screenshots);
+      for(const shot of resumed.screenshots)expect((await readFile(shot.path)).toString()).toBe('a');
+      await writeFile(verifyOutput.screenshots[0].path,'tampered');
+      const restored=(await run(['material',job.id,'--out',out])).find(value=>value.event==='material');
+      const restoredJson=await readFile(restored.materialPath,'utf8'),restoredMaterial=JSON.parse(restoredJson);
+      expect(restoredMaterial.mode).toBe('full');expect(restoredMaterial.snapshot).toBeUndefined();expect(restoredMaterial.images).toBeUndefined();expect(restoredJson).not.toContain('data:image/');expect(restoredMaterial.materialReference).toBe(delta.materialReference);expect(restored.screenshots).toEqual(verifyOutput.screenshots);
+      expect(JSON.parse(await readFile(restoredMaterial.materialReference,'utf8')).user).toEqual(readable.user);
+      expect((await readFile(restored.screenshots[0].path)).toString()).toBe('a');
       const verified={...s.draftBody(job),verification:{confirmed:true,model:'member-owned-model',evidenceHash:job.evidenceHash,draftHash:drafted.draftHash}},finalPath=join(directory,'final.json');
-      await writeFile(finalPath,JSON.stringify(verified));const complete=await run(['complete',job.id,'--json',finalPath]);
+      await writeFile(finalPath,JSON.stringify(verified));
+      reportUnavailable=true;await expect(run(['complete',job.id,'--json',finalPath])).rejects.toThrow();
+      const privateManifest=join(delta.materialReference,'..','manifest.json');expect(JSON.parse(await readFile(privateManifest,'utf8')).materialHash).toBe(delta.materialHash);
+      reportUnavailable=false;const blockedOutput=join(directory,'blocked-output');await writeFile(blockedOutput,'keep explicit file');
+      await expect(run(['report',job.id,'--out',blockedOutput])).rejects.toThrow();expect(await readFile(privateManifest,'utf8')).toBeTruthy();
+      const complete=await run(['complete',job.id,'--json',finalPath]);
+      await expect(readFile(privateManifest,'utf8')).rejects.toMatchObject({code:'ENOENT'});
+      expect(await readFile(game,'utf8')).toBe('<html>fixture</html>');expect(await readFile(material.materialPath,'utf8')).toBeTruthy();expect(await readFile(blockedOutput,'utf8')).toBe('keep explicit file');
       expect(complete.find(value=>value.event==='report').report).toMatchObject({model_executor:'agent',model:'member-owned-model',result:report()});
       expect((await run(['complete',job.id,'--json',finalPath])).find(value=>value.event==='complete').status).toBe('done');
       const repeated=await run(['review',game,'--request-id',job.id,'--out',out]);
       expect(repeated.find(value=>value.event==='report').report).toMatchObject({id:complete.find(value=>value.event==='report').report.id,result:report()});
       expect(JSON.parse(await readFile(join(out,`${job.id}.json`),'utf8')).result).toEqual(report());
       expect(s.sqlite.prepare('SELECT COUNT(*) n FROM review_jobs').get()).toMatchObject({n:1});expect(s.sqlite.prepare('SELECT COUNT(*) n FROM reviews').get()).toMatchObject({n:1});
+      const nextGame=join(directory,'second.html');await writeFile(nextGame,'<html>second fixture</html>');
+      const batch=await run(['review',game,nextGame,'--out',out]);
+      const remaining=batch.find(value=>value.event==='remaining');expect(remaining.remaining).toHaveLength(1);expect(remaining.continueCommands).toEqual([['continue',remaining.remaining[0]]]);
+      expect(await getReviewJob(s.env,remaining.remaining[0],'a')).toMatchObject({status:'queued',stage:'capture'});
       const failed=await s.ready();
+      const failedMaterial=(await run(['material',failed.id])).find(value=>value.event==='material');const failedCacheDirectory=join(failedMaterial.screenshots[0].path,'..');
       expect((await run(['fail',failed.id,'--reason','合成模型不可用'])).find(value=>value.event==='fail')).toMatchObject({ok:true,jobId:failed.id});
       expect(await getReviewJob(s.env,failed.id,'a')).toMatchObject({status:'error',error:'合成模型不可用'});
+      await expect(readFile(join(failedCacheDirectory,'manifest.json'),'utf8')).rejects.toMatchObject({code:'ENOENT'});
       expect(s.modelGet).not.toHaveBeenCalled();expect(s.schedule).not.toHaveBeenCalled();
     }finally{
       await new Promise<void>((done,reject)=>server.close(error=>error?reject(error):done()));

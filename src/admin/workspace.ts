@@ -5,6 +5,7 @@ const reads=createReadCache();
 import {progressHtml,withProgress} from '../progress';
 import {mountContent,contentListRequest} from './content';
 import {mountManagement} from './manage';
+import {mountFeedback} from './feedback';
 import {mountOverview} from './overview';
 import {baseRoute,detailTarget,inspectorRoute,readRoute,routeUrl,viewLabels} from './navigation';
 import type {AdminContext,AdminInspector,AdminProjectSequence,AdminRoute,AdminView} from './contracts';
@@ -14,7 +15,7 @@ type TrailEntry={target:AdminInspector;scrollTop:number};
 type ViewMemory=Partial<Record<AdminView,{url:string;scrollY:number}>>;
 const memoryKey='pgc-admin-navigation-v1';
 const app=document.querySelector<HTMLElement>('#app')!;
-const navIcons:Record<AdminView,string>={overview:'layout-dashboard',works:'gamepad-2',tasks:'workflow',reviews:'clipboard-check',members:'users',settings:'settings-2'};
+const navIcons:Record<AdminView,string>={overview:'layout-dashboard',works:'gamepad-2',tasks:'workflow',reviews:'clipboard-check',feedback:'clipboard-check',members:'users',settings:'settings-2'};
 const esc=(v:unknown)=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
 let route=readRoute(location.search),main:Slot|undefined,detail:Slot|undefined,mainUrl='',authenticated=false;
 let pollTimer:ReturnType<typeof setTimeout>|undefined,toastTimer:ReturnType<typeof setTimeout>|undefined;
@@ -120,7 +121,7 @@ function context(scope:Slot,root:HTMLElement,value:AdminRoute,inside=false):Admi
     setRefresh(callback,mode='idle'){if(scope.controller.signal.aborted)return;const changed=scope.mode!==mode||!scope.nextAt;scope.refresh=callback;scope.mode=mode;if(changed)scope.nextAt=Date.now()+pollDelay(scope);scheduleRefresh();},
     setProjects(items){if(!inside&&!scope.controller.signal.aborted)projects=items.map(p=>({id:p.id,type:p.type,title:p.title,hasGame:p.materials.game}));}};
 }
-async function mount(ctx:AdminContext){return ctx.route.view==='overview'?mountOverview(ctx):['works','tasks'].includes(ctx.route.view)?mountContent(ctx):mountManagement(ctx);}
+async function mount(ctx:AdminContext){return ctx.route.view==='feedback'?mountFeedback(ctx):ctx.route.view==='overview'?mountOverview(ctx):['works','tasks'].includes(ctx.route.view)?mountContent(ctx):mountManagement(ctx);}
 function navigate(changes:Partial<AdminRoute>,replace=false){
   if(!route.id){const target=detailTarget(changes,route);if(target){
     const view=inspectorRoute(target).view;

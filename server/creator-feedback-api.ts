@@ -2,6 +2,8 @@ import {authorized} from './settings';
 import {digest} from './review-device-state';
 import {CreatorFeedbackClient,FeedbackProviderError} from './creator-feedback-client';
 import {readFeedbackStatus,readFeedbackGame,readFeedbackRules,readFeedbackReviewHistory,readFeedbackContract,purgeFeedbackData} from './creator-feedback-sync';
+import {derivePlatformDecision,deriveAiDecision} from './review-evaluation';
+import {parseFeedbackDeclaration,readFeedbackAssessment,saveFeedbackAssessment,measureFeedbackFile} from './creator-feedback-assessment';
 import {feedbackEnabled,scheduleCreatorFeedback,type CreatorFeedbackEnv} from './creator-feedback-runner';
 
 type Env=CreatorFeedbackEnv&{ADMIN_PASSWORD:string;SETTINGS_KEY:string};
@@ -45,6 +47,37 @@ export async function creatorFeedbackAdminApi(request:Request,env:Env):Promise<R
       return json(await scheduleCreatorFeedback(env),202);
     }
     const state=await ready(env);observedGeneration=state.generation;
+    if(route==='/links'&&request.method==='GET'){
+      const after=url.searchParams.get('after')||'',limit=Number(url.searchParams.get('limit')||'20');
+      if(after&&!external(after)||!Number.isInteger(limit)||limit<1||limit>50)throw err('分页参数不正确。');
+      const rows=(await env.DB.prepare(`SELECT l.task_id AS jobId,l.owner_id AS ownerId,l.game_id AS workId,l.version_id AS versionId,l.matched_by AS matchedBy,l.created_at AS linkedAt,
+        j.title,j.status AS taskStatus,j.model_executor AS modelExecutor,COALESCE(m.display_name,CASE WHEN l.owner_id='admin' THEN '超级管理员' ELSE '成员' END) AS ownerName,
+        (SELECT json_extract(a.payload,'$.declaration.status') FROM creator_feedback_assessments a WHERE a.task_id=l.task_id AND a.kind='declaration' AND a.generation=? ORDER BY a.created_at DESC,a.rowid DESC LIMIT 1) AS verificationStatus,
+        (SELECT COUNT(*) FROM creator_feedback_assessments a WHERE a.task_id=l.task_id AND a.kind='file' AND a.generation=?) AS measuredFiles
+        FROM creator_feedback_links l JOIN review_jobs j ON j.id=l.task_id AND j.owner_id=l.owner_id JOIN creator_feedback_games g ON g.game_id=l.game_id LEFT JOIN members m ON m.id=l.owner_id
+        WHERE l.task_id>? AND l.scope_revision=? ORDER BY l.task_id LIMIT ?`).bind(state.generation,state.generation,after,state.scope_revision,limit+1).all()).results||[];
+      await sameGeneration(env,state);const items=rows.slice(0,limit).map((r:any)=>({...r,verificationStatus:r.verificationStatus||'unverified',strictEligible:false}));
+      return json({generation:state.generation,scopeRevision:state.scope_revision,complete:state.phase==='delta',items,nextAfter:rows.length>limit?items.at(-1)?.jobId:null});
+    }
+    if(route==='/assessment'&&request.method==='POST'){
+      const b=parseFeedbackDeclaration(await body(request));
+      const saved=await saveFeedbackAssessment(env.DB,state,b.jobId,b.requestId,b.generation,'declaration',{declaration:b.declaration});
+      const assessment=await readFeedbackAssessment(env.DB,b.jobId,state);await sameGeneration(env,state,saved.workId);return json({saved,assessment});
+    }
+    if(route==='/file-evidence'&&request.method==='POST'){
+      const jobId=url.searchParams.get('jobId'),requestId=url.searchParams.get('requestId'),generationRaw=url.searchParams.get('generation'),generation=Number(generationRaw);
+      if(!external(jobId)||!requestId||!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(requestId)||!generationRaw||!/^(0|[1-9]\d*)$/.test(generationRaw)||!Number.isSafeInteger(generation))throw err('文件核验任务、请求或授权代次不正确。',400);
+      if(generation!==state.generation)throw err('授权已变化，请重新读取后核验。',409);
+      const job=await env.DB.prepare('SELECT j.input_hash FROM review_jobs j JOIN creator_feedback_links l ON l.task_id=j.id AND l.owner_id=j.owner_id WHERE j.id=?').bind(jobId).first();if(!job)throw err('请先建立准确投稿关联。',404);
+      const file=await measureFeedbackFile(request,job.input_hash??null);
+      const saved=await saveFeedbackAssessment(env.DB,state,jobId!,requestId,generation,'file',{file});const assessment=await readFeedbackAssessment(env.DB,jobId!,state);await sameGeneration(env,state,saved.workId);
+      return json({saved,assessment});
+    }
+    if(route==='/assessment'&&request.method==='GET'){
+      const jobId=url.searchParams.get('jobId');if(!external(jobId))throw err('任务编号不正确。');
+      const link=await env.DB.prepare('SELECT game_id FROM creator_feedback_links WHERE task_id=?').bind(jobId).first();if(!link)throw err('尚未建立准确投稿关联。',404);
+      const assessment=await readFeedbackAssessment(env.DB,jobId!,state);await sameGeneration(env,state,link.game_id);return json({generation:state.generation,assessment});
+    }
     if(route==='/contract'&&request.method==='GET'){
       const contract=await readFeedbackContract(env.DB);await sameGeneration(env,state);return json({generation:state.generation,contract});
     }
@@ -88,15 +121,25 @@ export async function creatorFeedbackAdminApi(request:Request,env:Env):Promise<R
       await sameGeneration(env,state,game.id);
       return json({linked:true,jobId:job.id,workId:game.id,versionId:identity.id,matchedBy:saved.matched_by});
     }
-    if(route==='/job'&&request.method==='GET'){
+    if((route==='/job'||route==='/export')&&request.method==='GET'){
       const jobId=url.searchParams.get('jobId');if(!external(jobId))throw err('任务编号不正确。');
       const link=await env.DB.prepare('SELECT * FROM creator_feedback_links WHERE task_id=?').bind(jobId).first();if(!link)throw err('尚未建立准确投稿关联。',404);
       const game=await readFeedbackGame(env.DB,link.game_id),version=game?.versions.find((v:any)=>v.id===link.version_id);
       if(!version)throw err('该关联版本已不在授权缓存中。',404);
       const ai=await env.DB.prepare('SELECT score,result,model FROM reviews WHERE job_id=? AND owner_id=?').bind(jobId,link.owner_id).first();
       const result=ai?JSON.parse(ai.result):null;
-      const reviewHistory=(await readFeedbackReviewHistory(env.DB,game.id)).filter((r:any)=>r.versionId===version.id);await sameGeneration(env,state,game.id);
-      return json({jobId,workId:game.id,versionId:version.id,source:'creator-hub-feedback-v1',complete:state.phase==='delta',matchedBy:link.matched_by,version,reviews:game.reviews.filter((r:any)=>r.versionId===version.id),reviewHistory,ai:ai?{score:ai.score,model:ai.model,dimensions:{aes:result.aes,ease:result.ease,play:result.play}}:null,interpretation:'Independent source judgments, not reproduced defect labels; review stage alone does not establish final approval.'});
+      const task=await env.DB.prepare('SELECT title,input_hash,model_executor,rules_snapshot FROM review_jobs WHERE id=? AND owner_id=?').bind(jobId,link.owner_id).first();
+      const reviewHistory=(await readFeedbackReviewHistory(env.DB,game.id)).filter((r:any)=>r.versionId===version.id);
+      const assessment=await readFeedbackAssessment(env.DB,jobId!,state),platform=derivePlatformDecision(game,version.id),aiDecision=deriveAiDecision(result);
+      const differences=scoreDifferences(result,game.reviews.find((r:any)=>r.id===platform.reviewId));
+      await sameGeneration(env,state,game.id);
+      const value={jobId,ownerId:link.owner_id,title:task?.title??'',generation:state.generation,scopeRevision:state.scope_revision,workId:game.id,versionId:version.id,source:'creator-hub-feedback-v1',complete:state.phase==='delta',matchedBy:link.matched_by,
+        inputHash:task?.input_hash??null,aiRules:task?.rules_snapshot?JSON.parse(task.rules_snapshot):null,version,reviews:game.reviews.filter((r:any)=>r.versionId===version.id),reviewHistory,
+        ai:ai?{score:ai.score,model:ai.model,dimensions:{aes:result.aes,ease:result.ease,play:result.play},decision:aiDecision,report:result}:null,
+        platform,comparison:{state:aiDecision&&platform.state==='valid'?(aiDecision===platform.decision?'match':'different'):'unavailable',scoreDifferences:differences},assessment,
+        interpretation:'独立来源判断；组长退回可以是平台有效结论，阶段不等于终审。关联声明和本地文件测量不能证明来源文件绑定，意见不自动视为已复现缺陷。'};
+      const response=json(route==='/export'?{schemaVersion:1,exportedAt:new Date().toISOString(),...value}:value);
+      if(route==='/export')response.headers.set('Content-Disposition','attachment; filename="creator-feedback-'+jobId+'.json"');return response;
     }
     throw err('接口不存在或方法不支持。',404);
   }catch(error){
@@ -107,4 +150,12 @@ export async function creatorFeedbackAdminApi(request:Request,env:Env):Promise<R
     const code=(error as any)?.status;
     return json({error:typeof code==='number'&&code>=400&&code<500?(error as Error).message:'回流服务暂不可用。'},typeof code==='number'?code:500);
   }
+}
+
+function scoreDifferences(result:any,review:any){
+  const dimensions=[['aes','美学'],['ease','易玩性'],['play','可玩性']];
+  return dimensions.map(([key,name])=>{const matches=review?.scores?.filter((s:any)=>s.name===name)||[];const ai=typeof result?.[key]==='number'?result[key]:null;
+    const platform=matches.length===1&&typeof matches[0].score==='number'?matches[0].score:null;
+    const platformMax=matches.length===1&&typeof matches[0].max==='number'?matches[0].max:null;
+    return {dimension:key,name,ai,platform,platformMax,delta:ai!==null&&platform!==null&&platformMax===3?ai-platform:null};});
 }

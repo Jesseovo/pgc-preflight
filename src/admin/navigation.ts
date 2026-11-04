@@ -1,6 +1,6 @@
 import type {AdminInspector,AdminRoute,AdminView} from './contracts';
 
-export const viewLabels:Record<AdminView,string>={overview:'总览',works:'作品',tasks:'任务',reviews:'审核',members:'成员',settings:'平台设置'};
+export const viewLabels:Record<AdminView,string>={overview:'总览',works:'作品',tasks:'任务',reviews:'审核',feedback:'反馈闭环',members:'成员',settings:'平台设置'};
 export function readRoute(search:string):AdminRoute{
   const q=new URLSearchParams(search),view=(Object.hasOwn(viewLabels,q.get('view')||'')?q.get('view'):'works') as AdminView;
   const range=q.get('range');

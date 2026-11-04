@@ -45,7 +45,7 @@ export class ModelHttpError extends Error {
 export class ModelOutputError extends Error {
   constructor(message: string, public kind: 'empty' | 'truncated' | 'incomplete' | 'format') { super(message); }
 }
-export interface ModelMetrics { elapsedMs: number; firstTextMs: number | null; characters: number; thinkingCharacters: number; inputTokens: number | null; outputTokens: number | null; reasoningTokens: number | null; finishReason: string; maxTokens: number; effort: string; status: 'ok' | 'error'; error: string }
+export interface ModelMetrics { capacityWaitMs:number; throttleWaitMs:number; retryWaitMs:number; requestMs:number; firstResponseMs:number|null; firstTextFromRequestMs:number|null; firstTextKind:'stream-text'|'complete-response'|null; attempts:number; elapsedMs: number; firstTextMs: number | null; characters: number; thinkingCharacters: number; inputTokens: number | null; outputTokens: number | null; reasoningTokens: number | null; finishReason: string; maxTokens: number; effort: string; status: 'ok' | 'error'; error: string }
 
 function abortable<T>(promise: PromiseLike<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason || new DOMException('Aborted', 'AbortError'));
@@ -114,7 +114,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
     const stream = anthropic ? options.stream !== false : deepseek;
     const controller = new AbortController();
     const started = Date.now();
-    const metrics: ModelMetrics = {elapsedMs:0,firstTextMs:null,characters:0,thinkingCharacters:0,inputTokens:null,outputTokens:null,reasoningTokens:null,finishReason:'',maxTokens,effort,status:'error',error:''};
+    const metrics: ModelMetrics = {capacityWaitMs:0,throttleWaitMs:0,retryWaitMs:0,requestMs:0,firstResponseMs:null,firstTextFromRequestMs:null,firstTextKind:null,attempts:0,elapsedMs:0,firstTextMs:null,characters:0,thinkingCharacters:0,inputTokens:null,outputTokens:null,reasoningTokens:null,finishReason:'',maxTokens,effort,status:'error',error:''};
     const usage = (data: any) => { if (!data) return; metrics.inputTokens = data.input_tokens ?? data.prompt_tokens ?? metrics.inputTokens; metrics.outputTokens = data.output_tokens ?? data.completion_tokens ?? metrics.outputTokens; metrics.reasoningTokens = data.completion_tokens_details?.reasoning_tokens ?? metrics.reasoningTokens; };
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const totalMs = options.totalTimeoutMs || Math.max(300000, (options.timeoutMs || 90000) * 2);
@@ -124,12 +124,30 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(), options.timeoutMs || 90000);
     };
+    // UI updates never hold the response reader. One callback batch may be in
+    // flight; retain only the latest pending snapshot and stop at completion.
+    const progressController=new AbortController();
+    let progressClosed=false,progressBusy=false;
+    let pendingProgress:{phase:'thinking'|'output';characters:number;activity:boolean;progress:boolean}|null=null;
+    const notify=(value:NonNullable<typeof pendingProgress>)=>{
+      if(progressClosed)return;pendingProgress=pendingProgress?{...value,activity:pendingProgress.activity||value.activity,progress:pendingProgress.progress||value.progress}:value;if(progressBusy)return;
+      const drain=()=>{
+        const next=pendingProgress;pendingProgress=null;if(progressClosed||!next){progressBusy=false;return;}
+        progressBusy=true;
+        const updates=[];if(next.activity&&options.onActivity)updates.push(Promise.resolve().then(()=>options.onActivity!(next.phase,next.characters)));if(next.progress&&options.onProgress)updates.push(Promise.resolve().then(()=>options.onProgress!(next.characters)));
+        void abortable(Promise.allSettled(updates),progressController.signal).catch(()=>{}).finally(drain);
+      };drain();
+    };
     let capacity:Awaited<ReturnType<typeof tryModelSlot>>=null;let uncertain=false;
     const once = async () => {
+      let requestStarted:number|null=null;
+      try{
       if(!options.capacityReserved&&!capacity){
-        while(!capacity){capacity=await abortable(tryModelSlot(options.DB,config,crypto.randomUUID(),deadline+120000),controller.signal);if(!capacity){await options.onWait?.(5000,'pace');await pauseModel(5000,controller.signal);}}
+        const capacityStarted=Date.now();
+        try{while(!capacity){capacity=await abortable(tryModelSlot(options.DB,config,crypto.randomUUID(),deadline+120000),controller.signal);if(!capacity){await options.onWait?.(5000,'pace');await pauseModel(5000,controller.signal);}}}finally{metrics.capacityWaitMs+=Date.now()-capacityStarted;}
       }
-      await abortable(throttle.wait(controller.signal, options.onWait), controller.signal);
+      const throttleStarted=Date.now();
+      try{await abortable(throttle.wait(controller.signal, options.onWait), controller.signal);}finally{metrics.throttleWaitMs+=Date.now()-throttleStarted;}
       if (options.onWait) await abortable(Promise.resolve(options.onWait(0, 'pace')), controller.signal);
       touch();
       const headers: Record<string, string> = anthropic
@@ -138,6 +156,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
       if (options.onStart) await abortable(options.onStart(), controller.signal);
       uncertain=true;
+      requestStarted=Date.now();metrics.attempts++;
       const response = await abortable(fetch(anthropic ? `${config.baseUrl}/v1/messages` : `${config.baseUrl}/chat/completions`, {
         method:'POST', headers,
         body:JSON.stringify(anthropic ? { model: config.model, ...anthropicRequest(messages, maxTokens, stream), ...(inferred.capability.kind === 'adaptive' ? {thinking:{type:'adaptive'},output_config:{effort}} : {}) } : {
@@ -147,6 +166,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
         }),
         signal:controller.signal, redirect:'manual',
       }), controller.signal);
+      metrics.firstResponseMs??=Date.now()-requestStarted;
       if(!response.ok)uncertain=false;
       if (response.status>=300 && response.status<400) throw new Error('模型接口发生重定向，请填写最终接口地址。为保护密钥，不会跟随跳转。');
       if (!response.ok) throw await abortable(upstreamError(response, config.apiKey), controller.signal);
@@ -221,16 +241,13 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
               if (ended) { buffer = ''; break; }
             }
             metrics.characters = content.length;
-            if (content.length && metrics.firstTextMs === null) metrics.firstTextMs = Date.now() - started;
+            if (content.length && metrics.firstTextMs === null){metrics.firstTextMs=Date.now()-started;metrics.firstTextFromRequestMs=Date.now()-requestStarted;metrics.firstTextKind='stream-text';}
             const phase = content.length ? 'output' : 'thinking';
-            if (options.onActivity && (phase !== lastPhase || Date.now() - lastActivity >= 5000)) {
-              lastPhase = phase; lastActivity = Date.now();
-              try { await abortable(options.onActivity(phase, content.length), controller.signal); } catch {}
-            }
-            if (options.onProgress && content.length !== lastCharacters && Date.now() - lastProgress >= 5000) {
-              lastProgress = Date.now(); lastCharacters = content.length;
-              try { await abortable(options.onProgress(content.length), controller.signal); } catch {}
-            }
+            const activity=Boolean(options.onActivity&&(phase!==lastPhase||Date.now()-lastActivity>=5000));
+            const progress=Boolean(options.onProgress&&content.length!==lastCharacters&&Date.now()-lastProgress>=5000);
+            if(activity){lastPhase=phase;lastActivity=Date.now();}
+            if(progress){lastProgress=Date.now();lastCharacters=content.length;}
+            if(activity||progress)notify({phase,characters:content.length,activity,progress});
             // The protocol end marker completes the response. Some compatible
             // gateways keep the HTTP connection open afterwards; do not wait
             // for socket EOF before starting the verification stage.
@@ -257,8 +274,9 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       if (data.stop_reason === 'max_tokens' || data.choices?.[0]?.finish_reason === 'length') throw new ModelOutputError('模型思考与报告达到长度上限，内容不完整。', 'truncated');
       const content = anthropic ? anthropicText(data) : data.choices?.[0]?.message?.content;
       if (typeof content !== 'string' || !content.trim()) throw new ModelOutputError(data.choices?.[0]?.message?.reasoning_content ? '模型只返回了思考过程，没有生成报告正文。' : '模型没有返回可读的审核内容，请确认接口兼容 Chat Completions。', 'empty');
-      metrics.characters = content.length; metrics.firstTextMs ??= Date.now() - started;
+      metrics.characters=content.length;if(metrics.firstTextMs===null){metrics.firstTextMs=Date.now()-started;metrics.firstTextFromRequestMs=Date.now()-requestStarted;metrics.firstTextKind='complete-response';}
       return content;
+      }finally{if(requestStarted!==null)metrics.requestMs+=Date.now()-requestStarted;}
     };
     try {
       let retries = 0;
@@ -278,7 +296,8 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
           if ((!pendingRequest && !capacityWait && retries >= 3) || Date.now() + wait + 1000 >= deadline) throw error;
           if (!pendingRequest && !capacityWait) retries++;
           if (options.onWait) await abortable(Promise.resolve(options.onWait(wait, pendingRequest ? 'pending' : error.upstreamStatus === 503 ? 'unavailable' : 'rate_limit')), controller.signal);
-          await pauseModel(wait, controller.signal);
+          const retryStarted=Date.now();
+          try{await pauseModel(wait, controller.signal);}finally{metrics.retryWaitMs+=Date.now()-retryStarted;}
         }
       }
     } catch (error) {
@@ -287,6 +306,7 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
       if (controller.signal.aborted) throw new Error('模型响应超时，本次未完整生成，请稍后重试或检查模型配置。');
       throw error;
     } finally {
+      progressClosed=true;pendingProgress=null;progressController.abort();
       clearTimeout(timeout);
       clearTimeout(totalTimeout);
       if(uncertain)options.onUncertain?.();

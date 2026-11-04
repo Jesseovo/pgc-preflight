@@ -90,7 +90,7 @@ describe('administrator-private source feedback API',()=>{
   expect(s.mocks.contract).toHaveBeenCalledOnce();expect(s.mocks.identity).toHaveBeenCalledWith('known-version');expect(s.mocks.game).toHaveBeenCalledWith('known-work');
   expect(s.sqlite.prepare('SELECT owner_id,known_work_id,known_submission_id FROM creator_feedback_links').get()).toMatchObject({owner_id:'member',known_work_id:'known-work',known_submission_id:'known-version'});
   expect(s.preserved()).toEqual(before);expect(s.network).not.toHaveBeenCalled();
-  const detail=await(await s.call('/job?jobId=task-one')).json() as any;expect(detail.ai).toEqual({score:0,model:'synthetic-agent',dimensions:{aes:0,ease:null,play:0}});expect(detail.reviews).toEqual(game().reviews);
+  const detail=await(await s.call('/job?jobId=task-one')).json() as any;expect(detail.ai).toMatchObject({score:0,model:'synthetic-agent',dimensions:{aes:0,ease:null,play:0},decision:null});expect(detail.reviews).toEqual(game().reviews);
  });
  it('rejects a missing task, human-binding conflict and immutable reassignment before any provider request',async()=>{
   const s=await setup();expect((await s.call('/link',{...s.link,jobId:'missing-task'})).status).toBe(404);
@@ -124,6 +124,73 @@ describe('administrator-private source feedback API',()=>{
   const s=await setup();expect((await s.call('/link',s.link)).status).toBe(200);let rotated=false;
   s.onRead(query=>{if(!rotated&&query.startsWith('SELECT score,result,model')){rotated=true;s.sqlite.prepare('UPDATE creator_feedback_state SET generation=generation+1').run();}});
   const result=await s.call('/job?jobId=task-one');expect(result.status).toBe(409);expect(await result.text()).not.toContain('Synthetic source opinion');
+ });
+
+ it('lists bounded exact associations without source reports, reviewer text or credential hashes',async()=>{
+  const s=await setup();await s.call('/link',s.link);
+  const list=await(await s.call('/links?limit=1')).json() as any;expect(list.items).toHaveLength(1);expect(list.items[0]).toMatchObject({jobId:'task-one',ownerId:'member',verificationStatus:'unverified',strictEligible:false});expect(list.nextAfter).toBeNull();
+  const raw=JSON.stringify(list);for(const forbidden of [s.fingerprint,s.env.CREATOR_FEEDBACK_TOKEN,'Synthetic source opinion','Synthetic human feedback','reviewer_synthetic'])expect(raw).not.toContain(forbidden);
+  for(const q of ['limit=51','limit=0','limit=1.5','after=../bad'])expect((await s.call('/links?'+q)).status).toBe(400);
+ });
+ it('assessment, file and export remain administrator-only with same-origin writes and no device privilege borrowing',async()=>{
+  const s=await setup();await s.call('/link',s.link);
+  for(const path of ['/links','/assessment?jobId=task-one','/export?jobId=task-one'])for(const headers of [{Cookie:''},{Cookie:s.memberCookie},{Authorization:'Bearer synthetic-device'}] as Record<string,string>[])expect((await s.call(path,undefined,headers)).status).toBe(403);
+  expect((await s.call('/assessment',{}, {Origin:'https://foreign.test'})).status).toBe(403);
+  const request=new Request('https://feedback.test/api/admin/creator-feedback/file-evidence?jobId=task-one&requestId='+crypto.randomUUID()+'&generation=1',{method:'POST',headers:{Cookie:s.cookie,Origin:'https://foreign.test','Content-Type':'application/octet-stream'},body:'synthetic'});
+  expect((await creatorFeedbackAdminApi(request,s.env))!.status).toBe(403);
+ });
+ it('records immutable administrator declarations separately; self-attested hashes and rules never become strict eligible',async()=>{
+  const s=await setup(),before=s.preserved();await s.call('/link',s.link);
+  const declaration={jobId:'task-one',requestId:crypto.randomUUID(),generation:1,status:'declared',note:'Synthetic admin statement',fileRelation:'same-bytes',sourceArtifactHash:'a'.repeat(64),ruleRelation:'admin-inspected',sourceRuleId:1,pgcRuleId:'synthetic-rule',reference:'Synthetic inspection record'};
+  const first=await s.call('/assessment',declaration);expect(first.status).toBe(200);const a=await first.json() as any;expect(a.assessment).toMatchObject({status:'declared',strictEligible:false});expect(a.saved).toMatchObject({provenance:'admin-declaration',strictEligible:false});expect(a.assessment.gaps.length).toBeGreaterThan(0);
+  expect((await s.call('/assessment',declaration)).status).toBe(200);expect(s.sqlite.prepare('SELECT COUNT(*) n FROM creator_feedback_assessments').get()).toMatchObject({n:1});
+  expect((await s.call('/assessment',{...declaration,note:'Changed old assertion'})).status).toBe(409);
+  expect(()=>s.sqlite.prepare("UPDATE creator_feedback_assessments SET payload='{}'").run()).toThrow('immutable');expect(s.preserved()).toEqual(before);
+  for(const extra of [{status:'verified'},{strictEligible:true},{owner_id:'other'},{note:'x'.repeat(4097)}])expect((await s.call('/assessment',{...declaration,requestId:crypto.randomUUID(),...extra})).status).toBeGreaterThanOrEqual(400);
+ });
+ it('computes a real uploaded byte hash but never treats that as independently verified provider binding or stores source',async()=>{
+  const s=await setup(),before=s.preserved();await s.call('/link',s.link);const html='<script>throw new Error("Synthetic source must not execute")</script>';
+  const hash=await digest(html);s.sqlite.prepare('UPDATE review_jobs SET input_hash=? WHERE id=?').run(hash,'task-one');const kept=s.preserved();
+  const id=crypto.randomUUID(),url='https://feedback.test/api/admin/creator-feedback/file-evidence?jobId=task-one&requestId='+id+'&generation=1';
+  const call=(body:string,headers:Record<string,string>={})=>creatorFeedbackAdminApi(new Request(url,{method:'POST',headers:{Cookie:s.cookie,Origin:'https://feedback.test','Content-Type':'application/octet-stream',...headers},body}),s.env);
+  const r=(await call(html))!;expect(r.status).toBe(200);const b=await r.json() as any;expect(b.saved.file).toMatchObject({sha256:hash,bytes:Buffer.byteLength(html),inputHashMatches:true,sourceBindingVerified:false,origin:'admin-upload'});expect(b.assessment.strictEligible).toBe(false);
+  expect((await call(html))!.status).toBe(200);expect((await call(html+'different'))!.status).toBe(409);
+  const payload=s.sqlite.prepare('SELECT payload FROM creator_feedback_assessments').get() as any;expect(payload.payload).not.toContain('<script>');expect(s.preserved()).toEqual(kept);expect(s.network).not.toHaveBeenCalled();
+  expect((await call(html,{'Content-Length':String(8*1024*1024+1)}))!.status).toBe(413);expect((await call(html,{'Content-Type':'text/html'}))!.status).toBe(415);
+ });
+ it('flags a measured mismatch and leaves null rule/score semantics and source reports unchanged',async()=>{
+  const s=await setup();await s.call('/link',s.link);s.sqlite.prepare('UPDATE review_jobs SET input_hash=? WHERE id=?').run('a'.repeat(64),'task-one');
+  const req=new Request('https://feedback.test/api/admin/creator-feedback/file-evidence?'+new URLSearchParams({jobId:'task-one',requestId:crypto.randomUUID(),generation:'1'}),{method:'POST',headers:{Cookie:s.cookie,Origin:'https://feedback.test','Content-Type':'application/octet-stream'},body:'synthetic transformed bytes'});
+  const res=(await creatorFeedbackAdminApi(req,s.env))!;expect(res.status).toBe(200);const measured=await res.json() as any;expect(measured.saved.file.inputHashMatches).toBe(false);expect(measured.assessment.gaps.join('')).toContain('不一致');
+  const detail=await(await s.call('/job?jobId=task-one')).json() as any;expect(detail.platform.decision).toBeNull();expect(detail.ai.decision).toBeNull();expect(detail.version.ruleVersion).toBeNull();expect(detail.comparison.state).toBe('unavailable');expect(detail.comparison.scoreDifferences[0]).toMatchObject({ai:0,platform:null,delta:null});
+ });
+ it('exposes leader direct rejection as an effective source decision and exports raw provenance without changing old records',async()=>{
+  const s=await setup();await s.call('/link',s.link);const g=game();g.versions[0].status='rejected';g.versions[0].finalReviewId=g.reviews[0].id;g.reviews[0].decision='rejected';g.reviews[0].reviewerRole='leader';s.cache(g);const before=s.preserved();
+  const res=await s.call('/export?jobId=task-one');expect(res.headers.get('Content-Disposition')).toContain('attachment');const b=await res.json() as any;expect(b.schemaVersion).toBe(1);expect(b.platform).toMatchObject({state:'valid',decision:'rejected',reviewerRole:'leader'});expect(b.reviews[0].feedback).toBe('Synthetic source opinion');expect(b.assessment.strictEligible).toBe(false);expect(s.preserved()).toEqual(before);
+  expect(JSON.stringify(b)).not.toContain(s.fingerprint);expect(JSON.stringify(b)).not.toContain(s.env.CREATOR_FEEDBACK_TOKEN);
+ });
+ it.each(['generation','unlink','removed'])('physically purges assessment history on %s and cannot resurrect it after re-linking',async change=>{
+  const s=await setup();await s.call('/link',s.link);const declaration={jobId:'task-one',requestId:crypto.randomUUID(),generation:1,status:'excluded',note:'Synthetic excluded',fileRelation:'unknown',sourceArtifactHash:null,ruleRelation:'unknown',sourceRuleId:null,pgcRuleId:null,reference:''};expect((await s.call('/assessment',declaration)).status).toBe(200);
+  if(change==='generation')s.sqlite.prepare('UPDATE creator_feedback_state SET generation=generation+1').run();else if(change==='unlink')s.sqlite.prepare('DELETE FROM creator_feedback_links').run();else s.sqlite.prepare('DELETE FROM creator_feedback_games').run();
+  expect(s.sqlite.prepare('SELECT COUNT(*) n FROM creator_feedback_assessments').get()).toMatchObject({n:0});
+  if(change==='generation'){expect((await s.call('/assessment',declaration)).status).toBe(409);const current=await(await s.call('/assessment?jobId=task-one')).json() as any;expect(current.assessment).toMatchObject({status:'unverified',history:[],strictEligible:false});}
+  if(change==='unlink'){expect((await s.call('/link',s.link)).status).toBe(200);expect((await(await s.call('/assessment?jobId=task-one')).json() as any).assessment.history).toEqual([]);}
+ });
+ it('fences declaration writes and exports across authorization rotation and refuses late private data',async()=>{
+  const s=await setup();await s.call('/link',s.link);let changed=false;s.onRead(query=>{if(!changed&&query.startsWith('SELECT l.*,j.input_hash')){changed=true;s.sqlite.prepare('UPDATE creator_feedback_state SET generation=generation+1').run();}});
+  const b={jobId:'task-one',requestId:crypto.randomUUID(),generation:1,status:'unverified',note:'',fileRelation:'unknown',sourceArtifactHash:null,ruleRelation:'unknown',sourceRuleId:null,pgcRuleId:null,reference:''};expect((await s.call('/assessment',b)).status).toBe(409);expect(s.sqlite.prepare('SELECT COUNT(*) n FROM creator_feedback_assessments').get()).toMatchObject({n:0});
+ });
+
+ it.each(['generation','removed'])('does not return a just-saved private declaration if %s changes during summary read',async change=>{
+  const s=await setup();await s.call('/link',s.link);let triggered=false;
+  s.onRead(query=>{if(!triggered&&query.includes('SELECT a.* FROM creator_feedback_assessments')){triggered=true;if(change==='generation')s.sqlite.prepare('UPDATE creator_feedback_state SET generation=generation+1').run();else s.sqlite.prepare('DELETE FROM creator_feedback_games').run();}});
+  const b={jobId:'task-one',requestId:crypto.randomUUID(),generation:1,status:'declared',note:'Synthetic private declaration not to return late',fileRelation:'unknown',sourceArtifactHash:null,ruleRelation:'unknown',sourceRuleId:null,pgcRuleId:null,reference:''};
+  const response=await s.call('/assessment',b);expect([404,409]).toContain(response.status);expect(await response.text()).not.toContain(b.note);expect(s.sqlite.prepare('SELECT COUNT(*) n FROM creator_feedback_assessments').get()).toMatchObject({n:0});
+ });
+
+ it('preserves different source score scales without fabricating a cross-scale numeric delta',async()=>{
+  const s=await setup();await s.call('/link',s.link);const g=game();g.versions[0].status='rejected';g.versions[0].finalReviewId=g.reviews[0].id;g.reviews[0].decision='rejected';g.reviews[0].scores[0].max=5;s.cache(g);
+  const detail=await(await s.call('/job?jobId=task-one')).json() as any;expect(detail.comparison.scoreDifferences[0]).toMatchObject({ai:0,platform:0,platformMax:5,delta:null});
  });
 
 });

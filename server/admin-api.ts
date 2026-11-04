@@ -10,6 +10,7 @@ import {reviewActivity} from './review-usage';
 import {modelQuota} from './model-quota';
 import {adminDashboardApi} from './admin-dashboard-api';
 import {creatorFeedbackAdminApi} from './creator-feedback-api';
+import {reviewMetrics} from './review-metrics-api';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
@@ -31,6 +32,10 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
     const feedback=await creatorFeedbackAdminApi(request,{...secrets,DB,...runtime} as any);if(feedback)return feedback;
+    if(url.pathname==='/api/admin/review-metrics'&&request.method==='GET'){
+      if(!DB)return json({error:'审核统计服务尚未就绪。'},503);
+      return json(await reviewMetrics(DB,url.searchParams));
+    }
     {const {CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_RUNNER,...ordinarySecrets}=secrets as AppSecrets&Record<string,unknown>;secrets=ordinarySecrets;}
     if(runtime){const {CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_RUNNER,...otherRuntime}=runtime;runtime=otherRuntime;}
     const dashboard=await adminDashboardApi(request,{...secrets,DB,modelStore:store,...runtime});if(dashboard)return dashboard;

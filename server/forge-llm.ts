@@ -107,8 +107,8 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
         onActivity: req.onWait ? (phase, characters) => req.onWait!(phase === 'thinking' ? '模型正在思考，连接正常，尚未输出正文…' : `模型正在输出，已接收 ${characters.toLocaleString('en-US')} 个字符…`) : undefined,
         onMetrics: async metrics => {
           if (!env.DB) return;
-          await env.DB.prepare('INSERT INTO model_runs (id,profile_id,model,purpose,status,effort,max_tokens,input_tokens,output_tokens,reasoning_tokens,first_text_ms,elapsed_ms,characters,finish_reason,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-            .bind(runId,active.id,active.profile.model,req.purpose || 'create',metrics.status,metrics.effort,metrics.maxTokens,metrics.inputTokens,metrics.outputTokens,metrics.reasoningTokens,metrics.firstTextMs,metrics.elapsedMs,metrics.characters,metrics.finishReason,metrics.error,new Date().toISOString()).run();
+          await env.DB.prepare('INSERT INTO model_runs (id,profile_id,model,purpose,status,effort,max_tokens,input_tokens,output_tokens,reasoning_tokens,first_text_ms,elapsed_ms,characters,finish_reason,error,created_at,capacity_wait_ms,throttle_wait_ms,retry_wait_ms,request_ms,first_response_ms,first_text_from_request_ms,first_text_kind,attempts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+            .bind(runId,active.id,active.profile.model,req.purpose || 'create',metrics.status,metrics.effort,metrics.maxTokens,metrics.inputTokens,metrics.outputTokens,metrics.reasoningTokens,metrics.firstTextMs,metrics.elapsedMs,metrics.characters,metrics.finishReason,metrics.error,new Date().toISOString(),metrics.capacityWaitMs,metrics.throttleWaitMs,metrics.retryWaitMs,metrics.requestMs,metrics.firstResponseMs,metrics.firstTextFromRequestMs,metrics.firstTextKind,metrics.attempts).run();
         },
         onWait: req.onWait ? (ms, reason) => req.onWait!(ms ? `${reason === 'rate_limit' ? '模型接口限流，正在自动等待恢复' : reason === 'unavailable' ? '模型上游暂时繁忙，正在等待恢复' : reason === 'pending' ? '模型网关仍在处理同一请求，正在等待结果' : '同一模型的请求正在排队'}，约 ${Math.ceil(ms / 1000)} 秒后继续。` : '') : undefined,
       });

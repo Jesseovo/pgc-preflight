@@ -1,7 +1,7 @@
 // Administrator DTOs contain presentation metadata. Artifact source is fetched
 // only through the selected material endpoint, never through lists or totals.
 export type AdminRange='today'|'7d'|'30d'|'all';
-export type AdminView='overview'|'works'|'tasks'|'reviews'|'members'|'settings';
+export type AdminView='overview'|'works'|'tasks'|'reviews'|'feedback'|'members'|'settings';
 export type MaterialKind='expand'|'game'|'preview'|'brief'|'assets';
 export interface AdminMemberOption {id:string;displayName:string;username:string;enabled:boolean;star:boolean}
 export interface AdminProject {
