@@ -1,4 +1,4 @@
-import {CreatorFeedbackClient, FeedbackProviderError} from './creator-feedback-client';
+import {CreatorFeedbackClient, FeedbackProviderError, type FeedbackChange, type FeedbackGame} from './creator-feedback-client';
 
 export type FeedbackSyncEnv = {DB:any; CREATOR_FEEDBACK_TOKEN?:string; CREATOR_FEEDBACK_ENABLED?:string};
 type Client = Pick<CreatorFeedbackClient,'contract'|'snapshot'|'games'|'changes'|'rules'>;
@@ -81,6 +81,18 @@ export async function runFeedbackSync(env:FeedbackSyncEnv,options:{client?:Clien
   ...(game.versions||[]).flatMap((v:any)=>(v.reviews||[]).flatMap((r:any)=>chunks('review',`${r.id}:${r.revision}`,game.id,r))),
   ...(game.reviews||[]).flatMap((r:any)=>chunks('review',`${r.id}:${r.revision}`,game.id,r))
  ];
+ const invalidatePilotBinding=(workId:string,game?:FeedbackGame)=>{
+  const versions=game?.versions?.map(version=>version.id)??[];
+  const groups:string[]=[];
+  // Creator IDs are at most 240 ASCII characters. Keep each bound array below D1's value limit.
+  if(game&&!game.deleted)for(let start=0;start<versions.length;start+=4000)groups.push(JSON.stringify(versions.slice(start,start+4000)));
+  const mismatch=groups.length?`AND (source_author_id IS NOT ? OR (${groups.map(()=>
+   'NOT EXISTS(SELECT 1 FROM json_each(?) WHERE value=review_pilot_members.version_id)').join(' AND ')}))`:'';
+  return guarded(`UPDATE review_pilot_members SET binding_status='stale',source_author_id=NULL,work_id=NULL,version_id=NULL,
+   verified_at=NULL,source_generation=NULL,scope_revision=NULL,revision=revision+1,updated_at=?
+   WHERE work_id=? AND binding_status='linked' AND source_generation=? ${mismatch} AND ${guard}`,
+  [new Date(clock()).toISOString(),workId,generation,...(groups.length?[game?.authorId??null,...groups]:[])]);
+ };
  try{
   const client=options.client??new CreatorFeedbackClient(env.CREATOR_FEEDBACK_TOKEN);
   const contract=await client.contract();fenceTime=clock();
@@ -98,25 +110,38 @@ export async function runFeedbackSync(env:FeedbackSyncEnv,options:{client?:Clien
   }else if(s.phase==='snapshot'){
    const page=await client.games(s.snapshot_id,s.snapshot_after,20);fenceTime=clock();
    if(page.snapshot!==s.snapshot_id||page.cursor!==s.snapshot_cursor||page.nextAfter===s.snapshot_after&&page.nextAfter!==null)throw new Error('snapshot');
-   const writes=page.games.flatMap((g:any)=>gameWrites(g,cursor(s.snapshot_cursor).seq));
+   const writes=page.games.flatMap(game=>[...gameWrites(game,cursor(s.snapshot_cursor).seq),invalidatePilotBinding(game.id,game)]);
    await DB.batch([...writes,...chunks('contract','current',null,contractProvenance),update('snapshot_after=?,cursor=?',[page.nextAfter,page.nextAfter===null?s.snapshot_cursor:null]),finish(page.nextAfter===null?'delta':'snapshot',clock()+CONTINUE)]);
   }else{
    const page=await client.changes(s.cursor,20),before=cursor(s.cursor),after=cursor(page.cursor);
    if(before.scope!==after.scope||after.seq<before.seq||page.hasMore&&after.seq===before.seq)throw new Error('cursor');
    const rules=await client.rules();fenceTime=clock();
-   const writes:any[]=[];const seen=new Set<number>(),latest=new Map<string,any>();
-   for(const event of page.events as any[]){
+   const writes:any[]=[];const seen=new Set<number>(),observedByGame=new Map<string,FeedbackChange[]>();
+   for(const event of page.events){
     if(!Number.isSafeInteger(event.id)||event.id<0||event.id>after.seq)throw new Error('event');
     if(event.game&&event.workId&&event.game.id!==event.workId)throw new Error('event_identity');
     if(seen.has(event.id))continue;seen.add(event.id);
     if(event.id<=before.seq)continue;
     if(await DB.prepare('SELECT event_id FROM creator_feedback_events WHERE event_id=?').bind(event.id).first())continue;
     writes.push(guarded(`INSERT OR IGNORE INTO creator_feedback_events(event_id,game_id) SELECT ?,? WHERE ${guard}`,[event.id,event.workId??event.game?.id??null]));
-    const id=event.workId??event.game?.id;if(id&&(!latest.has(id)||latest.get(id).id<event.id))latest.set(id,event);
+    const id=event.workId??event.game?.id;
+    if(id){
+     const observations=observedByGame.get(id)||[];
+     observations.push(event);
+     observedByGame.set(id,observations);
+    }
    }
-   for(const [id,event]of latest){
+   for(const [id,observations]of observedByGame){
     const old=await DB.prepare('SELECT last_sequence FROM creator_feedback_games WHERE game_id=?').bind(id).first();
+    const event=observations.reduce((latest,current)=>current.id>latest.id?current:latest);
     if(old&&old.last_sequence>=event.id)continue;
+    // Cache the highest sequence as before, while retaining every newly observed
+    // loss of a binding. A later valid payload cannot restore that binding.
+    for(const observed of observations){
+     if(old&&old.last_sequence>=observed.id)continue;
+     if(observed.operation==='removed')writes.push(invalidatePilotBinding(id));
+     else if(observed.game)writes.push(invalidatePilotBinding(id,observed.game));
+    }
     if(event.operation==='removed'){
      writes.push(...['creator_feedback_links','creator_feedback_chunks','creator_feedback_games'].map(t=>guarded(`DELETE FROM ${t} WHERE game_id=? AND ${guard}`,[id])));
      writes.push(guarded(`UPDATE creator_feedback_events SET game_id=NULL WHERE game_id=? AND ${guard}`,[id]));

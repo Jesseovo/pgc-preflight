@@ -21,6 +21,19 @@ const review=(revision=1,feedback='Synthetic opinion',flags:any={})=>({id:'revie
 const game=(title='Synthetic current game',reviews:any[]=[review()])=>({id:'game_one',title,reviews,versions:[],comments:[]});
 const event=(id:number,g:any=game(),operation='updated')=>({id,workId:'game_one',game:g,operation,kind:'review'});
 async function bootstrap(s:ReturnType<typeof setup>){await s.step();await s.step();}
+const pilotGame={...game(),authorId:'author_fixture',deleted:false,versions:[{id:'version_fixture'}]};
+async function withPilotBinding(){
+ const s=setup();
+ s.client.games.mockResolvedValueOnce({snapshot:'snapshot',cursor:'1:10',games:[pilotGame],nextAfter:null});
+ await bootstrap(s);
+ s.sql.exec(`INSERT INTO members(id,username,display_name,password_hash,password_salt,created_at,updated_at)
+  VALUES ('pilot','synthetic','Fixture','unused','unused','now','now')`);
+ s.sql.prepare(`INSERT INTO review_pilot_members(member_id,pilot_enabled,creator_account,revision,enrollment_started_at,updated_at,
+  binding_status,source_author_id,work_id,version_id,verified_at,source_generation,scope_revision)
+  VALUES ('pilot',1,'Fixture',2,'enrolled','now','linked','author_fixture','game_one','version_fixture','now',?,1)`).run(s.row().generation);
+ const binding=()=>s.sql.prepare('SELECT * FROM review_pilot_members WHERE member_id=?').get('pilot');
+ return {...s,binding};
+}
 describe('private resumable provider feedback cache',()=>{
  it('is disabled by default and never calls the provider',async()=>{const s=setup();delete (s.env as any).CREATOR_FEEDBACK_ENABLED;expect((await s.step()).status).toBe('disabled');expect(s.client.contract).not.toHaveBeenCalled();});
  it('persists snapshot key before POST and resumes the same pending request then exact snapshot cursor',async()=>{
@@ -55,6 +68,80 @@ describe('private resumable provider feedback cache',()=>{
   s.sql.prepare('INSERT INTO creator_feedback_links VALUES(?,?,?,?,?,?,?,?,?)').run('task','game_one','version_one','owner','work','submission','exact',1,'now');
   s.client.changes.mockResolvedValueOnce({cursor:'1:30',events:[event(30,null,'removed')],hasMore:false});await s.step();
   expect(await readFeedbackGame(s.DB,'game_one')).toBeNull();expect(s.sql.prepare('SELECT count(*) n FROM creator_feedback_links').get()).toMatchObject({n:0});expect(s.sql.prepare("SELECT count(*) n FROM creator_feedback_chunks WHERE game_id='game_one'").get()).toMatchObject({n:0});
+ });
+ it.each([
+  ['soft-deleted game',{deleted:true}],
+  ['missing reference version',{versions:[{id:'version_other'}]}],
+  ['changed author',{authorId:'author_other'}],
+ ])('permanently invalidates a %s before restoration, even when both observations are on one page',async(_name,patch)=>{
+  for(const samePage of [false,true]){
+   const s=await withPilotBinding();
+   const invalid=event(20,{...pilotGame,...patch}),restored=event(30,pilotGame);
+   s.client.changes.mockResolvedValueOnce({cursor:samePage?'1:30':'1:20',events:samePage?[restored,invalid]:[invalid],hasMore:false});
+   await s.step();
+   if(!samePage){
+    s.client.changes.mockResolvedValueOnce({cursor:'1:30',events:[restored],hasMore:false});
+    await s.step();
+   }
+   expect(s.row().cursor).toBe('1:30');expect(await readFeedbackGame(s.DB,'game_one')).toEqual(pilotGame);
+   expect(s.binding()).toMatchObject({pilot_enabled:1,creator_account:'Fixture',enrollment_started_at:'enrolled',revision:3,
+    binding_status:'stale',source_author_id:null,work_id:null,version_id:null,verified_at:null,source_generation:null,scope_revision:null});
+  }
+ });
+ it('invalidates a removed observation even if the game returns on the same page',async()=>{
+  const s=await withPilotBinding();
+  s.client.changes.mockResolvedValueOnce({cursor:'1:30',events:[event(20,null,'removed'),event(30,pilotGame)],hasMore:false});
+  await s.step();expect(await readFeedbackGame(s.DB,'game_one')).toEqual(pilotGame);
+  expect(s.binding()).toMatchObject({revision:3,binding_status:'stale',source_author_id:null});
+ });
+ it('does not invalidate a binding from an observation older than the committed game cache',async()=>{
+  const s=await withPilotBinding();
+  s.sql.exec("UPDATE creator_feedback_games SET last_sequence=25 WHERE game_id='game_one'");
+  s.client.changes.mockResolvedValueOnce({cursor:'1:30',events:[event(20,{...pilotGame,deleted:true}),event(30,pilotGame)],hasMore:false});
+  await s.step();expect(s.row().cursor).toBe('1:30');expect(s.binding()).toMatchObject({revision:2,binding_status:'linked'});
+ });
+ it('preserves a reference version in a later bound ID group',async()=>{
+  const s=await withPilotBinding();
+  const versions=[...Array.from({length:4000},(_,i)=>({id:`version_${i}`})),...pilotGame.versions];
+  s.client.changes.mockResolvedValueOnce({cursor:'1:20',events:[event(20,{...pilotGame,versions})],hasMore:false});
+  await s.step();expect(s.row().cursor).toBe('1:20');expect(s.binding()).toMatchObject({revision:2,binding_status:'linked'});
+ });
+ it('rolls back a binding invalidation with the interrupted cache transaction',async()=>{
+  const s=await withPilotBinding();
+  s.client.changes.mockResolvedValue({cursor:'1:20',events:[event(20,{...pilotGame,deleted:true})],hasMore:false});
+  s.fail();await s.step();expect(s.row().cursor).toBe('1:10');expect(await readFeedbackGame(s.DB,'game_one')).toEqual(pilotGame);
+  expect(s.binding()).toMatchObject({revision:2,binding_status:'linked'});
+  await s.step();expect(s.row().cursor).toBe('1:20');expect(s.binding()).toMatchObject({revision:3,binding_status:'stale'});
+ });
+ it.each(['expired','replaced'])('fences pilot invalidation from a %s lease',async(reason)=>{
+  const s=await withPilotBinding(),real=Date.now(),spy=vi.spyOn(Date,'now').mockReturnValue(real);
+  s.client.changes.mockResolvedValueOnce({cursor:'1:20',events:[event(20,{...pilotGame,deleted:true})],hasMore:false});
+  s.client.rules.mockImplementationOnce(async()=>{
+   if(reason==='expired')spy.mockReturnValue(real+91_000);
+   else s.sql.exec("UPDATE creator_feedback_state SET lease_token='successor' WHERE id=1");
+   return {rules:[],historicalCoverage:null};
+  });
+  await s.step();expect(s.row().cursor).toBe('1:10');expect(await readFeedbackGame(s.DB,'game_one')).toEqual(pilotGame);
+  expect(s.binding()).toMatchObject({revision:2,binding_status:'linked'});
+ });
+ it('does not invalidate an explicitly rebound member in a newer generation',async()=>{
+  const s=await withPilotBinding(),nextGeneration=s.row().generation+1;
+  s.client.changes.mockResolvedValueOnce({cursor:'1:30',events:[event(20,{...pilotGame,deleted:true}),event(30,pilotGame)],hasMore:false});
+  s.client.rules.mockImplementationOnce(async()=>{
+   s.sql.prepare("UPDATE creator_feedback_state SET generation=?,lease_token='successor' WHERE id=1").run(nextGeneration);
+   s.sql.prepare(`UPDATE review_pilot_members SET binding_status='linked',source_author_id='author_fixture',work_id='game_one',
+    version_id='version_fixture',verified_at='reverified',source_generation=?,scope_revision=1,revision=revision+1 WHERE member_id='pilot'`).run(nextGeneration);
+   return {rules:[],historicalCoverage:null};
+  });
+  await s.step();expect(s.row().cursor).toBe('1:10');
+  expect(s.binding()).toMatchObject({revision:4,binding_status:'linked',source_generation:nextGeneration,verified_at:'reverified'});
+ });
+ it('atomically invalidates an unavailable reference while refreshing a same-generation snapshot',async()=>{
+  const s=await withPilotBinding();
+  s.sql.exec("UPDATE creator_feedback_state SET phase='snapshot',cursor=NULL WHERE id=1");
+  s.client.games.mockResolvedValueOnce({snapshot:'snapshot',cursor:'1:10',games:[{...pilotGame,deleted:true}],nextAfter:null});
+  await s.step();expect(s.row().cursor).toBe('1:10');expect((await readFeedbackGame(s.DB,'game_one')).deleted).toBe(true);
+  expect(s.binding()).toMatchObject({revision:3,binding_status:'stale'});
  });
  it('401 purges and halts even after manual reset until credential changes; rotation rebuilds same scope',async()=>{
   const s=setup();await bootstrap(s);s.client.contract.mockRejectedValueOnce(new FeedbackProviderError('http_error',401));

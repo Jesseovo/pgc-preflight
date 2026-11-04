@@ -11,6 +11,7 @@ import {modelQuota} from './model-quota';
 import {adminDashboardApi} from './admin-dashboard-api';
 import {creatorFeedbackAdminApi} from './creator-feedback-api';
 import {reviewMetrics} from './review-metrics-api';
+import {reviewPilotsAdminApi} from './review-pilots';
 
 export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecrets,members:MemberStore,DB?:ModelThrottleDatabase,runtime?:Record<string,unknown>):Promise<Response|null> {
   const url=new URL(request.url);
@@ -31,6 +32,7 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json({ok:true},200,{'Set-Cookie':sessionCookie(token,8*60*60)});
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
+    const pilots=await reviewPilotsAdminApi(request,{...secrets,DB,...runtime} as any);if(pilots)return pilots;
     const feedback=await creatorFeedbackAdminApi(request,{...secrets,DB,...runtime} as any);if(feedback)return feedback;
     if(url.pathname==='/api/admin/review-metrics'&&request.method==='GET'){
       if(!DB)return json({error:'审核统计服务尚未就绪。'},503);

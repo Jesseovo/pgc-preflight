@@ -1,0 +1,12 @@
+.adm-pilot-card{margin-top:14px;padding:16px;min-width:0}
+.adm-pilot-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.adm-pilot-heading h2{margin:0;font-size:16px}
+.adm-pilot-forms{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.adm-pilot-forms .adm-manage-form{padding:0;min-width:0}
+.adm-pilot-forms h3{margin:0;font-size:14px}
+.adm-pilot-forms h3 small{font-size:11px;font-weight:400;color:#61735c;margin-left:6px}
+.adm-pilot-forms fieldset{display:grid;gap:12px;padding:0;border:0;margin:0;min-width:0}
+.adm-pilot-bound{display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 10px;margin:0;font-size:12px}
+.adm-pilot-bound dd{margin:0;overflow-wrap:anywhere}
+.adm-pilot-card [data-pilot-message]{font-size:12px;margin:8px 0}
+@media(max-width:740px){.adm-pilot-forms{grid-template-columns:1fr}}

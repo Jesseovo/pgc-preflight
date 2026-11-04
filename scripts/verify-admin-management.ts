@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {build} from 'esbuild';
 import {createServer,type IncomingMessage} from 'node:http';
-import {mkdtemp,readFile,rm,writeFile} from 'node:fs/promises';
+import {mkdir,mkdtemp,readFile,rm,writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -16,6 +16,10 @@ const mutations:Array<{path:string;body:any}>=[];
 const unexpectedRequests:string[]=[];
 const member={id:'11111111-1111-1111-1111-111111111111',displayName:'合成成员',username:'fixture',enabled:true,canReview:true,star:true,dailyReviewLimit:50,createdAt:'2026-10-28T01:00:00Z',updatedAt:'2026-10-28T01:00:00Z',lastActivity:'2026-10-27T18:20:00.000Z'};
 const idleMember={...member,id:'33333333-3333-3333-3333-333333333333',username:'idle.fixture',displayName:'暂无活动成员',lastActivity:null};
+const emptyBinding=()=>({status:'unlinked',sourceAuthorId:null as string|null,workId:null as string|null,versionId:null as string|null,verifiedAt:null as string|null});
+const pilot={memberId:member.id,displayName:member.displayName,username:member.username,accountEnabled:true,pilotEnabled:false,creatorAccount:'',revision:0,enrollmentStartedAt:null as string|null,updatedAt:null as string|null,binding:emptyBinding()};
+let pilotAvailable=false,losePilotResponse=true,limitPilotLink=true;
+const pilotRequests=new Map<string,string>();
 const result={aes:2,ease:3,play:2,verdict:'建议修改',reviewer_comment:'合成审核意见',score_reasons:{aes:'美学证据',ease:'操作证据',play:'玩法证据'},uncertainties:['声音待确认'],strengths:['规则清楚'],issues:[{severity:'中',area:'反馈',problem:'合成问题',evidence:'合成证据',fix:'合成建议'}],fix_prompt:'请按建议修改'};
 const human={status:'reviewed',phase:'final',score:8,decision:'approved',feedback:'真人反馈',workId:'work-1',versionId:'v1'};
 const report={id:1,owner_id:member.id,title:'合成游戏',score:7,result,created_at:'2026-10-28T01:00:00Z',model_executor:'agent',probe:{evidenceOrigin:'member-device',summary:'合成采集摘要'},shots:[],human_review:human};
@@ -28,6 +32,30 @@ const server=createServer(async(request,response)=>{
   const url=new URL(request.url!,'http://fixture');
   const json=(value:unknown,status=200)=>{response.writeHead(status,{'Content-Type':'application/json; charset=utf-8'});response.end(JSON.stringify(value));};
   try{
+    if(url.pathname==='/api/admin/review-pilots'&&request.method==='GET'){
+      if(!pilotAvailable)return json({error:'灰测设置暂不可用'},404);
+      return json({members:[pilot,{...pilot,memberId:idleMember.id,pilotEnabled:false,creatorAccount:'',binding:emptyBinding()}]});
+    }
+    if(url.pathname.startsWith('/api/admin/review-pilots/')&&request.method==='POST'){
+      const body=await readBody(request);mutations.push({path:url.pathname,body});
+      assert.equal(body.memberId,member.id);assert.match(body.requestId,/^[a-f0-9-]{36}$/);
+      const prior=pilotRequests.get(body.requestId);
+      if(prior){assert.equal(prior,JSON.stringify(body));return json({member:pilot});}
+      if(body.expectedRevision!==pilot.revision)return json({error:'灰测设置已更新，请重新读取'},409);
+      const kind=url.pathname.split('/').at(-1);
+      if(kind==='link'&&limitPilotLink){limitPilotLink=false;return json({error:'来源限流，请稍后重试'},429);}
+      if(kind==='member'){
+        pilot.pilotEnabled=body.pilotEnabled;pilot.creatorAccount=body.creatorAccount;
+        pilot.binding={...emptyBinding(),status:pilot.creatorAccount?'declared':'unlinked'};
+      }else if(kind==='link'){
+        assert.equal(body.ownershipConfirmed,true);
+        pilot.binding={status:'linked',sourceAuthorId:'author_fixture',workId:'game_fixture',versionId:'version_fixture',verifiedAt:'2026-11-04T01:00:00Z'};
+      }else if(kind==='unlink')pilot.binding={...emptyBinding(),status:'declared'};
+      else throw new Error('Unexpected pilot operation');
+      pilot.revision++;pilotRequests.set(body.requestId,JSON.stringify(body));
+      if(losePilotResponse){losePilotResponse=false;return json({error:'合成连接失败，请用原内容重试'},503);}
+      return json({member:pilot});
+    }
     if(url.pathname==='/api/admin/members'&&request.method==='GET')return json({members:[member,idleMember]});
     if(url.pathname===`/api/admin/members/${member.id}`&&request.method==='PATCH'){
       const body=await readBody(request);mutations.push({path:url.pathname,body});
@@ -111,7 +139,7 @@ try{
   assert.equal(await page.evaluate(()=>(window as any).calls.some((c:any)=>c.path==='config')),false,'Member entry must not read model settings');
   assert((await page.$eval('[data-member-list] thead',el=>(el as HTMLElement).innerText)).includes('最近活动 · 北京时间'));
   assert((await page.$eval('[data-member-list] time',el=>(el as HTMLElement).innerText)).includes('02:20'),'Activity dates use Beijing time');
-  assert.equal(await page.$eval(`[data-member="${idleMember.id}"]`,el=>el.closest('tr')!.querySelectorAll('td')[3].textContent),'暂无','Missing activity is explicit');
+  assert.equal(await page.$eval(`[data-member="${idleMember.id}"]`,el=>el.closest('tr')!.querySelectorAll('td')[4].textContent),'暂无','Missing activity is explicit');
   await page.click('[data-member]');await page.waitForSelector('[data-permissions]');await page.click('[data-permissions] button[type=submit]');
   assert.equal(mutations.length,0,'Unchanged permissions must not revoke sessions');
   await page.click('[name=canReview]');await page.click('[data-permissions] button[type=submit]');
@@ -126,6 +154,60 @@ try{
   await setValue('[data-password] [name=confirmPassword]','synthetic123');await page.click('[data-password] button');
   await page.waitForFunction(()=>document.querySelector('[data-password] [role=status]')?.textContent?.includes('密码已重置'));
   assert.equal(await page.$eval('[data-password] [name=password]',el=>(el as HTMLInputElement).value),'');
+  await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('灰测设置暂不可用'));
+  pilotAvailable=true;
+  await page.click('[data-pilot-reload]');await page.waitForSelector('[data-pilot-member]');
+  assert.equal(await page.$eval('[name=creatorAccount]',el=>(el as HTMLInputElement).value),'');
+  assert.equal(await page.$eval('[data-pilot-link] fieldset',el=>(el as HTMLFieldSetElement).disabled),true);
+  await page.click('[name=pilotEnabled]');await setValue('[name=creatorAccount]','creator.fixture');
+  await page.click('[data-pilot-member] button[type=submit]');
+  await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('合成连接失败'));
+  const firstPilot=lastBody();assert.deepEqual(Object.keys(firstPilot).sort(),['creatorAccount','expectedRevision','memberId','pilotEnabled','requestId']);
+  assert.equal(firstPilot.expectedRevision,0);assert.equal(firstPilot.creatorAccount,'creator.fixture');assert.equal(firstPilot.pilotEnabled,true);
+  await page.click('[data-pilot-member] button[type=submit]');
+  await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('灰测设置已保存'));
+  assert.deepEqual(lastBody(),firstPilot,'Ambiguous response retry retains the original request UUID');
+  const setLink=async()=>{await setValue('[name=workId]','known-work');await setValue('[name=versionId]','known-version');};
+  await setLink();const beforeOwnership=mutations.length;await page.click('[data-pilot-link] button[type=submit]');assert.equal(mutations.length,beforeOwnership);
+  await page.click('[name=ownershipConfirmed]');pilot.revision++;
+  await page.click('[data-pilot-link] button[type=submit]');await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('请重新读取'));
+  assert.equal(lastBody().expectedRevision,1);assert.equal(pilot.binding.status,'declared');
+  assert.equal(await page.$eval('[name=versionId]',el=>(el as HTMLInputElement).value),'known-version','Conflict retains form values');
+  await page.click('[data-pilot-reload]');await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('已读取最新设置'));
+  await setLink();await page.click('[name=ownershipConfirmed]');await page.click('[data-pilot-link] button[type=submit]');
+  await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('来源限流'));
+  const limited=lastBody();assert.equal(limited.expectedRevision,2);assert.equal(pilot.binding.status,'declared');
+  await page.click('[data-pilot-link] button[type=submit]');await page.waitForSelector('[data-pilot-unlink]');assert.deepEqual(lastBody(),limited);
+  assert.match(await page.$eval('.adm-pilot-bound',el=>el.textContent||''),/version_fixture/);
+  const pilotScreenshots=join(repository,'artifacts','review-pilot-members-20261104');
+  await mkdir(pilotScreenshots,{recursive:true});
+  const capturePilotPage=async(name:string)=>{
+    await page.waitForFunction(()=>{
+      const card=document.querySelector('[data-member-pilot]');
+      return card?.querySelector('[data-pilot-unlink]')&&!card.hasAttribute('aria-busy');
+    });
+    const clip=await page.evaluate(async()=>{
+      await document.fonts.ready;
+      window.scrollTo(0,0);
+      await new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve())));
+      const card=document.querySelector('[data-member-pilot]')!;
+      return {x:0,y:0,width:innerWidth,height:Math.max(document.documentElement.scrollHeight,Math.ceil(card.getBoundingClientRect().bottom+scrollY+24))};
+    });
+    await page.screenshot({path:join(pilotScreenshots,name),clip,captureBeyondViewport:true});
+  };
+  await capturePilotPage('ui-desktop.png');
+  await page.setViewport({width:390,height:844});
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'Mobile pilot form must not overflow');
+  await capturePilotPage('ui-mobile.png');
+  await page.setViewport({width:1360,height:960});
+  await render({view:'members',id:undefined});await page.waitForFunction(()=>document.querySelector('[data-pilot-cell]')?.textContent?.includes('已关联（管理员确认）'));
+  await page.click('[data-member]');await page.waitForSelector('[data-pilot-unlink]');await page.click('[data-pilot-unlink]');
+  await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('投稿关联已解除'));
+  assert.equal(lastBody().expectedRevision,3);assert.equal(pilot.creatorAccount,'creator.fixture');assert.equal(pilot.pilotEnabled,true);
+  pilot.creatorAccount='"><img src=x onerror=window.__pilotInjection=1>';
+  await page.click('[data-pilot-reload]');await page.waitForFunction(()=>document.querySelector('[data-pilot-message]')?.textContent?.includes('已读取最新设置'));
+  assert.equal(await page.$eval('[name=creatorAccount]',el=>(el as HTMLInputElement).value),pilot.creatorAccount);
+  assert.equal(await page.$('[data-member-pilot] img'),null);assert.equal(await page.evaluate(()=>Boolean((window as any).__pilotInjection)),false);
   await render({view:'members',id:undefined,panel:'create'});await page.waitForSelector('dialog[open]');
   await setValue('dialog [name=username]','new.fixture');await setValue('dialog [name=displayName]','合成新成员');await setValue('dialog [name=password]','synthetic123');
   await page.click('dialog button[type=submit]');await page.waitForFunction(()=>!document.querySelector('dialog[open]'));
@@ -179,7 +261,7 @@ try{
   await page.waitForSelector('[data-report-import] [data-upload-result]');assert.equal(lastBody().owner_id,member.id);assert.deepEqual(lastBody().result,result);
   await page.click('[data-report-import] [data-upload-result]');await page.waitForSelector('.rr-reasons');assert.equal(await page.evaluate(()=>(window as any).route.id),'1');
   assert.deepEqual(errors,[]);assert.deepEqual(unexpectedRequests,[]);
-  console.log('PASS 管理模块：成员显式保存与失败保留、旧会话字段、0 额度、密码确认、创建抽屉、审核范围与管理员额度、真人分数、只读报告、模型懒加载与余额失败、公共资料审批发布、旧请求隔离、管理员上传幂等与导入、手机布局。');
+  console.log('PASS 管理模块：灰测配置、Creator 版本关联、独立读取失败、409/429 与幂等重试、成员显式保存与失败保留、旧会话字段、0 额度、密码确认、创建抽屉、审核范围与管理员额度、真人分数、只读报告、模型懒加载与余额失败、公共资料审批发布、旧请求隔离、管理员上传幂等与导入、手机布局。');
 }finally{
   releasePublic?.();await browser?.close();if(server.listening)await new Promise<void>(resolve=>server.close(()=>resolve()));
   await rm(temporary,{recursive:true,force:true});
