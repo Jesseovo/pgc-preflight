@@ -71,6 +71,17 @@ AI未知、失败和配置不匹配不算一致；缺失结果不得计成功。
 - 按作品划分校准与保留集合，按执行路径/模型配置/模式分别报告。仅提交并取得真人结论的群体存在投稿选择偏差；同时报告完整候选漏斗，不外推到所有上传游戏。
 - 现有 `freeze/evaluate` 命令用于执行前已有准确版本的预登记回放，不能事后补造登记日期来容纳自然投稿。自然任务积累到可核验后，需要独立的前瞻收集记录、原始不可改写报告与来源时间证据，才可计算观察结果；目前尚无合格结果。
 
+本地连续观察由 `readNaturalReviewSnapshot` 和 `scripts/collect-natural-reviews.ts` 提供，不新增线上接口或常驻进程。受控导出函数只读取 PGC 数据库，按固定创建时间起点枚举所有状态及隐藏任务，不以存在报告或已关联为筛选条件。联表键唯一，同一查询给出总数；超过10000条时显式标记不完整。导出保留原AI报告及其存储字符串摘要，省略源码、截图、凭据和个人姓名。
+
+```sh
+node --import tsx scripts/collect-natural-reviews.ts --policy PRIVATE_POLICY --snapshot PRIVATE_SNAPSHOT --out NEW_PRIVATE_DIRECTORY
+node --import tsx scripts/collect-natural-reviews.ts --policy PRIVATE_POLICY --snapshot NEXT_PRIVATE_SNAPSHOT --previous PRIOR_PRIVATE_DIRECTORY/ledger.json --out NEXT_PRIVATE_DIRECTORY
+```
+
+每次生成0700目录及0600的 `ledger.json`、`receipt.json`，拒绝覆盖。后续观察携带上一台账：同一观察幂等，未再出现的任务保留，终态报告、输入和关联变化单独记录；来源撤销可能造成关联不可读，不据此指控篡改。历史与计数摘要用于检查本地意外缺失，不认证上游来源。管理员授权变更后，私有导出仍须按数据使用约定清理，不能用台账绕过来源撤销。
+
+这是按需执行的观察工具，不保证捕获两次导出之间的每个变化。`capturedAt` 固定任务创建窗口上界；查询执行期间的任务进展可能晚于这个上界，保留实际时间，不能把快照当作所有字段在该历史时刻的重建。候选自动合格数始终为0，准确率始终为null；灰测成员资格、按作品去重与分组、原文件绑定、规则及独立质量审计均须在后续评估环节完成。
+
 ## 本次发布证据
 
 实现提交 `5dc5416` 已进入 `origin/main`；生产迁移0027/0028已应用，Worker `829fd5cd-f244-4b76-a86b-b7f90abc0fdd` 接收全部流量，保持自动回流开启与既有两分钟调度。发布使用 `--keep-vars`，原9名成员、设置、141份历史报告、规则和160条模型记录原有行逐字段比较均未变化。
