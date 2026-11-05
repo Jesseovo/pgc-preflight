@@ -8,6 +8,7 @@ import type {MemberStore} from './members';
 import {adminWorkspaceApi} from './admin-workspace-api';
 import {reviewActivity} from './review-usage';
 import {modelQuota} from './model-quota';
+import {modelProviderInfo,ModelProviderInfoError} from './model-provider-info';
 import {adminDashboardApi} from './admin-dashboard-api';
 import {creatorFeedbackAdminApi} from './creator-feedback-api';
 import {reviewMetrics} from './review-metrics-api';
@@ -32,6 +33,14 @@ export async function adminApi(request:Request,store:ConfigStore,secrets:AppSecr
       return json({ok:true},200,{'Set-Cookie':sessionCookie(token,8*60*60)});
     }
     if(!await authorized(request.headers.get('Cookie'),secrets))return json({error:'请先登录管理页。'},401);
+    if(url.pathname==='/api/admin/model-capabilities'){
+      if(request.method!=='GET')return json({error:'请使用 GET 查询模型能力。'},405);
+      try{return json(await modelProviderInfo(store,secrets.SETTINGS_KEY,url.searchParams.get('profile')));}
+      catch(error){
+        if(error instanceof ModelProviderInfoError)return json({error:error.message},error.status);
+        return json({error:'暂时无法读取模型能力。'},503);
+      }
+    }
     const pilots=await reviewPilotsAdminApi(request,{...secrets,DB,...runtime} as any);if(pilots)return pilots;
     const feedback=await creatorFeedbackAdminApi(request,{...secrets,DB,...runtime} as any);if(feedback)return feedback;
     if(url.pathname==='/api/admin/review-metrics'&&request.method==='GET'){
