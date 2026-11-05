@@ -54,6 +54,10 @@ async function cachedGame(DB:any,workId:string){
 function matches(game:FeedbackGame|null,workId:string,authorId:string,versionId:string){
   return game?.id===workId&&game.authorId===authorId&&game.deleted===false&&Array.isArray(game.versions)&&game.versions.some(version=>version?.id===versionId);
 }
+export async function cachedFeedbackVersionSequence(DB:any,workId:string,authorId:string,versionId:string){
+  const cached=await cachedGame(DB,workId);
+  return cached&&matches(cached.game,workId,authorId,versionId)?cached.sequence:null;
+}
 async function invalidateBinding(DB:any,row:PilotRow,cache?:{sequence:number|null}):Promise<PilotMember>{
   const cacheGuard=cache?'AND (SELECT last_sequence FROM creator_feedback_games WHERE game_id=?) IS ?':'';
   const updated=await DB.prepare(`UPDATE review_pilot_members SET binding_status='stale',source_author_id=NULL,work_id=NULL,
@@ -132,7 +136,7 @@ function parse(action:Action,input:Record<string,unknown>){
   }
   return common;
 }
-async function verifyLink(env:Env,credentialHash:string|null,workId:string,versionId:string):Promise<Binding>{
+export async function verifyFeedbackAuthorVersion(env:CreatorFeedbackEnv,credentialHash:string|null,workId:string,versionId:string):Promise<Binding>{
   if(!credentialHash)throw problem('回流未启用或尚未配置专用凭据。',503);
   const state=await env.DB.prepare('SELECT generation,scope_revision,credential_hash,status,phase FROM creator_feedback_state WHERE id=1').first();
   if(!state||state.credential_hash!==credentialHash||state.phase!=='delta'||state.scope_revision===null||['disabled','auth_revoked'].includes(state.status))throw problem('请先完成当前授权的回流同步。',409);
@@ -143,9 +147,9 @@ async function verifyLink(env:Env,credentialHash:string|null,workId:string,versi
     const identity=await client.identity(versionId);
     const game=await client.game(workId);
     if(identity.workId!==game.id||!sourceId(game.authorId)||!matches(game,game.id,game.authorId,identity.id))throw problem('作品归属或准确投稿版本无法核验。',409);
-    const cached=await cachedGame(env.DB,game.id);
-    if(!cached||!matches(cached.game,game.id,game.authorId,identity.id))throw problem('授权缓存尚未同步同一作者与准确投稿版本。',409);
-    return {authorId:game.authorId,workId:game.id,versionId:identity.id,generation:state.generation,scopeRevision:state.scope_revision,credentialHash,sequence:cached.sequence};
+    const sequence=await cachedFeedbackVersionSequence(env.DB,game.id,game.authorId,identity.id);
+    if(sequence===null)throw problem('授权缓存尚未同步同一作者与准确投稿版本。',409);
+    return {authorId:game.authorId,workId:game.id,versionId:identity.id,generation:state.generation,scopeRevision:state.scope_revision,credentialHash,sequence};
   }catch(error){
     if(!(error instanceof FeedbackProviderError))throw error;
     if([401,409,410].includes(error.status)){
@@ -154,6 +158,14 @@ async function verifyLink(env:Env,credentialHash:string|null,workId:string,versi
     }
     throw problem('来源接口暂不可用，未建立关联。',502);
   }
+}
+/** An administrator's current author verification, including its exact cached anchor. */
+export async function requirePilotAuthor(DB:any,memberId:string,credentialHash:string|null){
+  const row=await readRow(DB,memberId);
+  if(!row.accountEnabled||row.binding_status!=='linked'||!authorizedBinding(row,credentialHash))throw problem('需要管理员核对当前 Creator 作者归属。',409);
+  const anchor=await cachedGame(DB,row.work_id!);
+  if(!anchor||!matches(anchor.game,row.work_id!,row.source_author_id!,row.version_id!))throw problem('Creator 作者归属的来源版本已失效，请重新核对。',409);
+  return {authorId:row.source_author_id!,workId:row.work_id!,revision:row.revision!,sequence:anchor.sequence,generation:row.currentGeneration!,scopeRevision:row.currentScope!};
 }
 async function save(DB:any,row:PilotRow,input:ReturnType<typeof parse>,action:Action,payloadHash:string,binding?:Binding){
   const now=new Date().toISOString(),mutationId=crypto.randomUUID();
@@ -212,7 +224,7 @@ export async function reviewPilotsAdminApi(request:Request,env:Env):Promise<Resp
     }
     if((row.revision??0)!==input.expectedRevision)throw problem('成员设置已变化，请刷新后重试。',409);
     if(action==='link'&&!row.creator_account?.trim())throw problem('请先保存 Creator 账号声明。',409);
-    const binding='workId' in input?await verifyLink(env,credentialHash,input.workId,input.versionId):undefined;
+    const binding='workId' in input?await verifyFeedbackAuthorVersion(env,credentialHash,input.workId,input.versionId):undefined;
     if(binding&&row.binding_status==='linked'&&row.source_author_id!==binding.authorId)throw problem('该成员已有不同的来源作者关联，请先解除关联。',409);
     await save(env.DB,row,input,action,payloadHash,binding);
     return json({member:await resolveView(env.DB,await readRow(env.DB,input.memberId),credentialHash,true)});

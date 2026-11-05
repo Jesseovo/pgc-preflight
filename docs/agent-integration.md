@@ -87,6 +87,25 @@ node review-agent.mjs complete JOB_UUID --json /absolute/path/verified.json --ou
 
 ## 真人审核查询与回填
 
+### 创作成品与准确投稿
+
+用户指定 Forge 成品时，从版本历史下载指定 `game` 版本的原始 UTF-8 HTML，执行 `review original.html --artifact-version VERSION_ID`。也可以用同一参数执行 `submit` 后继续 `capture`。参数只支持单文件，平台核对当前成员、游戏成品版本与实际 HTML 的 SHA-256 后锁定。创作自检、生产项目描述和真人意见都不进入这次审核材料。用独立审核上下文完成初评、同模型同证据复核与报告，避免把创作自检作为审核结论。
+
+完成审核后，等用户明确要求投稿，再使用其已授权的 Creator Hub 个人创作入口投稿同一份 HTML。用该次投稿记录取准确 `workId`、`versionId` 和所上传 HTML 的小写 SHA-256。原审核设备执行 `record-submission JOB_UUID --json submission.json`，工具从原任务读取租约。JSON 仅包含以下四项。
+
+```json
+{
+  "workId": "actual-work-id",
+  "versionId": "actual-version-id",
+  "uploadHash": "<the actual 64-character SHA-256>",
+  "provenance": "creator-submission-record"
+}
+```
+
+个人 Creator Hub 凭据仅用于原站。PGC 使用独立的只读反馈授权核对管理员已确认的当前作者归属与准确投稿版本。缓存尚未同步时，在同步后用原编号和记录重试。同一审核任务的投稿绑定不可更换。上游当前未提供文件哈希，上传哈希属于 Agent 声明。该记录供管理员对照准确版本的真人反馈，不改写 AI 报告，也不触发广场发布。
+
+### 独立真人审核回填
+
 提交每款游戏时先读取 https://creator-hub-7mi.pages.dev/ 上对应本人作品及准确投稿版本的真人分数和意见。使用你在该站已经获得的个人创作授权，先读取既有 PGC 创作入口的 `/contract`，再按当前约定查询本人 `/works` 与作品详情；不要猜测接口或将网页登录接口当作创作令牌接口。另一个站点的令牌只能发送到它授权的入口，不能发送给 PGC OverFlow，也不能放进回填 JSON、游戏或日志。
 
 使用原部署保存的 `workId`、`releaseId`、投稿版本 ID 和本次本地文件的关联记录核对作品与版本；也可使用用户对指定作品及版本的明确确认。不能只凭同名、最新版本或相似内容自动关联。若同款游戏已经更新，应关联本次被审文件实际对应的投稿版本，不能拿旧版或新版真人分数冒充本次版本。
@@ -190,7 +209,7 @@ node review-agent.mjs fail JOB_UUID --reason "无法完成的实际原因"
 | ACTION | JSON 请求与结果 |
 | --- | --- |
 | `pair` | `{code, deviceId: UUID, token: 64位随机十六进制, name}`；配对码只能使用一次，相同参数可安全重传 |
-| `submit` | `{request_id: UUID, title, filename, html, topic_id?}`；返回本人本地审核任务，`model_executor: agent`、`quota_charged: 0` |
+| `submit` | `{request_id: UUID, title, filename, html, topic_id?, artifactVersionId?}`；返回本人本地审核任务，`model_executor: agent`、`quota_charged: 0`。指定成品版本时核对实际 HTML SHA-256 |
 | `jobs` / `job` | `{}` / `{id}`；列出本人任务或查询状态 |
 | `claim` | `{claimId: UUID, id: JOB_UUID, version}`；返回 `{id, lease, title, html, model_executor, stage, evidenceHash}`；同设备可恢复原租约 |
 | `heartbeat` | `{version, freeMemoryMB, job?: {id, lease}}`；采集时约 20 秒一次，长时间本地推理也可续心跳 |
@@ -198,6 +217,7 @@ node review-agent.mjs fail JOB_UUID --reason "无法完成的实际原因"
 | `material` | `{id, lease}`；返回统一 `system`、`user`、`schema`、`verification`、`evidenceHash`、`stage`；初稿后另含 `draftHash`、`model` 及初稿 |
 | `draft` | `{id, lease, model, modelConfiguration?: {effort}, evidenceHash, report}`；验证并锁定初稿，返回 `draftHash`，阶段变为 `verify` |
 | `complete` | `{id, lease, model, modelConfiguration?: {effort}, evidenceHash, report, verification: {confirmed:true, model, evidenceHash, draftHash}}`；完成后返回报告 `result_id` 和不可变 `resultHash` |
+| `record-submission` | `{id, lease, workId, versionId, uploadHash, provenance: "creator-submission-record"}`；原设备仅可为已完成并锁定成品版本的审核回填准确投稿；同记录重传幂等，结果保留 `strictEligible: false` |
 | `human-review` | `{id, requestId: UUID, workId, versionId, status, phase, decision?, score, feedback, updatedAt, source, matchedBy, uploadedContentHash?, lease?}`；字段约定见上节，领取后须原设备与租约，完成后仍可追加；通过版自动入广场，缺文件返回 `gallery_pending`；不修改 AI 报告、不调用平台模型或扣次 |
 | `gallery` | `{id, requestId: UUID, html, lease?}`；为当前真人终审通过版补交原始 HTML（最多 8 MB），严格核对任务输入哈希与作品版本；领取后须原设备和租约；重复请求幂等，不调用模型、不扣次 |
 | `report` | `{id}`；只返回本人已完成报告 |

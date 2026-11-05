@@ -3,6 +3,11 @@ import {renderFeedbackDetail,renderFeedbackMetrics} from '../src/admin/feedback'
 import {readRoute,routeUrl,detailTarget} from '../src/admin/navigation';
 const malicious='<img src=x onerror="window.__sourceExecuted=true"><script>window.__sourceExecuted=true</script>';
 describe('administrator feedback presentation',()=>{
+ it('labels verified identities separately from Agent file claims and preserves comparison totals',()=>{
+  const html=renderFeedbackDetail({jobId:'job',versionId:'submission',creation:{artifactVersionId:malicious,uploadHash:'a'.repeat(64),strictEligible:false},ai:{executor:'agent',score:null},comparison:{totals:{ai:null,platform:0}},platform:{decision:'rejected',reviewerRole:'leader'}});
+  for(const text of ['成员 Agent','Creator Hub 真人反馈','Creator 作者与准确投稿版本已核对','Agent 投稿记录 SHA-256','上游未提供文件哈希','<td>总分</td><td>未知</td><td>0</td>','不具备条件'])expect(html).toContain(text);
+  expect(html).not.toContain('<img');
+ });
  it('escapes source reports, opinions, identifiers and admin statements without executable source markup',()=>{
   const html=renderFeedbackDetail({jobId:malicious,title:malicious,versionId:malicious,complete:true,matchedBy:'user-confirmed',inputHash:'a'.repeat(64),ai:{score:0,model:malicious,dimensions:{aes:0,ease:null,play:0},report:{reviewer_comment:malicious}},platform:{decision:'rejected',reviewId:'r',reviewerRole:'leader',reasons:[]},comparison:{state:'unavailable',scoreDifferences:[{name:malicious,ai:0,platform:null,delta:null}]},reviews:[{id:'r',stage:'decision_review',revision:1,feedback:malicious,total:null,scores:[]}],assessment:{status:'declared',gaps:[malicious],files:[],history:[{note:malicious}]}});
   expect(html).not.toContain('<img');expect(html).not.toContain('<script>');expect(html).toContain('&lt;img');expect(html).toContain('组长');expect(html).toContain('不具备条件');expect(html).toContain('未知');expect(html).toContain('0');

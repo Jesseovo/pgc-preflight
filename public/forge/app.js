@@ -22,6 +22,8 @@ const $ = (s, el = document) => el.querySelector(s);
 const view = $("#view");
 const memberOnly = document.body.dataset.memberOnly === "true" || location.pathname === "/review";
 const state = { session: null, tab: memberOnly ? "review" : "picks", vocab: null, settings: null, info: null, drawn: [], busy: false, showDup: false, cardNotices: new Map() };
+const creativeV2Available = () => state.info?.creative_v2_available !== false;
+let statusReady = Promise.resolve();
 
 // ---------- helpers ----------
 
@@ -45,7 +47,14 @@ function focusCardActivity(root, topicId) {
 async function rawApi(method, path, data) {
   if(method!=='GET'){
     metadataReads.clear();taskReads.clear();
-    if(state.executor==='agent'&&(path==='expand'||/^topics\/\d+\/(brief|preview|assets|game)(?:\?|$)/.test(path)))path+=(path.includes('?')?'&':'?')+'executor=agent';
+    const [route,query] = path.split('?',2);
+    if(method==='POST'){
+      const params = new URLSearchParams(query);
+      const creation = route==='expand'||/^topics\/\d+\/(brief|preview|assets|game)$/.test(route);
+      if(creation){await statusReady;if(creativeV2Available())params.set('creative_version','2');}
+      if(state.executor==='agent'&&(creation||route==='mechanisms/check'))params.set('executor','agent');
+      if(params.size)path=`${route}?${params}`;
+    }
   }
   const load=()=>fetchApi(method,path,data);
   if(method==='GET'&&/^(topics\?|topics\/\d+\?summary=1$|products$|state$|settings$|vocab$)/.test(path))return metadataReads.read(path,load);
@@ -251,7 +260,8 @@ function repaintFor(root, repaint) { return () => {
   repaint();
   bindGamePlayers(root);
   if (!id || !identity) return;
-  const preferred = [...root.querySelectorAll(`[data-id="${CSS.escape(id)}"] [${identity}]`)].find(item => item.getAttribute(identity) === value);
+  const candidate = active?.dataset.candidate;
+  const preferred = [...root.querySelectorAll(`[data-id="${CSS.escape(id)}"] [${identity}]`)].find(item => item.getAttribute(identity) === value&&item.dataset.candidate===candidate);
   if (preferred?.disabled) { focusCardActivity(root, id); return; }
   const target = preferred
     || (identity === 'data-viewer-version' ? root.querySelector(`[data-id="${CSS.escape(id)}"] [data-viewer-act="back"]`) : null)
@@ -260,10 +270,39 @@ function repaintFor(root, repaint) { return () => {
   else if (id) focusCardActivity(root, id);
 }; }
 
+const stageLabels={build:'制作',polish:'精修',repair:'定向修复'};
+function creationChecksHtml(viewer) {
+  const {checks,evidence,record} = viewer;
+  const hash = (label,value) => value ? `<p class="small"><b>${label}</b> <code style="overflow-wrap:anywhere">${esc(value)}</code></p>` : '';
+  const intro='<p class="small muted">创作阶段记录与正式审核分别保存。自检说明使用的采集范围与尚未验证的项目。</p>';
+  if(evidence&&record){
+    const shots=Array.isArray(evidence.shots)?evidence.shots:[];
+    return intro+`<h3>${esc(stageLabels[record.stage]||record.stage)} · 原始采集</h3>
+      ${hash('HTML 摘要',record.content_hash)}${hash('采集摘要',record.evidence_hash)}
+      <div class="creation-viewer-versions">${shots.filter(shot=>/^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/]+={0,2}$/.test(shot?.data||'')).map(shot=>`<figure style="margin:0">
+        <img class="preview" src="${esc(shot.data)}" loading="lazy" decoding="async" alt="${esc(shot.label||'原始视口截图')}" style="display:block;width:100%;max-width:360px">
+        <figcaption class="small">${esc(shot.label||'')} · ${esc(shot.id||'')}</figcaption>
+      </figure>`).join('')}</div>
+      <details><summary>查看采集记录</summary><pre class="md">${esc(JSON.stringify(evidence.probe||{},null,2))}</pre></details>`;
+  }
+  return intro+(checks.length?`<div class="creation-viewer-versions">${checks.map((item,index)=>{
+    const result=item.self_check||{},check=result.selfCheck;
+    return `<section class="box">
+      <div class="row"><strong class="grow">${esc(stageLabels[item.stage]||item.stage)}</strong>${item.evidence_hash?`<button class="ghost small" data-viewer-act="creation-evidence" data-check-index="${index}">看本阶段原图</button>`:''}</div>
+      <p class="muted small">${esc(item.created_at||'')}${result.model?` · ${esc(result.model)}`:''}</p>
+      ${hash('产物版本',item.version_id)}${hash('HTML 摘要',item.content_hash)}${hash('采集摘要',item.evidence_hash)}
+      ${hash('自检所依据的采集摘要',result.judgedEvidenceHash)}
+      ${check?.findings?.length?`<ul>${check.findings.map(finding=>`<li><b>${esc(({confirmed:'已确认',experience:'体验建议',unverified:'待验证'})[finding.kind]||finding.kind)}</b> · ${esc(finding.phenomenon)}</li>`).join('')}</ul>`:''}
+      ${check?.unverified?.length?`<p class="small">未验证 · ${esc(check.unverified.join('、'))}</p>`:''}
+      <details><summary>查看自检原文</summary><pre class="md">${esc(JSON.stringify(result,null,2))}</pre></details>
+    </section>`;
+  }).join('')}</div>`:'<p class="muted small">当前没有制作自检记录。</p>');
+}
+
 function renderCardViewer(topic) {
   const viewer = topic._viewer;
   if (!viewer) return '';
-  const labels = {brief:'简报',preview:'样板图',assets:'美术资产',game:'游戏成品',versions:'历史版本'};
+  const labels = {brief:'简报',preview:'样板图',assets:'美术资产',game:'游戏成品',versions:'历史版本',creationChecks:'制作自检'};
   let body = '';
   if (viewer.kind === 'versions') {
     if (viewer.version) body = `${versionDocument(viewer.version, topic.id)}`;
@@ -273,12 +312,14 @@ function renderCardViewer(topic) {
   else if (viewer.kind === 'preview') body = `<img class="preview" style="max-width:360px;margin:0 auto" src="data:image/svg+xml;charset=utf-8,${encodeURIComponent(viewer.content||'')}" alt="样板图预览">`;
   else if (viewer.kind === 'assets') body = `<iframe class="assets-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="美术资产预览" src="/api/forge/topics/${topic.id}/assets-preview"></iframe>`;
   else if (viewer.kind === 'game') body = gamePlayer(`/api/forge/topics/${topic.id}/product-preview`,topic.data?.title||'游戏试玩');
+  else if (viewer.kind === 'creationChecks') body = creationChecksHtml(viewer);
   const v = viewer.version;
   const buttons = viewer.kind === 'versions'
     ? (v ? `<button class="ghost" data-viewer-act="back">返回版本列表</button><button class="ghost" data-viewer-act="copy-version">复制内容</button><button class="primary" data-viewer-act="restore" ${v.current?'disabled':''}>${v.current?'当前版本':v.disposition==='pending'?'采用此结果':'恢复此版本'}</button>` : '')
     : viewer.kind === 'brief' ? `<button class="ghost" data-viewer-act="copy">复制简报</button><a class="btn" href="/api/forge/topics/${topic.id}/brief" download>下载 .md</a><button class="ghost" data-viewer-act="regenerate">重新生成</button>`
     : viewer.kind === 'preview' ? `<button class="ghost" data-viewer-act="download">下载 SVG</button><button class="ghost" data-viewer-act="regenerate">重新生成</button>`
     : viewer.kind === 'assets' ? `<a class="btn" href="/api/forge/topics/${topic.id}/assets" download>下载资产 HTML</a><button class="ghost" data-viewer-act="regenerate">重新生成</button>`
+    : viewer.kind === 'creationChecks' ? (viewer.evidence?'<button class="ghost" data-viewer-act="creation-checks-back">返回制作自检</button>':'')
     : `<a class="btn" href="/api/forge/topics/${topic.id}/product-file">下载 HTML</a><button class="ghost" data-viewer-act="copy">复制 HTML</button><button class="ghost" data-viewer-act="regenerate" ${['queued','running'].includes(topic.product_status)?'disabled':''}>重新制作</button>`;
   const title = v ? `${VERSION_LABELS[v.kind]||v.kind} · ${v.created_at||'历史版本'}` : labels[viewer.kind];
   return `<section class="creation-viewer" data-viewer-kind="${esc(viewer.kind)}"><header class="creation-viewer-head"><strong>${esc(title)}</strong><button type="button" class="ghost small" data-viewer-act="close" aria-label="收起查看器">收起</button></header>${v?.stale?'<p class="small bad">生成时使用的上游内容已变化，采用前请核对。</p>':''}${viewer.notice?`<p class="creation-viewer-notice small" role="status">${esc(viewer.notice)}</p>`:''}<div class="creation-viewer-body">${body}</div><footer class="creation-viewer-actions">${buttons}</footer></section>`;
@@ -300,6 +341,9 @@ async function openCardArtifact(button, topic, kind, repaint, root) {
       const response = await api('GET',`topics/${topic.id}/versions`);
       const versions = Array.isArray(response)?response:response.versions||[];
       topic._viewer={kind,versions};
+    } else if (kind === 'creationChecks') {
+      const checks=await api('GET',`topics/${topic.id}/creation-checks`);
+      topic._viewer={kind,checks:Array.isArray(checks)?checks:[]};
     } else if (kind === 'game') topic._viewer={kind};
     else {
       const saved = await api('GET',`topics/${topic.id}`);
@@ -308,13 +352,24 @@ async function openCardArtifact(button, topic, kind, repaint, root) {
     }
     if (!root?.isConnected) return;
     repaint();
-  },kind==='versions'?'读取历史版本':kind==='game'?'读取游戏成品':`读取${({brief:'简报',preview:'样板图',assets:'美术资产'})[kind]}`);
+  },`读取${({versions:'历史版本',game:'游戏成品',brief:'简报',preview:'样板图',assets:'美术资产',creationChecks:'制作自检'})[kind]}`);
 }
 
 function handleCardViewerAction(event, button, card, topic, repaint, root) {
     const versionId=button.dataset.viewerVersion;
     if(versionId){void guard(button,async()=>{const summary=topic._viewer.versions.find(item=>item.id===versionId);topic._viewer.version={...summary,...await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(versionId)}`)};if(state.tab==='project'){const url=new URL(location.href);url.searchParams.set('version',versionId);history.replaceState(history.state,'',url);}repaint();},'读取历史版本');return;}
     const action=button.dataset.viewerAct;
+    if(action==='creation-evidence'){
+      void guard(button,async()=>{
+        const viewer=topic._viewer,record=viewer?.checks?.[Number(button.dataset.checkIndex)];
+        if(!record?.task_id||!stageLabels[record.stage])return;
+        const evidence=await api('GET',`topics/${topic.id}/creation-checks/${encodeURIComponent(record.task_id)}/${record.stage}`);
+        if(topic._viewer!==viewer)return;
+        Object.assign(viewer,{evidence,record});repaint();
+      },'读取本阶段原图');
+      return;
+    }
+    if(action==='creation-checks-back'){delete topic._viewer.evidence;delete topic._viewer.record;repaint();return;}
     if(action==='close'&&state.tab==='project'&&state.projectPanel!=='create'){navigateWorkspace({tab:'picks',project:String(topic.id),panel:'create'},true);return;}
     if(action==='close'){closeCardViewer(topic,root,repaint);return;}
     if(action==='back'){topic._viewer.version=null;repaint();return;}
@@ -418,7 +473,7 @@ document.addEventListener('click',event=>{const button=event.target.closest('[da
 const executorControl=()=>`<label class="executor-choice">创作方式 <select data-executor aria-label="创作执行方式"><option value="platform" ${state.executor!=='agent'?'selected':''}>平台执行</option><option value="agent" ${state.executor==='agent'?'selected':''}>个人 Agent</option></select></label>`;
 document.addEventListener('change',event=>{if(event.target.matches('[data-executor]')){state.executor=event.target.value;try{sessionStorage.setItem(`forge-executor-${state.session.id}`,state.executor);}catch{}document.querySelectorAll('[data-executor]').forEach(el=>el.value=state.executor);}});
 async function renderProject(alive){
-  const [topic,rows]=await Promise.all([api('GET',`topics/${state.projectId}?summary=1`),rawApi('GET','generation-jobs').catch(()=>[])]);await syncPreviewTasks([topic],rows);if(!alive())return;
+  const [topic,rows]=await Promise.all([api('GET',`topics/${state.projectId}?summary=1`),rawApi('GET','generation-jobs').catch(()=>[]),statusReady]);await syncPreviewTasks([topic],rows);if(!alive())return;
   const panel=state.projectPanel;
   const reports=panel==='review'?await api('GET','reviews'):[];
   if(panel==='versions'){const versions=await api('GET',`topics/${topic.id}/versions`);if(!alive())return;topic._viewer={kind:'versions',versions:Array.isArray(versions)?versions:versions.versions||[]};const version=new URLSearchParams(location.search).get('version');if(version){topic._viewer.version=await api('GET',`topics/${topic.id}/versions/${encodeURIComponent(version)}`);if(!alive())return;}}
@@ -452,19 +507,102 @@ function chipsHtml(t) {
   return `<div class="chips">${DIMS.filter(d=>t[d]).map((d) => `<span class="chip" title="${DIM_LABEL[d]}">${esc(t[d])}</span>`).join("")}</div>`;
 }
 
+const mechanismChecks = new Map();
+const mechanismKey = (topic,index) => `${topic.id}:${index}`;
+const mechanismFields = [['subject','题材'],['action','玩家动作'],['rule','核心规则'],['structure','挑战结构']];
+const mechanismStateLabels = {
+  no_matches:'目录中没有检索到可比较的条目', distinct:'已有结果确认存在机制区别',
+  exact:'目录中已有相同机制', duplicate:'比较结果为机制重复',
+  uncertain:'比较结果待核对', pending:'等待机制比较',
+};
+const canChooseMechanism = check => check&&!check.stale&&['distinct','no_matches'].includes(check.effective_state||check.state);
+const expandReady = topic => Boolean(topic?.data?.title||Array.isArray(topic?.data?.candidates));
+
+function mechanismBatchCard(topic) {
+  const {candidates,recommended} = topic.data;
+  const picks = [...new Set(Array.isArray(recommended)?recommended:[])].filter(index=>Number.isInteger(index)&&candidates[index]).slice(0,3);
+  const others = candidates.map((_,index)=>index).filter(index=>!picks.includes(index));
+  const candidateHtml = index => {
+    const candidate=candidates[index],record=mechanismChecks.get(mechanismKey(topic,index)),check=record?.check;
+    const result=check?.stale?'目录或候选已更新，请重新查重。':mechanismStateLabels[check?.effective_state||check?.state];
+    const reasons=(check?.judgment?.matches||[]).filter(item=>item.reason).map(item=>`<li>${esc(item.reason)}</li>`).join('');
+    return `<section class="section" id="mechanism-${topic.id}-${index}">
+      <h3>${esc(candidate.title||`候选 ${index+1}`)}</h3>
+      <p>${esc(candidate.logline)}</p>
+      ${[['strength','创作方向'],['action','动作'],['rule','规则'],['risks','风险']].filter(([key])=>candidate[key]).map(([key,label])=>`<div class="kv"><b>${label}</b>${esc(candidate[key])}</div>`).join('')}
+      <details class="topic-details"><summary>玩法与美术细节</summary>${[['subject','题材'],['structure','挑战结构'],['medium','媒介'],['controls','操作'],['core_loop','核心循环'],['progression','节奏'],['art_direction','美术'],['audio','音频']].filter(([key])=>candidate[key]).map(([key,label])=>`<div class="kv"><b>${label}</b>${esc(candidate[key])}</div>`).join('')}</details>
+      ${record?.pending?`<div role="status">${progressHtml({label:'机制查重',detail:record.detail||'正在读取机制目录…',status:record.status||'waiting'})}</div>`:''}
+      ${record?.error?`<p class="small bad" role="status">${esc(record.error)}</p>`:''}
+      ${result?`<p class="small" role="status">${esc(result)}</p>`:''}
+      ${reasons||check?.admin_resolution?.reason?`<details class="topic-details"><summary>查看比较说明</summary>${reasons?`<ul>${reasons}</ul>`:''}${check?.admin_resolution?.reason?`<p>${esc(check.admin_resolution.reason)}</p>`:''}</details>`:''}
+      ${creativeV2Available()?`<div class="row"><button class="ghost small" data-act="${check&&!check.stale?'mechanismRefresh':'mechanismCheck'}" data-candidate="${index}" ${record?.pending?'disabled':''}>${check?check.stale?'重新查重':'刷新查重记录':'机制查重'}</button>${canChooseMechanism(check)?`<button class="primary small" data-act="mechanismChoose" data-candidate="${index}">选择并登记</button>`:''}</div>`:''}
+    </section>`;
+  };
+  return `<article class="card creation-card" data-id="${topic.id}">
+    <div class="art"><div class="title">${esc(topic.subject||'本轮候选')}</div></div>
+    <div class="body">${chipsHtml(topic)}<p class="small muted">${candidates.length} 个候选 · ${picks.length} 个推荐</p>
+      ${picks.map(candidateHtml).join('')||'<p class="muted small">这一轮没有推荐，仍可查看其他候选。</p>'}
+      ${others.length?`<details class="topic-details" data-candidate-more ${topic._showAllCandidates?'open':''}><summary>查看其余 ${others.length} 个候选</summary>${others.map(candidateHtml).join('')}</details>`:''}
+    </div>
+    <div class="acts"><button class="ghost" data-act="versions">历史版本</button></div>
+    <div class="creation-viewer-slot">${renderCardViewer(topic)}</div>
+  </article>`;
+}
+
+async function trackMechanismCheck(topic,index,response,repaint) {
+  const key=mechanismKey(topic,index);
+  const record=mechanismChecks.get(key)||{};
+  mechanismChecks.set(key,record);
+  record.pending=true;
+  record.error='';
+  record.jobId=response.jobId;
+  try {
+    const result=response.pending?await observeGeneration({id:response.jobId,kind:'mechanism-check'},{
+      update:patch=>{Object.assign(record,{detail:patch.detail,status:patch.status});repaint();},
+    }):response;
+    const checkId=result?.check_id||response.check_id;
+    if(!checkId)throw new Error('任务没有返回可读取的查重记录。');
+    record.check=await rawApi('GET',`mechanisms/${encodeURIComponent(checkId)}`);
+  } catch(error) {
+    record.error=error.message;
+  } finally {
+    record.pending=false;
+    repaint();
+  }
+}
+
+function resumeMechanismChecks(rows,topics) {
+  const known=new Set();
+  for(const row of rows){
+    const match=row.kind==='mechanism-check'&&row.scope?.match(/:mechanism-check:(\d+):(\d+)$/);
+    if(!match)continue;
+    const topic=topics.find(item=>item.id===Number(match[1])),index=Number(match[2]);
+    if(!topic?.data?.candidates?.[index])continue;
+    const key=mechanismKey(topic,index);
+    if(known.has(key)||mechanismChecks.get(key)?.pending)continue;
+    known.add(key);
+    if(['queued','running'].includes(row.status))void trackMechanismCheck(topic,index,{pending:true,jobId:row.id},paintDrawn);
+    else if(row.status==='done'&&row.result?.check_id&&!mechanismChecks.has(key))mechanismChecks.set(key,{check:row.result});
+    else if(row.status==='error'&&!mechanismChecks.has(key))mechanismChecks.set(key,{error:row.error||'查重未完成。'});
+  }
+}
+
 function creationFooter(t,mode){
   const active=['queued','running'].includes(t.product_status),saved=!!t.has_product;
-  const action=saved?'viewProduct':active?'resumeProduct':t.product_status==='error'?'retryProduct':'makeGame';
-  const label=saved?'试玩游戏':active?'制作中':t.product_status==='error'?'重试制作':'开始制作';
-  const materials=mode==='picks'?`<div class="creation-materials">${[['preview','样板图','has_preview','preview_status'],['brief','简报','has_brief','brief_status'],['assets','美术资产','has_assets','assets_status']].map(([kind,title,has,status])=>{
+  const needsBrief=mode==='picks'&&creativeV2Available()&&!saved&&!active&&!t.has_brief;
+  const action=saved?'viewProduct':active?'resumeProduct':needsBrief?'prepareBrief':t.product_status==='error'?'retryProduct':'makeGame';
+  const label=saved?'试玩游戏':active?'制作中':needsBrief?'先准备简报':t.product_status==='error'?'重试制作':'开始制作';
+  const materials=mode==='picks'?`<div class="creation-materials">${[['brief','简报','has_brief','brief_status'],['preview','样板图','has_preview','preview_status'],['assets','美术资产','has_assets','assets_status']].map(([kind,title,has,status])=>{
     const running=t[status]==='running',blocked=kind==='assets'&&!t.has_brief&&!t[has];
     return `<button class="material-link" data-act="${kind}" ${running&&!t[has]?'disabled title="任务正在后台生成"':blocked?'disabled title="先生成简报，再生成美术资产"':''}><span>${title}</span><small>${running&&!t[has]?'生成中':t[has]?'查看':t[status]==='error'?'重试':blocked?'需先生成简报':'生成'}</small></button>`;
   }).join('')}</div>`:'';
-  return `<footer class="creation-footer">${materials}<div class="creation-main-actions"><button class="primary" data-act="${mode==='picks'&&!saved?'makeGame':action}" ${active&&!saved?'disabled':''}>${label}</button><button class="ghost" data-act="versions">历史版本</button></div><details class="creation-more"><summary>更多操作</summary><div>${saved?`<button class="ghost" data-act="regenerateGame" ${active?'disabled':''}>${active?'新版本制作中':'重新制作游戏'}</button>`:''}${mode==='products'&&saved?`<a class="btn" href="/api/forge/topics/${t.id}/product-file">下载 HTML</a>`:''}${mode==='picks'?`<button class="ghost" data-act="${t.status==='made'?'unmake':'make'}">${t.status==='made'?'取消已制作标记':'标记为外部已制作'}</button><button class="ghost bad" data-act="reject">移出候选</button>`:''}</div></details></footer>`;
+  const checks=creativeV2Available()||t.creative_version===2?'<button class="ghost" data-act="creationChecks">制作自检</button>':'';
+  return `<footer class="creation-footer">${materials}<div class="creation-main-actions"><button class="primary" data-act="${action}" ${active&&!saved?'disabled':''}>${label}</button><button class="ghost" data-act="versions">历史版本</button>${checks}</div><details class="creation-more"><summary>更多操作</summary><div>${saved?`<button class="ghost" data-act="regenerateGame" ${active?'disabled':''}>${active?'新版本制作中':'重新制作游戏'}</button>`:''}${mode==='products'&&saved?`<a class="btn" href="/api/forge/topics/${t.id}/product-file">下载 HTML</a>`:''}${mode==='picks'?`<button class="ghost" data-act="${t.status==='made'?'unmake':'make'}">${t.status==='made'?'取消已制作标记':'标记为外部已制作'}</button><button class="ghost bad" data-act="reject">移出候选</button>`:''}</div></details></footer>`;
 }
 
 function topicCard(t, mode) {
   const d = t.data || {};
+  if (mode==='draw'&&Array.isArray(d.candidates)) return mechanismBatchCard(t);
   if (t.status === "drawn") {
     return `<article class="card pending" data-id="${t.id}">
       <div class="art"><div class="title">…</div></div>
@@ -472,8 +610,6 @@ function topicCard(t, mode) {
       <div class="acts">${t._pendingVersion ? '' : t._error ? `<button class="ghost" data-act="retry">重试扩写</button>` : t.expand_status !== 'running' && !t._inflight ? `<button class="ghost" data-act="retry">开始扩写</button>` : ''}<button class="ghost" data-act="versions">历史版本</button></div>
     </article>`;
   }
-  const subScores = [d.aes, d.ease, d.play].filter(value => value !== null && value !== undefined && value !== '').join('/');
-  const sc = [t.score !== null && t.score !== undefined && t.score !== '' ? String(t.score) : '', subScores].filter(Boolean).join(' · ') || '待评分';
   const sw = (d.palette || []).filter(hexOk).map((h) => `<span style="background:${h}" title="${esc(h)}"></span>`).join("");
   const acts = [`<button class="ghost" data-act="versions">历史版本</button>`];
   if (mode === "draw") {
@@ -490,7 +626,7 @@ function topicCard(t, mode) {
   if (mode === "picks" && (t.has_brief || t.brief_status === 'error')) acts.push(`<button class="ghost" data-act="assets" ${!t.has_assets&&t.assets_status === 'running'?'disabled':''}>${!t.has_assets&&t.assets_status === 'running' ? "资产生成中" : t.has_assets ? "看资产" : t.assets_status==='error' ? "重试资产" : "生成资产"}</button>`);
   const working=[['product_status','游戏制作'],['brief_status','简报生成'],['assets_status','资产生成'],['preview_status','样板图生成']].filter(([key])=>['queued','running'].includes(t[key])).map(([,label])=>label);
   return `<article class="card state-${t.status} ${mode==='picks'?'creation-card':''}" data-id="${t.id}">
-    <div class="art" style="${artStyle(d)}"><div class="title"><button class="project-title" data-open-project="${t.id}">${esc(d.title)}</button></div><div class="score" title="预估 美学/易玩性/可玩性">${esc(sc)}</div></div>
+    <div class="art" style="${artStyle(d)}"><div class="title"><button class="project-title" data-open-project="${t.id}">${esc(d.title||t.subject||'未命名项目')}</button></div></div>
     <div class="body">
       ${chipsHtml(t)}
       <p class="creation-logline">${esc(d.logline)}</p>
@@ -550,7 +686,56 @@ function bindCards(root, list, rerender) {
     const act = btn.dataset.act;
     const repaint = repaintFor(root, rerender);
     if (!t) return;
+    if (act==='mechanismCheck'||act==='mechanismRefresh'||act==='mechanismChoose') {
+      const index=Number(btn.dataset.candidate);
+      if(!t.data?.candidates?.[index])return;
+      const key=mechanismKey(t,index);
+      if(btn.closest('[data-candidate-more]'))t._showAllCandidates=true;
+      if(act==='mechanismCheck'){
+        const record=mechanismChecks.get(key)||{};
+        if(record.pending)return;
+        record.pending=true;record.error='';record.detail='正在查询机制目录…';
+        mechanismChecks.set(key,record);
+        repaint();
+        try {
+          const response=await rawApi('POST','mechanisms/check',{topic_id:id,candidate_index:index});
+          await trackMechanismCheck(t,index,response,()=>root.isConnected?repaint():paintDrawn());
+        } catch(error) {
+          record.pending=false;record.error=error.message;repaint();
+        }
+        return;
+      }
+      if(act==='mechanismRefresh'){
+        await guard(btn,()=>trackMechanismCheck(t,index,mechanismChecks.get(key)?.check||{},repaint),'读取最新查重记录');
+        return;
+      }
+      await guard(btn,async()=>{
+        const record=mechanismChecks.get(key);
+        if(!canChooseMechanism(record?.check))return;
+        const check=await rawApi('GET',`mechanisms/${encodeURIComponent(record.check.check_id)}`);
+        record.check=check;
+        if(!canChooseMechanism(check)){repaint();return;}
+        const shared=mechanismFields.map(([field,label])=>`${label}  ${check.candidate?.[field]||''}`).join('\n');
+        if(!confirm(`选择此候选并创建项目？以下四项摘要会分享给其他 Star 创作者。\n\n${shared}`))return;
+        let chosen;
+        try { chosen=await rawApi('POST','mechanisms/choose',{topic_id:id,candidate_index:index,check_id:check.check_id}); }
+        catch(error) {
+          if(error.status===409)await trackMechanismCheck(t,index,check,repaint);
+          throw error;
+        }
+        if(!chosen?.topic_id)throw new Error('登记完成后未返回项目编号，请刷新项目列表。');
+        record.check={...check,stale:true};
+        navigateWorkspace({tab:'picks',project:String(chosen.topic_id)});
+      },'登记所选机制');
+      return;
+    }
     if (act === 'versions') { await openCardArtifact(btn,t,'versions',repaint,root); return; }
+    if (act === 'creationChecks') { await openCardArtifact(btn,t,'creationChecks',repaint,root); return; }
+    if (act === 'prepareBrief') {
+      setTopicNotice(t,'请先在材料区生成简报，再开始制作。',root);
+      card.querySelector('[data-act="brief"]:not(:disabled)')?.focus();
+      return;
+    }
     if (act === 'makeGame') {
       if (t.has_product && t.product_status !== 'running') await openCardArtifact(btn, t, 'game', repaint, root);
       else startProductJob(t, repaint, {resume:['queued', 'running'].includes(t.product_status)});
@@ -581,6 +766,11 @@ function bindCards(root, list, rerender) {
     const t = list().find((x) => x.id === id);
     saveNoteFromInput(e.target, t);
   });
+  root.addEventListener('toggle',event=>{
+    if(!event.target.matches?.('[data-candidate-more]'))return;
+    const topic=list().find(item=>item.id===Number(event.target.closest('.card')?.dataset.id));
+    if(topic)topic._showAllCandidates=event.target.open;
+  },true);
   // Restore observation after a reload without starting a second model job.
   for (const [kind, job] of Object.entries(TOPIC_JOBS)) {
     for (const topic of list()) if (topic[job.status] === 'running' && !jobRequests.has(`${kind}-${topic.id}`)) {
@@ -716,26 +906,28 @@ async function renderDraw(alive) {
   }
   const vocab = await loadVocab();
   if (!state.drawn.length) state.drawn = await api("GET", "topics?status=drawn,new,dup&limit=60");
-  await syncPreviewTasks(state.drawn);
+  const rows=await rawApi('GET','generation-jobs').catch(()=>[]);
+  await syncPreviewTasks(state.drawn,rows);
   if (!alive()) return;
   for(const t of state.drawn)if(t.expand_status==='error')t._error=t.expand_error||'扩写未完成，请重试。';
-  await Promise.all(state.drawn.filter(t=>t.status==='drawn'&&t.expand_status!=='running'&&!t._error).map(async topic=>{
+  await Promise.all(state.drawn.filter(t=>t.status==='drawn'&&!expandReady(t)&&t.expand_status!=='running'&&!t._error).map(async topic=>{
     try{const versions=await rawApi('GET',`topics/${topic.id}/versions`);topic._pendingVersion=(Array.isArray(versions)?versions:versions.versions||[]).some(version=>version.kind==='expand'&&version.disposition==='pending');}catch{}
   }));
   if (!alive()) return;
-  const opts = (d) => vocab.filter((v) => v.dim === d && v.enabled && !v.used)
+  const modern=creativeV2Available();
+  const opts = (d) => vocab.filter((v) => v.dim === d && v.enabled && (modern||!v.used))
     .map((v) => `<option value="${esc(v.word)}">${esc(v.word)}</option>`).join("");
   return alive.commit(async()=>{
   view.innerHTML = executorControl()+`<div class="box section">
-      <div class="row"><h2 class="grow">抽签</h2>
-        <label class="small muted">数量 <input type="number" id="drawN" min="1" max="40" value="${esc(state.settings?.draw_size || 12)}" style="width:64px"></label>
+      <div class="row"><h2 class="grow">${modern?'发现选题':'抽签'}</h2>
+        ${modern?'':`<label class="small muted">数量 <input type="number" id="drawN" min="1" max="40" value="${esc(state.settings?.draw_size || 12)}" style="width:64px"></label>`}
         <button class="primary" id="drawBtn">抽一批</button></div>
-      <p class="muted small">按历史审核分数加权随机组合五个维度，自动跳过做过的题材和重复组合，再交给 AI 扩写、打分、查重。想指定某个维度就在下面锁定。</p>
+      <p class="muted small">${modern?'每轮从一组种子构思 8–12 个候选，推荐最多 3 个。选中感兴趣的机制后查重，再决定是否登记为项目。':'完整创作流程灰测中。当前可以按原流程抽取并扩写选题。'} 想指定某个维度就在下面锁定。</p>
       <div class="locks">${DIMS.map((d) => `<label class="field">${DIM_LABEL[d]}<select data-lock="${d}"><option value="">随机</option>${opts(d)}</select></label>`).join("")}</div>
       <label class="field personal-requirements">补充要求<textarea id="drawRequirements" rows="3" placeholder="如目标人群、画面风格、操作限制；用于平台生成"></textarea></label>
       <details class="custom-topic"><summary>使用自己的主题</summary><div class="row"><input id="customSubject" class="grow" maxlength="200" placeholder="输入主题，例如：午夜修补玩具"><button class="ghost" id="customDrawBtn">创建主题并扩写</button></div><p class="muted small">沿用上面的维度锁定与补充要求，创建一个个人选题。</p></details>
       <div class="progress" id="progress"></div>
-      <div id="lowStock"></div>
+      ${modern?'':'<div id="lowStock"></div>'}
     </div>
     <div class="row section"><span class="muted small grow" id="drawSummary"></span>
       <button class="ghost small" id="clearBtn">清空未处理的</button></div>
@@ -745,15 +937,16 @@ async function renderDraw(alive) {
   $("#clearBtn").onclick = (e) => guard(e.target, async () => {
     const left = state.drawn.filter((t) => t.status === "new" || t.status === "dup" || t.status === "drawn");
     if (!left.length) return;
-    if (!confirm(`把 ${left.length} 个未处理的选题都标记为"不要"？这会稍微降低它们组合里各个词的权重。`)) return;
+    if (!confirm(`归档 ${left.length} 轮未处理的选题？`)) return;
     for (const t of left) Object.assign(t, await api("PATCH", `topics/${t.id}`, { status: "rejected" }));
     state.drawn = [];
     paintDrawn();
   });
   bindCards($("#cards"), () => state.drawn, paintDrawn);
+  if(modern)resumeMechanismChecks(rows,state.drawn);
   paintDrawn();
   paintLowStock();
-  const stuck = state.drawn.filter((t) => t.status === "drawn" && t.expand_status === 'running' && !t._inflight && !t._error).map((t) => t.id);
+  const stuck = state.drawn.filter((t) => t.status === "drawn" && !expandReady(t) && t.expand_status === 'running' && !t._inflight && !t._error).map((t) => t.id);
   if (stuck.length) expandIds(stuck,{resume:true});
   });
 }
@@ -762,18 +955,18 @@ function paintDrawn() {
   const box = $("#cards");
   if (!box) return;
   const shown = state.drawn.filter((t) => t.status !== "rejected" && (state.showDup || t.status !== "dup"));
-  shown.sort((a, b) => (a.status === "drawn") - (b.status === "drawn") || (b.score || 0) - (a.score || 0));
+  shown.sort((a,b)=>Number(expandReady(b))-Number(expandReady(a))||b.id-a.id);
   patchHtml(box,shown.map((t) => topicCard(t, "draw")).join("") || `<p class="muted">还没有选题，点"抽一批"。</p>`);
   const dups = state.drawn.filter((t) => t.status === "dup").length;
   const liked = state.drawn.filter((t) => t.status === "liked").length;
-  $("#drawSummary").innerHTML = `${shown.length} 个在看 · ${liked} 个已要` +
+  $("#drawSummary").innerHTML = (creativeV2Available()?`${shown.length} 轮选题`:`${shown.length} 个在看 · ${liked} 个已要`) +
     (dups ? ` · <a href="#" id="dupToggle">${state.showDup ? "隐藏" : "显示"} ${dups} 个撞题</a>` : "");
   const dt = $("#dupToggle");
   if (dt) dt.onclick = (e) => { e.preventDefault(); state.showDup = !state.showDup; paintDrawn(); };
   bindGamePlayers(box);
 }
 
-// Every drawn subject is used up for good, so warn before the pool runs dry.
+// Legacy draw reserves subjects immediately.
 function paintLowStock() {
   const box = $("#lowStock");
   if (!box || !state.info) return;
@@ -797,9 +990,12 @@ async function suggestWords(dim,progress) {
 async function doDraw(subject = '') {
   const locks = {};
   for (const s of view.querySelectorAll("select[data-lock]")) if (s.value) locks[s.dataset.lock] = s.value;
-  const n = Number($("#drawN").value) || 12;
-  const fresh = await api("POST", "draw", { n:subject?1:n, locks, subject, requirements:$('#drawRequirements').value.trim(), request_id:crypto.randomUUID() });
-  state.drawn = fresh.concat(state.drawn.filter((t) => t.status !== "drawn"));
+  const modern=creativeV2Available(),n=Number($('#drawN')?.value)||12;
+  const fresh = await api("POST","draw",{
+    ...(modern?{creative_version:2}:{n:subject?1:n}),locks,subject,
+    requirements:$('#drawRequirements').value.trim(),request_id:crypto.randomUUID(),
+  });
+  state.drawn = fresh.concat(state.drawn).slice(0,60);
   paintDrawn();
   refreshStatus().then(paintLowStock).catch(() => {});
   await expandIds(fresh.map((t) => t.id));
@@ -825,14 +1021,14 @@ async function expandIds(ids, {resume = false} = {}) {
   };
   const updateTopic = (topic) => {
     if (!topic || !Number.isFinite(Number(topic.id))) return;
-    if (topic.data?.title) {
+    if (expandReady(topic)) {
       outcomes.set(Number(topic.id), 'done');
       pendingExpandIds.delete(Number(topic.id));
     }
     const local = state.drawn.find((item) => item.id === Number(topic.id));
     if (!local) return;
     Object.assign(local, topic);
-    if (topic.data?.title) {
+    if (expandReady(topic)) {
       local._inflight = false;
       local._error = "";
       local._pendingVersion = false;
@@ -860,8 +1056,8 @@ async function expandIds(ids, {resume = false} = {}) {
   };
   for (const id of unique) {
     const t = state.drawn.find((item) => item.id === id);
-    if (t?.data?.title) outcomes.set(id, 'done');
-    if (t && !t.data?.title) { t._inflight = true; t._error = ""; t._pendingVersion=false; pendingExpandIds.add(id); }
+    if (expandReady(t)) outcomes.set(id, 'done');
+    if (t && !expandReady(t)) { t._inflight = true; t._error = ""; t._pendingVersion=false; pendingExpandIds.add(id); }
   }
   paintDrawn();
   paintProgress();
@@ -914,12 +1110,12 @@ async function expandIds(ids, {resume = false} = {}) {
         const topic = await api("GET", `topics/${id}`);
         updateTopic(topic);
         const local = state.drawn.find((item) => item.id === id);
-        if (topic?.expand_status === "error" && !topic.data?.title) {
+        if (topic?.expand_status === "error" && !expandReady(topic)) {
           if (local) { local._error = topic.expand_error || "扩写失败，请点击重试。"; local._inflight = false; }
           outcomes.set(id, 'error');
           pendingExpandIds.delete(id);
         }
-        if(!topic.data?.title&&topic.expand_status!=='running'&&pendingExpandIds.has(id)){
+        if(!expandReady(topic)&&topic.expand_status!=='running'&&pendingExpandIds.has(id)){
           const response=await rawApi('GET',`topics/${id}/versions`),versions=Array.isArray(response)?response:response.versions||[];
           if(versions.some(version=>version.kind==='expand'&&version.disposition==='pending'))finishPending(id);
         }
@@ -937,7 +1133,7 @@ async function expandIds(ids, {resume = false} = {}) {
   };
   for (const id of unique) {
     const t = state.drawn.find((item) => item.id === id);
-    if (!t?.data?.title && pendingExpandIds.has(id) && !activeExpandPolls.has(id)) {
+    if (!expandReady(t) && pendingExpandIds.has(id) && !activeExpandPolls.has(id)) {
       activeExpandPolls.add(id);
       void poll(id).finally(() => activeExpandPolls.delete(id));
     }
@@ -1001,7 +1197,7 @@ async function renderProducts(alive) {
   const products = list.filter(topic => topic.has_product || ['queued', 'running', 'error'].includes(topic.product_status));
   return alive.commit(async()=>{
   view.innerHTML = `<div class="row section"><h2 class="grow">已有成品</h2><button class="ghost" data-tab="picks">全部项目</button><span class="muted small">${products.length} 款</span></div>
-    <p class="muted small section">生成的可试玩首版保存在这里，可试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
+    <p class="muted small section">成品可以试玩或下载为单文件。${products.some(item => ['queued', 'running'].includes(item.product_status)) ? '正在制作的任务会在完成后自动出现。' : ''}</p>
     <div class="cards" id="productCards"></div>`;
   const paint = () => {
     if (!alive()) return;
@@ -1034,6 +1230,7 @@ function bindProductCards(root, list, paint) {
     const button = event.target.closest('[data-act]');
     if (!button) return;
     if(button.dataset.act==='versions'){await openCardArtifact(button,topic,'versions',repaint,root);return;}
+    if(button.dataset.act==='creationChecks'){await openCardArtifact(button,topic,'creationChecks',repaint,root);return;}
     if(button.dataset.act==='viewProduct'){await openCardArtifact(button,topic,'game',repaint,root);return;}
     if(button.dataset.act==='resumeProduct'){startProductJob(topic,repaint,{resume:true});return;}
     if(button.dataset.act==='retryProduct'){startProductJob(topic,repaint);return;}
@@ -1048,6 +1245,14 @@ function startProductJob(topic, repaint = () => {}, {resume = false,regenerate=f
   if (existing?.pending) {
     existing.listeners.push({topic, repaint});
     Object.assign(topic, existing.topic); repaint();
+    return;
+  }
+  if(!resume&&creativeV2Available()&&topic.has_brief!=null&&!topic.has_brief){
+    setTopicNotice(topic,'请先在材料区生成简报，再开始制作。');
+    const card=view.querySelector(`[data-id="${topic.id}"]`);
+    const brief=card?.querySelector('[data-act="brief"]:not(:disabled)');
+    if(brief)brief.focus();
+    else if(!card?.querySelector('[data-act="brief"]'))navigateWorkspace({tab:'picks',project:String(topic.id)});
     return;
   }
   const entry = {topic, pending:true,regenerate,listeners:[{topic, repaint}]};
@@ -1069,6 +1274,20 @@ function startProductJob(topic, repaint = () => {}, {resume = false,regenerate=f
   repaint();
   void (async () => {
     try {
+      await statusReady;
+      if(!resume&&creativeV2Available()&&topic.has_brief==null){
+        const saved=await api('GET',`topics/${topic.id}?summary=1`);
+        if(!saved.has_brief){
+          topic.product_status=saved.product_status;
+          topic.product_error=saved.product_error;
+          topic._productProgress=null;
+          entry.task.done('请先准备简报。');
+          setTopicNotice(topic,'请先在材料区生成简报，再开始制作。');
+          if(state.tab==='products')navigateWorkspace({tab:'picks',project:String(topic.id)});
+          entry.repaint();
+          return;
+        }
+      }
       if(!resume)await waitForTopicNote(topic);
       const html = await requestProductJob(topic.id, entry, resume);
       topic.has_product = 1; topic.product_status = ''; topic.product_error = ''; topic.status = 'made';
@@ -1099,7 +1318,7 @@ async function requestProductJob(id, entry, resume = false) {
     const started=queued?.jobId?await observeGeneration({id:queued.jobId},{update:state=>entry.update(state)}):queued;
     if(started.html)return started.html;
     if (started.status === 'done' && started.has_product) return (await api('GET', `topics/${id}/product`)).html;
-    entry.update({detail:'后台已接收，Opus 将根据选题资料制作可试玩首版。'});
+    entry.update({detail:'制作任务已保存，等待执行。'});
   } catch (error) {
     if(error.versionPending)throw error;
     if (error.status && error.status < 500) throw error;
@@ -1115,7 +1334,7 @@ async function requestProductJob(id, entry, resume = false) {
         const html=(await api('GET',`topics/${id}/product`)).html;
         if(!entry.regenerate||html!==previous)return html;
       }
-      entry.update({detail:saved.product_error || 'Opus 正在制作 HTML 游戏，等待完整版本…'});
+      entry.update({detail:saved.product_error || '正在等待本次制作结果…'});
       if (!['queued', 'running'].includes(saved.product_status)) throw Object.assign(new Error('后台没有接收到制作任务，请重新开始制作。'), {terminal:true});
     } catch (error) {
       if (error.terminal || (error.status && error.status < 500)) throw error;
@@ -1320,11 +1539,13 @@ async function renderGames(alive) {
 // ---------- 设置 ----------
 
 async function renderSettings(alive) {
-  const s = await api('GET', 'settings');
+  const [s]=await Promise.all([api('GET','settings'),statusReady]);
   if (!alive()) return;
   return alive.commit(async()=>{
-  view.innerHTML = `<div class="box section"><h2>我的工作台</h2><p class="muted small">网页创作使用平台模型，游戏制作固定 Opus 5.5。审核由自己的 Agent 完成，也可独立接入创作 Agent。结果保存在个人空间。</p><form id="drawPrefs" class="row"><label class="field">每次抽几个<input id="drawSizePref" type="number" min="1" max="40" value="${Number(state.settings?.draw_size || 12)}"></label><button class="ghost">保存抽签偏好</button></form></div><div class="box section"><h2>公共选题规律与雷区</h2><pre class="md">${esc(s.redlines || '暂无规则')}</pre></div><div class="box section"><h2>公共制作模板</h2><pre class="md">${esc(s.template || '暂无模板')}</pre></div><div class="box section"><h2>F 部分骨架</h2><pre class="md">${esc(s.template_f || '暂无骨架')}</pre></div><div class="row section"><button class="ghost" id="exportBtn">导出我的数据</button><button class="ghost" id="changePassword">修改密码</button><button class="ghost" id="logoutBtn">退出登录</button></div>`;
-  $('#drawPrefs').onsubmit = event => { event.preventDefault(); const value = Math.min(40,Math.max(1,Number($('#drawSizePref').value) || 12)); state.settings.draw_size = String(value); try {localStorage.setItem(`forge-draw-size-${state.session.id}`, String(value));} catch {} toast('个人抽签偏好已保存'); };
+  const drawPrefs=creativeV2Available()?'':`<form id="drawPrefs" class="row"><label class="field">每次抽几个<input id="drawSizePref" type="number" min="1" max="40" value="${Number(state.settings?.draw_size || 12)}"></label><button class="ghost">保存抽签偏好</button></form>`;
+  view.innerHTML = `<div class="box section"><h2>我的工作台</h2><p class="muted small">网页创作使用平台模型，游戏制作固定 Opus 5.5。审核由自己的 Agent 完成，也可独立接入创作 Agent。结果保存在个人空间。</p>${drawPrefs}</div><div class="box section"><h2>公共选题规律与雷区</h2><pre class="md">${esc(s.redlines || '暂无规则')}</pre></div><div class="box section"><h2>公共制作模板</h2><pre class="md">${esc(s.template || '暂无模板')}</pre></div><div class="box section"><h2>F 部分骨架</h2><pre class="md">${esc(s.template_f || '暂无骨架')}</pre></div><div class="row section"><button class="ghost" id="exportBtn">导出我的数据</button><button class="ghost" id="changePassword">修改密码</button><button class="ghost" id="logoutBtn">退出登录</button></div>`;
+  const form=$('#drawPrefs');
+  if(form)form.onsubmit = event => { event.preventDefault(); const value = Math.min(40,Math.max(1,Number($('#drawSizePref').value) || 12)); state.settings.draw_size = String(value); try {localStorage.setItem(`forge-draw-size-${state.session.id}`, String(value));} catch {} toast('个人抽签偏好已保存'); };
   $('#exportBtn').onclick = event => guard(event.target,async () => download(`pgc-personal-${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(await api('GET','export'),null,2),'application/json'));
   $('#changePassword').onclick = () => {
     openModal('修改我的密码', `<form id="personalPassword" class="agent-password"><label class="field">原密码<input name="currentPassword" type="password" autocomplete="current-password" required maxlength="128"></label><label class="field">新密码<input name="newPassword" type="password" autocomplete="new-password" required minlength="6" maxlength="128"></label><button class="primary" type="submit">保存新密码</button><p id="passwordMessage" role="status"></p></form>`);
@@ -1365,7 +1586,7 @@ async function boot() {
     if (!memberOnly) {
       // Settings and account counters must not delay the first useful page.
       state.settings={};
-      void refreshStatus().catch(()=>{});
+      statusReady=refreshStatus().catch(()=>{});
       settingsReady=api("GET","settings").then(settings=>{state.settings={...settings,...state.settings};}).catch(()=>{});
       try{state.executor=sessionStorage.getItem(`forge-executor-${state.session.id}`)||"platform";}catch{state.executor="platform";}
       try{const size=localStorage.getItem(`forge-draw-size-${state.session.id}`);if(size)state.settings.draw_size=size;}catch{}

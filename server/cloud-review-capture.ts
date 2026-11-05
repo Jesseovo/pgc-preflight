@@ -12,7 +12,9 @@ export function captureFor(env: any) {
       try{browser = await acquireBrowser(env.DB, () => puppeteer.limits(env.BROWSER), () => connectAcquiredBrowser(()=>puppeteer.acquire(env.BROWSER),id=>puppeteer.connect(env.BROWSER,id),onWait), onWait);status='ok';}
       finally{if(env.reviewJobId)await recordReviewTiming(env.DB,{jobId:env.reviewJobId,eventId:crypto.randomUUID(),phase:'browser_start',origin:'server',startedAt:new Date(started).toISOString(),durationMs:Math.max(0,Date.now()-started),status}).catch(()=>{});}
       await onWait?.('正在采集三种手机比例的真实游戏画面…');
-      return await captureReview(browser as unknown as Browser, html);
+      return env.creationCaptureStrict===true
+        ? await captureReview(browser as unknown as Browser,html,{denyExternal:true})
+        : await captureReview(browser as unknown as Browser,html);
     } finally { await browser?.close().catch(() => {}); }
   };
 }

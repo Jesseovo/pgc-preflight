@@ -18,6 +18,8 @@ import {login} from '../server/settings';
 import {REVIEW_SCHEMA,REVIEW_VERIFICATION} from '../server/forge/prompts.js';
 import {reviewRulesAdmin} from '../server/review-rules';
 import {hashReviewConfiguration} from '../server/review-timing';
+import {CreatorFeedbackClient,type FeedbackGame} from '../server/creator-feedback-client';
+import {creatorFeedbackAdminApi} from '../server/creator-feedback-api';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.restoreAllMocks();});
@@ -50,6 +52,116 @@ async function setup(){
   async function verified(job:any){const draft=draftBody(job),saved=await ok('draft',draft);return {...draft,verification:{confirmed:true,model:draft.model,evidenceHash:job.evidenceHash,draftHash:saved.draftHash}};}
   return {sqlite,DB,env,devices,call,ok,submit,claim,evidence,ready,draftBody,verified,modelGet,schedule,send};
 }
+
+const artifactHtml='<!doctype html><html><p>准确版本一</p></html>';
+const artifactId='immutable-game-version';
+function seedArtifact(sqlite:DatabaseSync){
+  sqlite.prepare("INSERT INTO topics(id,owner_id,batch,subject,medium,gesture,structure,mood,data,created_at,updated_at) VALUES(21,'a','fixture','fixture','fixture','fixture','fixture','fixture',?,'now','now')").run(JSON.stringify({title:'CREATOR_DESIGN_SHOULD_NOT_ENTER_REVIEW',logline:'private creation notes'}));
+  const insert=sqlite.prepare("INSERT INTO artifact_versions(id,owner_id,topic_id,kind,content,input_revision,executor,disposition,created_at) VALUES(?,?,21,?,?,0,'agent','historical','now')");
+  insert.run(artifactId,'a','game',artifactHtml);
+  insert.run('same-bytes-other-version','a','game',artifactHtml);
+  insert.run('assets-version','a','assets',artifactHtml);
+}
+async function seedFeedback(s:Awaited<ReturnType<typeof setup>>){
+  const env=Object.assign(s.env,{CREATOR_FEEDBACK_TOKEN:'fixture-only-feedback-token',CREATOR_FEEDBACK_ENABLED:'true'});
+  s.sqlite.prepare("UPDATE creator_feedback_state SET generation=2,scope_revision=3,status='ready',phase='delta',credential_hash=? WHERE id=1").run(await digest(env.CREATOR_FEEDBACK_TOKEN));
+  const review={id:'review_creator',versionId:'version_creator',stage:'decision_review',revision:4,eventSequence:11,reviewerId:'reviewer_creator',reviewerRole:'leader',scores:[{name:'美学',description:'',max:3,score:0},{name:'易玩性',description:'',max:3,score:null}],total:0,decision:'rejected',feedback:'source opinion',createdAt:'2026-11-05T00:00:00Z',recordedAt:null,scored:true,historicalBaseline:false,deleted:false,reopened:false,revoked:false,effective:true};
+  const game:FeedbackGame={id:'game_creator',authorId:'author_creator',title:'Synthetic',description:'',status:'rejected',revision:1,createdAt:'now',updatedAt:'now',archived:false,deleted:false,textRedacted:true,idNamespace:'integration_pseudonym',
+    versions:[{id:'version_creator',revision:1,title:'Synthetic',description:'',submittedAt:'now',updateNote:null,withdrawn:false,ruleVersion:null,status:'rejected',statusSource:'decision_review',finalReviewId:review.id,files:{html:{bytes:123}},fileAccess:false}],reviews:[{...review,revision:3,total:null,decision:null,scores:[]},review],comments:[]};
+  s.sqlite.prepare('INSERT INTO creator_feedback_games(game_id,last_sequence,updated_at) VALUES(?,11,1)').run(game.id);
+  const cache=s.sqlite.prepare('INSERT INTO creator_feedback_chunks(kind,entity_id,game_id,part,payload) VALUES(?,?,?,0,?)');
+  cache.run('game',game.id,game.id,JSON.stringify(game));
+  cache.run('review',`${review.id}:3`,game.id,JSON.stringify({...review,revision:3,total:null,decision:null}));
+  s.sqlite.prepare(`INSERT INTO review_pilot_members(member_id,pilot_enabled,creator_account,revision,updated_at,binding_status,source_author_id,work_id,version_id,verified_at,source_generation,scope_revision)
+    VALUES('a',1,'Synthetic',1,'now','linked',?,?,?,'now',2,3)`).run(game.authorId,game.id,game.versions[0].id);
+  const contract=vi.spyOn(CreatorFeedbackClient.prototype,'contract').mockResolvedValue({version:1,scopeRevision:3,dataset:'ordinary_games',authorScope:'all',fileVersionCount:0,idNamespace:'integration_pseudonym',historySince:null,pollingSeconds:120,snapshotsExpireHours:24,pagination:{defaultLimit:20,maxLimit:50},rateLimit:{requestsPerMinute:120}});
+  const identity=vi.spyOn(CreatorFeedbackClient.prototype,'identity').mockResolvedValue({id:'version_creator',workId:game.id,idNamespace:'integration_pseudonym'});
+  const readGame=vi.spyOn(CreatorFeedbackClient.prototype,'game').mockResolvedValue(game);
+  const cookie=`pgc_admin=${await login(env.ADMIN_PASSWORD,env)}`;
+  const admin=(path:string,body?:unknown)=>creatorFeedbackAdminApi(new Request(`https://fixture.test/api/admin/creator-feedback${path}`,{method:body===undefined?'GET':'POST',headers:{Cookie:cookie,Origin:'https://fixture.test','Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)}),env);
+  return {game,contract,identity,readGame,admin};
+}
+
+async function artifactReview(s:Awaited<ReturnType<typeof setup>>){
+  seedArtifact(s.sqlite);
+  const submit={request_id:crypto.randomUUID(),html:artifactHtml,artifactVersionId:artifactId,creationSelfCheck:'CREATION_SELF_CHECK_SECRET'};
+  const queued=await s.ok('submit',submit),job=await s.claim(queued.id);
+  const accepted=await s.ok('evidence',s.evidence(job));
+  const record={id:job.id,lease:job.lease,workId:'actual-work',versionId:'actual-submission',uploadHash:await digest(artifactHtml),provenance:'creator-submission-record'};
+  return {submit,job:{...job,evidenceHash:accepted.evidenceHash},record};
+}
+
+describe('成品版本、独立审核与准确投稿',()=>{
+  it('checks owner, kind, bytes and retry identity before locking independent evidence',async()=>{
+    const s=await setup();
+    const {submit,job,record}=await artifactReview(s);
+    expect((await s.call('submit',{...submit,request_id:crypto.randomUUID()},'b')).status).toBe(404);
+    expect((await s.call('submit',{...submit,request_id:crypto.randomUUID(),artifactVersionId:'assets-version'})).status).toBe(404);
+    expect((await s.call('submit',{...submit,request_id:crypto.randomUUID(),html:artifactHtml+' '})).status).toBe(409);
+    expect((await s.call('submit',{...submit,artifactVersionId:'same-bytes-other-version'})).status).toBe(409);
+    expect((await s.call('submit',{...submit,artifactVersionId:undefined})).status).toBe(409);
+    expect(await s.ok('submit',submit)).toMatchObject({id:job.id,artifactVersionId:artifactId,input_hash:record.uploadHash});
+    expect(s.sqlite.prepare('SELECT topic_id,artifact_version_id,input_hash FROM review_jobs WHERE id=?').get(job.id)).toEqual({topic_id:21,artifact_version_id:artifactId,input_hash:record.uploadHash});
+    expect((await s.call('record-submission',record)).status).toBe(409);
+    const material=await s.ok('material',job),text=JSON.stringify(material.user);
+    expect(text).toContain('准确版本一');
+    for(const excluded of [artifactId,'CREATION_SELF_CHECK_SECRET','CREATOR_DESIGN_SHOULD_NOT_ENTER_REVIEW'])expect(text).not.toContain(excluded);
+    const verified=await s.verified(job);
+    expect((await s.call('complete',{...verified,model:'creator-model'})).status).toBe(409);
+    const verify=await s.ok('material',job);
+    expect(verify.evidenceHash).toBe(material.evidenceHash);
+    await s.ok('complete',verified);
+    expect(await s.ok('report',{id:job.id})).toMatchObject({artifactVersionId:artifactId,evidence_hash:material.evidenceHash,result:verified.report});
+    expect(s.modelGet).not.toHaveBeenCalled();
+  });
+
+  it('binds the verified author and exact submission once while preserving AI, history, 0 and null',async()=>{
+    const s=await setup(),source=await seedFeedback(s);
+    const {job,record}=await artifactReview(s);
+    await s.ok('complete',await s.verified(job));
+    const original=await s.ok('report',{id:job.id});
+    expect((await s.call('record-submission',record,'b')).status).toBe(404);
+    expect((await s.call('record-submission',record,'a2')).status).toBe(409);
+    expect((await s.call('record-submission',{...record,uploadHash:'f'.repeat(64)})).status).toBe(409);
+    expect((await s.call('record-submission',{...record,creatorToken:'private'})).status).toBe(400);
+    expect((await source.admin('/link',{jobId:job.id,workId:record.workId,versionId:record.versionId,matchedBy:'user-confirmed'}))?.status).toBe(409);
+    expect(source.contract).not.toHaveBeenCalled();
+    const accepted=await s.ok('record-submission',record);
+    expect(accepted).toEqual({ok:true,jobId:job.id,artifactVersionId:artifactId,sourceIdentityVerified:true,fileVerification:'agent-declared',strictEligible:false});
+    expect(await s.ok('record-submission',record)).toEqual(accepted);
+    expect(source.identity).toHaveBeenCalledOnce();
+    expect(source.identity).toHaveBeenCalledWith(record.versionId);
+    expect(source.readGame).toHaveBeenCalledWith(record.workId);
+    expect((await s.call('record-submission',{...record,versionId:'another-submission'})).status).toBe(409);
+    expect((await s.call('human-review',human(job))).status).toBe(409);
+    expect(await s.ok('report',{id:job.id})).toEqual(original);
+    for(const table of ['gallery_games','review_human_reviews'])expect(s.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({n:0});
+    const detail=await source.admin(`/job?jobId=${job.id}`);
+    expect(detail?.status).toBe(200);
+    expect(await detail?.json()).toMatchObject({creation:{artifactVersionId:artifactId,uploadHash:record.uploadHash,fileVerification:'agent-declared',strictEligible:false},
+      ai:{executor:'agent',score:7},platform:{decision:'rejected',reviewerRole:'leader'},comparison:{totals:{ai:7,platform:0},decidingReviewRevision:4,scoreDifferences:[{platform:0},{platform:null},{platform:null}]},
+      reviews:[{revision:3,total:null},{revision:4,stage:'decision_review',total:0,scores:[{score:0},{score:null}]}],reviewHistory:[{revision:3,total:null}]});
+    expect(s.modelGet).not.toHaveBeenCalled();
+  });
+
+  it('does not commit either row when the pilot mapping or source changes during verification',async()=>{
+    const s=await setup(),source=await seedFeedback(s),{job,record}=await artifactReview(s);
+    await s.ok('complete',await s.verified(job));
+    source.readGame.mockImplementationOnce(async()=>{
+      s.sqlite.prepare('UPDATE review_pilot_members SET revision=revision+1 WHERE member_id=?').run('a');
+      return source.game;
+    });
+    expect((await s.call('record-submission',record)).status).toBe(409);
+    source.readGame.mockResolvedValueOnce({...source.game,authorId:'different-author'});
+    expect((await s.call('record-submission',record)).status).toBe(409);
+    source.readGame.mockImplementationOnce(async()=>{
+      s.sqlite.exec('UPDATE creator_feedback_state SET generation=generation+1 WHERE id=1');
+      return source.game;
+    });
+    expect((await s.call('record-submission',record)).status).toBe(409);
+    for(const table of ['creation_review_submissions','creator_feedback_links'])expect(s.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()).toEqual({n:0});
+  });
+});
 
 describe('成员 Agent 本地模型审核协议',()=>{
   it('manifest opt-in retains full defaults, image hashes and immutable review delta',async()=>{

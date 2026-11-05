@@ -3,6 +3,7 @@ import {processForgeJob, type ForgeEnv, type ForgeJob} from './forge-api';
 import {failForgeTask, FORGE_TASK_LIMIT_MS, type ForgeTask} from './forge-tasks';
 import {memberStore} from './storage';
 import {claimCreationModel} from './model-capacity';
+import {creationPipelineAlarm} from './forge-creation-pipeline';
 
 async function requireCreationAccess(env:ForgeEnv,owner:string){
   if(owner==='admin')return; // historical platform tasks only
@@ -40,7 +41,7 @@ export async function executeForgeTask(env: ForgeEnv, id: string) {
     }},job);
     // Artifact HTML and briefs live on topics, not in a second task copy.
     const version=await env.DB.prepare('SELECT id,topic_id,disposition FROM artifact_versions WHERE task_id=?').bind(id).first();
-    const saved = version?{id:version.topic_id,version_id:version.id,disposition:version.disposition}:['preview','suggest','tag'].includes(job.type) ? result : {id:'id' in job ? job.id : undefined};
+    const saved = version?{id:version.topic_id,version_id:version.id,disposition:version.disposition}:['preview','suggest','tag','mechanism-check'].includes(job.type) ? result : {id:'id' in job ? job.id : undefined};
     await env.DB.prepare("UPDATE forge_tasks SET status='done',result=?,detail='已完成',error='',updated_at=? WHERE id=? AND status='running'").bind(JSON.stringify(saved),new Date().toISOString(),id).run();
   } catch (error) {
     await failForgeTask(env,row,error instanceof Error ? error.message : '生成未完成，请手动重试。');
@@ -55,8 +56,8 @@ export class ForgeRunner {
     const id = await request.text();
     if (!/^[a-f0-9-]{36}$/.test(id)) return new Response('Invalid task',{status:400});
     await this.state.storage.put('taskId',id);
-    const row = await this.env.DB.prepare('SELECT status,executor FROM forge_tasks WHERE id=?').bind(id).first();
-    if (row?.executor!=='agent' && row?.status === 'queued' && !await this.state.storage.getAlarm()) await this.state.storage.setAlarm(Date.now()+100);
+    const row = await this.env.DB.prepare('SELECT status,executor,creative_version,kind FROM forge_tasks WHERE id=?').bind(id).first();
+    if (row?.executor!=='agent' && (row?.status === 'queued'||row?.status==='running'&&row.creative_version===2&&row.kind==='game') && !await this.state.storage.getAlarm()) await this.state.storage.setAlarm(Date.now()+100);
     return Response.json({ok:true});
   }
   async alarm() {
@@ -64,6 +65,7 @@ export class ForgeRunner {
     if (!id) return;
     const row: ForgeTask | null = await this.env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
     if(row?.executor==='agent'){await this.state.storage.deleteAlarm();await this.state.storage.deleteAll();return;}
+    if(row?.creative_version===2&&row.kind==='game')return creationPipelineAlarm(this.state,{...this.env,modelStore:configStore(this.env.DB)},id);
     if (row?.status === 'queued') {
       await this.state.storage.setAlarm(Date.now()+FORGE_TASK_LIMIT_MS);
       await executeForgeTask({...this.env,modelStore:configStore(this.env.DB)},id);

@@ -3,6 +3,7 @@ import {reviewTaskStatus} from '../review-task-status';
 import {reviewReportErrors} from '../../server/review-report';
 import {mountReviewPilotMember,readReviewPilots,reviewPilotBadges,type ReviewPilotMember} from './pilot-members';
 import './manage.css';
+import {mountCreationMechanisms} from './creation-mechanisms';
 
 type Member={id:string;username:string;displayName:string;enabled:boolean;canReview:boolean;star?:boolean;dailyReviewLimit?:number;createdAt:string;updatedAt?:string;lastActivity?:string|null};
 type PublicData={settings:Record<string,string>;vocab:any[];games:any[];publishableGames?:any[];suggestions?:any[];members?:any[]};
@@ -162,6 +163,7 @@ export async function mountManagement(ctx:AdminContext):Promise<()=>void>{
       <section class="adm-card adm-manage-public-block"><div class="adm-manage-block-head"><div><h2>词库建议审批</h2><p>成员 Agent 的补词结果经批准后进入公共词库。</p></div><span class="adm-badge">${(data.suggestions||[]).filter(s=>!s.status||s.status==='pending').length} 待审批</span></div><div data-suggestions></div></section>
       <section class="adm-card adm-manage-public-block"><div class="adm-manage-block-head"><div><h2>公共案例</h2><p>只有明确发布的现有作品进入共享案例库。</p></div></div><div data-public-games></div></section>`;
     await reviewRulesPanel(target.querySelector<HTMLElement>('[data-review-rules]')!);
+    const mechanisms=document.createElement('section');mechanisms.className='adm-card adm-manage-public-block';target.querySelector('[data-review-rules]')!.after(mechanisms);await mountCreationMechanisms(mechanisms,api,live);
     const feedback=target.querySelector('[data-public-message]');
     const mutate=async(scope:HTMLElement,payload:unknown,success:string)=>{await action(scope,async()=>{await api('public-data','POST',payload);notice(success);await publicData(target);},scope.querySelector('[role="status"]')||feedback);};
     target.querySelectorAll<HTMLButtonElement>('[data-rule]').forEach(b=>b.onclick=()=>{const key=b.dataset.rule!,label=b.closest('article')!.querySelector('b')!.textContent!;const area=target.querySelector<HTMLElement>('[data-rule-editor]')!;area.innerHTML=`<form class="adm-manage-rule-editor"><label class="adm-field"><span>${esc(label)}</span><textarea name="value" rows="16" spellcheck="false">${esc(data.settings[key]||'')}</textarea></label><div class="adm-manage-form-actions"><button class="adm-button primary" type="submit">保存${esc(label)}</button>${button('取消','data-rule-close')}<span role="status" aria-live="polite"></span></div></form>`;const form=area.querySelector<HTMLFormElement>('form')!;form.querySelector<HTMLTextAreaElement>('textarea')!.focus();form.querySelector<HTMLButtonElement>('[data-rule-close]')!.onclick=()=>area.replaceChildren();form.onsubmit=e=>{e.preventDefault();void mutate(form,{action:'settings',settings:{[key]:form.querySelector<HTMLTextAreaElement>('textarea')!.value}},'公共规则已保存。');};});

@@ -11,11 +11,13 @@ import {validateReviewEvidence} from './review-evidence';
 import {currentHumanReview,saveHumanReview} from './human-review';
 import {publishGalleryGame} from './gallery';
 import {recordReviewTiming,markReviewExecution,validateMemberTiming,recordReviewBoundary,recordReviewConfiguration,hashReviewConfiguration} from './review-timing';
+import {recordCreationSubmission} from './creation-review-links';
+import type {CreatorFeedbackEnv} from './creator-feedback-runner';
 
 const json=(value:unknown,status=200)=>Response.json(value,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
-type Env={DB:any;SETTINGS_KEY:string;ADMIN_PASSWORD:string;modelStore:{get():Promise<any>};REVIEW_RUNNER?:any};
+type Env=CreatorFeedbackEnv&{SETTINGS_KEY:string;ADMIN_PASSWORD:string;modelStore:{get():Promise<any>};REVIEW_RUNNER?:any};
 const validId=(value:any)=>typeof value==='string'&&/^[a-f0-9-]{36}$/.test(value);
-const reviewActions=new Set(['submit','jobs','job','report','heartbeat','claim','evidence','material','draft','complete','fail','human-review','gallery']);
+const reviewActions=new Set(['submit','jobs','job','report','heartbeat','claim','evidence','material','draft','complete','fail','human-review','gallery','record-submission']);
 const localModel=(value:unknown)=>{if(typeof value!=='string'||!value.trim()||value.length>200)throw problem('请填写实际执行初评与复核的本地模型标识。');return value.trim();};
 function localConfiguration(value:any){
   if(value===undefined)return null;
@@ -47,10 +49,10 @@ async function leased(env:Env,device:any,b:any){
   if(!row||!['running','done','error'].includes(row.status))throw problem('任务租约已失效，请停止本次采集。',409);
   return row;
 }
-async function readBody(request:Request){
+async function readBody(request:Request,maxBytes=16*1024*1024){
   if(!request.headers.get('Content-Type')?.includes('application/json'))throw problem('请使用 JSON。',415);
-  if(Number(request.headers.get('Content-Length'))>16*1024*1024)throw problem('请求内容过大。',413);
-  const text=await request.text();if(new TextEncoder().encode(text).length>16*1024*1024)throw problem('请求内容过大。',413);
+  if(Number(request.headers.get('Content-Length'))>maxBytes)throw problem('请求内容过大。',413);
+  const text=await request.text();if(new TextEncoder().encode(text).length>maxBytes)throw problem('请求内容过大。',413);
   try{return JSON.parse(text);}catch{throw problem('请求内容不是合法 JSON。');}
 }
 export async function deviceStatus(DB:any,ownerId?:string){
@@ -91,6 +93,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
     if(request.method!=='POST')throw problem('请使用 POST。',405);
     const action=new URL(request.url).pathname.slice('/api/review-device/'.length),DB=env.DB;
     if(action!=='pair'&&!reviewActions.has(action))throw problem('此接入仅开放本人 AI 审核操作。',403);
+    if(action==='record-submission')return json(await recordCreationSubmission(env,await authenticate(request,env),await readBody(request,4096)));
     const b=await readBody(request);
     if(action==='pair'){
       if(!validId(b.deviceId)||!/^[a-f0-9]{64}$/.test(b.token)||!/^[a-f0-9]{40}$/.test(b.code))throw problem('配对信息不正确。');
@@ -128,6 +131,7 @@ export async function reviewDeviceApi(request:Request,env:Env){
       if(!report)throw problem('审核报告不存在。',404);
       for(const key of ['result','probe','shots','rules_snapshot'])report[key]=JSON.parse(report[key]||'null');
       report.human_review=await currentHumanReview(DB,job.id,device.owner_id);
+      if(job.artifactVersionId)report.artifactVersionId=job.artifactVersionId;
       return json(report);
     }
     if(action==='heartbeat'){
@@ -196,7 +200,8 @@ export async function reviewDeviceApi(request:Request,env:Env){
         const evidence=await readReviewInput(DB,row.id,'review_evidence');
         if(!row.local_material_hash){
           const input=await readReviewInput(DB,row.id);
-          const {images,...request}=await prepareReview({...env,ownerId:device.owner_id,modelExecutor:'agent'}, {...input,...evidence,rulesSnapshot:row.rules_snapshot?parseReviewRulesSnapshot(row.rules_snapshot):null,reportSchemaVersion:row.report_schema_version===2?2:1});
+          // A linked version is reviewed independently of the creator's mutable project and self-checks.
+          const {images,...request}=await prepareReview({...env,ownerId:device.owner_id,modelExecutor:'agent'}, {...input,...evidence,topic_id:row.artifact_version_id?undefined:input.topic_id,rulesSnapshot:row.rules_snapshot?parseReviewRulesSnapshot(row.rules_snapshot):null,reportSchemaVersion:row.report_schema_version===2?2:1});
           let imageIndex=0;
           const snapshot={...request,user:request.user.map((part:any)=>part.type==='image'?{type:'image',index:imageIndex++}:part),schema:row.report_schema_version===2?REVIEW_SCHEMA_V2:REVIEW_SCHEMA,verification:row.report_schema_version===2?REVIEW_VERIFICATION_V2:REVIEW_VERIFICATION};
           const hash=await digest(canonicalJson(snapshot));

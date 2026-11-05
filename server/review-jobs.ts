@@ -5,6 +5,7 @@ import { recoverDeviceReviews, failDeviceReview } from './review-device-state';
 import {digest} from './review-device-state';
 import {withHumanReviews} from './human-review';
 import {getActiveReviewRules} from './review-rules';
+import {validReviewArtifactVersion,verifyReviewArtifact} from './creation-review-links';
 
 type ReviewJob = { type: 'review'; id: string };
 export interface ReviewJobEnv {
@@ -18,10 +19,12 @@ export interface ReviewJobEnv {
 }
 const stamp = () => new Date().toISOString();
 const fail = (message: string, status = 400) => Object.assign(new Error(message), { status });
-const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, review_mode,report_schema_version,rules_snapshot, human_review=null }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,...(report_schema_version===2?{review_mode,report_schema_version,rules_snapshot:JSON.parse(rules_snapshot)}:{}),human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
+const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, artifact_version_id, review_mode,report_schema_version,rules_snapshot, human_review=null }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,...(artifact_version_id?{artifactVersionId:artifact_version_id}:{}),...(report_schema_version===2?{review_mode,report_schema_version,rules_snapshot:JSON.parse(rules_snapshot)}:{}),human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
   const local = env.modelExecutor !== 'platform';
+  const artifactId=payload?.artifactVersionId;
+  if(artifactId!==undefined&&(!validReviewArtifactVersion(artifactId)||env.reviewExecutor!=='device'||env.modelExecutor!=='agent'))throw fail('指定成品版本只支持已配对的审核 Agent。');
   if (!local && !env.REVIEW_QUEUE && !env.REVIEW_RUNNER && env.reviewExecutor!=='device') throw fail('后台审核服务尚未就绪，请稍后重试。', 503);
   if (typeof payload?.html !== 'string' || !payload.html.trim()) throw fail('缺少游戏源码。');
   if (new TextEncoder().encode(payload.html).length > 8 * 1024 * 1024) throw fail('单个 HTML 不能超过 8 MB。', 413);
@@ -35,22 +38,29 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   }
   const id = payload.request_id;
   if (typeof id !== 'string' || !/^[a-f0-9-]{36}$/.test(id)) throw fail('审核请求标识无效，请重新提交。');
+  const inputHash=await digest(payload.html);
+  const original=async(row:any)=>{
+    if((artifactId||row.artifact_version_id)&&(artifactId!==row.artifact_version_id||inputHash!==row.input_hash||
+      payload.topic_id!=null&&payload.topic_id!==row.topic_id||(payload.review_mode??'basic')!==row.review_mode))throw fail('原审核请求已经锁定成品版本、文件和审核模式。',409);
+    return publicJob((await withHumanReviews(env.DB,[row],true))[0]);
+  };
   const existing = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
   if (existing) {
     if(!local && existing.model_executor==='platform' && existing.executor==='cloud' && existing.status==='queued' && existing.input_ready && existing.error?.startsWith('后台调度未确认')){
       await scheduleCloudReview(env,id);
       await env.DB.prepare("UPDATE review_jobs SET error='' WHERE id=? AND status='queued'").bind(id).run();
     }
-    return publicJob((await withHumanReviews(env.DB,[existing],true))[0]);
+    return original(existing);
   }
+  let topicId=payload.topic_id??null;
   if(payload.topic_id!==undefined&&payload.topic_id!==null){
     if(!Number.isInteger(payload.topic_id)||payload.topic_id<1)throw fail('选题编号无效。');
     const topic=await env.DB.prepare('SELECT owner_id FROM topics WHERE id=?').bind(payload.topic_id).first();
     if(!topic||(ownerId!=='admin'&&topic.owner_id!==ownerId))throw fail('选题不存在。',404);
   }
+  if(artifactId)topicId=await verifyReviewArtifact(env.DB,ownerId,artifactId,inputHash,topicId);
   const title = String(payload.title || '未命名').slice(0, 120);
   const filename = String(payload.filename || '').slice(0, 200);
-  const inputHash=await digest(payload.html);
   const rules=await getActiveReviewRules(env.DB);
   const rulesSnapshot=rules?JSON.stringify(rules):null;
   const reportSchemaVersion=rules?2:1;
@@ -61,19 +71,20 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
-  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,topic_id,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash,rules_snapshot,report_schema_version,review_mode)
-    SELECT ?,?,?,?,?,'capture',?,?,?,'device',0,'agent',0,?,?,?,? WHERE
-    (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))`)
-    .bind(id,ownerId,title,filename,payload.topic_id||null,day,now,now,inputHash,rulesSnapshot,reportSchemaVersion,reviewMode,ownerId,ownerId).run()
+  const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,topic_id,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash,rules_snapshot,report_schema_version,review_mode${artifactId?',artifact_version_id':''})
+    SELECT ?,?,?,?,?,'capture',?,?,?,'device',0,'agent',0,?,?,?,?${artifactId?',?':''} WHERE
+    (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))
+    ${artifactId?"AND EXISTS(SELECT 1 FROM artifact_versions WHERE id=? AND owner_id=? AND topic_id=? AND kind='game')":''}`)
+    .bind(id,ownerId,title,filename,topicId,day,now,now,inputHash,rulesSnapshot,reportSchemaVersion,reviewMode,...(artifactId?[artifactId]:[]),ownerId,ownerId,...(artifactId?[artifactId,ownerId,topicId]:[])).run()
     : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, topic_id, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash,rules_snapshot,report_schema_version,review_mode)
     SELECT ?, ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',?,?,?,? WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
-    .bind(id, ownerId, title, filename, payload.topic_id||null, day, now, now,env.reviewExecutor||'cloud',inputHash,rulesSnapshot,reportSchemaVersion,reviewMode, ownerId, ownerId, ownerId, ownerId, day).run();
+    .bind(id, ownerId, title, filename, topicId, day, now, now,env.reviewExecutor||'cloud',inputHash,rulesSnapshot,reportSchemaVersion,reviewMode, ownerId, ownerId, ownerId, ownerId, day).run();
   if (!inserted.meta.changes) {
     const duplicate = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
-    if (duplicate) return publicJob((await withHumanReviews(env.DB,[duplicate],true))[0]);
+    if (duplicate) return original(duplicate);
     if(ownerId !== 'admin'){
       const member=await env.DB.prepare('SELECT enabled,can_review FROM members WHERE id=?').bind(ownerId).first();
       if(!member?.enabled||!member.can_review)throw fail('当前账号已停用或审核权限已撤销。',403);
@@ -84,7 +95,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
     throw fail('最多同时排队 50 个审核任务，请等待当前任务完成。', 429);
   }
   try {
-    const text = JSON.stringify({ html: payload.html, title, topic_id: payload.topic_id || null });
+    const text = JSON.stringify({ html: payload.html, title, topic_id: topicId });
     const chunks = [];
     for (let i = 0; i < text.length;) {
       let end = Math.min(i + 120000, text.length);
@@ -108,7 +119,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
       throw fail(`后台调度未确认，任务 ${id} 已保留，请使用原编号重试。`,503);
     }
   }
-  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform',...(reportSchemaVersion===2?{review_mode:reviewMode,report_schema_version:2,rules_snapshot:rules}:{}) };
+  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform',...(artifactId?{artifactVersionId:artifactId,input_hash:inputHash}:{}),...(reportSchemaVersion===2?{review_mode:reviewMode,report_schema_version:2,rules_snapshot:rules}:{}) };
 }
 
 export async function scheduleCloudReview(env: Pick<ReviewJobEnv,'REVIEW_RUNNER'|'REVIEW_QUEUE'>, id:string) {

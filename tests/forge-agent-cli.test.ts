@@ -60,6 +60,7 @@ describe('个人创作Agent自包含命令行接入',()=>{
       const lost=await run(['draw','--json',drawPath],{allowError:true});expect(lost.code).toBe(1);expect(lost.stderr).toContain('fixture response lost after commit');
       const drawn=(await run(['draw','--json',drawPath])).values[0],drawnReplay=(await run(['draw','--json',drawPath])).values[0];expect(drawnReplay).toEqual(drawn);expect(drawn).toHaveLength(1);
       const drawCalls=requests.filter(item=>item.action==='draw');expect(new Set(drawCalls.map(item=>item.body.request_id)).size).toBe(1);expect(drawCalls[0].body.request_id).toMatch(/^[a-f0-9-]{36}$/);
+      expect(drawCalls[0].body.creative_version).toBe(2);
       expect(sqlite.prepare('SELECT count(*) n FROM topics').get()).toMatchObject({n:1});
       const otherDraw=await inputFile('other-draw',{subject:'CLI unique second subject',locks:{medium:'ink'}}),concurrentDraws=await Promise.all([run(['draw','--json',otherDraw]),run(['draw','--json',otherDraw])]);
       expect(concurrentDraws[0].values).toEqual(concurrentDraws[1].values);const concurrentDrawCalls=requests.filter(item=>item.action==='draw').slice(-2);expect(concurrentDrawCalls[0].body.request_id).toBe(concurrentDrawCalls[1].body.request_id);expect(concurrentDrawCalls[0].body.request_id).not.toBe(drawCalls[0].body.request_id);
@@ -94,6 +95,41 @@ describe('个人创作Agent自包含命令行接入',()=>{
       const completion=requests.filter(item=>item.action==='complete').at(-1)!;expect(completion.body).toMatchObject({id:suggest.id,receipt:suggestionReceipt,model:'member-owned-model'});
       expect((await run(['complete',suggest.id,'--json',resultPath])).values[0].task.status).toBe('done');expect(sqlite.prepare('SELECT count(*) n FROM vocab_suggestions').get()).toMatchObject({n:1});
       expect(completed.stdout+completed.stderr).not.toContain(suggestionReceipt);expect(completed.stdout+completed.stderr).not.toContain(token);
+
+      const pageInput=await inputFile('mechanisms-page',{after:3,limit:5,receipt:'not a request field'});
+      expect((await run(['mechanisms','--json',pageInput])).values[0]).toMatchObject({items:[],next:null});
+      expect(requests.at(-1)).toMatchObject({action:'mechanisms',body:{after:3,limit:5}});
+      expect(requests.at(-1)?.body).not.toHaveProperty('receipt');
+
+      sqlite.prepare("UPDATE topics SET status='liked',origin='mechanism-choice',data=?,brief_md=? WHERE id=?")
+        .run(JSON.stringify({title:'CLI stages'}),'### F1. CLI stages\n### F10. Audio',drawn[0].id);
+      const createGamePath=await inputFile('game-task',{kind:'game',id:drawn[0].id});
+      const game=(await run(['create','--json',createGamePath])).values[0].tasks[0];
+      expect((await run(['claim',game.id])).values[0].materials).toMatchObject({pipeline:{version:2}});
+      const html='<!doctype html><html><meta name="viewport" content="width=device-width"><script>document.title="PRIVATE_STAGE_HTML";</script></html>';
+      const stagePath=await inputFile('build-stage',{stage:'build',output:{html,requirements:[{id:'R1',text:'Use a title',status:'implemented'}],decisions:[],coreChanges:[]},model:'member-stage-model'});
+      const shotData='data:image/jpeg;base64,/9j/2Q==';
+      const capturedAt='2026-11-05T00:00:01.000Z';
+      const actions=['9:16','9:19.5','9:21'].map(ratio=>({id:`baseline-${ratio}-tap`,ratio,type:'tap',startedAt:capturedAt,x:180,y:400,count:1}));
+      const shots=[0,null,1,2].map((actionIndex,index)=>({id:`baseline-${index+1}`,label:`fixture-${index+1}`,data:shotData,capturedAt,actionRefs:actionIndex===null?[]:[actions[actionIndex].id]}));
+      const capture={origin:'member-device',inputHash:await digest(html),shots,probe:{captureMethod:'browser-viewport-v1',actions,observations:shots.map(({data,...shot})=>shot)}};
+      const staleCapture=await inputFile('stale-capture',{...capture,inputHash:'0'.repeat(64)});
+      const requestCount=requests.length;
+      expect((await run(['stage',game.id,'--json',stagePath,'--capture',staleCapture],{allowError:true})).stderr).toContain('阶段 HTML 与采集文件不一致');
+      expect(requests).toHaveLength(requestCount);
+      const evidencePath=await inputFile('build-capture',capture),nextPath=join(directory,'polish.json');
+      const locked=(await run(['stage',game.id,'--json',stagePath,'--capture',evidencePath,'--out',nextPath]));
+      expect(locked.stdout).not.toMatch(/PRIVATE_STAGE_HTML|data:image/);
+      expect(locked.values[0]).toMatchObject({event:'creation-stage',stage:'build',nextStage:'polish',content_hash:capture.inputHash,path:nextPath});
+      expect(requests.at(-1)).toMatchObject({action:'creation-stage',body:{stage:'build',capture:{inputHash:capture.inputHash},model:'member-stage-model'}});
+      const next=JSON.parse(await readFile(nextPath,'utf8')).nextMaterials;
+      const images=next.user.filter((part:any)=>part.type==='image');
+      expect(images).toHaveLength(4);
+      for(const image of images){
+        expect(image).not.toHaveProperty('data');
+        expect((await readFile(image.path)).toString('base64')).toBe('/9j/2Q==');
+        if(process.platform!=='win32')expect((await stat(image.path)).mode&0o777).toBe(0o600);
+      }
       expect(requests.every(item=>item.authorization===`Bearer ${token}`)).toBe(true);expect(modelGet).not.toHaveBeenCalled();expect(schedule).not.toHaveBeenCalled();
       expect((await readdir(privateDir)).some(name=>name.endsWith('.tmp'))).toBe(false);
       const before=requests.length,nullPath=await inputFile('invalid',null);const invalid=await run(['draw','--json',nullPath],{allowError:true});expect(invalid.code).toBe(1);expect(invalid.stderr).toContain('JSON 对象');expect(requests).toHaveLength(before);

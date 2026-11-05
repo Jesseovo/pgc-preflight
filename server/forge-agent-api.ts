@@ -1,3 +1,6 @@
+import {recordAgentCreationStage,completeAgentCreation,validateAgentCreationCompletion} from './forge-creation-pipeline';
+import {isMechanismSeed,isMechanismChoice,listMechanisms,mechanismMatches,preflightMechanismJudgment,recordMechanismJudgment,chooseMechanism,mechanismCheckStatus} from './forge-mechanisms';
+import {creativeV2Available,requireCreativeV2} from './creative-rollout';
 import {identity} from './members';
 import {memberStore} from './storage';
 import {canonicalJson,digest,problem,stamp} from './review-device-state';
@@ -19,25 +22,29 @@ export function publicCreatorTask(row:any){
   return {id:row.id,kind:row.kind,owner_id:row.owner_id,executor:row.executor,status:row.status,detail:disconnected?'等待 Agent 重新连接':row.detail,error:row.error,created_at:row.created_at,updated_at:row.updated_at,started_at:row.started_at,result:row.result?JSON.parse(row.result):null};
 }
 export async function validateAgentTask(DB:any,owner:string,job:any){
-  if(!kinds.includes(job.type))throw problem('创作任务类型不支持。');
+  if(!kinds.includes(job.type)&&job.type!=='mechanism-check')throw problem('创作任务类型不支持。');
   if(artifactColumns[job.type]){
     const id=job.type==='expand'?job.ids?.[0]:job.id;
     if(!Number.isSafeInteger(id)||id<1||(job.type==='expand'&&(!Array.isArray(job.ids)||job.ids.length!==1)))throw problem('需要有效的选题编号。');
   }
   if(job.type==='suggest'&&!['subject','medium'].includes(job.dim))throw problem('只支持补充题材与美术媒介。');
   const s=await inputSnapshot(DB,owner,job),t=s.topic;
-  if(t&&job.type!=='expand'&&!t.data.title)throw problem('请先扩写选题。',409);
+  if(job.type==='mechanism-check'&&(!isMechanismSeed(t)||!Number.isInteger(job.candidate_index)||!t.data?.candidates?.[job.candidate_index]))throw problem('需要有效的私有候选方案。',409);
+  if(t&&((isMechanismSeed(t)&&job.type!=='expand'&&job.type!=='mechanism-check')||(isMechanismChoice(t)&&job.type==='expand')))throw problem('请从候选完成选择，已发布机制不能直接重新扩写。',409);
+  if(t&&job.type!=='expand'&&job.type!=='mechanism-check'&&!t.data.title)throw problem('请先扩写选题。',409);
   if(job.type==='assets'&&!t?.brief_md?.trim())throw problem('先生成简报，再生成资产。',409);
   if(job.type==='game'&&!['liked','made'].includes(t?.status))throw problem('请先把选题加入候选，再开始制作。',409);
+  if(job.type==='game'&&s.creative_version===2&&!t?.brief_md?.trim())throw problem('完整制作需要先生成策划书。',409);
   taskMaterials(job,s);
   return s;
 }
 export async function createAgentTask(env:any,owner:string,job:any,taskId:string=crypto.randomUUID(),snapshot?:any){
   const DB=env.DB,s=snapshot||await validateAgentTask(DB,owner,job),t=s.topic;
-  const scope=`${owner}:${job.type}:${t?.id??(job.dim||'all')}`,at=stamp();
+  if(s.creative_version===2||job.type==='mechanism-check')await requireCreativeV2(env,owner);
+  const scope=`${owner}:${job.type}:${t?.id??job.id??(job.dim||'all')}${job.type==='mechanism-check'?':'+job.candidate_index:''}`,at=stamp();
   const column=job.type==='game'?'product':['expand','brief','assets'].includes(job.type)?job.type:null;
   await DB.batch([
-    DB.prepare("INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,owner_id,executor,input_snapshot,created_at,updated_at) VALUES(?,?,?,?,'queued','等待 Agent 接单',?,'agent',?,?,?)").bind(taskId,job.type,scope,JSON.stringify(job),owner,JSON.stringify(s),at,at),
+    DB.prepare("INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,owner_id,executor,input_snapshot,created_at,updated_at,creative_version) VALUES(?,?,?,?,'queued','等待 Agent 接单',?,'agent',?,?,?,?)").bind(taskId,job.type,scope,JSON.stringify(job),owner,JSON.stringify(s),at,at,s.creative_version||1),
     ...(column?[DB.prepare(`UPDATE topics SET ${column}_status='${job.type==='game'?'queued':'running'}',${column}_error='等待 Agent 接单'${job.type==='game'?',product_request_id=?':''} WHERE id=? AND owner_id=? AND EXISTS(SELECT 1 FROM forge_tasks WHERE id=? AND status='queued')`).bind(...(job.type==='game'?[taskId]:[]),t.id,owner,taskId)]:[]),
   ]);
   const row=await DB.prepare("SELECT * FROM forge_tasks WHERE owner_id=? AND (id=? OR (scope=? AND status IN ('queued','running'))) ORDER BY created_at DESC LIMIT 1").bind(owner,taskId,scope).first();
@@ -78,7 +85,7 @@ export async function forgeAgentApi(request:Request,env:any){
   try{
     if(request.method!=='POST')throw problem('请使用 POST。',405);
     const action=new URL(request.url).pathname.slice('/api/forge-agent/'.length),DB=env.DB;
-    const actions=new Set(['pair','context','draw','create','jobs','job','claim','heartbeat','complete','fail']);
+    const actions=new Set(['pair','context','draw','create','jobs','job','claim','heartbeat','complete','fail','mechanisms','mechanism-match','mechanism-judge','mechanism-choose','creation-stage']);
     if(!actions.has(action))throw problem('创作凭据不允许这个操作。',403);
     const b=await agentBody(request);
     if(action==='pair'){
@@ -101,21 +108,26 @@ export async function forgeAgentApi(request:Request,env:any){
       return json({ok:true,deviceId:b.deviceId,expiresAt});
     }
     const {device,member}=await authenticate(request,env);
-    if(!member.star&&!['complete','fail'].includes(action))throw problem('Star 权限已撤销，仅可回传已执行任务。',403);
+    if(!member.star&&!['complete','fail','creation-stage'].includes(action))throw problem('Star 权限已撤销，仅可回传已执行任务。',403);
     await DB.prepare('UPDATE forge_agents SET last_seen=? WHERE id=?').bind(stamp(),device.id).run();
+    if((action==='draw'||action==='create')&&b.creative_version===2||['mechanism-match','mechanism-judge','mechanism-choose'].includes(action))await requireCreativeV2(env,member.id);
     if(action==='context'){
       const {publicSettings}=await import('./forge-workspace');
-      return json({settings:await publicSettings(DB),vocab:await all(DB,'SELECT * FROM vocab ORDER BY dim,id'),games:await all(DB,'SELECT * FROM games WHERE owner_id=? OR is_public=1',member.id),instructions:'题材通过 draw 接口原子占用。任务只按用户明确要求执行，补词作为管理员建议。',model_execution:'local-agent'});
+      return json({creative_v2_available:await creativeV2Available(env,member.id),settings:await publicSettings(DB),vocab:await all(DB,'SELECT * FROM vocab ORDER BY dim,id'),games:await all(DB,'SELECT * FROM games WHERE owner_id=? OR is_public=1',member.id),instructions:'新流程 draw 使用 creative_version:2，候选私有，mechanism-choose 正式选择时原子占用并共享四项摘要。任务只按用户明确要求执行，补词作为管理员建议。',model_execution:'local-agent'});
     }
+    if(action==='mechanisms')return json(await listMechanisms(DB,b));
+    if(action==='mechanism-match')return json(await mechanismMatches(DB,member.id,b,{executor:'agent',deviceId:device.id}));
+    if(action==='mechanism-judge')return json(await recordMechanismJudgment(DB,member.id,b,{executor:'agent',deviceId:device.id}));
+    if(action==='mechanism-choose')return json(await chooseMechanism(DB,member.id,b));
     if(action==='draw')return json(await reserveDraw(DB,member.id,b));
     if(action==='create'){
       if(!uuid(b.request_id))throw problem('创建任务需要 request_id UUID。');
-      const hash=await digest(canonicalJson({kind:b.kind,id:b.id,ids:b.ids,dim:b.dim,n:b.n}));
+      const hash=await digest(canonicalJson({kind:b.kind,id:b.id,ids:b.ids,dim:b.dim,n:b.n,...(b.creative_version===2?{creative_version:2}:{}),...(b.kind==='mechanism-check'?{candidate_index:b.candidate_index}:{})}));
       const prior=await DB.prepare('SELECT * FROM forge_requests WHERE owner_id=? AND request_id=?').bind(member.id,b.request_id).first();
       if(prior){if(prior.kind!=='create'||prior.payload_hash!==hash)throw problem('请求编号已使用。',409);if(prior.result)return json(JSON.parse(prior.result));}
       await DB.prepare("INSERT OR IGNORE INTO forge_requests(owner_id,request_id,kind,payload_hash) VALUES(?,?,'create',?)").bind(member.id,b.request_id,hash).run();
       const reserved=await DB.prepare('SELECT * FROM forge_requests WHERE owner_id=? AND request_id=?').bind(member.id,b.request_id).first();if(reserved.kind!=='create'||reserved.payload_hash!==hash)throw problem('请求编号已使用。',409);
-      const jobs=b.kind==='expand'?(Array.isArray(b.ids)?[...new Set(b.ids)]:[b.id]).map(id=>({type:'expand',ids:[id]})):[{type:b.kind,id:b.id,dim:b.dim,n:Math.min(60,Math.max(5,Number(b.n)||30))}];
+      const jobs=(b.kind==='expand'?(Array.isArray(b.ids)?[...new Set(b.ids)]:[b.id]).map(id=>({type:'expand',ids:[id]})):[{type:b.kind,id:b.id,dim:b.dim,n:Math.min(60,Math.max(5,Number(b.n)||30)),candidate_index:b.candidate_index}]).map(job=>({...job,creative_version:b.creative_version===2?2:1}));
       if(!jobs.length||jobs.length>40)throw problem('每批最多创建 40 个任务。');
       // Validate the whole batch before creating its first durable task.
       const snapshots=[];for(const job of jobs)snapshots.push(await validateAgentTask(DB,member.id,job));
@@ -138,7 +150,8 @@ export async function forgeAgentApi(request:Request,env:any){
       if(!row){
         const candidate=await DB.prepare("SELECT * FROM forge_tasks WHERE owner_id=? AND executor='agent' AND status='queued' AND (? IS NULL OR id=?) ORDER BY created_at,id LIMIT 1").bind(member.id,b.id||null,b.id||null).first();
         if(candidate){
-          const snapshot=await validateAgentTask(DB,member.id,JSON.parse(candidate.payload)),at=stamp();
+          const job=JSON.parse(candidate.payload),snapshot:any=await validateAgentTask(DB,member.id,job),at=stamp();
+          if(candidate.kind==='mechanism-check')snapshot.comparison=await mechanismMatches(DB,member.id,{topic_id:job.id,candidate_index:job.candidate_index},{executor:'agent',deviceId:device.id},{version_id:snapshot.heads.expand,content_revision:snapshot.revision});
           row=await DB.prepare(`UPDATE forge_tasks SET status='running',device_id=?,claim_id=?,receipt_hash=?,input_snapshot=?,started_at=?,updated_at=?,detail='Agent 正在执行'
             WHERE id=? AND status='queued' AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE owner_id=? AND device_id=? AND claim_id=?) RETURNING *`)
             .bind(device.id,b.claimId,receiptHash,JSON.stringify(snapshot),at,at,candidate.id,member.id,device.id,b.claimId).first();
@@ -146,6 +159,10 @@ export async function forgeAgentApi(request:Request,env:any){
         }
       }
       if(!row)return json(null);
+      if(row.kind==='mechanism-check'){
+        const snapshot=JSON.parse(row.input_snapshot),job=JSON.parse(row.payload);
+        if(!snapshot.comparison){const check=await mechanismMatches(DB,member.id,{topic_id:job.id,candidate_index:job.candidate_index},{executor:'agent',deviceId:device.id},{version_id:snapshot.heads.expand,content_revision:snapshot.revision});snapshot.comparison=check;await DB.prepare("UPDATE forge_tasks SET input_snapshot=? WHERE id=? AND json_extract(input_snapshot,'$.comparison') IS NULL").bind(JSON.stringify(snapshot),row.id).run();row=await DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(row.id).first();}
+      }
       return json({task:publicCreatorTask(row),materials:taskMaterials(JSON.parse(row.payload),JSON.parse(row.input_snapshot))});
     }
     if(action==='heartbeat'){
@@ -154,6 +171,7 @@ export async function forgeAgentApi(request:Request,env:any){
     }
     const row=await DB.prepare("SELECT * FROM forge_tasks WHERE id=? AND owner_id=? AND device_id=? AND receipt_hash=? AND executor='agent'").bind(b.id,member.id,device.id,await digest(String(b.receipt||''))).first();
     if(!row)throw problem('任务回传凭证无效。',409);
+    if(action==='creation-stage')return json(await recordAgentCreationStage(DB,row,b,device.token_hash));
     if(action==='fail'){
       if(row.status==='done')return json({task:publicCreatorTask(row)});
       const job=JSON.parse(row.payload),column=row.kind==='game'?'product':['expand','brief','assets'].includes(row.kind)?row.kind:null,at=stamp(),message=String(b.message||'Agent 执行未完成').slice(0,700);
@@ -167,26 +185,33 @@ export async function forgeAgentApi(request:Request,env:any){
       if(finished.status==='running')throw problem('结果正在保存，请重试原结果回传。',409);
       return json({ok:true,task:publicCreatorTask(finished)});
     }
-    if(b.model!==undefined&&(typeof b.model!=='string'||b.model.length>160))throw problem('模型名称格式不正确。');
+    if(b.model!==undefined&&!(b.model===null&&row.kind==='game'&&row.creative_version===2)&&(typeof b.model!=='string'||b.model.length>160))throw problem('模型名称格式不正确。');
     const hash=await digest(canonicalJson({result:b.result,model:b.model||''}));
     if(row.status==='done'){if(row.result_hash!==hash)throw problem('任务已有结果，不能替换。',409);return json({task:publicCreatorTask(row),...JSON.parse(row.result||'{}')});}
     if(row.status!=='running')throw problem('任务未在执行。',409);
     const snapshot=JSON.parse(row.input_snapshot),job=JSON.parse(row.payload);
     let prepared:any=null;
-    if(artifactColumns[row.kind]){try{prepared=await prepareArtifact(row.kind,b.result,snapshot);}catch(e){throw problem((e as Error).message);}}
+    if(artifactColumns[row.kind]&&!(row.kind==='game'&&row.creative_version===2)){try{prepared=await prepareArtifact(row.kind,b.result,snapshot);}catch(e){throw problem((e as Error).message);}}
     if(row.kind==='suggest'&&(!Array.isArray(b.result?.words)||!b.result.words.length||b.result.words.length>60||b.result.words.some((w:any)=>!w||typeof w.word!=='string'||!w.word.trim()||w.word.length>160)))throw problem('补词结果格式不正确。');
     if(row.kind==='tag'){
       const items=b.result?.items,allowed=new Map(snapshot.tagGames.map((g:any)=>[g.id,g]));
       if(!Array.isArray(items)||items.length>50||items.some((i:any)=>!i||!allowed.has(i.id)||['subject','medium','gesture','structure','mood'].some(k=>typeof i[k]!=='string'||i[k].length>200))||new Set(items.map((i:any)=>i.id)).size!==items.length)throw problem('打标结果包含无效作品或字段。');
     }
-    const locked=await DB.prepare("UPDATE forge_tasks SET result_hash=? WHERE id=? AND status='running' AND (result_hash IS NULL OR result_hash=?) RETURNING id").bind(hash,row.id,hash).first();
+    if(row.kind==='game'&&row.creative_version===2){if(!b.result||Object.keys(b.result).some(k=>k!=='stage'))throw problem('完成制作只接受末阶段引用。');await validateAgentCreationCompletion(DB,row,b.result.stage,b.model);}
+    if(row.kind==='mechanism-check'){const check=snapshot.comparison;if(!check)throw problem('查重材料尚未锁定。',409);if(check.state==='pending')await preflightMechanismJudgment(DB,member.id,{check_id:check.check_id,judgment:b.result,model:b.model},{executor:'agent',deviceId:device.id,claimedTaskId:row.id});}
+    const locked=await DB.prepare("UPDATE forge_tasks SET result_hash=? WHERE id=? AND status='running' AND (result_hash IS NULL OR result_hash=?) AND EXISTS(SELECT 1 FROM forge_agents d JOIN members m ON m.id=d.owner_id WHERE d.id=? AND d.owner_id=forge_tasks.owner_id AND d.token_hash=? AND d.revoked=0 AND d.expires_at>? AND m.enabled=1 AND d.session_version=m.session_version) RETURNING id").bind(hash,row.id,hash,device.id,device.token_hash,stamp()).first();
     if(!locked){
       const finished=await DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(row.id).first();
       if(finished?.status==='done'&&finished.result_hash===hash)return json({task:publicCreatorTask(finished),...JSON.parse(finished.result||'{}')});
       throw problem('该任务正在提交另一份结果。',409);
     }
     let result:any;
-    if(['expand','brief','preview','assets','game'].includes(row.kind)){
+    if(row.kind==='game'&&row.creative_version===2){result=await completeAgentCreation(DB,row,b.result?.stage,b.model);}
+    else if(row.kind==='mechanism-check'){
+      const check=snapshot.comparison;if(!check)throw problem('查重材料尚未锁定。',409);
+      result=check.state==='pending'?await recordMechanismJudgment(DB,member.id,{check_id:check.check_id,judgment:b.result,model:b.model},{executor:'agent',deviceId:device.id,claimedTaskId:row.id}):await mechanismCheckStatus(DB,member.id,check.check_id);
+    }
+    else if(['expand','brief','preview','assets','game'].includes(row.kind)){
       const content=prepared!;
       const version=await saveArtifact(DB,{owner:member.id,topicId:snapshot.topic.id,kind:row.kind,content,taskId:row.id,revision:snapshot.revision,policyRevision:snapshot.policy_revision,heads:snapshot.heads,executor:'agent',deviceId:device.id,model:b.model});
       result={id:snapshot.topic.id,version_id:version.id,disposition:version.disposition,...(row.kind==='preview'?{svg:content}:{})};

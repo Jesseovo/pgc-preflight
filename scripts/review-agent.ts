@@ -9,6 +9,7 @@ import {AdaptivePlay, PLAY_LIMITS} from './review-adaptive';
 import {createServer} from 'node:http';
 import {reviewSource} from '../server/review-source';
 import {ReviewMaterialCache,pruneReviewMaterialCaches} from './review-material-cache';
+import {parseCreationSubmission,validReviewArtifactVersion} from '../server/creation-review-links';
 
 // On-demand Agent tool; enhanced play uses an idle-bounded local browser helper.
 // stdout is JSON Lines. Credentials never appear in output or command arguments.
@@ -63,6 +64,7 @@ function option(name:string){const i=args.indexOf(name);if(i<0)return undefined;
 const enhanced=args.includes('--enhanced');if(enhanced)args.splice(args.indexOf('--enhanced'),1);
 const alsoWait=args.includes('--wait');if(alsoWait)args.splice(args.indexOf('--wait'),1);
 const output=option('--out'),requestId=option('--request-id'),jsonInput=option('--json'),humanReviewInput=option('--human-review'),gameInput=option('--game'),failureReason=option('--reason');
+const artifactVersionId=option('--artifact-version');
 const creatorHubSource='https://creator-hub-7mi.pages.dev';
 const humanReviewDir=join(dataDir,'human-reviews');
 const humanReviewStatuses=new Set(['reviewed','pending','unavailable','unlinked']);
@@ -114,6 +116,19 @@ async function submitHumanReview(id:string,path:string){
     print({event:'gallery_pending',jobId:id,message:(e as Error).message,retryCommand:['gallery',id,'--game',gameInput?resolve(gameInput):'/absolute/path/original-game.html']});
   }
   return result;
+}
+
+async function recordSubmission(id:string){
+  if(!jsonInput)throw new Error('请用 --json 提供实际 Creator 投稿记录。');
+  const bytes=await readFile(resolve(jsonInput));
+  if(bytes.length>4096)throw new Error('投稿记录 JSON 不能超过 4 KB。');
+  let value:unknown;
+  try{value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{throw new Error('投稿记录文件不是有效 UTF-8 JSON。');}
+  const declaration=parseCreationSubmission(value);
+  let lease:unknown;
+  try{lease=JSON.parse(await readFile(join(dataDir,'claims',`${id}.json`),'utf8')).claimId;}catch{/* Only the original local device can send the declaration. */}
+  if(typeof lease!=='string'||!uuid(lease))throw new Error('缺少原审核设备的本地租约，请在原设备操作。');
+  print({event:'record-submission',...await api('record-submission',{...declaration,id,lease})});
 }
 
 async function publishGame(id:string,path=gameInput){
@@ -264,7 +279,9 @@ async function capture(id:string){
 async function submit(path:string){
   if(!/\.html?$/i.test(path))throw new Error('只支持 .html / .htm 文件。');
   const bytes=await readFile(resolve(path));if(!bytes.length||bytes.length>8*1024*1024)throw new Error('单个文件必须在 1 字节至 8 MB 之间。');
-  const key=createHash('sha256').update(origin).update(token).update(resolve(path)).update(bytes).update(enhanced?'enhanced':'').digest('hex');
+  let html=bytes.toString('utf8');
+  if(artifactVersionId)try{html=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);}catch{throw new Error('关联成品版本须使用原始 UTF-8 HTML。');}
+  const key=createHash('sha256').update(origin).update(token).update(resolve(path)).update(bytes).update(enhanced?'enhanced':'').update(artifactVersionId?`\0artifact:${artifactVersionId}`:'').digest('hex');
   const manifest=join(dataDir,'submissions',`${key}.json`);
   let saved:any;try{saved=JSON.parse(await readFile(manifest,'utf8'));}catch{}
   let id=requestId||saved?.id;
@@ -275,11 +292,11 @@ async function submit(path:string){
   id||=randomUUID();if(!uuid(id))throw new Error('request-id 必须是 UUID。');
   // Persist before transmission: a lost response reuses the reservation.
   if(id!==saved?.id)await atomic(manifest,JSON.stringify({id,createdAt:new Date().toISOString()}));
-  const job=await api('submit',{html:bytes.toString('utf8'),filename:basename(path),title:basename(path).replace(/\.html?$/i,''),request_id:id,...(enhanced?{review_mode:'enhanced'}:{})});
+  const job=await api('submit',{html,filename:basename(path),title:basename(path).replace(/\.html?$/i,''),request_id:id,...(enhanced?{review_mode:'enhanced'}:{}),...(artifactVersionId?{artifactVersionId}:{})});
   // Keep only a pointer to the user's file for a later human approval. The
   // platform checks its original hash before publishing; no extra source copy.
-  await atomic(join(dataDir,'sources',`${id}.json`),JSON.stringify({path:resolve(path),hash:createHash('sha256').update(bytes.toString('utf8')).digest('hex')}));
-  print({event:'submitted',job:enhanced?{id:job.id,status:job.status,stage:job.stage,review_mode:job.review_mode}:job});return id as string;
+  await atomic(join(dataDir,'sources',`${id}.json`),JSON.stringify({path:resolve(path),hash:createHash('sha256').update(html).digest('hex')}));
+  print({event:'submitted',job:enhanced?{id:job.id,status:job.status,stage:job.stage,review_mode:job.review_mode,artifactVersionId:job.artifactVersionId}:job});return id as string;
 }
 const playDir=join(dataDir,'play');
 const playPath=(id:string,suffix:string)=>join(playDir,`${id}.${suffix}`);
@@ -380,7 +397,7 @@ async function playCommand(command:string,id:string){
 let lockPath:string|undefined,lockOwned=false,heartbeat:ReturnType<typeof setInterval>|undefined;
 try{
   if(command==='help'){
-    print({enhancedCommands:['review original.html --enhanced','play-first-look JOB --json first-look.json','play-analyze JOB','play-observe JOB','play-act JOB --json actions.json','play-finish JOB','play-close JOB'],commands:['pair (PGC_PAIR_CODE or stdin)','review <file.html> [more.html] [--out directory] [--request-id UUID] [--human-review human.json (单文件)]','submit <file.html> [more.html] [--human-review human.json (单文件)]','human-review <job-id> --json human.json [--game original.html]','gallery <job-id> [--game original.html]','continue <job-id> (采集一款并返回材料)','capture <job-id>','material <job-id> [--out directory]','draft <job-id> --json draft.json','complete <job-id> --json verified.json [--out directory]','heartbeat <job-id>','fail <job-id> --reason 原因','status <job-id>','jobs','wait <job-id>','report <job-id> [--out directory]'],note:'review 提交、采集并导出可执行的审核材料后返回；Agent 使用自己的模型初评和同模型复核，分别提交 draft/complete。工具不配置、持有或调用模型 API。真人审核只回填用户明确匹配的作品与版本记录，不获取外部平台凭据。真人终审明确通过的原版游戏会共享到仅登录可见的游戏广场。'});
+    print({enhancedCommands:['review original.html --enhanced','play-first-look JOB --json first-look.json','play-analyze JOB','play-observe JOB','play-act JOB --json actions.json','play-finish JOB','play-close JOB'],commands:['pair (PGC_PAIR_CODE or stdin)','review <file.html> [more.html] [--out directory] [--request-id UUID] [--human-review human.json (单文件)]','submit <file.html> [more.html] [--human-review human.json (单文件)]','review <file.html> --artifact-version ID','record-submission <job-id> --json submission.json','human-review <job-id> --json human.json [--game original.html]','gallery <job-id> [--game original.html]','continue <job-id> (采集一款并返回材料)','capture <job-id>','material <job-id> [--out directory]','draft <job-id> --json draft.json','complete <job-id> --json verified.json [--out directory]','heartbeat <job-id>','fail <job-id> --reason 原因','status <job-id>','jobs','wait <job-id>','report <job-id> [--out directory]'],note:'review 提交、采集并导出可执行的审核材料后返回；Agent 使用自己的模型初评和同模型复核，分别提交 draft/complete。工具不配置、持有或调用模型 API。record-submission 在用户明确投稿后回填准确投稿编号与文件哈希，关联独立的管理员反馈对照。真人审核只回填用户明确匹配的作品与版本记录，不获取外部平台凭据。通过 human-review 回填的真人终审明确通过原版进入游戏广场。'});
   }else{
     await mkdir(dataDir,{recursive:true,mode:0o700});
     for(const sub of ['submissions','claims','outbox','sources'])await mkdir(join(dataDir,sub),{recursive:true,mode:0o700});
@@ -417,6 +434,7 @@ try{
       else if(command==='submit'||command==='review'){
         if(enhanced&&args.length!==1)throw new Error('增强试玩每台设备一次只采集一款。');
         if(!args.length||requestId&&args.length!==1)throw new Error('请提供 HTML 文件；--request-id 仅支持单文件。');
+        if(artifactVersionId&&(!validReviewArtifactVersion(artifactVersionId)||args.length!==1))throw new Error('--artifact-version 需要一个成品版本编号和一份原始 HTML。');
         if(humanReviewInput&&args.length!==1)throw new Error('--human-review 仅支持单个 HTML 文件，批量请用 human-review 命令分别回填。');
         const ids:string[]=[],errors:string[]=[];
         for(const path of args)try{ids.push(await submit(path));}catch(e){errors.push((e as Error).message);print({event:'error',file:basename(path),message:(e as Error).message});}
@@ -427,7 +445,7 @@ try{
         if(alsoWait)try{await waitFor(command==='review'?captured:ids);}catch(e){errors.push((e as Error).message);}
         if(errors.length)throw new Error(errors.join('\n'));
       }else if(command==='jobs')print(await api('jobs'));
-      else if(['status','report','wait','capture','continue','material','draft','complete','heartbeat','fail','human-review','gallery'].includes(command)){
+      else if(['status','report','wait','capture','continue','material','draft','complete','heartbeat','fail','human-review','gallery','record-submission'].includes(command)){
         if(args.length!==1||!uuid(args[0]))throw new Error('请提供一个任务编号（UUID）。');
         const id=args[0];
         if(command==='wait')await waitFor([id]);
@@ -442,6 +460,7 @@ try{
         }
         else if(command==='draft'||command==='complete')await submitLocal(command,id);
         else if(command==='human-review'){if(!jsonInput)throw new Error('请用 --json 提供真人审核 JSON 文件。');await submitHumanReview(id,jsonInput);}
+        else if(command==='record-submission')await recordSubmission(id);
         else if(command==='gallery')await publishGame(id);
         else print(await api('job',{id}));
       }else throw new Error('未知命令，请运行 help。');

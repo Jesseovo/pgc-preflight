@@ -28,12 +28,13 @@ async function fixture(){
     expect(response.status,JSON.stringify(value)).toBe(200);return value;
   };
   const requests:Array<{action:string;body:any;authorization:string}>=[];
-  let rejectHuman=false,loseHuman=false;
+  let rejectHuman=false,loseHuman=false,acceptSubmission=false;
   const server=createServer(async(req,res)=>{
     try{
       const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
       const bytes=Buffer.concat(chunks),action=String(req.url).split('/').at(-1)!;
       requests.push({action,body:JSON.parse(bytes.toString()),authorization:String(req.headers.authorization||'')});
+      if(action==='record-submission'&&acceptSubmission){res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({ok:true,strictEligible:false}));return;}
       if(action==='human-review'&&rejectHuman){res.writeHead(409,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'fixture human import unavailable'}));return;}
       const response=await reviewDeviceApi(new Request(`http://127.0.0.1${req.url}`,{method:'POST',headers:req.headers as Record<string,string>,body:bytes}),env);
       if(action==='human-review'&&loseHuman&&response.ok){loseHuman=false;res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'fixture response lost after commit'}));return;}
@@ -64,10 +65,35 @@ async function fixture(){
     const target=resolve(directory),parent=resolve(tmpdir());if(!target.startsWith(parent+sep)||!target.split(sep).at(-1)?.startsWith('pgc-human-cli-'))throw new Error('Unexpected temporary test path');
     await rm(target,{recursive:true,force:true});
   };
-  return {directory,privateDir,sqlite,token,requests,modelGet,schedule,direct,run,json,evidence,complete,close,rejectHuman:(value:boolean)=>rejectHuman=value,loseHuman:()=>loseHuman=true};
+  return {directory,privateDir,sqlite,token,requests,modelGet,schedule,direct,run,json,evidence,complete,close,rejectHuman:(value:boolean)=>rejectHuman=value,loseHuman:()=>loseHuman=true,acceptSubmission:()=>acceptSubmission=true};
 }
 
 describe('真人审核回填CLI',()=>{
+  it('submits exact UTF-8 artifact bytes and only the original lease with the four Creator declaration fields',async()=>{
+    const s=await fixture();
+    try{
+      const game=join(s.directory,'game.html'),html='\ufeff<html>准确版本</html>',artifactVersionId='game-original-version';
+      await writeFile(game,html);
+      s.sqlite.prepare("INSERT INTO artifact_versions(id,owner_id,topic_id,kind,content,input_revision,executor,disposition,created_at) VALUES(?,'owner',1,'game',?,0,'agent','historical','now')").run(artifactVersionId,html);
+      const {values}=await s.run(['submit',game,'--artifact-version',artifactVersionId]);
+      const job=values.find(v=>v.event==='submitted').job;
+      expect(job).toMatchObject({artifactVersionId,input_hash:await digest(html)});
+      expect(s.requests[0].body).toMatchObject({artifactVersionId,html});
+      const declaration={workId:'source-work',versionId:'source-version',uploadHash:job.input_hash,provenance:'creator-submission-record'};
+      const valid=await s.json('valid-declaration',declaration),forged=await s.json('forged-declaration',{...declaration,lease:'forged',personalToken:'private-token'});
+      expect((await s.run(['record-submission',job.id,'--json',valid],true)).code).toBe(1);
+      expect(s.requests).toHaveLength(1);
+      const claim=await s.evidence(job.id);await s.complete(claim);
+      await writeFile(join(s.privateDir,'claims',`${job.id}.json`),JSON.stringify({claimId:claim.lease}));
+      expect((await s.run(['record-submission',job.id,'--json',forged],true)).code).toBe(1);
+      expect(s.requests).toHaveLength(1);
+      s.acceptSubmission();
+      const response=await s.run(['record-submission',job.id,'--json',valid]);
+      expect(s.requests.at(-1)).toMatchObject({action:'record-submission',body:{...declaration,id:job.id,lease:claim.lease}});
+      expect(response.values).toEqual([{event:'record-submission',ok:true,strictEligible:false}]);
+      expect(response.stdout+response.stderr).not.toContain(claim.lease);
+    }finally{await s.close();}
+  },30000);
   it('已完成任务按原租约回填，响应丢失同请求幂等，更新记录使用新请求且不传外部凭据',async()=>{
     const s=await fixture();
     try{

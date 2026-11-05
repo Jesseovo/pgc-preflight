@@ -6,8 +6,10 @@ import {forgeApi} from '../server/forge-api';
 import {executeForgeTask} from '../server/forge-runner';
 import {hashPassword,memberLogin,updateMember} from '../server/members';
 import {memberStore} from '../server/storage';
-import {login} from '../server/settings';
+import {login,saveConfig} from '../server/settings';
 import {adminWorkspaceApi} from '../server/admin-workspace-api';
+import {adminPublishMechanismSummary,mechanismMatches,recordMechanismJudgment} from '../server/forge-mechanisms';
+import worker,{ReviewControlPlane} from '../server/worker';
 
 const databases:DatabaseSync[]=[];
 afterEach(()=>{vi.unstubAllGlobals();databases.splice(0).forEach(db=>db.close());});
@@ -45,11 +47,224 @@ async function setup(){
 }
 
 async function page(s:Awaited<ReturnType<typeof setup>>,path:string,method='GET',data?:any,owner='a'){
-  return forgeApi(new Request(`https://agent.test/api/forge/${path}`,{method,headers:{Cookie:s.cookies[owner],Origin:'https://agent.test','Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}),s.env,path.split('/'),s.members);
+  return forgeApi(new Request(`https://agent.test/api/forge/${path}`,{method,headers:{Cookie:s.cookies[owner],Origin:'https://agent.test','Content-Type':'application/json'},body:data===undefined?undefined:JSON.stringify(data)}),s.env,path.split('?')[0].split('/'),s.members);
 }
 const assetScript='const GAME_ASSETS={meta:{style:"pixel"},sprites:{star(ctx){ctx.fillRect(0,0,4,4)}}};';
 const assetsHtml=`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><canvas></canvas><script id="game-assets">${assetScript}</script></body></html>`;
 const gameHtml=assetsHtml.replace('</body>','<script>GAME_ASSETS.sprites.star(document.querySelector("canvas").getContext("2d"));</script></body>');
+
+const mechanismCard=(index:number)=>({
+  subject:'Signal workshop',action:`Tap signal ${index} at its peak`,rule:`Charge ${index} cells before the pulse expires`,structure:'timing trials',
+  title:`Private Signal ${index}`,logline:'Charge cells by timing pulses.',medium:'pixel',gesture:'tap',mood:'calm',
+  core_loop:'Read the meter, tap the signal, repeat.',controls:'Tap the center.',twist:'The meter reverses after a miss.',
+  progression:'Add a decoy after ten seconds.',art_direction:'Layered pixels.',audio:'Short clicks and quiet pulse.',
+  why_addictive:'Chase the best timing streak.',risks:'Mistiming spends a charge.',strength:'Playability through different rhythms.',
+  palette:['#202020','#ffffff','#333333'],keywords:['timing','pulse','meter'],
+});
+const mechanismOutput={candidates:Array.from({length:8},(_,i)=>mechanismCard(i)),recommended:[0,3]};
+async function generatedMechanism(s:Awaited<ReturnType<typeof setup>>){
+  await s.pair();
+  const drawn=await page(s,'draw','POST',{creative_version:2,request_id:crypto.randomUUID(),subject:'Signal workshop'});
+  expect(drawn.status).toBe(200);
+  const [topic]=await drawn.json() as any;
+  const job=await s.create(topic.id,'expand'),lease=await s.claim(job.id);
+  expect(lease.materials).toMatchObject({kind:'expand',format_version:2,schema:{required:['candidates','recommended']}});
+  const complete=await s.call('complete',{id:job.id,receipt:lease.receipt,result:mechanismOutput,model:'local-generator'});
+  expect(complete.status).toBe(200);
+  await adminPublishMechanismSummary(s.DB,{subject:'Workshop',action:'Tap signal at its peak',rule:'Reach the target on every pulse',structure:'timing trials',reason:'Shared historical summary'});
+  return topic.id as number;
+}
+function comparisonResult(check:any){
+  return {matches:check.matches.map((match:any)=>({match_id:match.id,verdict:'distinct',reason:'The new option spends a charge on mistakes and counts cumulative cells.',
+    evidence:[{field:'rule',candidate_quote:check.candidate.rule,catalog_quote:match.rule}]}))};
+}
+
+function workerRoutes(s:Awaited<ReturnType<typeof setup>>,mode?:string){
+  const rate={limit:async()=>({success:true})},ctx={waitUntil(){}};
+  const env={...s.env,CREATIVE_V2_ROLLOUT:mode,FORGE_RATE_LIMIT:rate,CHECK_RATE_LIMIT:rate};
+  const control=new ReviewControlPlane(ctx,env);
+  const proxy=vi.fn((request:Request)=>control.fetch(request));
+  env.CONTROL_PLANE={idFromName:(name:string)=>name,get:()=>({fetch:proxy})};
+  const request=(path:string,method:string,headers:Record<string,string>,body?:unknown)=>worker.fetch(new Request(`https://agent.test/api/${path}`,{
+    method,headers:{Origin:'https://agent.test','Content-Type':'application/json',...headers},body:body===undefined?undefined:JSON.stringify(body),
+  }),env,ctx);
+  return {proxy,web:(path:string,method='GET',body?:unknown,owner='a')=>request(`forge/${path}`,method,{Cookie:s.cookies[owner]},body),
+    agent:(path:string,body:unknown={},owner='a')=>request(`forge-agent/${path}`,'POST',{Authorization:`Bearer ${owner.repeat(64)}`},body)};
+}
+
+function enrollPilot(s:Awaited<ReturnType<typeof setup>>,owner='a'){
+  s.sqlite.prepare(`INSERT INTO review_pilot_members(member_id,pilot_enabled,creator_account,revision,updated_at)
+    VALUES(?,1,'',1,'now')`).run(owner);
+}
+
+describe('生产 Worker 经控制面的创作灰度',()=>{
+  it('网页和设备入口遵守同一试点开关，无配置时默认试点，仍允许旧协议',async()=>{
+    const s=await setup();await s.pair();await s.pair('b');enrollPilot(s);
+    const live=workerRoutes(s);
+    expect(await (await live.web('state')).json()).toMatchObject({creative_v2_available:true});
+    expect(await (await live.web('state','GET',undefined,'b')).json()).toMatchObject({creative_v2_available:false});
+    expect(await (await live.agent('context',{},'b')).json()).toMatchObject({creative_v2_available:false});
+    const draw={creative_version:2,subject:'Same motif',request_id:crypto.randomUUID()};
+    expect((await live.web('draw','POST',draw)).status).toBe(200);
+    expect((await live.web('draw','POST',draw,'b')).status).toBe(403);
+    expect((await live.agent('draw',draw,'b')).status).toBe(403);
+    expect((await live.agent('draw',{subject:'Legacy motif',request_id:crypto.randomUUID()},'b')).status).toBe(200);
+    expect((await workerRoutes(s,'off').web('draw','POST',draw)).status).toBe(403);
+    expect((await workerRoutes(s,'pilto').web('draw','POST',draw)).status).toBe(403);
+    expect((await workerRoutes(s,'all').agent('draw',draw,'b')).status).toBe(200);
+    expect(live.proxy).toHaveBeenCalledTimes(7);
+  });
+
+  it('撤销试点只阻止新流程创建，旧租约可继续，同一工作流跨成员隔离',async()=>{
+    const s=await setup();await s.pair();await s.pair('b');enrollPilot(s);
+    const live=workerRoutes(s,'pilot');
+    const draw=async()=>{
+      const response=await live.web('draw','POST',{creative_version:2,request_id:crypto.randomUUID(),subject:'Signal workshop'});
+      expect(response.status).toBe(200);
+      const [topic]=await response.json() as any;
+      return topic.id as number;
+    };
+    const topic_id=await draw(),other=await draw();
+    const newJob=await live.agent('create',{kind:'expand',id:topic_id,creative_version:2,request_id:crypto.randomUUID()});
+    expect(newJob.status).toBe(200);
+    const {tasks:[task]}=await newJob.json() as any;
+    s.sqlite.prepare('UPDATE review_pilot_members SET pilot_enabled=0 WHERE member_id=?').run('a');
+    expect((await live.web('expand','POST',{ids:[other]})).status).toBe(403);
+    expect((await live.agent('create',{kind:'expand',id:other,request_id:crypto.randomUUID()})).status).toBe(403);
+    const receipt='e'.repeat(64),claim={id:task.id,claimId:crypto.randomUUID(),receipt};
+    const claimed=await live.agent('claim',claim);
+    expect(claimed.status).toBe(200);
+    expect(await claimed.json()).toMatchObject({materials:{format_version:2}});
+    const completion={id:task.id,receipt,result:mechanismOutput,model:'member-local-model'};
+    expect((await live.agent('complete',completion,'b')).status).toBe(409);
+    expect((await live.agent('complete',completion)).status).toBe(200);
+    expect((await live.agent('create',{kind:'mechanism-check',id:topic_id,candidate_index:0,request_id:crypto.randomUUID()})).status).toBe(403);
+    expect((await live.web(`topics/${topic_id}`,'GET',undefined,'b')).status).toBe(404);
+    enrollPilot(s,'b');
+    expect((await live.web('mechanisms/check','POST',{topic_id,candidate_index:0},'b')).status).toBe(404);
+    expect((await live.web('generation-jobs/'+task.id,'GET',undefined,'b')).status).toBe(404);
+    expect((await live.web('generation-jobs/'+task.id)).status).toBe(200);
+  });
+
+  it('后台机制写入在正式入口受超级管理员与设备凭据边界保护',async()=>{
+    const s=await setup(),topic_id=await generatedMechanism(s);enrollPilot(s);
+    const live=workerRoutes(s,'pilot'),card=mechanismCard(0);
+    const body={subject:card.subject,action:card.action,rule:'Charge an extra cell before the pulse expires',structure:card.structure,reason:'PRIVATE_ADMIN_REASON'};
+    expect((await live.web('mechanisms/publish','POST',body)).status).toBeGreaterThanOrEqual(400);
+    expect((await live.agent('mechanisms/publish',body)).status).toBe(403);
+    expect((await live.web('mechanisms/publish','POST',body,'admin')).status).toBe(200);
+    const platform={executor:'platform'} as const;
+    const check=await mechanismMatches(s.DB,'a',{topic_id,candidate_index:0},platform);
+    await recordMechanismJudgment(s.DB,'a',{check_id:check.check_id,judgment:comparisonResult(check),model:'synthetic-model'},platform);
+    const resolution={check_id:check.check_id,verdict:'duplicate',reason:'Adjudicated action and rule.'};
+    expect((await live.web('mechanisms/resolve','POST',resolution)).status).toBeGreaterThanOrEqual(400);
+    expect(s.sqlite.prepare('SELECT count(*) n FROM forge_mechanism_admin_resolutions').get()).toMatchObject({n:0});
+    const adjudicated=await live.web('mechanisms/resolve','POST',resolution,'admin');
+    expect(adjudicated.status).toBe(200);
+    expect(await adjudicated.json()).toMatchObject({state:'distinct',effective_state:'duplicate'});
+    expect((await live.web('mechanisms','GET',undefined,'plain')).status).toBe(403);
+    const catalog=await live.web('mechanisms','GET',undefined,'b');
+    expect(catalog.status).toBe(200);
+    expect(await catalog.json()).toMatchObject({items:[{subject:'Workshop'},{subject:card.subject,action:card.action,rule:body.rule,structure:card.structure}]});
+  });
+});
+
+describe('版本化选题的网页与设备任务',()=>{
+  it('隔离候选及查重任务，重复创建和领取复用原材料，格式错误可以修正',async()=>{
+    const s=await setup(),topic_id=await generatedMechanism(s);
+    const queue=async(candidate_index:number)=>await page(s,'mechanisms/check?executor=agent','POST',{topic_id,candidate_index});
+    const [first,repeat,different]=await Promise.all([queue(0),queue(0),queue(1)]);
+    expect([first.status,repeat.status,different.status]).toEqual([200,200,200]);
+    const [one,two,other]=await Promise.all([first.json(),repeat.json(),different.json()]) as any[];
+    expect(one.jobId).toBe(two.jobId);
+    expect(one.jobId).not.toBe(other.jobId);
+    expect((await queue(99)).status).toBeGreaterThanOrEqual(400);
+    expect((await page(s,'mechanisms','GET',undefined,'plain')).status).toBe(403);
+    expect((await page(s,`topics/${topic_id}`,'GET',undefined,'b')).status).toBe(404);
+    const firstLease=await s.claim(one.jobId),replay=await s.claim(one.jobId,'a',firstLease.receipt,firstLease.claimId);
+    expect(firstLease.materials).toMatchObject({kind:'mechanism-check',state:'pending',candidate_index:0});
+    expect(replay.materials.check_id).toBe(firstLease.materials.check_id);
+    expect((await page(s,`mechanisms/${firstLease.materials.check_id}`,'GET',undefined,'b')).status).toBe(404);
+    const request={id:one.jobId,receipt:firstLease.receipt,model:'local-comparator'};
+    expect((await s.call('complete',{...request,result:{matches:[]}})).status).toBe(400);
+    expect(s.sqlite.prepare('SELECT result_hash FROM forge_tasks WHERE id=?').get(one.jobId)).toMatchObject({result_hash:null});
+    expect((await s.call('mechanism-judge',{check_id:firstLease.materials.check_id,judgment:comparisonResult(firstLease.materials),model:request.model})).status).toBe(409);
+    const body={...request,result:comparisonResult(firstLease.materials)};
+    const submitted=await s.call('complete',body);
+    expect(submitted.status).toBe(200);
+    const result=await submitted.json() as any;
+    expect(result).toMatchObject({task:{status:'done'},state:'distinct',model:{provenance:'member-agent-declared'}});
+    expect(await (await s.call('complete',body)).json()).toEqual(result);
+    const chosen=await page(s,'mechanisms/choose','POST',{topic_id,candidate_index:0,check_id:result.check_id});
+    expect(chosen.status).toBe(200);
+    const catalog=await (await page(s,'mechanisms','GET',undefined,'b')).json() as any;
+    expect(catalog.items).toHaveLength(2);
+    expect(JSON.stringify(catalog)).not.toContain('Private Signal');
+  });
+
+  it('目录改变后不采纳领取时的判断，Star 撤销后只允许原设备完成已领取查重',async()=>{
+    const s=await setup(),topic_id=await generatedMechanism(s);
+    const queued=async(candidate_index:number)=>(await (await page(s,'mechanisms/check?executor=agent','POST',{topic_id,candidate_index})).json()) as any;
+    const staleTask=await queued(0),stale=await s.claim(staleTask.jobId);
+    await adminPublishMechanismSummary(s.DB,{subject:'Second summary',action:'Hold and release at the peak',rule:'Spend one unit on release',structure:'timing trials',reason:'Shared summary'});
+    const submit=async(id:string,lease:any)=>s.call('complete',{id,receipt:lease.receipt,result:comparisonResult(lease.materials),model:'local-comparator'});
+    const staleResponse=await submit(staleTask.jobId,stale);
+    expect(staleResponse.status).toBe(200);
+    expect(await staleResponse.json()).toMatchObject({stale:true,judgment:null});
+    expect((await page(s,'mechanisms/choose','POST',{topic_id,candidate_index:0,check_id:stale.materials.check_id})).status).toBe(409);
+    const validTask=await queued(1),valid=await s.claim(validTask.jobId);
+    s.sqlite.prepare('UPDATE members SET star=0 WHERE id=?').run('a');
+    expect((await s.call('mechanism-match',{topic_id,candidate_index:1})).status).toBe(403);
+    const completed=await submit(validTask.jobId,valid);
+    expect(completed.status).toBe(200);
+    expect(await completed.json()).toMatchObject({state:'distinct',task:{status:'done'}});
+    expect((await page(s,'mechanisms/choose','POST',{topic_id,candidate_index:1,check_id:valid.materials.check_id})).status).toBe(403);
+  });
+
+  it('平台查重重复点击返回原任务和原查重号，目录失效或账号停用后不发模型请求',async()=>{
+    const s=await setup(),topic_id=await generatedMechanism(s);
+    const config=await saveConfig({profile:'opus',protocol:'anthropic',baseUrl:'https://fixture.example',model:'claude-opus-5-5',apiKey:'test-only-key'},
+      {get:async()=>null,set:async()=>{}},s.env.SETTINGS_KEY);
+    s.env.modelStore={get:async()=>config};
+    const queue=async(candidate_index:number)=>(await (await page(s,'mechanisms/check','POST',{topic_id,candidate_index})).json()) as any;
+    const [one,repeat,other]=await Promise.all([queue(0),queue(0),queue(1)]);
+    expect(repeat).toMatchObject({jobId:one.jobId,check_id:one.check_id});
+    expect(other.jobId).not.toBe(one.jobId);
+    expect(typeof one.check_id).toBe('string');
+    const [platformRequest,agentRequest]=await Promise.all([queue(2),
+      page(s,'mechanisms/check?executor=agent','POST',{topic_id,candidate_index:2}).then(response=>response.json()) as Promise<any>]);
+    expect(agentRequest).toMatchObject({jobId:platformRequest.jobId,check_id:platformRequest.check_id,executor:platformRequest.executor});
+    await adminPublishMechanismSummary(s.DB,{subject:'New workshop',action:'Hold the switch',rule:'Increase the budget every round',structure:'timing trials',reason:'Shared summary'});
+    await executeForgeTask(s.env,one.jobId);
+    expect(s.fetcher).not.toHaveBeenCalled();
+    expect(s.sqlite.prepare('SELECT model_started_at FROM forge_tasks WHERE id=?').get(one.jobId)).toMatchObject({model_started_at:null});
+    const fresh=await queue(0);
+    const payload=JSON.parse((s.sqlite.prepare('SELECT payload FROM forge_tasks WHERE id=?').get(fresh.jobId) as any).payload);
+    s.fetcher.mockResolvedValueOnce(Response.json({content:[{type:'text',text:JSON.stringify(comparisonResult(payload.comparison))}],stop_reason:'end_turn'}));
+    await executeForgeTask(s.env,fresh.jobId);
+    expect(s.fetcher).toHaveBeenCalledTimes(1);
+    expect(await (await page(s,`mechanisms/${fresh.check_id}`)).json()).toMatchObject({state:'distinct',model:{provenance:'platform-executed'}});
+    s.sqlite.prepare('UPDATE members SET enabled=0 WHERE id=?').run('a');
+    await executeForgeTask(s.env,other.jobId);
+    expect(s.fetcher).toHaveBeenCalledTimes(1);
+    expect(s.sqlite.prepare('SELECT status,model_started_at FROM forge_tasks WHERE id=?').get(other.jobId)).toMatchObject({status:'error',model_started_at:null});
+  });
+
+  it('只允许超级管理员发布历史摘要，Star 可读取且普通成员不可访问',async()=>{
+    const s=await setup();await s.pair();
+    const card=mechanismCard(0),publication={subject:card.subject,action:card.action,rule:card.rule,structure:card.structure,reason:'Private operator note'};
+    expect((await page(s,'mechanisms/publish','POST',publication)).status).toBeGreaterThanOrEqual(400);
+    expect((await s.call('mechanisms/publish',publication)).status).toBe(403);
+    const published=await page(s,'mechanisms/publish','POST',publication,'admin');
+    expect(published.status).toBe(200);
+    const catalog=await s.call('mechanisms');
+    expect(catalog.status).toBe(200);
+    expect(await catalog.json()).toMatchObject({items:[{subject:publication.subject,action:publication.action,rule:publication.rule,structure:publication.structure}]});
+    const browser=await page(s,'mechanisms','GET');
+    expect(await browser.text()).not.toContain(publication.reason);
+    expect((await page(s,'mechanisms','GET',undefined,'plain')).status).toBe(403);
+  });
+});
 
 describe('成员个人 Agent 的权限、租约与结果版本',()=>{
   it('扩写到成品逐步保存带来源的不可覆盖版本，资产原样复用；恢复另存版本并标记下游过时',async()=>{

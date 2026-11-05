@@ -24,7 +24,7 @@ export {CreatorFeedbackRunner} from './creator-feedback-runner';
 
 interface QueueMessage<T> { id: string; body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
-interface Env extends CreatorFeedbackEnv { ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
+interface Env extends CreatorFeedbackEnv { CREATIVE_V2_ROLLOUT?:string; ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 
@@ -45,9 +45,10 @@ const app = {
       return binding.get(binding.idFromName('review-control-v1')).fetch(request);
     }
     const store=configStore(env.DB),members=memberStore(env.DB);
+    const creativeRollout=env.CREATIVE_V2_ROLLOUT??'pilot';
     if(url.pathname.startsWith('/api/forge-agent/')){
       if(url.pathname.endsWith('/pair')){const rate=await env.CHECK_RATE_LIMIT.limit({key:`forge-pair:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'配对操作较多，请稍后重试。'},429);}
-      return forgeAgentApi(request,{...env,modelStore:store});
+      return forgeAgentApi(request,{...env,CREATIVE_V2_ROLLOUT:creativeRollout,modelStore:store});
     }
     if(url.pathname.startsWith('/api/forge/agent/'))return forgeAgentWeb(request,{...env,modelStore:store});
     if(url.pathname.startsWith('/api/review-device/')){
@@ -70,7 +71,7 @@ const app = {
     if(url.pathname.startsWith('/api/forge/')){
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
-      return forgeApi(request,{DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,
+      return forgeApi(request,{CREATIVE_V2_ROLLOUT:creativeRollout,DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,
         reviewExecutor:'device',
       },route,members,ctx);
     }
@@ -162,7 +163,7 @@ const app = {
       .bind(new Date().toISOString(), new Date(Date.now() - 15 * 60 * 1000).toISOString()).run();
   },
   async queue(batch: QueueBatch<ForgeJob>, env: Env): Promise<void> {
-    const forgeEnv = { DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB),FORGE_RUNNER:env.FORGE_RUNNER,captureReview:captureFor(env) };
+    const forgeEnv = { CREATIVE_V2_ROLLOUT:env.CREATIVE_V2_ROLLOUT,DB: env.DB, ADMIN_PASSWORD: env.ADMIN_PASSWORD, SETTINGS_KEY: env.SETTINGS_KEY, modelStore: configStore(env.DB),FORGE_RUNNER:env.FORGE_RUNNER,captureReview:captureFor(env) };
     for (const message of batch.messages) {
       try {
         // Old queued creation messages only dispatch alarms. Never run long

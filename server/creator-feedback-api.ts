@@ -50,7 +50,7 @@ export async function creatorFeedbackAdminApi(request:Request,env:Env):Promise<R
     if(route==='/links'&&request.method==='GET'){
       const after=url.searchParams.get('after')||'',limit=Number(url.searchParams.get('limit')||'20');
       if(after&&!external(after)||!Number.isInteger(limit)||limit<1||limit>50)throw err('分页参数不正确。');
-      const rows=(await env.DB.prepare(`SELECT l.task_id AS jobId,l.owner_id AS ownerId,l.game_id AS workId,l.version_id AS versionId,l.matched_by AS matchedBy,l.created_at AS linkedAt,
+      const rows=(await env.DB.prepare(`SELECT l.task_id AS jobId,l.owner_id AS ownerId,l.game_id AS workId,l.version_id AS versionId,l.matched_by AS matchedBy,l.created_at AS linkedAt,j.artifact_version_id AS artifactVersionId,
         j.title,j.status AS taskStatus,j.model_executor AS modelExecutor,COALESCE(m.display_name,CASE WHEN l.owner_id='admin' THEN '超级管理员' ELSE '成员' END) AS ownerName,
         (SELECT json_extract(a.payload,'$.declaration.status') FROM creator_feedback_assessments a WHERE a.task_id=l.task_id AND a.kind='declaration' AND a.generation=? ORDER BY a.created_at DESC,a.rowid DESC LIMIT 1) AS verificationStatus,
         (SELECT COUNT(*) FROM creator_feedback_assessments a WHERE a.task_id=l.task_id AND a.kind='file' AND a.generation=?) AS measuredFiles
@@ -101,7 +101,8 @@ export async function creatorFeedbackAdminApi(request:Request,env:Env):Promise<R
     if(route==='/link'&&request.method==='POST'){
       const b=await body(request);
       if(Object.keys(b).some(k=>!['jobId','workId','versionId','matchedBy'].includes(k))||!external(b.jobId)||!external(b.workId)||!external(b.versionId)||!['user-confirmed','published-record'].includes(b.matchedBy))throw err('需要原任务、准确作品和投稿版本及关联依据。');
-      const job=await env.DB.prepare('SELECT id,owner_id FROM review_jobs WHERE id=?').bind(b.jobId).first();if(!job)throw err('原审核任务不存在。',404);
+      const job=await env.DB.prepare('SELECT id,owner_id,artifact_version_id FROM review_jobs WHERE id=?').bind(b.jobId).first();if(!job)throw err('原审核任务不存在。',404);
+      if(job.artifact_version_id)throw err('成品版本审核由原审核设备回填实际投稿记录。',409);
       const prior=(await env.DB.prepare('SELECT work_id,version_id FROM review_human_reviews WHERE job_id=? AND work_id IS NOT NULL').bind(job.id).all()).results;
       if(prior.some((p:any)=>p.work_id!==b.workId||p.version_id!==b.versionId))throw err('原任务已有不同的准确投稿关联，不能换绑。',409);
       const old=await env.DB.prepare('SELECT * FROM creator_feedback_links WHERE task_id=?').bind(job.id).first();
@@ -128,15 +129,22 @@ export async function creatorFeedbackAdminApi(request:Request,env:Env):Promise<R
       if(!version)throw err('该关联版本已不在授权缓存中。',404);
       const ai=await env.DB.prepare('SELECT score,result,model FROM reviews WHERE job_id=? AND owner_id=?').bind(jobId,link.owner_id).first();
       const result=ai?JSON.parse(ai.result):null;
-      const task=await env.DB.prepare('SELECT title,input_hash,model_executor,rules_snapshot FROM review_jobs WHERE id=? AND owner_id=?').bind(jobId,link.owner_id).first();
+      const task=await env.DB.prepare('SELECT title,input_hash,model_executor,rules_snapshot,artifact_version_id FROM review_jobs WHERE id=? AND owner_id=?').bind(jobId,link.owner_id).first();
+      const declaration=task?.artifact_version_id?await env.DB.prepare(`SELECT upload_hash,provenance,created_at FROM creation_review_submissions
+        WHERE task_id=? AND known_work_id=? AND known_submission_id=?`).bind(jobId,link.known_work_id,link.known_submission_id).first():null;
+      const creation=declaration?{artifactVersionId:task.artifact_version_id,uploadHash:declaration.upload_hash,provenance:declaration.provenance,recordedAt:declaration.created_at,
+        sourceIdentityVerified:true,fileVerification:'agent-declared',strictEligible:false}:null;
       const reviewHistory=(await readFeedbackReviewHistory(env.DB,game.id)).filter((r:any)=>r.versionId===version.id);
       const assessment=await readFeedbackAssessment(env.DB,jobId!,state),platform=derivePlatformDecision(game,version.id),aiDecision=deriveAiDecision(result);
-      const differences=scoreDifferences(result,game.reviews.find((r:any)=>r.id===platform.reviewId));
+      const decidingReview=platform.state==='valid'?game.reviews.filter((r:any)=>r.id===platform.reviewId&&r.versionId===version.id)
+        .sort((a:any,b:any)=>b.revision-a.revision)[0]:null;
+      const differences=scoreDifferences(result,decidingReview);
       await sameGeneration(env,state,game.id);
       const value={jobId,ownerId:link.owner_id,title:task?.title??'',generation:state.generation,scopeRevision:state.scope_revision,workId:game.id,versionId:version.id,source:'creator-hub-feedback-v1',complete:state.phase==='delta',matchedBy:link.matched_by,
-        inputHash:task?.input_hash??null,aiRules:task?.rules_snapshot?JSON.parse(task.rules_snapshot):null,version,reviews:game.reviews.filter((r:any)=>r.versionId===version.id),reviewHistory,
-        ai:ai?{score:ai.score,model:ai.model,dimensions:{aes:result.aes,ease:result.ease,play:result.play},decision:aiDecision,report:result}:null,
-        platform,comparison:{state:aiDecision&&platform.state==='valid'?(aiDecision===platform.decision?'match':'different'):'unavailable',scoreDifferences:differences},assessment,
+        inputHash:task?.input_hash??null,aiRules:task?.rules_snapshot?JSON.parse(task.rules_snapshot):null,version,reviews:game.reviews.filter((r:any)=>r.versionId===version.id),reviewHistory,creation,
+        ai:ai?{score:ai.score,model:ai.model,executor:task?.model_executor??null,dimensions:{aes:result.aes,ease:result.ease,play:result.play},decision:aiDecision,report:result}:null,
+        platform,comparison:{state:aiDecision&&platform.state==='valid'?(aiDecision===platform.decision?'match':'different'):'unavailable',scoreDifferences:differences,
+          totals:{ai:ai?.score??null,platform:decidingReview?.total??null},decidingReviewRevision:decidingReview?.revision??null},assessment,
         interpretation:'独立来源判断；组长退回可以是平台有效结论，阶段不等于终审。关联声明和本地文件测量不能证明来源文件绑定，意见不自动视为已复现缺陷。'};
       const response=json(route==='/export'?{schemaVersion:1,exportedAt:new Date().toISOString(),...value}:value);
       if(route==='/export')response.headers.set('Content-Disposition','attachment; filename="creator-feedback-'+jobId+'.json"');return response;

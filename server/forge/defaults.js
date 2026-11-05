@@ -1,6 +1,24 @@
 // Default editable texts. Each one is stored in the settings table on first
 // use and can be changed from the 设置 page; these are only the fallbacks.
 
+// This version describes creative work only. It is independent of published
+// review rules, and does not replace administrator-edited settings.
+export const CREATIVE_GUIDANCE_VERSION = "pgc-minigame-v2";
+export const CREATIVE_DIRECTION_V2 = `【创作合约】
+- 交付单个自包含 HTML，无外部资源、网络请求、外链字体或依赖。原生触摸操作，不需要键盘，面向玩家的文案默认用简明英文。
+- 固定 540×960 逻辑舞台（9:16），按可用宽高等比缩放并居中。长屏和桌面的额外区域只延伸背景，不拉伸或裁切可玩舞台，不留下突兀空带。尊重安全区，避免 HUD、提示和目标被刘海或手指遮挡。
+- 打开即见游戏和不挡视线的短手势提示。第一次有效触摸既开局又生效；之前不受伤。结束只触发一次，一步重开并完整清理状态。
+- 做有真实失败压力的挑战，或有风险和收手决策的虚拟筹码玩法。一个易理解的手势和一个来自题材或媒介的独特规则。写清变化节奏、风险奖励、可达的结束条件，以及挂机和重复动作能否取巧。
+- 视觉从媒介的质感、造型与动态入手，HUD 也使用同一套视觉语言。用户手势解锁 BGM；给操作、得分、伤害、结束和按钮清晰的音效，提供静音。后台暂停并静音，恢复可继续；存储失败也能玩。
+- 美学、易玩性、可玩性用来明确创作方向与风险。正式审核独立进行，不预估分数、通过概率，也不把历史频率作为设计硬门槛。`;
+
+export const CREATIVE_BRIEF_SUPPLEMENT_V2 = `【F 节必须说清的决定】
+- F1–F4：创作亮点及实现风险；色板 hex、质感、各物体的轮廓和状态、HUD 布局；首次触摸与判定；明确输赢、风险奖励和防偷懒。
+- F5–F8：集中调参表、单位、边界、增长上限和连击窗口；熟练和新手各自的时长估算及算式；敌人行为与预警、首个变化和后续进展、终点或高潮；计分、连击中断、倍率、评级、最高分和结算死因。若无 Boss，写明该设计实际的高潮或结束方式。
+- F9–F10：全部玩家可见英文原文及触发条件；BGM 曲风、调式、BPM、乐器及动态层次；动作、命中、受伤、得分、失败与 UI 声音、混音和静音。
+- F 节之后加「制作需求清单」：每条有稳定 ID（R1、R2…）、来源小节和能观察到的验收条件，覆盖已确认需求。
+- 最后加「补充决定」：逐条列没有写明、由你补齐的具体决定及理由；如触及核心规则、操作、胜负、媒介或音乐风格，显式标为「核心改动」，写清原约定、建议与原因。未获得授权的改动作为待确认项，不当成已确认设计；没有改动时注明无。`;
+
 export const DEFAULT_SETTINGS = {
   provider: "anthropic",          // anthropic | anthropic_compat | openai
   anthropic_model: "claude-opus-5-5",

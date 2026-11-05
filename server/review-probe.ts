@@ -37,11 +37,12 @@ function installReviewProbe() {
 }
 
 /** Capture the browser viewport, including DOM, CSS, WebGL and every canvas layer. */
-export async function captureReview(browser: Browser, html: string) {
+export async function captureReview(browser: Browser, html: string, options: {denyExternal?:boolean} = {}) {
   const context = await browser.createBrowserContext();
   let expired = false;
   const deadline = setTimeout(() => { expired = true; void context.close().catch(() => {}); }, 65000);
-  const sources = [...RESOURCE_HOSTS].map(host => `https://${host}`).join(' ');
+  const sources = options.denyExternal ? '' : [...RESOURCE_HOSTS].map(host => `https://${host}`).join(' ');
+  const allowed = (url:string)=>resourceAllowed(url)&&(!options.denyExternal||/^(data:|blob:|about:blank$)/i.test(url));
   try {
     const frames = [];
     let shotNumber=0;
@@ -61,18 +62,18 @@ export async function captureReview(browser: Browser, html: string) {
         const url = request.url();
         if (url === `${origin}/index.html` && request.isNavigationRequest() && request.frame() === page.mainFrame()) {
           void request.respond({ status: 200, contentType: 'text/html; charset=utf-8', headers: {
-            'Content-Security-Policy': `default-src 'self' data: blob: ${sources}; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: ${sources}; style-src 'self' 'unsafe-inline' ${sources}; connect-src ${sources}; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-same-origin`,
+            'Content-Security-Policy': `default-src 'self' data: blob: ${sources}; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: ${sources}; style-src 'self' 'unsafe-inline' ${sources}; connect-src ${sources || "'none'"}; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-same-origin`,
             'Referrer-Policy': 'no-referrer',
           }, body: html }).catch(() => {});
         } else if (url.startsWith(`${origin}/`)) {
           if (!url.endsWith('/favicon.ico')) resources.missing.push(labelResource(url));
           void request.abort().catch(() => {});
-        } else if (request.isNavigationRequest() || !resourceAllowed(url)) {
+        } else if (request.isNavigationRequest() || !allowed(url)) {
           resources.restricted.push(labelResource(url)); void request.abort().catch(() => {});
         } else void request.continue().catch(() => {});
       });
       page.on('response', response => { if (response.status() >= 400) resources.failed.push(`${response.status()} ${labelResource(response.url())}`); });
-      page.on('requestfailed', request => { if (resourceAllowed(request.url()) && !request.url().startsWith(origin)) resources.failed.push(labelResource(request.url())); });
+      page.on('requestfailed', request => { if (allowed(request.url()) && !request.url().startsWith(origin)) resources.failed.push(labelResource(request.url())); });
       page.on('console', message => {
         if (/content security policy/i.test(message.text())) {
           const url = message.text().match(/https?:\/\/[^\s'"<>]+/)?.[0];

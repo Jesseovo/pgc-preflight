@@ -23,6 +23,18 @@ const topics = new Map([[1, makeTopic(1, true)], [2, makeTopic(2, false)]]);
 const products = new Map([[1, game(1)]]);
 const posts: Array<{ kind: string; id: number; regenerate: string | null }> = [];
 const jobs: any[] = [];
+const workflowRequests: Array<{route:string;query:URLSearchParams;body:any}>=[];
+const cards=Array.from({length:8},(_,index)=>({
+  title:`Mechanism ${index+1}`,logline:'Follow the paper signal.',strength:'The clue and gesture use the same rhythm.',
+  subject:'纸信号',action:'Tap twice to match the pulse',rule:`Match the cue number ${index+1}`,structure:'节奏试炼',
+  risks:'Fast cues may need a longer warning.',
+}));
+const fixtureCheck={check_id:'check-fixture',state:'uncertain',effective_state:'distinct',stale:false,candidate:cards[0],admin_resolution:{reason:'已核对规则差异'}};
+const fixtureEvidence={
+  shots:Array.from({length:4},(_,i)=>({id:`build:baseline-${i+1}`,label:`原始画面 ${i+1}`,data:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQImWNgAAAAAgABSK+kcQAAAABJRU5ErkJggg=='})),
+  probe:{captureMethod:'browser-viewport-v1'},
+};
+let v2Available=true;
 const versions = new Map<number, any[]>([[1, [
   { id: 'game-1', kind: 'game', content: game(1), current: false, disposition: 'historical' },
   { id: 'brief-1', kind: 'brief', content: brief, current: true, disposition: 'current' },
@@ -57,13 +69,37 @@ const server = createServer(async (req, res) => {
   const parts = url.pathname.split('/');
   const json = (value: unknown, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
   const preview = (content: string) => { res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Security-Policy': "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'" }); res.end(content); };
+  const requestBody=async()=>{let text='';for await(const chunk of req)text+=chunk;return JSON.parse(text);};
   try {
     if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
     if (url.pathname === '/api/auth/me') return json({ id: 'fixture-star', role: 'member', star: true, canReview: true, displayName: '交互验证' });
-    if (url.pathname === '/api/forge/state') return json({ games: 2, vocab: 5 });
+    if (url.pathname === '/api/forge/state') return json({ games: 2, vocab: 5, creative_v2_available:v2Available });
     if (url.pathname === '/api/forge/settings') return json({ draw_size: 2 });
-    if (url.pathname === '/api/forge/vocab') return json([]);
-    if (url.pathname === '/api/forge/topics' || url.pathname === '/api/forge/products') return json([...topics.values()]);
+    if (url.pathname === '/api/forge/vocab') return json([{dim:'subject',word:'曾使用的题材',enabled:true,used:true}]);
+    if (url.pathname === '/api/forge/topics' || url.pathname === '/api/forge/products') return json([...topics.values()].filter(topic=>{
+      const status=url.searchParams.get('status');
+      return !status||status.split(',').includes(topic.status);
+    }));
+    if(req.method==='POST'&&['draw','expand','mechanisms/check','mechanisms/choose'].some(route=>url.pathname===`/api/forge/${route}`)){
+      const route=url.pathname.slice('/api/forge/'.length),body=await requestBody();
+      workflowRequests.push({route,query:url.searchParams,body});
+      if(route==='draw'){
+        const seed={...makeTopic(3,false),status:'drawn',data:{},creative_version:2};
+        topics.set(3,seed);versions.set(3,[]);return json([seed]);
+      }
+      if(route==='expand'){
+        const seed=topics.get(3)!;
+        seed.data={candidates:cards,recommended:[0,1,2]};
+        return json({pending:true,topics:[seed]});
+      }
+      if(route==='mechanisms/check'){
+        jobs.push({id:'mechanism-fixture',kind:'mechanism-check',scope:'fixture:mechanism-check:3:0',executor:'agent',status:'done',result:fixtureCheck});
+        return json({pending:true,jobId:'mechanism-fixture',executor:'agent'});
+      }
+      const chosen={...makeTopic(4,false),status:'liked',creative_version:2,has_brief:0,data:cards[0],score:null};
+      topics.set(4,chosen);return json({topic_id:4});
+    }
+    if(url.pathname==='/api/forge/mechanisms/check-fixture')return json(fixtureCheck);
     if (url.pathname === '/api/forge/generation-jobs') return json([...jobs].reverse().map(({ topicId: _topicId, ...job }) => job));
     if (url.pathname.startsWith('/api/forge/generation-jobs/')) return json(jobs.find(job => job.id === parts[4]));
 
@@ -80,6 +116,9 @@ const server = createServer(async (req, res) => {
         return json(topic);
       }
       if (tail === 'versions' && req.method === 'GET') return json((versions.get(id) || []).map(({ content: _content, ...version }) => version));
+      if(tail==='creation-checks'&&id===1)return json([{stage:'build',task_id:'creation-fixture',version_id:'version-fixture',
+        content_hash:'content-fixture',evidence_hash:'evidence-fixture',self_check:{model:'fixture model',selfCheck:{findings:[],unverified:['未试听']}}}]);
+      if(tail==='creation-checks/creation-fixture/build'&&id===1)return json(fixtureEvidence);
       const versionMatch = tail.match(/^versions\/([^/]+)(?:\/(preview))?$/);
       if (versionMatch) {
         const version = (versions.get(id) || []).find(item => item.id === versionMatch[1]);
@@ -99,6 +138,7 @@ const server = createServer(async (req, res) => {
       const kind = tail.match(/^(game|brief|preview|assets)$/)?.[1];
       if (kind && req.method === 'POST') {
         const regenerate = url.searchParams.get('regenerate');
+        assert.equal(url.searchParams.get('creative_version'),'2');
         if (topic.has_product && kind === 'game') assert.equal(regenerate, '1', 'Regenerating an existing game must create a new version');
         posts.push({ kind, id, regenerate });
         const idForJob = `job-${++sequence}`;
@@ -155,6 +195,10 @@ try {
   page.on('pageerror', error => errors.push(String(error)));
   page.on('response', response => { if (response.status() >= 500) errors.push(`HTTP ${response.status()} ${new URL(response.url()).pathname}`); });
   await page.setViewport({ width: 1360, height: 980 });
+  const firstCard = '[data-id="1"]';
+  const openProducts=()=>page.$eval('#view [data-tab=products]',button=>(button as HTMLButtonElement).click());
+  const v2Only=process.argv.includes('--v2-only');
+  if(!v2Only){
   await page.goto(origin + '/test?tab=draw&layout=cards'); await page.waitForSelector('#drawBtn');
   await page.click('[data-tab=picks]'); await page.waitForSelector('.creation-card');
   assert.equal(await page.$$eval('.creation-card', cards => cards.length), 2);
@@ -164,7 +208,6 @@ try {
   await page.screenshot({ path: 'artifacts/creation-cards-desktop.png', fullPage: true });
 
   // Reading a material should expand inside its card, without a blocking dialog.
-  const firstCard = '[data-id="1"]';
   await page.click(`${firstCard} [data-act=brief]`); await page.waitForSelector(`${firstCard} .brief-document`);
   assert.match(await page.$eval(`${firstCard} .brief-document`, (element: any) => element.textContent), /纸间花园/);
   assert.equal(await page.$eval('#modal', (element: any) => element.hidden), true, 'Viewing material must not open a modal');
@@ -204,7 +247,7 @@ try {
   assert.equal(restored, 1); assert.equal(posts.length, beforeRestore, 'Restoring a version must not call a model');
 
   // A failed remake leaves the previous build available to play.
-  await page.click('[data-tab=picks]'); await page.waitForSelector('#pickCards'); await page.click('[data-tab=products]'); await page.waitForSelector('#productCards [data-id="1"] [data-act=viewProduct]');
+  await page.goto(origin+'/forge/?tab=products&layout=cards'); await page.waitForSelector('#productCards [data-id="1"] [data-act=viewProduct]');
   await page.click('[data-id="1"] .creation-more summary'); await page.click('[data-id="1"] [data-act=regenerateGame]');
   await waitForPost('game', 1); finish('game', 1, 'error');
   await page.waitForFunction(() => document.querySelector('[data-id="1"] .bad.small')?.textContent?.includes('合成失败'));
@@ -216,7 +259,7 @@ try {
   await page.click('[data-tab=picks]'); await page.waitForSelector('[data-id="2"] [data-act=makeGame]');
   await page.click('[data-id="2"] [data-act=makeGame]'); await waitForPost('game', 2);
   assert.equal(posts.filter(post => post.kind === 'game' && post.id === 2).length, 1);
-  await page.reload(); await page.waitForSelector('#view .card'); await page.click('[data-tab=picks]'); await page.waitForSelector('#pickCards'); await page.click('[data-tab=products]');
+  await page.reload(); await page.waitForSelector('#pickCards'); await openProducts();
   await page.waitForSelector('[data-id="2"] .product-job-progress');
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(posts.filter(post => post.kind === 'game' && post.id === 2).length, 1, 'Reload recovery must not resubmit a running game');
@@ -228,7 +271,7 @@ try {
   // Late material reads must not open an old card after switching sections.
   delayNextTopicRead = 350;
   await page.click('[data-tab=picks]'); await page.waitForSelector('[data-id="1"] [data-act=brief]');
-  await page.click('[data-id="1"] [data-act=brief]'); await page.click('[data-tab=picks]'); await page.waitForSelector('#pickCards'); await page.click('[data-tab=products]');
+  await page.click('[data-id="1"] [data-act=brief]'); await openProducts();
   await page.waitForSelector('[data-id="1"] [data-act=viewProduct]'); await new Promise(resolve => setTimeout(resolve, 450));
   assert.equal(await page.$('.creation-viewer'), null, 'A late reply must not reopen a viewer in another section');
 
@@ -239,8 +282,52 @@ try {
   await page.screenshot({ path: 'artifacts/creation-cards-mobile.png', fullPage: true });
   const touchHeight = await page.$eval('.creation-materials .material-link', (element: any) => element.getBoundingClientRect().height);
   assert(touchHeight >= 36, 'Material buttons should remain comfortable to tap');
+  }
+
+  await page.setViewport({width:390,height:844,isMobile:true,hasTouch:true});
+  await page.goto(origin+'/forge/?tab=picks&layout=cards');
+  await page.waitForSelector(`${firstCard} [data-act=creationChecks]`);
+  await page.click(`${firstCard} [data-act=creationChecks]`);
+  await page.waitForFunction(()=>document.querySelector('[data-viewer-kind=creationChecks]')?.textContent?.includes('未试听'));
+  await page.click('[data-viewer-act=creation-evidence]');
+  await page.waitForFunction(()=>document.querySelectorAll('[data-viewer-kind=creationChecks] figure img').length===4);
+  assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1'));
+  await page.click('[data-viewer-act=creation-checks-back]');
+  assert(await page.$('[data-viewer-act=creation-evidence]'));
+
+  await page.click('[data-tab=draw]');await page.waitForSelector('#drawBtn');
+  assert.equal(await page.$('#drawN'),null);
+  assert(await page.$('[data-lock=subject] option[value="曾使用的题材"]'));
+  await page.select('[data-executor]','agent');
+  await page.click('#drawBtn');
+  await page.waitForSelector('#mechanism-3-0 [data-act=mechanismCheck]');
+  assert.equal(workflowRequests[0].body.creative_version,2);
+  assert.equal(workflowRequests[1].query.get('creative_version'),'2');
+  assert.equal(workflowRequests[1].query.get('executor'),'agent');
+  assert.equal(await page.$$eval('[data-candidate-more]:not([open]) section',nodes=>nodes.length),5);
+  assert.equal(await page.$('[data-id="3"] [data-act=mechanismChoose]'),null);
+  await page.click('#mechanism-3-0 [data-act=mechanismCheck]');
+  await page.waitForSelector('#mechanism-3-0 [data-act=mechanismChoose]');
+  assert.equal(workflowRequests[2].query.get('executor'),'agent');
+  assert.match(await page.$eval('#mechanism-3-0',node=>node.textContent||''),/已有结果确认存在机制区别/);
+  const dialog=new Promise<string>(resolve=>page.once('dialog',value=>{resolve(value.message());void value.accept();}));
+  await page.click('#mechanism-3-0 [data-act=mechanismChoose]');
+  assert.match(await dialog,/四项摘要会分享给其他 Star 创作者/);
+  await page.waitForSelector('#projectContent [data-act=prepareBrief]');
+  assert.equal(workflowRequests[3].body.check_id,'check-fixture');
+  const postCount=posts.length;
+  await page.click('#projectContent [data-act=prepareBrief]');
+  assert.equal(posts.length,postCount,'The prerequisite action should not call a model.');
+  assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-act')),'brief');
+
+  v2Available=false;
+  await page.goto(origin+'/test?tab=draw');await page.waitForSelector('#drawN');
+  assert.match(await page.$eval('#view',node=>node.textContent||''),/完整创作流程灰测中/);
+  assert.equal(await page.$('[data-lock=subject] option[value="曾使用的题材"]'),null);
+  assert.equal(await page.$('[data-act=mechanismCheck]'),null);
   assert.deepEqual(errors, []);
-  console.log('PASS 创作卡片内查看、材料预览、iframe 卸载、9:16 隔离试玩、历史恢复、失败重制保留旧成品、刷新去重、迟到响应、手机布局。');
+  console.log('PASS 阶段原图、灰测入口、机制查重执行方、管理员判定、明确登记、简报前置与手机布局。');
+  if(!v2Only)console.log('PASS 原材料预览、隔离试玩、历史恢复与任务恢复。');
 } finally {
   await browser.close();
   await new Promise<void>(resolve => server.close(() => resolve()));

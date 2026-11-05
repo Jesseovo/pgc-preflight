@@ -1,5 +1,6 @@
 // @ts-nocheck
 // Migrated PGC Forge backend. Its data transforms are intentionally kept close to the original implementation.
+import {creativeV2Available,requireCreativeV2} from './creative-rollout';
 import { SEED_GAMES, SEED_VOCAB } from "./forge/seed.js";
 import { DEFAULT_SETTINGS, DEFAULT_REDLINES, DEFAULT_TEMPLATE, DEFAULT_TEMPLATE_F } from "./forge/defaults.js";
 import { DIMS, drawCombos, exampleSets, learnedFactors, factorFor, norm } from "./forge/logic.js";
@@ -20,6 +21,9 @@ import {
   briefSystem, briefUser, ASSETS_SYSTEM, assetsUser, tagSystem, tagUser, TAG_SCHEMA, suggestSystem, suggestUser, SUGGEST_SCHEMA,
   reviewSystem, reviewSystemLegacy, GAME_SYSTEM, gameUser,
 } from "./forge/prompts.js";
+import {adminResolveMechanism,adminPublishMechanismSummary,isMechanismSeed,mechanismMatches,mechanismCheckStatus,recordMechanismJudgment,chooseMechanism,listMechanisms,mechanismExpansionPrompt,prepareMechanismExpansion} from './forge-mechanisms';
+import {creationChecks,creationEvidence} from './forge-creation-pipeline';
+import {briefSystemV2,briefUserV2,PREVIEW_SYSTEM_V2,previewUserV2,ASSETS_SYSTEM_V2,assetsUserV2} from './forge/prompts.js';
 import {createAgentTask,publicCreatorTask,validateAgentTask} from './forge-agent-api';
 import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnapshot,prepareArtifact} from './forge-workspace';
 import {currentHumanReview,withHumanReviews} from './human-review';
@@ -64,6 +68,8 @@ export interface ForgeEnv {
   DB: any;
   ownerId?:string;
   memberMode?:boolean;
+  creativeVersion?:1|2;
+  CREATIVE_V2_ROLLOUT?:string;
   modelExecutor?:'agent'|'platform';
   generationSnapshot?:any;
   ADMIN_PASSWORD: string;
@@ -77,7 +83,7 @@ export interface ForgeEnv {
   reviewExecutor?: 'device';
 }
 
-export type ForgeJob = { type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string; regenerate?:boolean } | { type: 'review'; id: string } | {type:'preview';id:number} | {type:'suggest';dim:string;n:number} | {type:'tag'};
+export type ForgeJob = ({ type: 'expand'; ids: number[] } | { type: 'brief'; id: number } | { type: 'assets'; id: number } | { type: 'game'; id: number; requestId: string; regenerate?:boolean } | { type: 'review'; id: string } | {type:'preview';id:number} | {type:'suggest';dim:string;n:number} | {type:'tag'} | {type:'mechanism-check';id:number;checkId:string;comparison:any}) & {creative_version?:1|2};
 
 // Per-topic background jobs share one claim/lease/recovery path.
 type TopicJobKind = 'brief' | 'assets';
@@ -145,6 +151,34 @@ function artifactPreview(content:string,kind:string){
 
 export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
   const [a, b, c] = route;
+  let drawData;
+  if(method==='POST'&&a==='draw'){const text=await request.text();if(new TextEncoder().encode(text).length>65536)throw new HttpError(413,'选题请求过大。');try{drawData=JSON.parse(text);}catch{throw new HttpError(400,'请求体不是合法 JSON');}if(!drawData||typeof drawData!=='object'||Array.isArray(drawData))throw new HttpError(400,'选题请求需要 JSON 对象。');}
+  env={...env,creativeVersion:new URL(request.url).searchParams.get('creative_version')==='2'?2:env.creativeVersion||1};
+  if(method==='POST'&&env.memberMode){
+    const requested=env.creativeVersion===2||(a==='draw'&&drawData.creative_version===2);
+    if(requested||a==='mechanisms')await requireCreativeV2(env,ownerId);
+  }
+  if(a==='mechanisms'){
+    if(method==='GET'&&!b)return listMechanisms(env.DB,{after:Number(new URL(request.url).searchParams.get('after'))||0});
+    if(method==='GET'&&b)return mechanismCheckStatus(env.DB,ownerId,b);
+    if(!env.memberMode&&ownerId==='admin'&&method==='POST'&&b==='resolve')return adminResolveMechanism(env.DB,await body(request));
+    if(!env.memberMode&&ownerId==='admin'&&method==='POST'&&b==='publish')return adminPublishMechanismSummary(env.DB,await body(request));
+    if(!env.memberMode)throw new HttpError(403,'请使用 Star 成员账号选择机制。');
+    const data=await body(request);
+    if(method==='POST'&&b==='choose')return chooseMechanism(env.DB,ownerId,data);
+    if(method==='POST'&&b==='check'){
+      const active=await first(env,"SELECT id,payload,executor FROM forge_tasks WHERE owner_id=? AND scope=? AND status IN ('queued','running')",ownerId,`${ownerId}:mechanism-check:${data.topic_id}:${data.candidate_index}`);
+      if(active)return {pending:true,jobId:active.id,check_id:JSON.parse(active.payload).checkId||null,executor:active.executor};
+      if(new URL(request.url).searchParams.get('executor')==='agent'){const task=await createAgentTask(env,ownerId,{type:'mechanism-check',id:data.topic_id,candidate_index:data.candidate_index,creative_version:2});return {pending:true,jobId:task.id,executor:task.executor,check_id:JSON.parse(task.payload).checkId||null};}
+      const check=await mechanismMatches(env.DB,ownerId,data,{executor:'platform'});
+      if(check.state!=='pending')return mechanismCheckStatus(env.DB,ownerId,check.check_id);
+      if(!env.FORGE_RUNNER)throw new HttpError(503,'后台查重服务尚未就绪。');
+      const task=await enqueueForgeTask(env,{type:'mechanism-check',id:data.topic_id,checkId:check.check_id,comparison:check,creative_version:2});
+      return {pending:true,jobId:task.id,executor:task.executor,check_id:JSON.parse(task.payload).checkId||null};
+    }
+    throw new HttpError(404,'机制接口不存在。');
+  }
+  if(a==='topics'&&c==='creation-checks'&&method==='GET'){const topic=await getTopic(env,Number(b));return route[3]?creationEvidence(env.DB,topic.owner_id,topic.id,route[3],route[4]):creationChecks(env.DB,topic.owner_id,topic.id);}
   if(a==='topics'&&c==='versions'&&method==='GET'){
     const topic=await getTopic(env,Number(b));
     if(route[3]){const v=await first(env,'SELECT * FROM artifact_versions WHERE id=? AND topic_id=? AND owner_id=?',route[3],topic.id,topic.owner_id);if(!v)throw new HttpError(404,'版本不存在。');if(route[4]==='preview'){if(!['game','assets','preview'].includes(v.kind))throw new HttpError(400,'这个版本不是可视预览。');return artifactPreview(v.content,v.kind);}return v;}
@@ -155,12 +189,12 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     const v=await first(env,'SELECT * FROM artifact_versions WHERE id=? AND topic_id=? AND owner_id=?',data.version_id,topic.id,topic.owner_id);if(!v)throw new HttpError(404,'版本不存在。');
     return saveArtifact(env.DB,{owner:topic.owner_id,topicId:topic.id,kind:v.kind,content:v.content,revision:topic.content_revision,policyRevision:v.policy_revision,heads:JSON.parse(v.input_versions||'{}'),executor:'restore',restoredFrom:v.id,force:true});
   }
-  if(env.memberMode && method==='POST' && a==='draw'){const data=await body(request);return reserveDraw(env.DB,ownerId,{...data,request_id:data.request_id||crypto.randomUUID()});}
+  if(env.memberMode && method==='POST' && a==='draw'){const data=drawData;return reserveDraw(env.DB,ownerId,{...data,request_id:data.request_id||crypto.randomUUID()});}
   // Public vocabulary suggestions and personal tagging retain the Agent path.
 
   if(env.memberMode && method==='POST' && (['suggest','tag'].includes(a)||(new URL(request.url).searchParams.get('executor')==='agent'&&(a==='expand'||(a==='topics'&&['brief','preview','assets','game'].includes(c)))))){
     const data=await body(request).catch(()=>({}));
-    const jobs=a==='expand'?(Array.isArray(data.ids)?[...new Set(data.ids)]:[]).map(id=>({type:'expand',ids:[id]})):[a==='topics'?{type:c,id:Number(b)}:a==='suggest'?{type:'suggest',dim:data.dim,n:Math.min(60,Math.max(5,Number(data.n)||30))}:{type:'tag'}];
+    const jobs=a==='expand'?(Array.isArray(data.ids)?[...new Set(data.ids)]:[]).map(id=>({type:'expand',ids:[id],creative_version:env.creativeVersion})):[a==='topics'?{type:c,id:Number(b),creative_version:env.creativeVersion}:a==='suggest'?{type:'suggest',dim:data.dim,n:Math.min(60,Math.max(5,Number(data.n)||30))}:{type:'tag'}];
     if(!jobs.length||jobs.length>40)throw new HttpError(400,'每批 1–40 个任务。');
     const snapshots=[];for(const job of jobs)snapshots.push(await validateAgentTask(env.DB,ownerId,job));
     const rows=[];for(let i=0;i<jobs.length;i++)rows.push(await createAgentTask(env,ownerId,jobs[i],undefined,snapshots[i]));
@@ -175,7 +209,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
       return publicForgeTask(row);
     }
     await recoverForgeTasks(env);
-    return (await all(env,"SELECT id,executor,owner_id,kind,scope,status,detail,error,result,created_at,started_at,updated_at FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString(),ownerId,ownerId)).map(publicForgeTask);
+    return (await all(env,"SELECT id,executor,owner_id,kind,scope,status,detail,error,result,created_at,started_at,updated_at,creative_version,phase,phase_started_at FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString(),ownerId,ownerId)).map(publicForgeTask);
   }
   if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
   if(a==='review'&&b==='worker-status'&&!c&&method==='GET')return deviceStatus(env.DB,ownerId);
@@ -222,7 +256,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     case "DELETE games/:id": return deleteRow(env, "games", id);
     case "POST import": return importWorks(env, await body(request));
     case "POST tag": return env.FORGE_RUNNER ? startSimpleTask(env,{type:'tag'}) : tagGames(env);
-    case "POST draw": return draw(env, await body(request));
+    case "POST draw": return draw(env, drawData);
     case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
     case "GET products": return listProducts(env);
@@ -280,7 +314,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     case "PATCH topics/:id": return patchTopic(env, id, await body(request));
     case "POST topics/:id/preview": {
       const topic=await getTopic(env,id);
-      if(!topic.data.title)throw new HttpError(409,'这个选题还没扩写');
+      if(!topic.data.title||isMechanismSeed(topic))throw new HttpError(409,'请先正式选择一个机制方案。');
       return env.FORGE_RUNNER ? startSimpleTask(env,{type:'preview',id}) : preview(env,id);
     }
     case "POST topics/:id/brief": return brief(env, id, ctx, new URL(request.url).searchParams.get('regenerate') === '1');
@@ -302,7 +336,7 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
 async function startSimpleTask(env,job){
   const active=activeModelProfile(await env.modelStore.get(),'create');
   if(!active?.profile.enabled||!active.profile.encryptedKey)throw new HttpError(503,'管理员尚未配置并启用创作模型。');
-  const row=await enqueueForgeTask(env,job);
+  const row=await enqueueForgeTask(env,{...job,creative_version:env.creativeVersion||job.creative_version});
   return {pending:true,jobId:row.id};
 }
 
@@ -328,6 +362,7 @@ async function putSettings(env, data) {
 // ---------- state / seed / export ----------
 
 async function getState(env) {
+  const creative_v2_available=await creativeV2Available(env,env.ownerId||'admin');
   const [games, vocab, topics, fresh] = await Promise.all([
     first(env, "SELECT COUNT(*) AS n FROM games WHERE (?='admin' OR owner_id=?)",env.ownerId||'admin',env.ownerId||'admin'),
     first(env, "SELECT COUNT(*) AS n FROM vocab"),
@@ -338,7 +373,7 @@ async function getState(env) {
   const s = await getSettings(env);
   const model = env.memberMode?null:await env.modelStore.get();
   const active=activeModelProfile(model,'create'),game=activeModelProfile(model,'game');
-  return {
+  return {creative_v2_available,
     executor:'platform',
     games: games.n,
     vocab: vocab.n,
@@ -559,7 +594,7 @@ async function listTopics(env, params) {
   const statuses = (params.get("status") || "new,liked").split(",").filter(Boolean);
   const limit = Math.min(Number(params.get("limit")) || 100, 500);
   const marks = statuses.map(() => "?").join(",");
-  const rows = await all(env, `SELECT id, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
+  const rows = await all(env, `SELECT id, creative_version, origin, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
       preview_svg IS NOT NULL AS has_preview, expand_status, expand_error, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
       assets_html IS NOT NULL AS has_assets, assets_status, assets_error,
       product_html IS NOT NULL AS has_product, product_status, product_error
@@ -568,7 +603,7 @@ async function listTopics(env, params) {
 }
 
 async function listProducts(env) {
-  const rows = await all(env, `SELECT id, subject, medium, gesture, structure, mood, status, data, score, note, updated_at,
+  const rows = await all(env, `SELECT id, creative_version, origin, subject, medium, gesture, structure, mood, status, data, score, note, updated_at,
       product_html IS NOT NULL AS has_product, product_status, product_error
     FROM topics WHERE (product_html IS NOT NULL OR product_status IN ('queued', 'running', 'error')) AND (?='admin' OR owner_id=?)
     ORDER BY updated_at DESC, id DESC LIMIT 300`,env.ownerId||'admin',env.ownerId||'admin');
@@ -598,6 +633,7 @@ async function withTopicLease<T>(env, ids: number[], statusColumn: 'expand_statu
 
 async function patchTopic(env, id, data) {
   const t = await getTopic(env, id);
+  if(isMechanismSeed(t)&&data.status!==undefined&&data.status!=='rejected')throw new HttpError(409,'请从候选方案完成查重并正式选择，不能直接修改为项目。');
   const status = data.status ?? t.status;
   if (data.status != null && !TOPIC_STATUSES.has(data.status)) throw new HttpError(400, "状态不对");
   await run(env, "UPDATE topics SET status = ?, note = ?,content_revision=content_revision+1, updated_at = ? WHERE id = ?", status, data.note ?? t.note, now(), id);
@@ -633,10 +669,10 @@ async function expand(env, { ids }, ctx) {
   // A browser/proxy may lose the response after the model has already
   // completed and persisted the topic. Make retries idempotent: return the
   // saved result instead of generating it a second time.
-  const pending = topics.filter((topic) => !topic.data?.title);
+  const pending = topics.filter((topic) => !topic.data?.title&&!topic.data?.candidates);
   if (!pending.length) return topics;
   if(env.FORGE_RUNNER){
-    for(const topic of pending)await enqueueForgeTask(env,{type:'expand',ids:[topic.id]});
+    for(const topic of pending){if(topic.origin==='mechanism-choice')throw new HttpError(409,'已选择机制不能重新扩写修改目录。');await enqueueForgeTask(env,{type:'expand',ids:[topic.id],creative_version:env.creativeVersion});}
     return {pending:true,topics:(await all(env,`SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`,...ids)).map(hydrate)};
   }
   if (env.FORGE_QUEUE || ctx?.waitUntil) {
@@ -661,7 +697,7 @@ async function expand(env, { ids }, ctx) {
 async function expandBatch(env, ids) {
   const marks = ids.map(() => "?").join(",");
   const topics = env.generationSnapshot?.topic?[env.generationSnapshot.topic]:(await all(env, `SELECT * FROM topics WHERE id IN (${marks}) AND (?='admin' OR owner_id=?) ORDER BY id`, ...ids,env.ownerId||'admin',env.ownerId||'admin')).map(hydrate);
-  const pending = topics.filter((topic) => !topic.data?.title);
+  const pending = topics.filter((topic) => !topic.data?.title&&!topic.data?.candidates);
   if (!pending.length) return topics;
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'expand'));
   const [cfg, games, prior] = env.generationSnapshot ? [env.generationSnapshot.cfg,env.generationSnapshot.games,env.generationSnapshot.prior] : await Promise.all([
@@ -669,6 +705,15 @@ async function expandBatch(env, ids) {
     visibleGames(env),
     all(env, "SELECT data, subject FROM topics WHERE owner_id=? AND status IN ('new', 'liked', 'made') ORDER BY id",env.ownerId||'admin'),
   ]);
+  if(pending.some(isMechanismSeed)){
+    for(const t of pending){
+      if(!isMechanismSeed(t))throw new HttpError(409,'新旧选题请分别处理。');
+      const prompt=mechanismExpansionPrompt(t,{redlines:cfg.redlines,vocab:env.generationSnapshot?.vocab||[]});
+      const out=await complete(env,cfg,{...prompt,purpose:'expand',maxTokens:24000,maxAttempts:1,validate:value=>{try{prepareMechanismExpansion(value);return [];}catch{return ['候选方案结构不完整'];}}});
+      await persistGenerated(env,t.id,'expand',JSON.stringify(prepareMechanismExpansion(out)));
+    }
+    return (await all(env,`SELECT * FROM topics WHERE id IN (${marks}) ORDER BY id`,...ids)).map(hydrate);
+  }
   const { positives, negatives } = exampleSets(games);
   const existing = games.map((g) => `- ${g.title}｜${g.descr}｜${g.gesture}`)
     .concat(prior.map((p) => JSON.parse(p.data || "{}")).filter((d) => d.title).map((d) => `- ${d.title}｜${d.logline}（已抽过的选题）`))
@@ -731,11 +776,11 @@ async function waitForExpanded(env, ids, maxWaitMs) {
 
 async function preview(env, id) {
   const t = env.generationSnapshot?.topic || await getTopic(env, id);
-  if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
+  if (isMechanismSeed(t)||!t.data.title) throw new HttpError(409, "请先正式选择已扩写的机制方案。");
   const cfg = await getSettings(env);
   // A retry may have different topic context or model settings. Reusing a
   // completed key makes Riffle reject the request as IDEMPOTENCY_CONFLICT.
-  const text = await complete(env, cfg, { system: PREVIEW_SYSTEM, user: previewUser(t), maxTokens: 16000, idempotencyKey: `pgc-preview-${id}-${Date.now()}`, purpose: 'preview' });
+  const text = await complete(env, cfg, { system: env.generationSnapshot?.creative_version===2?PREVIEW_SYSTEM_V2:PREVIEW_SYSTEM, user: env.generationSnapshot?.creative_version===2?previewUserV2(t,t.brief_md):previewUser(t), maxTokens: 16000, idempotencyKey: `pgc-preview-${id}-${Date.now()}`, purpose: 'preview' });
   const svg = sanitizeSvg(text);
   await persistGenerated(env,id,'preview',svg);
   return { id, svg };
@@ -868,13 +913,14 @@ function brief(env, id, ctx, regenerate = false) {
 async function startGameJob(env: ForgeEnv, id: number,regenerate=false) {
   const topic = await getTopic(env, id);
   if (!regenerate&&topic.product_html?.trim()) return { id, status: 'done', has_product: true };
-  if (!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
+  if (isMechanismSeed(topic)||!topic.data?.title || !['liked', 'made'].includes(topic.status)) throw new HttpError(409, "请先把已扩写的选题加入候选，再开始制作。");
+  if((env.creativeVersion===2||topic.creative_version===2)&&!topic.brief_md?.trim())throw new HttpError(409,'完整制作需要先生成策划书；样板图仍可独立生成和采用。');
   const model = activeModelProfile(await env.modelStore.get(), 'game');
   if (!model?.profile.enabled || !model.profile.encryptedKey) {
     throw new HttpError(409, "游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。");
   }
   if(env.FORGE_RUNNER){
-    const task=await enqueueForgeTask(env,{type:'game',id,requestId:crypto.randomUUID(),...(regenerate?{regenerate:true}:{})});
+    const task=await enqueueForgeTask(env,{type:'game',id,creative_version:env.creativeVersion,requestId:crypto.randomUUID(),...(regenerate?{regenerate:true}:{})});
     return {id,pending:true,status:'pending',taskId:task.id,jobId:task.id,executor:task.executor};
   }
   if (['queued', 'running'].includes(topic.product_status)) return { id, status: 'pending' };
@@ -894,11 +940,11 @@ async function startGameJob(env: ForgeEnv, id: number,regenerate=false) {
 async function startTopicJob(env, kind: TopicJobKind, id, ctx, regenerate, job: (env, id, t) => Promise<unknown>) {
   const k = TOPIC_JOBS[kind];
   const t = await getTopic(env, id);
-  if (!t.data.title) throw new HttpError(409, "这个选题还没扩写");
+  if (isMechanismSeed(t)||!t.data.title) throw new HttpError(409, "请先正式选择已扩写的机制方案。");
   if (kind === 'assets' && !t.brief_md?.trim()) throw new HttpError(409, "先生成简报（细纲），资产要按它来做。");
   if(env.FORGE_RUNNER){
     if(!regenerate&&t[k.status]!=='running'&&t[k.output]?.trim())return {id,[kind]:t[k.output]};
-    const task=await enqueueForgeTask(env,{type:kind,id});
+    const task=await enqueueForgeTask(env,{type:kind,id,creative_version:env.creativeVersion});
     return {id,pending:true,status:'pending',taskId:task.id,jobId:task.id,executor:task.executor};
   }
   // A previous request may have completed after the browser lost its
@@ -923,6 +969,13 @@ function markTopicJobError(env, kind: TopicJobKind, id, error, onlyIfRunning = f
 }
 
 export async function processForgeJob(env: ForgeEnv, job: ForgeJob) {
+  if(job.type==='mechanism-check'){
+    const current=await mechanismCheckStatus(env.DB,env.ownerId||'admin',job.checkId);
+    if(current.stale)throw new HttpError(409,'候选或机制目录已更新，请重新查重。');
+    if(current.state!=='pending')return current;
+    const judgment=await complete(env,{}, {...job.comparison,maxTokens:8000,maxAttempts:1,purpose:'expand',onStart:async()=>{const latest=await mechanismCheckStatus(env.DB,env.ownerId||'admin',job.checkId);if(latest.stale||latest.state!=='pending')throw new HttpError(409,'查重材料已经变化，未发起新模型请求。');}});
+    return recordMechanismJudgment(env.DB,env.ownerId||'admin',{check_id:job.checkId,judgment,model:activeModelProfile(await env.modelStore.get(),'create')?.profile.model||''},{executor:'platform'});
+  }
   if(job.type==='preview')return preview(env,job.id);
   if(job.type==='suggest')return suggestVocab(env,job);
   if(job.type==='tag')return tagGames(env);
@@ -993,9 +1046,9 @@ async function assetsJob(env, id, t) {
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'assets'));
   try {
     const text = await withTopicLease(env, [id], 'assets_status', () => complete(env, cfg, {
-      system: ASSETS_SYSTEM,
+      system: env.generationSnapshot?.creative_version===2?ASSETS_SYSTEM_V2:ASSETS_SYSTEM,
       purpose: 'assets',
-      user: assetsUser(t, designPart(t.brief_md), t.preview_svg || ''),
+      user: env.generationSnapshot?.creative_version===2?assetsUserV2(t,t.brief_md,t.preview_svg||''):assetsUser(t,designPart(t.brief_md),t.preview_svg||''),
       // Thinking and HTML share this budget. Keep the artifact compact and
       // make this a single paid attempt: a truncated asset pack is not safely
       // repairable by replaying the whole request with a fresh key.
@@ -1061,9 +1114,9 @@ async function briefJob(env, id, t) {
   const slowModel = /opus|claude/i.test(routedModel(await env.modelStore.get(), 'brief'));
   try {
     const md = await withTopicLease(env, [id], 'brief_status', () => complete(env, cfg, {
-        system: briefSystem({ templateF: cfg.template_f, redlines: cfg.redlines }),
+        system: (env.generationSnapshot?.creative_version===2?briefSystemV2:briefSystem)({templateF:cfg.template_f,redlines:cfg.redlines}),
         purpose: 'brief',
-        user: briefUser(t),
+        user: env.generationSnapshot?.creative_version===2?briefUserV2(t):briefUser(t),
         // Reserve room for both thinking and the complete production brief.
         maxTokens: slowModel ? 64000 : 24000,
         timeoutMs: slowModel ? 300000 : 180000,
