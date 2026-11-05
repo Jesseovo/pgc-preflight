@@ -91,7 +91,15 @@ function assistantBlocks() {
       const block = { ...value.content_block };
       const field = block.type === 'text' ? 'text' : block.type === 'thinking' ? 'thinking' : block.type === 'tool_use' ? 'input' : '';
       if (!field && (block.type !== 'redacted_thinking' || typeof block.data !== 'string')) throw bad();
-      if (block.type === 'tool_use' && (typeof block.id !== 'string' || typeof block.name !== 'string')) throw bad();
+      if (block.type === 'tool_use') {
+        if (typeof block.id !== 'string' || typeof block.name !== 'string') throw bad();
+        if (Object.hasOwn(block, 'caller')) {
+          const { caller } = block;
+          if (!isObject(caller) || Object.keys(caller).length !== 1 || caller.type !== 'direct') throw bad();
+          // Pinned CCB strips caller from its continuation with tool search disabled.
+          delete block.caller;
+        }
+      }
       if (block.type === 'thinking') block.signature = '';
       active = { block, field, deltas: [] };
       return;

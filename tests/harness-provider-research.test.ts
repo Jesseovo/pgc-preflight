@@ -49,6 +49,9 @@ const assistantContent = [
   { type: 'text', text: 'Synthetic explanation' },
   { type: 'tool_use', id: 'toolu_synthetic', name: tool, input: { path: 'input/research.txt' } },
 ];
+const toolStart = (metadata: object = {}) => event('content_block_start', {
+  index: 3, content_block: { type: 'tool_use', id: assistantContent[3].id, name: tool, input: {}, ...metadata },
+});
 const toolSse = messageStart +
   event('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } }) +
   event('content_block_delta', { index: 0, delta: { type: 'thinking_delta', thinking: assistantContent[0].thinking } }) +
@@ -57,7 +60,7 @@ const toolSse = messageStart +
   event('content_block_start', { index: 1, content_block: assistantContent[1] }) + event('content_block_stop', { index: 1 }) +
   event('content_block_start', { index: 2, content_block: { type: 'text', text: 'ignored by pinned CCB' } }) +
   event('content_block_delta', { index: 2, delta: { type: 'text_delta', text: assistantContent[2].text } }) + event('content_block_stop', { index: 2 }) +
-  event('content_block_start', { index: 3, content_block: { type: 'tool_use', id: assistantContent[3].id, name: tool, input: {} } }) +
+  toolStart() +
   event('content_block_delta', { index: 3, delta: { type: 'input_json_delta', partial_json: '{"path":' } }) +
   event('content_block_delta', { index: 3, delta: { type: 'input_json_delta', partial_json: '"input/research.txt"}' } }) +
   event('content_block_stop', { index: 3 }) + event('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 11 } }) + event('message_stop');
@@ -267,7 +270,9 @@ describe('isolated provider research broker', () => {
     expect(s.fetcher).toHaveBeenCalledOnce();
   });
 
-  it.each([['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r']])('matches a correlated tool continuation with %s SSE framing', async (_name, newline) => {
+  it.each([
+    ['LF', '\n', false], ['CRLF', '\r\n', false], ['CR', '\r', false], ['direct caller', '\n', true],
+  ] as const)('matches a correlated tool continuation with %s', async (_name, newline, directCaller) => {
     const s = await setup();
     s.config.profiles!.opus!.baseUrl = 'https://synthetic.invalid';
     s.manifest.modelContractHash = await modelContractHash(s.config, 'game');
@@ -281,7 +286,8 @@ describe('isolated provider research broker', () => {
         JSON.stringify(body.messages) === JSON.stringify(followup.messages);
     };
     const { lease } = await s.register();
-    const nativeStream = toolSse.replaceAll('\n', newline);
+    const source = directCaller ? toolSse.replace(toolStart(), toolStart({ caller: { type: 'direct' } })) : toolSse;
+    const nativeStream = source.replaceAll('\n', newline);
     s.fetcher.mockResolvedValueOnce(new Response(nativeStream, { headers: { 'Content-Type': 'text/event-stream' } }));
     const first = await handleHarnessProviderResearch(await s.signed({ lease }), s.options);
     expect(await first.text()).toBe(nativeStream);
@@ -296,6 +302,23 @@ describe('isolated provider research broker', () => {
     const second = await handleHarnessProviderResearch(await s.signed({ lease, id, body: JSON.stringify(followup) }), s.options);
     expect(await second.text()).toBe(sse);
     expect(s.fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { type: 'code_execution_20260120', tool_id: 'srvtoolu_synthetic' },
+    { type: 'direct', tool_id: 'srvtoolu_synthetic' },
+    null,
+  ])('rejects unsupported tool caller metadata %j without publishing a continuation digest', async caller => {
+    const s = await setup();
+    const { lease } = await s.register();
+    const wire = toolSse.replace(toolStart(), toolStart({ caller }));
+    s.fetcher.mockResolvedValueOnce(new Response(wire, { headers: { 'Content-Type': 'text/event-stream' } }));
+    const first = await handleHarnessProviderResearch(await s.signed({ lease }), s.options);
+    await expect(first.text()).rejects.toThrow('research_assistant_digest_failed');
+    expect(s.ledger.sqlite.prepare('SELECT count(*) AS count FROM provider_research_assistant_digests').get()).toEqual({ count: 0 });
+    const id = 'probe-0-ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    expect((await handleHarnessProviderResearch(await s.signed({ lease, id }), s.options)).status).toBe(401);
+    expect(s.fetcher).toHaveBeenCalledOnce();
   });
 
   it('never accepts a digest from a partial stream', async () => {
