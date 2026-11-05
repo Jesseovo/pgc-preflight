@@ -219,7 +219,7 @@ export interface HarnessRequestIdentity extends HarnessRunIdentity { requestId: 
 interface RequestRow { body_hash: string; state: RequestState; deadline_at: number }
 
 export async function reserveHarnessRequest(db: HarnessDatabase, id: HarnessRequestIdentity, bodyHash: string,
-  outputCap: number, now = Date.now(), requestStartedAt = now, allowedUntil = Infinity): Promise<
+  outputCap: number, now = Date.now(), requestStartedAt = now, allowedUntil = Infinity, expectedModelTurns: number | null = null): Promise<
   { status: 'reserved'; deadlineAt: number; outputCap: number } |
   { status: 'duplicate'; previous: RequestState } |
   { status: 'conflict' | 'blocked' }
@@ -232,9 +232,10 @@ export async function reserveHarnessRequest(db: HarnessDatabase, id: HarnessRequ
   const row = await db.prepare(`INSERT INTO harness_requests(task_id,generation,request_id,body_hash,output_cap,created_at,deadline_at)
     SELECT task_id,generation,?,?,min(?,total_output_cap-output_tokens-reserved_tokens),?,min(deadline_at,?)
     FROM harness_runs WHERE task_id=? AND generation=? AND status='active' AND deadline_at>? AND model_turns<max_model_turns
+    AND (? IS NULL OR model_turns=?)
     AND ?>0 AND ?<=per_request_cap AND output_tokens+reserved_tokens<total_output_cap AND ?>?
     ON CONFLICT DO NOTHING RETURNING deadline_at,output_cap`)
-    .bind(id.requestId,bodyHash,outputCap,requestStartedAt,requestDeadline,id.taskId,id.generation,now,
+    .bind(id.requestId,bodyHash,outputCap,requestStartedAt,requestDeadline,id.taskId,id.generation,now,expectedModelTurns,expectedModelTurns,
       outputCap,outputCap,requestDeadline,now).first<{ deadline_at: number; output_cap: number }>();
   if (row) return { status: 'reserved', deadlineAt: row.deadline_at, outputCap: row.output_cap };
   const previous = await db.prepare('SELECT body_hash,state,deadline_at FROM harness_requests WHERE task_id=? AND generation=? AND request_id=?')

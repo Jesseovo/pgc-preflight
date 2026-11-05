@@ -8,7 +8,7 @@ import {
   HARNESS_MAX_REQUEST_MS, HARNESS_MODEL_HEADERS, type HarnessFailureCode, type HarnessFinishReason, type HarnessModelPolicy,
 } from './harness-protocol';
 import { tryModelSlot } from './model-capacity';
-import { createModelThrottle, pauseModel, retryAfterMs } from './model-throttle';
+import { createModelThrottle, pauseModel, retryAfterMs, type ModelThrottleDatabase } from './model-throttle';
 import { decryptKey, type ModelConfig, type ModelRuntime } from './settings';
 
 const maxRequestBytes = 24 * 1024 * 1024;
@@ -39,6 +39,7 @@ const invalid = (): never => { throw new GatewayError('invalid_request', 400); }
 
 export interface HarnessGatewayOptions {
   DB: HarnessDatabase;
+  capacityDB?: ModelThrottleDatabase;
   loadConfig: () => Promise<ModelConfig | null>;
   settingsKey: string;
   authorizeRun: (run: HarnessRun) => Promise<boolean>;
@@ -47,6 +48,7 @@ export interface HarnessGatewayOptions {
   waitUntil?: (promise: Promise<unknown>) => void;
   deadlineAt?: number;
   requestIdPrefix?: string;
+  expectedModelTurns?: number;
 }
 
 function errorResponse(code: GatewayErrorCode, status: number, protocol: HarnessModelPolicy['protocol'] | null = null): Response {
@@ -383,6 +385,7 @@ async function isKeyQueueFull(response: Response, signal: AbortSignal): Promise<
 
 export async function handleHarnessModelRequest(request: Request, options: HarnessGatewayOptions): Promise<Response> {
   const db = options.DB;
+  const capacityDB = options.capacityDB ?? db;
   const now = options.now ?? Date.now;
   let protocol: HarnessModelPolicy['protocol'] | null = null;
   let id: HarnessRequestIdentity | undefined;
@@ -424,7 +427,7 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
     const url = providerUrl(runtime);
     const body = parseModelRequest(await requestBody(request, signal), run.model, runtime);
     const bodyHash = await harnessSha256(JSON.stringify(body.body));
-    const reservation = await reserveHarnessRequest(db, id, bodyHash, body.outputCap, now(), requestStartedAt, stageDeadline);
+    const reservation = await reserveHarnessRequest(db, id, bodyHash, body.outputCap, now(), requestStartedAt, stageDeadline, options.expectedModelTurns);
     if (reservation.status !== 'reserved') {
       const code = reservation.status === 'duplicate' ? 'request_duplicate' :
         reservation.status === 'conflict' ? 'request_conflict' : 'budget_or_state';
@@ -437,10 +440,10 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
     clearTimeout(timeout);
     timeout = setTimeout(() => localAbort.abort(), Math.max(0, reservation.deadlineAt - now()));
     const idempotencyKey = `pgc-harness-${await harnessSha256([id.taskId,id.generation,id.requestId].join('\n'))}`;
-    const throttle = createModelThrottle(db, runtime);
+    const throttle = createModelThrottle(capacityDB, runtime);
     while (!slot) {
       signal.throwIfAborted();
-      slot = await tryModelSlot(db, runtime, idempotencyKey, reservation.deadlineAt + 120_000);
+      slot = await tryModelSlot(capacityDB, runtime, idempotencyKey, reservation.deadlineAt + 120_000);
       if (!slot) await pauseModel(5_000, signal);
     }
     const fetcher = options.fetcher ?? fetch;

@@ -53,3 +53,9 @@ node scripts/run-harness-native-probe.mjs \
 `/run` 返回 502 时仍应保存回执。每个项目为 true、false 或 null，分别表示满足、观测不符或证据不足。HTTP/HTTPS 仅认私有拦截器返回的固定标记。TLS 或连接失败保留 null。当前探针没有独立的非 HTTP 外网 canary，`nonHttpEgressDenied` 保留 null。无真实供应商请求，不能证明模型兼容性。非零 UID 与 capability 位分开判定。Cloudflare 对 `durable_object` 调度下的进程能力有单独限制说明。[Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/) · [出站规则](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)
 
 只保存必要的研究回执和镜像摘要。确认实例和 Alarm 已清理后撤销研究 Secret、关闭研究路由并删除临时 Worker。不要将本回执用于 `HARNESS_RELEASE`。
+
+## 独立的真实渠道研究 broker
+
+`server/harness-provider-research.ts` 是单独的服务端模块，默认 Worker 和上述合成流探针均不加载它。候选服务必须绑定独立研究 D1 及现有生产容量库，通过服务端读取现行配置，使用独立的 256 位 HMAC Secret。容器只收到该研究任务的租约。研究账本和遥测留在研究库，只有既有模型限流及槽位操作使用生产容量库。
+
+可信研究 Runner 以签名 `GET /api/__harness-provider-research/plan` 取得固定任务的注册计划，在研究库注册原样的 snapshot 和已锁模型。每次 `POST /api/__harness-provider-research/model` 以相同 HMAC 协议签署路径、方法、任务、代次、请求 ID、时间、原始请求字节哈希及租约。研究配置中的 matcher 必须校验冻结的系统文本、用户文本、图像字节及完整工具定义。Anthropic 工具续轮还须校验对应的模型历史摘要与工具结果。摘要表由 `scripts/harness-provider-research-ledger.sql` 在研究库创建。宽松 matcher 不具备部署条件。即使合成夹具通过，也须独立完成发布验收。
