@@ -28,7 +28,7 @@ function setup(executor='agent'){
   sqlite.prepare("INSERT INTO forge_agents(id,owner_id,session_version,token_hash,pairing_hash,name,expires_at,created_at) VALUES('device','owner',1,'fixture','fixture','Fixture',?,'now')").run(new Date(Date.now()+86400000).toISOString());
   sqlite.exec("INSERT INTO topics(id,owner_id,batch,subject,medium,gesture,structure,mood,created_at,updated_at,brief_md) VALUES(1,'owner','fixture','fixture','fixture','fixture','fixture','fixture','now','now','Complete brief')");
   const topic={id:1,data:{title:'Fixture',logline:'Fixture loop',twist:'Fixture trade-off',art_direction:'Fixture art'},brief_md:'Complete brief',requirements:'Keep the goal'};
-  const snapshot={topic,revision:0,policy_revision:0,heads:{},cfg:{},creative_version:2};
+  const snapshot={topic,revision:0,policy_revision:0,heads:{},cfg:{},creative_version:2,platform_creation_policy:{version:1,effort:'high',maxTokens:64000}};
   const id=crypto.randomUUID(),now=new Date().toISOString();
   sqlite.prepare("INSERT INTO forge_tasks(id,kind,scope,payload,status,owner_id,executor,input_snapshot,created_at,updated_at,creative_version,device_id,receipt_hash) VALUES(?,'game','owner:game:1','{\"type\":\"game\",\"id\":1}',?,'owner',?,?,?,?,2,?,?)")
     .run(id,executor==='agent'?'running':'queued',executor,JSON.stringify(snapshot),now,now,executor==='agent'?'device':null,executor==='agent'?'receipt-hash':null);
@@ -60,6 +60,7 @@ function modelOutput(build:any,polish:any){
     await runtime.generation?.onStart();
     const result=runtime.generation?.id.endsWith(':build')?build:polish;
     expect(request.maxAttempts).toBe(1);
+    expect(request.maxTokens).toBe(64000);
     expect(request.requiredProfile).toBe('opus');
     expect(request.outputEffort).toBe('high');
     expect(request.validate?.(result)).toEqual([]);
@@ -163,6 +164,20 @@ describe('staged creation evidence and publication',()=>{
     expect(records.find((row:any)=>row.stage==='polish').self_check).toMatchObject({judgedInputHash:await digest(html('build')),outputHash:await digest(html('polish'))});
     await creationPipelineAlarm(s.state,s.env,s.id);
     expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps an already queued pre-upgrade task at its original output ceiling',async()=>{
+    const s=setup('platform'),snapshot=JSON.parse(s.row().input_snapshot);
+    delete snapshot.platform_creation_policy;
+    s.sqlite.prepare('UPDATE forge_tasks SET input_snapshot=? WHERE id=?').run(JSON.stringify(snapshot),s.id);
+    vi.mocked(complete).mockImplementationOnce(async(_runtime,_cfg,request)=>{
+      expect(request.maxTokens).toBe(32768);
+      expect(request.outputEffort).toBe('high');
+      return output('build');
+    });
+    await creationPipelineAlarm(s.state,s.env,s.id);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(s.row().status).toBe('running');
   });
 
   it('rejects vision-disabled profiles and waits only 24 hours for a model slot',async()=>{

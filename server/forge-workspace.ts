@@ -31,7 +31,7 @@ export async function inputSnapshot(DB:any,owner:string,job:any){
   const tagGames=job.type==='tag'?games.filter((g:any)=>g.owner_id===owner&&(!g.gesture||!g.medium)).slice(0,50):[];
   const latestPolicy=(await DB.prepare('SELECT revision FROM workspace_policy_revision WHERE id=1').first()).revision;
   const latestTopic=topic?await DB.prepare('SELECT content_revision FROM topics WHERE id=? AND owner_id=?').bind(topic.id,owner).first():null;
-  if(policy_revision===latestPolicy&&(!topic||latestTopic?.content_revision===topic.content_revision))return {creative_version:job.creative_version===2||topic?.creative_version===2?2:1,creative_guidance:job.creative_version===2||topic?.creative_version===2?CREATIVE_GUIDANCE_VERSION:null,topic,revision:topic?.content_revision||0,policy_revision,heads,cfg,games,prior,vocab,tagGames};
+  if(policy_revision===latestPolicy&&(!topic||latestTopic?.content_revision===topic.content_revision))return {creative_version:job.creative_version===2||topic?.creative_version===2?2:1,creative_guidance:job.creative_version===2||topic?.creative_version===2?CREATIVE_GUIDANCE_VERSION:null,...(job.type==='game'&&(job.creative_version===2||topic?.creative_version===2)?{platform_creation_policy:{version:1,effort:'high',maxTokens:64000}}:{}),topic,revision:topic?.content_revision||0,policy_revision,heads,cfg,games,prior,vocab,tagGames};
   }
   throw problem('创作材料正在更新，请稍后重新领取。',409);
 }
