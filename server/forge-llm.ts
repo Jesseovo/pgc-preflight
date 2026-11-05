@@ -51,7 +51,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;capacityReserved?:boolean;onUncertain?():void;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;capacityReserved?:boolean;onUncertain?():void;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; strictJson?: boolean; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (req.requiredProfile && (!active || active.profile.protocol !== 'anthropic' || !/^claude-opus-5-5$/i.test(active.profile.model))) throw new LLMError('游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。', 409);
@@ -115,7 +115,7 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       try {
         const text = await transport(attemptMessages);
         if (!req.schema) return text;
-        const parsed = parseJson(text),value=req.normalize?req.normalize(parsed):parsed;
+        const parsed = req.strictJson ? parseRootJson(text) : parseJson(text),value=req.normalize?req.normalize(parsed):parsed;
         const errors = req.validate?.(value) || [];
         if (errors.length){
           const known=new Set(['report','result','data','final_report','review','final','scores','aes','ease','play','score_reasons','uncertainties','verdict','reviewer_comment','fix_prompt','strengths','issues','properties','type','required','verification','$schema']);
@@ -126,12 +126,14 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
       } catch (error) {
         lastError = error;
         const message = String(error instanceof Error ? error.message : error);
-        const parseFailure = !env.generation && /模型返回的不是合法 JSON/.test(message);
-        const outputFailure = !env.generation && error instanceof ModelOutputError && error.kind !== 'incomplete';
-        if(env.DB&&(parseFailure||outputFailure)){
+        const invalidJson = /模型返回的不是合法 JSON/.test(message);
+        const invalidOutput = error instanceof ModelOutputError && error.kind !== 'incomplete';
+        const parseFailure = !env.generation && invalidJson;
+        const outputFailure = !env.generation && invalidOutput;
+        if(env.DB&&(invalidJson||invalidOutput)){
           // A completed HTTP stream can still be an unusable report. Log only
           // structural field names, never source, provider output or reasoning.
-          const detail=error instanceof ModelOutputError&&error.kind==='format'?message.slice(0,250):parseFailure?'模型返回的不是合法 JSON。':`模型输出未通过校验（${(error as ModelOutputError).kind}）。`;
+          const detail=error instanceof ModelOutputError&&error.kind==='format'?message.slice(0,250):invalidJson?'模型返回的不是合法 JSON。':`模型输出未通过校验（${(error as ModelOutputError).kind}）。`;
           await env.DB.prepare("UPDATE model_runs SET status='error',error=? WHERE id=?").bind(detail,runId).run().catch(()=>{});
         }
         // All HTTP retry decisions belong to transport. A second retry loop
@@ -161,6 +163,17 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
   } catch (error) {
     if (error instanceof LLMError) throw error;
     throw new LLMError(error instanceof Error ? error.message : '模型调用失败。');
+  }
+}
+
+// A game contains JavaScript object literals. Never treat a nested `{}` in
+// malformed JSON or raw HTML as the complete structured creation result.
+export function parseRootJson(text: string): any {
+  const cleaned = String(text).trim();
+  try { return JSON.parse(cleaned); }
+  catch {
+    const shape = cleaned.startsWith('{') ? 'object-like' : cleaned.startsWith('<') ? 'markup' : cleaned.startsWith('```') ? 'fenced' : 'other';
+    throw new LLMError(`模型返回的不是合法 JSON 根对象（${shape}，${cleaned.length} 字符）；没有提取内嵌代码或自动重试。`, 502);
   }
 }
 

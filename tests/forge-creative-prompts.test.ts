@@ -73,6 +73,24 @@ describe('新版创作材料',()=>{
     expect(()=>gameStageUser('repair',{topic,brief,html,capture:{...capture,shots:[...shots.slice(1),shots[1]]}})).toThrow('四张');
   });
 
+  it.each([
+    ['build',GAME_BUILD_SCHEMA],
+    ['polish',GAME_POLISH_SCHEMA],
+    ['repair',GAME_REPAIR_SCHEMA],
+  ] as const)('%s 的输出使用准确顶层字段和可无损解码的 HTML 字符串', (stage,schema)=>{
+    const system=gameStageSystem(stage);
+    const keyList=system.match(/顶层字段恰好是 (.*?)。/)?.[1];
+    expect(keyList?.split('、').map(key=>JSON.parse(key))).toEqual(schema.required);
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties.html).toMatchObject({type:'string'});
+    const encodedExample=system.split('这段字符串只演示转义。\n')[1]?.split('\n')[0];
+    expect(JSON.parse(encodedExample)).toBe('<canvas id="game"></canvas>\n<script>\tconst pattern = /\\d+/;</script>');
+    expect(system).toContain('不要在对象外输出 Markdown 代码围栏');
+    expect(system).toContain('HTML 中不要嵌入 pgc:check');
+    const input=gameStageUser(stage,{topic,brief,html,capture});
+    expect(input.at(-1)).toMatchObject({type:'text',text:expect.stringContaining('正确转义的 "html" 字符串')});
+  });
+
   it('自检作为独立结构，返工不得要求额外返工',()=>{
     expect(GAME_BUILD_SCHEMA.required).toEqual(['html','requirements','decisions','coreChanges']);
     expect(GAME_POLISH_SCHEMA.properties.selfCheck.required).toContain('findings');

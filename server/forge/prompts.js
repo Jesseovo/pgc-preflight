@@ -278,14 +278,14 @@ export function extractGameAssetScript(html) {
   return String(html || "").match(/<script\b[^>]*\s+id\s*=\s*(["'])game-assets\1(?=\s|>)[^>]*>([\s\S]*?)<\/script\s*>/i)?.[2] || "";
 }
 
-const GAME_STAGE_COMMON = `你是 PGC 游戏制作者。交付完整的单文件可玩 HTML，依照锁定的完整 F1–F10 策划（包括后期节奏、高潮、计分、文案和音频），遵守最新明确要求，且沿用锁定样板图和原样复用已有 <script id="game-assets"> 的内容。
+const GAME_STAGE_COMMON = `你是 PGC 游戏制作者。制作完整的单文件可玩 HTML，以 JSON 的 html 字段交付。依照锁定的完整 F1–F10 策划（包括后期节奏、高潮、计分、文案和音频），遵守最新明确要求，且沿用锁定样板图和原样复用已有 <script id="game-assets"> 的内容。
 ${CREATIVE_DIRECTION_V2}
 ${CREATIVE_MATERIALS}
 
 - 540×960 舞台完整显示，使用 getBoundingClientRect() 换算 Pointer 坐标；触摸事件不得滚动页面，处理拖动边界和 pointercancel。独立文件和受限 iframe 中均可运行。阶段提示不挡视线；状态和读数可辨。
 - 策划是设计依据。缺项的补充决定列入 decisions，写明补什么、理由；记录数值调整的原值、新值和理由。核心规则、操作、胜负、媒介或音乐风格的改动必须写入 coreChanges，写清原约定、改动和理由；没有授权时保持核心设计，把未解决冲突写为待确认。没有简报时依据选题和用户要求补齐，明确记录补充，不能假称已有策划。
 - requirements 逐条列 {id,text,status,evidence?,reason?}：沿用制作需求 ID，没有现成 ID 时用 R1、R2…稳定编号；状态为 implemented / unverified / deferred。implemented 表示代码实现，不声称运行验证；evidence 只填源码或实际采集依据。未验证和未完成分别写原因。不要漏掉设计后段。精修或定向修复保留前一阶段全部需求 ID，可以根据证据更新状态。coreChanges 累积保留此前每条原文，可追加新条目。
-- 只输出一个 JSON 对象。html 是完整的 <!doctype html> … </html> 文件；JSON 的其他字段单独保存，不能写进 HTML 注释、脚本、DOM 或可访问状态。严禁嵌入 pgc:check、自评分、人工反馈原文、内部证据或报告。没有行数或极简首版限制。`;
+- 完整实现已确认的玩法内容。没有行数或极简首版限制。`;
 
 const GAME_EVIDENCE_BOUNDARY = `【证据边界】
 - 视口图实际送达时，使用图像和动作 ID 引用，说明现象、触发条件、可能根因、最小改动和如何复测。若模型不支持视觉而未送图，只能根据实际运行记录和源码，不能引用未看到的图或宣称已验证外观。区分已确认的问题、体验建议和待验证事项。只改源码可以说明改了哪里，不能声称在输出的新 HTML 上已复测。
@@ -296,13 +296,16 @@ const GAME_EVIDENCE_BOUNDARY = `【证据边界】
 /** @param {"build"|"polish"|"repair"} stage */
 export function gameStageSystem(stage) {
   if (stage === "build") return `${GAME_STAGE_COMMON}
-本阶段制作可运行版本：完整打通规则、操作、阶段推进、胜负、风险奖励、得分、重开、BGM、音效和存储容错。集中维护调参区；优先清晰可验证的实现，不在此阶段虚报试听、试玩或性能。输出 {html,requirements,decisions,coreChanges}。`;
+本阶段制作可运行版本：完整打通规则、操作、阶段推进、胜负、风险奖励、得分、重开、BGM、音效和存储容错。集中维护调参区；优先清晰可验证的实现，不在此阶段虚报试听、试玩或性能。
+${gameStageFormat(stage)}`;
   if (stage === "polish") return `${GAME_STAGE_COMMON}
-本阶段精修：从上一版 HTML 和实际采集出发，保持玩法、输入、胜负和资产库，深化媒介纹理、轮廓、待机和状态反馈、HUD、混音与随进度变化的音色。把能从输入复现的基础问题一并最小修正；整理保留的要求与待复测事项。输出 {html,requirements,decisions,coreChanges,selfCheck}。
-${GAME_EVIDENCE_BOUNDARY}`;
+本阶段精修：从上一版 HTML 和实际采集出发，保持玩法、输入、胜负和资产库，深化媒介纹理、轮廓、待机和状态反馈、HUD、混音与随进度变化的音色。把能从输入复现的基础问题一并最小修正；整理保留的要求与待复测事项。
+${GAME_EVIDENCE_BOUNDARY}
+${gameStageFormat(stage)}`;
   if (stage === "repair") return `${GAME_STAGE_COMMON}
-本阶段只处理已指出的、可从最新采集复现的非核心问题。先用采集确认触发和根因，再做最小修复；不能证实就保持现状并标记待验证。保留已经正常的设计和资产。输出 {html,requirements,decisions,coreChanges,selfCheck}；requestRepair 必须为 false，不继续自动返工。
-${GAME_EVIDENCE_BOUNDARY}`;
+本阶段只处理已指出的、可从最新采集复现的非核心问题。先用采集确认触发和根因，再做最小修复；不能证实就保持现状并标记待验证。保留已经正常的设计和资产。requestRepair 必须为 false，不继续自动返工。
+${GAME_EVIDENCE_BOUNDARY}
+${gameStageFormat(stage)}`;
   throw new Error("未知的游戏制作阶段。");
 }
 
@@ -311,7 +314,7 @@ const listOf = (items) => ({ type: "array", items });
 const closed = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
 const enumStr = (...values) => ({ type: "string", enum: values });
 const productionFields = {
-  html: str,
+  html: { ...str, description: "完整单文件 HTML 原文，作为顶层 JSON 字符串编码一次，含 <!doctype html> 和 </html>。其余交付字段留在 JSON 根对象。" },
   requirements: listOf(closed({ id: str, text: str, status: enumStr("implemented", "unverified", "deferred"), evidence: str, reason: str }, ["id", "text", "status"])),
   decisions: listOf(str),
   coreChanges: listOf(str),
@@ -326,6 +329,20 @@ const selfCheckFields = (requestRepair) => closed({
 export const GAME_BUILD_SCHEMA = closed(productionFields);
 export const GAME_POLISH_SCHEMA = closed({ ...productionFields, selfCheck: selfCheckFields(bool) });
 export const GAME_REPAIR_SCHEMA = closed({ ...productionFields, selfCheck: selfCheckFields({ ...bool, enum: [false] }) });
+
+const htmlEscapeExample = '<canvas id="game"></canvas>\n<script>\tconst pattern = /\\d+/;</script>';
+
+/** @param {"build"|"polish"|"repair"} stage */
+function gameStageFormat(stage) {
+  const keys = {build: GAME_BUILD_SCHEMA, polish: GAME_POLISH_SCHEMA, repair: GAME_REPAIR_SCHEMA}[stage].required;
+  return `【交付格式】
+回复的第一个字符是 {，最后一个字符是 }。只输出一个合法的 JSON 根对象，顶层字段恰好是 ${keys.map(key => JSON.stringify(key)).join("、")}。不要在对象外输出 Markdown 代码围栏、说明或 HTML，也不要使用 result 或 data 包装。
+把完整的 <!doctype html> … </html> 交付为顶层 "html" 字段的一个 JSON 字符串。按 JSON.stringify 的转义规则写入其中的双引号、反斜线、换行和制表符。JSON 解析一次后，html 的内容须是原始 HTML，包含原始脚本，不再需要解码。这段字符串只演示转义。
+${JSON.stringify(htmlEscapeExample)}
+其余顶层字段单独保存。不能写进 HTML 注释、脚本、DOM 或可访问状态。HTML 中不要嵌入 pgc:check、自评分、人工反馈原文、内部证据或报告。只记录实际实现、决定和已获得的证据。`;
+}
+
+const gameOutputReminder = '请按系统给定的顶层字段返回单个 JSON 对象。完整 HTML 只放在正确转义的 "html" 字符串中。';
 
 /**
  * @param {"build"|"polish"|"repair"} stage
@@ -345,7 +362,7 @@ export function gameStageUser(stage, input) {
     parts.push({ type: "text", text: "【锁定样板图的图像附件】" });
     parts.push({ type: "image", data: styleImage });
   }
-  if (stage === "build") return parts;
+  if (stage === "build") return [...parts, { type: "text", text: gameOutputReminder }];
   if (stage !== "polish" && stage !== "repair") throw new Error("未知的游戏制作阶段。");
   const shots = capture?.shots;
   if (!html || !Array.isArray(shots) || shots.length !== 4 || new Set(shots.map(shot => shot?.id)).size !== shots.length ||
@@ -357,6 +374,7 @@ export function gameStageUser(stage, input) {
     parts.push({ type: "text", text: `原图证据 ID：${id}；${label}；动作：${(actionRefs || []).join("、") || "无"}` });
     parts.push({ type: "image", data });
   }
+  parts.push({ type: "text", text: gameOutputReminder });
   return parts;
 }
 

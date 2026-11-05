@@ -192,6 +192,17 @@ describe('后台创作的持久任务',()=>{
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it('持久制作的结构错误计为失败，保留一次调用且不记录原始源码',async()=>{
+    const s=await setup();
+    const fetcher=vi.fn(async()=>response('<!doctype html><script>const secret = {}; /* PRIVATE_SOURCE */</script>'));
+    vi.stubGlobal('fetch',fetcher);
+    const runtime={...s.env,generation:{id:'format-fixture',deadline:Date.now()+60000,onStart:async()=>{},onWait:async()=>{}}};
+    await expect(complete(runtime,{}, {system:'s',user:'u',purpose:'game',schema:{type:'object'},strictJson:true,maxAttempts:1})).rejects.toThrow('不是合法 JSON 根对象');
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const run=s.sqlite.prepare('SELECT status,error FROM model_runs ORDER BY created_at DESC LIMIT 1').get() as any;
+    expect(run.status).toBe('error');expect(run.error).toContain('不是合法 JSON');expect(run.error).not.toContain('PRIVATE_SOURCE');
+  });
+
   it('非流式简报超过五分钟仍可完成，不误触流式空闲超时',async()=>{
     const s=await setup();vi.useFakeTimers();
     const row=await enqueueForgeTask(s.env,{type:'brief',id:9});

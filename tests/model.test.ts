@@ -1,6 +1,6 @@
 import {afterEach,describe,expect,it,vi} from 'vitest';
 import {modelTransport} from '../server/model';
-import {parseJson} from '../server/forge-llm';
+import {parseJson,parseRootJson} from '../server/forge-llm';
 
 afterEach(()=>{vi.unstubAllGlobals();vi.useRealTimers();});
 
@@ -59,6 +59,15 @@ describe('模型传输',()=>{
     expect(value.items[0].title).toBe('A {B}');
   });
 
+  it('制作只接受完整 JSON，不把 HTML 内的 JS 空对象误认成阶段结果',()=>{
+    const value={html:'<!doctype html><script>const x = {}; const s = "quoted";</script>',requirements:[],decisions:[],coreChanges:[]};
+    expect(parseRootJson(JSON.stringify(value))).toEqual(value);
+    for(const source of [value.html,'{"html":"<script>const x = {};\nPRIVATE_SOURCE</script>"}',JSON.stringify(value)+' extra']){
+      expect(()=>parseRootJson(source)).toThrow('不是合法 JSON 根对象');
+      try{parseRootJson(source);}catch(error){expect(String(error)).not.toContain('PRIVATE_SOURCE');}
+    }
+  });
+
   it('Opus 制作的 32k 预算不会被传输层截成 24k，其他模型仍保留原上限',async()=>{
     const budgets:number[]=[];
     vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init?:RequestInit)=>{
@@ -83,6 +92,20 @@ describe('模型传输',()=>{
     await modelTransport({...opus,maxOutputTokens:16000},{maxTokens:64000})([]);
     expect(bodies.map(b=>b.max_tokens)).toEqual([64000,64000,16000]);
     expect(bodies[0]).toMatchObject({thinking:{type:'adaptive'},output_config:{effort:'medium'}});
+  });
+
+  it('制作阶段的 Opus low 优先于共享配置 high，其他用途保持原强度',async()=>{
+    const bodies:any[]=[],metrics:any[]=[];
+    vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init?:RequestInit)=>{
+      bodies.push(JSON.parse(String(init?.body)));
+      return Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'});
+    }));
+    const opus={...config,protocol:'anthropic' as const,model:'claude-opus-5-5',effort:'high' as const};
+    await modelTransport(opus,{purpose:'game',outputEffort:'low',maxTokens:32768,onMetrics:async value=>{metrics.push(value);}})([]);
+    await modelTransport(opus,{purpose:'review',outputEffort:'low'})([]);
+    expect(bodies[0]).toMatchObject({max_tokens:32768,thinking:{type:'adaptive'},output_config:{effort:'low'}});
+    expect(metrics[0].effort).toBe('low');
+    expect(bodies[1].output_config.effort).toBe('high');
   });
 
   it('修复尾随逗号时保留字符串里的逗号、括号和转义引号',()=>{
