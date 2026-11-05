@@ -38,6 +38,24 @@ const json = (value: unknown, status = 200, headers?: Record<string, string>) =>
 const wait = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 const encoder = new TextEncoder();
 
+async function hasEmptyBody(request: Request): Promise<boolean> {
+  const body = request.body;
+  if (!body) return true;
+  if (body.locked) return false;
+  // Workerd can represent a bodyless POST as a stream that ends on the first read.
+  const reader = body.getReader();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 250); });
+    return await Promise.race([reader.read().then(({ done }) => done, () => false), deadline]);
+  } finally {
+    clearTimeout(timer);
+    // Reject promptly even when cancellation of a stalled input cannot finish.
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 function secret(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(32)), byte => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -77,7 +95,9 @@ export default {
     if (!matches(authorization, 'Bearer ' + env.HARNESS_RESEARCH_TOKEN)) return reject('authorization_mismatch');
     const action = url.pathname;
     const method = action === '/status' ? 'GET' : 'POST';
-    if (url.search || request.method !== method || request.body || !['/run', '/arm-timeout', '/status'].includes(action)) return json({ error: 'route_denied' }, 404, diagnostics);
+    if (url.search || request.method !== method || !['/run', '/arm-timeout', '/status'].includes(action) || !await hasEmptyBody(request)) {
+      return json({ error: 'route_denied' }, 404, diagnostics);
+    }
     const response = await env.NATIVE_PROBE.get(env.NATIVE_PROBE.idFromName(probeName)).fetch(new Request(internal + action, { method }));
     const headers = new Headers(response.headers);
     headers.delete('x-pgc-native-probe-stage');
@@ -195,7 +215,7 @@ export class NativeProbeRunner {
       return json({ ok: true });
     }
     if (pathname === '/status' && request.method === 'GET') return json(await storage.get('receipt') ?? { state: 'idle' });
-    if (request.method !== 'POST' || request.body || !['/run', '/arm-timeout'].includes(pathname)) return deny();
+    if (request.method !== 'POST' || !['/run', '/arm-timeout'].includes(pathname) || !await hasEmptyBody(request)) return deny();
     if (this.ctx.container?.images?.ccb !== this.env.RESEARCH_IMAGE) return json({ error: 'image_mismatch' }, 409);
     const action: Action = pathname === '/run' ? 'run' : 'arm-timeout';
     const active: Active = {

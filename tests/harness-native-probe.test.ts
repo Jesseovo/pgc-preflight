@@ -14,6 +14,17 @@ const scope = { taskId: 'task-a', generation: 'generation-a', lease: 'd'.repeat(
 const endpoint = 'http://pgc-harness.internal/v1/messages';
 const internal = 'http://pgc-native-probe.internal';
 const request = (url: string, headers: Record<string, string> = {}) => new Request(url, { method: 'POST', headers, body: '{}' });
+function streamPost(url: string, stream: 'empty' | 'data' | 'stalled') {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (stream === 'empty') controller.close();
+      if (stream === 'data') controller.enqueue(new Uint8Array([1]));
+    },
+    cancel: () => new Promise(() => {}),
+  });
+  const options = { method: 'POST', headers: { Authorization: 'Bearer ' + token }, body, duplex: 'half' };
+  return new Request(url, options);
+}
 
 describe('native harness research boundary', () => {
   it('denies an explicit wrong task, generation, bearer, key and any non-gateway route', () => {
@@ -79,6 +90,20 @@ describe('native harness research boundary', () => {
     expect(notified).toHaveBeenCalledTimes(1);
     await cli.body?.cancel();
   });
+
+  it('dispatches a genuinely empty stream, and refuses data or a stalled body before dispatch', async () => {
+    const fetch = vi.fn(async (_request: Request) => new Response('fixture'));
+    const env = { HARNESS_RESEARCH_TOKEN: token, RESEARCH_IMAGE: image, NATIVE_PROBE: { idFromName: (name: string) => name, get: () => ({ fetch }) } };
+    const url = 'https://research.invalid/run';
+    const denied = await Promise.all((['data', 'stalled'] as const).map(stream =>
+      worker.fetch(streamPost(url, stream), env)));
+    expect(denied.map(response => response.status)).toEqual([404, 404]);
+    expect(fetch).not.toHaveBeenCalled();
+    const empty = streamPost(url, 'empty');
+    expect(empty.body).not.toBeNull();
+    expect((await worker.fetch(empty, env)).status).toBe(200);
+    expect(fetch.mock.calls[0][0].body).toBeNull();
+  });
 });
 
 function setup({ privileged = false } = {}) {
@@ -134,6 +159,19 @@ function setup({ privileged = false } = {}) {
 }
 
 describe('native probe orchestration with scripted container', () => {
+  it('enforces empty stream handling again on the Durable Object boundary', async () => {
+    const s = setup();
+    const url = internal + '/arm-timeout';
+    const denied = await Promise.all((['data', 'stalled'] as const).map(stream =>
+      s.runner.fetch(streamPost(url, stream))));
+    expect(denied.map(response => response.status)).toEqual([403, 403]);
+    expect(s.container.start).not.toHaveBeenCalled();
+    expect(s.getAlarm()).toBeNull();
+    expect((await s.runner.fetch(streamPost(url, 'empty'))).status).toBe(202);
+    expect(s.container.start).toHaveBeenCalledOnce();
+    await s.runner.alarm();
+  });
+
   it('requires capability evidence, redacts ephemeral credentials, and destroys the instance', async () => {
     const s = setup({ privileged: true });
     const response = await s.post('/run');
