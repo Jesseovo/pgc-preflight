@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createHarness } from '../harness/runtime.mjs';
+import { assertContainerIsolation, createHarness } from '../harness/runtime.mjs';
 import { canonical, fileEntry, sha256 } from '../harness/envelope.mjs';
 import { inspectStream } from '../harness/model-bridge.mjs';
 import { validateCreationOutput } from '../server/forge-creation-pipeline';
@@ -39,6 +39,17 @@ await forbidden(() => readFile('/pgc-forbidden-host-fixture'), 'ERR_ACCESS_DENIE
 await forbidden(() => writeFile('/pgc-forbidden-host-fixture', 'not allowed'), 'ERR_ACCESS_DENIED');
 await forbidden(() => spawnSync(process.execPath, ['--version']), 'ERR_ACCESS_DENIED');
 await forbidden(() => new Socket().connect({ host: '127.0.0.1', port: 1 }), 'PGC_CCB_NETWORK_DENIED');
+if (process.permission.has('fs.read', '/proc/' + process.ppid + '/environ')) process.exit(21);
+const allowedPort = Number(new URL(api).port);
+let portReads = 0;
+const socket = new Socket();
+await new Promise((resolve, reject) => {
+  socket.once('error', reject);
+  socket.connect({ host: '127.0.0.1', get port() { return ++portReads === 1 ? allowedPort : 1; } }, () => {
+    if (socket.remotePort === allowedPort) resolve();
+    else reject(new Error('Unexpected destination'));
+  });
+}).finally(() => socket.destroy());
 if ((await fetch(api + '/v1/messages/count_tokens', { method: 'POST', body: '{}' })).status !== 403 ||
     (await fetch(server.url, { method: 'POST', body: '{}' })).status !== 403) process.exit(13);
 let rpc = 0;
@@ -122,6 +133,29 @@ const syntheticSSE = (protocol: string, reason: string, tokens: number) => proto
   : `data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } })}\n\ndata: {"type":"message_stop"}\n\n`;
 
 type Gateway = (request: IncomingMessage, response: ServerResponse, body: any) => void;
+
+describe('Linux container startup verification', () => {
+  const capabilityFields = ['CapEff', 'CapPrm', 'CapInh', 'CapAmb', 'CapBnd'];
+  const status = [
+    'Uid:\t1000\t1000\t1000\t1000',
+    ...capabilityFields.map(field => `${field}:\t0000000000000000`),
+    'NoNewPrivs:\t1',
+  ].join('\n');
+
+  it('requires all five masks empty, no_new_privs, and nonzero real/effective/saved/filesystem UIDs', () => {
+    expect(() => assertContainerIsolation(status)).not.toThrow();
+    for (const field of capabilityFields) {
+      expect(() => assertContainerIsolation(status.replace(
+        `${field}:\t0000000000000000`, `${field}:\t0000000000000100`,
+      ))).toThrow('Container process isolation is not active');
+    }
+    for (const uids of ['0 1000 1000 1000', '1000 0 1000 1000', '1000 1000 0 1000', '1000 1000 1000 0']) {
+      expect(() => assertContainerIsolation(status.replace(/^Uid:[^\n]+/, `Uid: ${uids}`))).toThrow();
+    }
+    expect(() => assertContainerIsolation(status.replace('NoNewPrivs:\t1', 'NoNewPrivs:\t0'))).toThrow();
+    expect(() => assertContainerIsolation(status.replace(/^CapBnd:[^\n]+$/m, ''))).toThrow();
+  });
+});
 
 describe('CCB Node runtime boundary', () => {
   let directory: string;

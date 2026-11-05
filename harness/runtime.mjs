@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
@@ -298,8 +299,18 @@ export function createHarness({ controlToken, gatewayURL, fixtureCli, smokeCli, 
   };
 }
 
+export function assertContainerIsolation(status) {
+  const uids = /^Uid:[ \t]*(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]+(\d+)[ \t]*$/m.exec(status)?.slice(1);
+  if (!uids || uids.some(uid => Number(uid) === 0) || !/^NoNewPrivs:[ \t]*1[ \t]*$/m.test(status) ||
+      !['CapEff', 'CapPrm', 'CapInh', 'CapAmb', 'CapBnd'].every(field =>
+        new RegExp(`^${field}:[ \\t]*0+[ \\t]*$`, 'm').test(status))) {
+    throw new Error('Container process isolation is not active');
+  }
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
+    assertContainerIsolation(readFileSync('/proc/self/status', 'utf8'));
     const runtime = createHarness({
       controlToken: process.env.PGC_HARNESS_CONTROL_TOKEN,
       gatewayURL: process.env.PGC_HARNESS_GATEWAY_URL,

@@ -3,7 +3,7 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { awaitIdleResearchWorker, observeResearchAction } from './harness-native-probe-run-state.mjs';
+import { awaitIdleResearchWorker, observeResearchAction, researchResponseDiagnostic } from './harness-native-probe-run-state.mjs';
 
 // A fresh research bearer exists only in this process and the research Worker
 // Secret. Never pass it in argv, return it, or write it into a local receipt.
@@ -56,19 +56,21 @@ async function configureSecret() {
 }
 async function request(path, method, timeoutMs) {
   let httpStatus = null;
+  let diagnostic;
   try {
     const response = await fetch(new URL(path, url), { method, redirect: 'manual',
       headers: { Authorization: 'Bearer ' + bearer }, signal: AbortSignal.timeout(timeoutMs) });
     httpStatus = response.status;
+    diagnostic = researchResponseDiagnostic(response.headers);
     const chunks = []; let bytes = 0;
     for await (const chunk of response.body ?? []) {
       bytes += chunk.byteLength;
       if (bytes > 512_000) throw new Error('Response exceeds research limit');
       chunks.push(chunk);
     }
-    return { httpStatus, receipt: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+    return { httpStatus, diagnostic, receipt: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
   } catch {
-    return { httpStatus, receipt: null, executionState: 'unknown' };
+    return { httpStatus, diagnostic, receipt: null, executionState: 'unknown' };
   }
 }
 await save();
@@ -77,7 +79,7 @@ try {
   report.secretConfigured = true; await save();
   report.preflight = await awaitIdleResearchWorker(request); await save();
   if (report.preflight.outcome === 'ready') {
-    console.log('Research Worker confirmed idle; starting one fixed synthetic run.');
+    console.log('Research Worker confirmed idle; submitting the fixed synthetic run.');
     report.network = await observeResearchAction(request, '/run', 'run'); await save();
     if (report.network.receipt?.action === 'run' && report.network.receipt.checks?.containerDestroyed === true) {
       console.log('First container closed; checking alarm cleanup.');

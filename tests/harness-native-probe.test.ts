@@ -38,13 +38,28 @@ describe('native harness research boundary', () => {
     const call = (path: string, method: string, auth = token, body?: string) => worker.fetch(new Request('https://research.invalid' + path, {
       method, headers: { Authorization: 'Bearer ' + auth }, body,
     }), env);
-    expect((await call('/run', 'POST', 'bad')).status).toBe(401);
+    const missing = new Request('https://research.invalid/run', { method: 'POST' });
+    const denials = [
+      [await call('/run', 'POST', 'bad', '{}'), 'authorization_mismatch'],
+      [await worker.fetch(missing, env), 'authorization_missing'],
+      [await worker.fetch(missing, { ...env, HARNESS_RESEARCH_TOKEN: '' }), 'probe_unconfigured'],
+    ] as const;
+    for (const [denied, error] of denials) {
+      expect(denied.status).toBe(401);
+      expect(denied.headers.get('x-pgc-native-probe-version')).toBe('auth-v1');
+      expect(denied.headers.get('x-pgc-native-probe-method')).toBe('POST');
+      expect(denied.headers.get('x-pgc-native-probe-stage')).toBe('pre-dispatch-auth');
+      expect(await denied.json()).toEqual({ error });
+    }
     expect((await call('/observed', 'POST')).status).toBe(404);
     expect((await call('/run?url=https://else.invalid', 'POST')).status).toBe(404);
     expect((await call('/run', 'POST', token, '{}')).status).toBe(404);
     expect((await call('/status', 'POST')).status).toBe(404);
     expect(fetch).not.toHaveBeenCalled();
-    expect((await call('/run', 'POST')).status).toBe(200);
+    const accepted = await call('/run', 'POST');
+    expect(accepted.status).toBe(200);
+    expect(accepted.headers.get('x-pgc-native-probe-method')).toBe('POST');
+    expect(accepted.headers.get('x-pgc-native-probe-stage')).toBeNull();
     const captured = (fetch.mock.calls as unknown as [[Request]])[0][0];
     expect(captured.url).toBe(internal + '/run');
     expect(captured.headers.get('authorization')).toBeNull();

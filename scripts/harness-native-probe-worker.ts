@@ -65,11 +65,24 @@ const deny = () => json({ error: 'probe_denied' }, 403, { [probeMarker]: 'blocke
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (!configured(env) || !matches(request.headers.get('authorization'), 'Bearer ' + env.HARNESS_RESEARCH_TOKEN)) return json({ error: 'unauthorized' }, 401);
+    const diagnostics = {
+      'x-pgc-native-probe-version': 'auth-v1',
+      'x-pgc-native-probe-method': request.method === 'GET' || request.method === 'POST' ? request.method : 'other',
+    };
+    const reject = (error: 'probe_unconfigured' | 'authorization_missing' | 'authorization_mismatch') =>
+      json({ error }, 401, { ...diagnostics, 'x-pgc-native-probe-stage': 'pre-dispatch-auth' });
+    const authorization = request.headers.get('authorization');
+    if (!configured(env)) return reject('probe_unconfigured');
+    if (!authorization) return reject('authorization_missing');
+    if (!matches(authorization, 'Bearer ' + env.HARNESS_RESEARCH_TOKEN)) return reject('authorization_mismatch');
     const action = url.pathname;
     const method = action === '/status' ? 'GET' : 'POST';
-    if (url.search || request.method !== method || request.body || !['/run', '/arm-timeout', '/status'].includes(action)) return json({ error: 'route_denied' }, 404);
-    return env.NATIVE_PROBE.get(env.NATIVE_PROBE.idFromName(probeName)).fetch(new Request(internal + action, { method }));
+    if (url.search || request.method !== method || request.body || !['/run', '/arm-timeout', '/status'].includes(action)) return json({ error: 'route_denied' }, 404, diagnostics);
+    const response = await env.NATIVE_PROBE.get(env.NATIVE_PROBE.idFromName(probeName)).fetch(new Request(internal + action, { method }));
+    const headers = new Headers(response.headers);
+    headers.delete('x-pgc-native-probe-stage');
+    for (const [name, value] of Object.entries(diagnostics)) headers.set(name, value);
+    return new Response(response.body, { status: response.status, headers });
   },
 };
 

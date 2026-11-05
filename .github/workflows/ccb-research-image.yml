@@ -13,6 +13,8 @@ on:
       - 'harness/**'
       - 'server/harness-*.ts'
       - 'tests/harness-*.test.ts'
+      - 'scripts/harness-native-probe*'
+      - 'scripts/run-harness-native-probe.mjs'
       - '.github/workflows/ccb-research-image.yml'
 
 permissions:
@@ -88,6 +90,41 @@ jobs:
           }
           throw new Error('Private runtime did not become ready');
           JS
+
+      - name: Verify image drops process privileges itself
+        shell: bash
+        run: |
+          docker run --rm --network none --cap-drop ALL --entrypoint /usr/bin/setpriv "${RESEARCH_IMAGE}" --version
+          probe_name="ccb-privileges-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$probe_name" >/dev/null 2>&1 || true' EXIT
+          for mode in already-restricted granted-capabilities; do
+            if [ "$mode" = already-restricted ]; then
+              startup=(--cap-drop ALL)
+              command=()
+            else
+              startup=(--user 0:0 --entrypoint /usr/bin/setpriv)
+              command=(--reuid=1000 --regid=1000 --clear-groups --inh-caps=+setpcap,+net_raw --ambient-caps=+setpcap,+net_raw /bin/sh -ec 'for kind in CapEff CapAmb; do value="$(sed -n "s/^$kind:[[:space:]]*//p" /proc/self/status)"; case "$value" in *[1-9a-f]*) ;; *) exit 1 ;; esac; done; exec /opt/harness/launch')
+            fi
+            docker run --detach --name "$probe_name" --network none \
+              --add-host pgc-harness.internal:127.0.0.1 \
+              --read-only --tmpfs /tmp:rw,nosuid,nodev \
+              --env PGC_HARNESS_CONTROL_TOKEN=synthetic-offline-probe-only \
+              --env PGC_HARNESS_GATEWAY_URL=http://pgc-harness.internal \
+              "${startup[@]}" "${RESEARCH_IMAGE}" "${command[@]}" >/dev/null
+            docker exec -i "$probe_name" node --input-type=module - < harness/check-process-privileges.mjs
+            docker rm -f "$probe_name" >/dev/null
+          done
+
+          # A nonzero bounding set without effective CAP_SETPCAP cannot be
+          # cleared. The image must stop before Node rather than run partially
+          # restricted. These are Docker's normal USER node capabilities.
+          docker create --name "$probe_name" --network none \
+            --env PGC_HARNESS_CONTROL_TOKEN=synthetic-offline-probe-only \
+            --env PGC_HARNESS_GATEWAY_URL=http://pgc-harness.internal \
+            "${RESEARCH_IMAGE}" >/dev/null
+          docker start "$probe_name" >/dev/null
+          test "$(timeout 15 docker wait "$probe_name")" != 0
+          test "$(docker inspect --format '{{.State.Running}}' "$probe_name")" = false
 
       - name: Push tested research image with dedicated CI credential
         if: github.event_name == 'workflow_dispatch' && inputs.publish_image
