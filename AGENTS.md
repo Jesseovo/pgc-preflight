@@ -235,3 +235,5 @@
 - 成员v2使用creation-stage携原回执分阶段回传，内容/模型/证据哈希锁定；complete只引用已完成末阶段。错误或早到回传须在result_hash CAS之前校验。自检单独存储，不嵌pgc:check；初评/复核不能读自检或真人答案。未知模型不补造，成员证据标记member-device。修改后的新输出不能借修改前的观察宣称已复测修复。
 - artifactVersionId关联AI任务必须所有权和实际HTML UTF-8 SHA-256一致；实际投稿声明由原审核设备原租约回填，服务端核对Creator identity、版本、已确认作者归属和范围代次。无上游文件哈希保持Agent声明且strictEligible=false；不改AI报告、旧human_review或广场。未来80%目标仍须真实新样本独立评估。
 - 真实发布状态与测试数以对应私有release JSON为准；合成测试、浏览器采集或真实一款制作都不能证明普遍审核准确率提升。
+- 2026-11-05 实际发布：迁移0030–0032已应用，创作功能代码`0b6d0ac`及管理员能力查询`a90ed75`已推送main，Worker `9512a694-e4d3-4638-9d06-75f516043bba`承接100%流量，仍为pilot。745项程序测试通过；真实Opus合成游戏完成两轮high/64000及八张原图，实际用量33444/49709，最终HTML40536字节。模型声明改动开始方式，产物按规则pending，不自动采用；临时账号作品已清理。失败记录、原图、HTML及发布JSON仅在ignored私有目录`artifacts/pgc-minigame-release-20261105/`。成员Star由用户自行开启；未完成真实Creator投稿对照，不宣称80%准确率。
+- 管理员只读`GET /api/admin/model-capabilities?profile=...`使用保存的Key查询固定Riffle `/v1/models`，不发模型生成，不改配置；拒绝Bearer设备访问、跳转，限制15秒及128KiB，响应只含匹配模型的安全能力字段和未知字段类型。认证读取声明最大输出64000、上下文1000000；能力信息不自动改变审核预算、权限或模型选择。
