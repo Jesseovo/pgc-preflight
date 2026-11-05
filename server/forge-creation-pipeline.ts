@@ -7,6 +7,7 @@ import {claimCreationModel} from './model-capacity';
 import {captureFor} from './cloud-review-capture';
 import {digest,canonicalJson,stamp,problem} from './review-device-state';
 import {failForgeTask} from './forge-tasks';
+import {parseProductionOutput} from './forge-production-output';
 
 type Stage='build'|'polish'|'repair';
 type Checkpoint={model?:string|null;phase:string;stage:Stage;snapshot:any;config:any;output?:any;capture?:any;previous?:any;previousCapture?:any;versionId?:string;createdAt:number;stageStartedAt?:number;failure?:string};
@@ -205,7 +206,7 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
       const s=cp.snapshot;
       const input={topic:s.topic,brief:s.topic.brief_md,styleSvg:s.topic.preview_svg||'',assetHtml:s.topic.assets_html||'',html:cp.previous?.html,capture:cp.previousCapture,selfCheck:cp.previous?.selfCheck,requirements:cp.previous?.requirements,decisions:cp.previous?.decisions,coreChanges:cp.previous?.coreChanges};
       const runtime={...env,modelStore:{get:async()=>cp!.config},generation:{id:`${id}:${cp.stage}`,capacityReserved:lease.reserved,deadline:Date.now()+12*60000,onUncertain:()=>{uncertain=true;},onStart:async()=>{await access(env,row);const update=await DB.prepare("UPDATE forge_tasks SET model_started_at=coalesce(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(stamp(),stamp(),id).run();if(!update.meta.changes)throw new Error('制作任务已停止。');},onWait:async(message:string)=>progress(DB,id,`${cp!.stage}:model`,`${labels[cp!.stage]} · ${message}`)}};
-      const result=await complete(runtime,s.cfg,{system:gameStageSystem(cp.stage),user:gameStageUser(cp.stage,input),schema:schemas[cp.stage],strictJson:true,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous),maxTokens:32768,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
+      const result=await complete(runtime,s.cfg,{system:gameStageSystem(cp.stage,'framed'),user:gameStageUser(cp.stage,input,'framed'),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous),maxTokens:32768,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
       const html=await prepareArtifact('game',result.html,s);
       output={...result,html};
     }catch(e){cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await storage.deleteAll();return false;}

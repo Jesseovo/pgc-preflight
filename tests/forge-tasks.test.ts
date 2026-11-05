@@ -5,6 +5,7 @@ import {dispatch as dispatchForge} from '../server/forge-api';
 import {executeForgeTask,ForgeRunner} from '../server/forge-runner';
 import {enqueueForgeTask,failForgeTask,readForgeTask,recoverForgeTasks} from '../server/forge-tasks';
 import {complete} from '../server/forge-llm';
+import {parseProductionOutput} from '../server/forge-production-output';
 import {saveConfig} from '../server/settings';
 import {tryModelSlot} from '../server/model-capacity';
 import type {ModelConfig} from '../server/settings';
@@ -201,6 +202,17 @@ describe('后台创作的持久任务',()=>{
     expect(fetcher).toHaveBeenCalledTimes(1);
     const run=s.sqlite.prepare('SELECT status,error FROM model_runs ORDER BY created_at DESC LIMIT 1').get() as any;
     expect(run.status).toBe('error');expect(run.error).toContain('不是合法 JSON');expect(run.error).not.toContain('PRIVATE_SOURCE');
+  });
+
+  it('制作分段解码仍执行结构校验，不修改源码或补造制作记录',async()=>{
+    const s=await setup();
+    const html='<!doctype html><script>const pattern=/\\d+/;const empty={};</script>';
+    const record={requirements:[{id:'R1',text:'Play',status:'implemented'}],decisions:[],coreChanges:[]};
+    const fetcher=vi.fn(async()=>response(`<PGC_HTML>\n${html}\n</PGC_HTML>\n<PGC_RECORD>\n${JSON.stringify(record)}\n</PGC_RECORD>`));
+    vi.stubGlobal('fetch',fetcher);
+    const validate=vi.fn(()=>[]);
+    const result=await complete(s.env,{}, {system:'s',user:'u',purpose:'game',parse:parseProductionOutput,validate,maxAttempts:1});
+    expect(result).toEqual({html,...record});expect(validate).toHaveBeenCalledWith(result);expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it('非流式简报超过五分钟仍可完成，不误触流式空闲超时',async()=>{

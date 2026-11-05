@@ -91,6 +91,34 @@ describe('新版创作材料',()=>{
     expect(input.at(-1)).toMatchObject({type:'text',text:expect.stringContaining('正确转义的 "html" 字符串')});
   });
 
+  it.each([
+    ['build',GAME_BUILD_SCHEMA],
+    ['polish',GAME_POLISH_SCHEMA],
+    ['repair',GAME_REPAIR_SCHEMA],
+  ] as const)('%s 的平台格式将原始 HTML 与严格的 JSON 记录分开', (stage,schema)=>{
+    const system=gameStageSystem(stage,'framed');
+    expect(system.match(/^<\/?PGC_(?:HTML|RECORD)>$/gm)).toEqual([
+      '<PGC_HTML>','</PGC_HTML>','<PGC_RECORD>','</PGC_RECORD>',
+    ]);
+    expect(system).toContain('<PGC_HTML>\n<!doctype html>');
+    expect(system).toContain('</html>\n</PGC_HTML>\n<PGC_RECORD>');
+    expect(system).toContain('直接输出 HTML 原文');
+    expect(system).not.toMatch(/以 JSON 的 html 字段交付|顶层 "html" 字段|JSON\.stringify/);
+    expect(system).toContain('HTML 中不要嵌入 pgc:check');
+    const metadata=JSON.parse(system.split('【记录 JSON Schema】\n')[1]);
+    const {html: _html,...recordProperties}=schema.properties;
+    expect(metadata).toEqual({...schema,properties:recordProperties,required:schema.required.filter(name=>name!=='html')});
+    const material={topic,brief,html,capture};
+    const framed=gameStageUser(stage,material,'framed');
+    expect(framed.at(-1)).toMatchObject({type:'text',text:expect.stringContaining('PGC_HTML 和 PGC_RECORD')});
+    expect(asText(framed)).not.toContain('正确转义的 "html" 字符串');
+    const agent=gameStageUser(stage,material);
+    expect(agent).toEqual(gameStageUser(stage,material,'json'));
+    expect(gameStageSystem(stage)).toBe(gameStageSystem(stage,'json'));
+    expect(gameStageSystem(stage)).not.toMatch(/PGC_HTML|PGC_RECORD/);
+    expect(framed.slice(0,-1)).toEqual(agent.slice(0,-1));
+  });
+
   it('自检作为独立结构，返工不得要求额外返工',()=>{
     expect(GAME_BUILD_SCHEMA.required).toEqual(['html','requirements','decisions','coreChanges']);
     expect(GAME_POLISH_SCHEMA.properties.selfCheck.required).toContain('findings');
