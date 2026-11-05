@@ -6,10 +6,23 @@ type Binding = { idFromName(name: string): unknown; get(id: unknown): { fetch(re
 type Env = { NATIVE_PROBE: Binding; HARNESS_RESEARCH_TOKEN: string; RESEARCH_IMAGE: string };
 type Action = 'run' | 'arm-timeout';
 type Check = boolean | null;
+type ProbeErrorCode =
+  | 'unexpected_existing_container' | 'container_start_failed' | 'outbound_binding_failed'
+  | 'http_intercept_failed' | 'https_intercept_failed' | 'inactivity_timeout_failed'
+  | 'runtime_health_unavailable' | 'runtime_control_auth_failed' | 'native_inspect_failed'
+  | 'native_image_mismatch' | 'network_exec_failed' | 'runtime_start_unavailable' | 'runtime_start_rejected'
+  | 'process_exec_failed' | 'runtime_status_unavailable' | 'workspace_exec_failed'
+  | 'probe_execution_failed' | 'container_cleanup_unconfirmed' | 'probe_watchdog_expired' | 'receipt_unavailable';
+class ProbeFailure extends Error {
+  constructor(readonly code: ProbeErrorCode) { super(code); }
+}
+async function probeStep<T>(code: ProbeErrorCode, operation: () => T | Promise<T>): Promise<T> {
+  try { return await operation(); } catch { throw new ProbeFailure(code); }
+}
 type Capabilities = { uids: number[] | null; effective: string | null; permitted: string | null; inheritable: string | null; ambient: string | null; bounding: string | null; noNewPrivs: boolean | null };
 type Inspection = { runtime: Capabilities | null; cli: Capabilities | null; childSecretIsolation: boolean | null; workspaceEmpty: boolean };
 type Receipt = {
-  image: string; action: Action; state: 'running' | 'passed' | 'failed'; releaseReady: false; error?: string;
+  image: string; action: Action; state: 'running' | 'passed' | 'failed'; releaseReady: false; error?: ProbeErrorCode;
   checks: Record<string, Check>; processes?: Pick<Inspection, 'runtime' | 'cli'>; cleanup?: 'request' | 'alarm';
 };
 type Active = { action: Action; taskId: string; generation: string; lease: string; runId: string; control: string; deadlineAt: number; image: string };
@@ -188,14 +201,14 @@ export class NativeProbeRunner {
     if (!claimed) return json({ error: 'probe_active_or_already_finished' }, 409);
     try {
       await this.boot(active, receipt);
+      await storage.put('receipt', receipt);
       if (action === 'arm-timeout') {
-        await storage.put('receipt', receipt);
         await storage.setAlarm(Date.now() + 5_000);
         return json(receipt, 202);
       }
       await this.run(active, receipt);
-    } catch {
-      receipt.error = 'probe_execution_failed';
+    } catch (error) {
+      receipt.error = error instanceof ProbeFailure ? error.code : 'probe_execution_failed';
     }
     await this.cleanup(active, receipt, 'request');
     return json(receipt, receipt.state === 'passed' ? 200 : 502);
@@ -203,31 +216,39 @@ export class NativeProbeRunner {
 
   private async boot(active: Active, receipt: Receipt) {
     const container = this.ctx.container;
-    if (container.running) throw new Error('unexpected_existing_container');
-    container.start({
+    if (container.running) throw new ProbeFailure('unexpected_existing_container');
+    await probeStep('container_start_failed', () => container.start({
       image: active.image, instance: 'standard-1', enableInternet: false,
       env: { PGC_HARNESS_CONTROL_TOKEN: active.control, PGC_HARNESS_GATEWAY_URL: gateway },
-    });
-    const intercept = this.ctx.exports.NativeProbeOutbound({ props: {
+    }));
+    const intercept = await probeStep('outbound_binding_failed', () => this.ctx.exports.NativeProbeOutbound({ props: {
       taskId: active.taskId, generation: active.generation, lease: active.lease,
-    } });
-    await container.interceptAllOutboundHttp(intercept);
-    await container.interceptOutboundHttps('*', intercept);
-    await container.setInactivityTimeout(maxRunMs + 10_000);
+    } }));
+    await probeStep('http_intercept_failed', () => container.interceptAllOutboundHttp(intercept));
+    await probeStep('https_intercept_failed', () => container.interceptOutboundHttps('*', intercept));
+    await probeStep('inactivity_timeout_failed', () => container.setInactivityTimeout(maxRunMs + 10_000));
     const readyBy = Date.now() + 18_000;
     while (Date.now() < readyBy) {
       try {
         const response = await this.runtime(active, '/v1/health');
-        if (response.ok && (await response.json() as { status?: string }).status === 'ready') break;
+        if (response.ok && (await response.json() as { status?: string }).status === 'ready') {
+          receipt.checks.runtimeBoot = true;
+          break;
+        }
       } catch { /* Still booting. */ }
       await wait(300);
     }
-    const authorized = await this.runtime(active, '/v1/health');
-    const denied = await container.getTcpPort(8080).fetch(new Request('http://container/v1/health', { signal: AbortSignal.timeout(3000) }));
-    receipt.checks.runtimeBoot = authorized.ok && (await authorized.json() as { status?: string }).status === 'ready';
+    if (receipt.checks.runtimeBoot !== true) {
+      receipt.checks.runtimeBoot = false;
+      throw new ProbeFailure('runtime_health_unavailable');
+    }
+    const denied = await probeStep('runtime_control_auth_failed', () =>
+      container.getTcpPort(8080).fetch(new Request('http://container/v1/health', { signal: AbortSignal.timeout(3000) })));
     receipt.checks.controlAuth = denied.status === 401;
-    receipt.checks.imagePinned = (await container.inspect())?.image === active.image;
-    if (!receipt.checks.runtimeBoot || !receipt.checks.controlAuth || !receipt.checks.imagePinned) throw new Error('boot_checks_failed');
+    if (!receipt.checks.controlAuth) throw new ProbeFailure('runtime_control_auth_failed');
+    const running = await probeStep('native_inspect_failed', () => container.inspect());
+    receipt.checks.imagePinned = running?.image === active.image;
+    if (!receipt.checks.imagePinned) throw new ProbeFailure('native_image_mismatch');
   }
 
   private runtime(active: Active, path: string, body?: object) {
@@ -257,9 +278,9 @@ export class NativeProbeRunner {
   }
 
   private async run(active: Active, receipt: Receipt) {
-    const network = await this.exec<Record<string, unknown>>(networkScript, {
+    const network = await probeStep('network_exec_failed', () => this.exec<Record<string, unknown>>(networkScript, {
       taskId: active.taskId, generation: active.generation, lease: active.lease,
-    });
+    }));
     for (const name of ['privateGateway', 'httpInterceptDenied', 'httpsInterceptDenied', 'crossTaskDenied']) {
       receipt.checks[name] = readCheck(network?.[name]);
     }
@@ -272,12 +293,15 @@ export class NativeProbeRunner {
       systemPrompt: 'Isolated synthetic research fixture. No external provider is available.',
       prompt: 'Reply with READY.', files: [], outputPath: 'result.txt',
     };
-    const start = await this.runtime(active, '/v1/start', { envelope, envelopeSha256: await sha(canonical(envelope)), lease: active.lease });
+    const envelopeSha256 = await sha(canonical(envelope));
+    const start = await probeStep('runtime_start_unavailable', () =>
+      this.runtime(active, '/v1/start', { envelope, envelopeSha256, lease: active.lease }));
     receipt.checks.runtimeAccepted = start.status === 202;
-    if (!receipt.checks.runtimeAccepted) throw new Error('runtime_rejected');
+    if (!receipt.checks.runtimeAccepted) throw new ProbeFailure('runtime_start_rejected');
+    await this.ctx.storage.put('receipt', receipt);
     let inspection: Inspection | null = null;
     while (Date.now() < deadlineAt - 2000) {
-      const current = await this.exec<Inspection>(inspectScript);
+      const current = await probeStep('process_exec_failed', () => this.exec<Inspection>(inspectScript));
       if (current.cli) inspection = current;
       if (inspection && await this.ctx.storage.get('observed')) break;
       await wait(350);
@@ -292,15 +316,18 @@ export class NativeProbeRunner {
       : null;
     receipt.checks.childSecretIsolation = readCheck(inspection?.childSecretIsolation);
     while (Date.now() < Math.min(deadlineAt + 6000, active.deadlineAt)) {
-      const status = await this.runtime(active, '/v1/status');
-      const state = status.ok ? await status.json() as { state?: string; failure?: string } : {};
+      const state = await probeStep('runtime_status_unavailable', async () => {
+        const status = await this.runtime(active, '/v1/status');
+        if (!status.ok) throw new Error();
+        return await status.json() as { state?: string; failure?: string };
+      });
       if (state.state !== 'running') {
         receipt.checks.runtimeDeadline = state.state === 'failed' && state.failure === 'deadline_exceeded';
         break;
       }
       await wait(350);
     }
-    const cleaned = await this.exec<Inspection>(inspectScript);
+    const cleaned = await probeStep('workspace_exec_failed', () => this.exec<Inspection>(inspectScript));
     receipt.checks.workspaceRemoved = cleaned.workspaceEmpty === true && cleaned.cli === null;
   }
 
@@ -315,12 +342,19 @@ export class NativeProbeRunner {
     const storage = this.ctx.storage;
     if ((await storage.get('active') as Active | undefined)?.runId !== active.runId) return;
     try {
-      if (this.ctx.container.running) await this.ctx.container.destroy();
+      const running = this.ctx.container.running;
+      if (source === 'alarm') receipt.checks.wasRunningBeforeAlarm = running;
+      receipt.checks.destroyInvoked = false;
+      if (running) {
+        receipt.checks.destroyInvoked = true;
+        await this.ctx.container.destroy();
+      }
       receipt.checks.containerDestroyed = !this.ctx.container.running && await this.ctx.container.inspect() === null;
     } catch { receipt.checks.containerDestroyed = false; }
     if (!receipt.checks.containerDestroyed) receipt.error ??= 'container_cleanup_unconfirmed';
     receipt.cleanup = source;
-    if (source === 'alarm') receipt.checks.alarmCleanup = receipt.checks.containerDestroyed;
+    if (source === 'alarm') receipt.checks.alarmCleanup = receipt.checks.wasRunningBeforeAlarm === true &&
+      receipt.checks.destroyInvoked === true && receipt.checks.containerDestroyed;
     const required = active.action === 'run'
       ? ['runtimeBoot', 'controlAuth', 'imagePinned', 'privateGateway', 'httpInterceptDenied', 'httpsInterceptDenied',
         'crossTaskDenied', 'runtimeAccepted', 'cliReachedFixture', 'nonRootUid', 'privilegeDrop', 'childSecretIsolation', 'runtimeDeadline', 'workspaceRemoved', 'containerDestroyed']

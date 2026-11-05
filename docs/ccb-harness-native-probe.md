@@ -42,12 +42,12 @@ node scripts/run-harness-native-probe.mjs \
 
 控制脚本保存 `native-probe-run.json`，其 `overallIsolationAccepted` 固定为 false。退出码为零只表示已收到回执并确认两次容器清理，仍须逐项核对失败和未知项。研究 Secret 不能恢复为本地明文；后续独立研究重新生成凭据和资源。
 
-请求都使用相同研究 Secret 的 Bearer 鉴权。三条允许的路由不接收请求体或查询参数。
+请求都使用相同研究 Secret 的 Bearer 鉴权。三条允许的路由不接收请求体或查询参数。写入 Secret 后只用状态 GET 等待最多 60 秒。仅收到已认证的 `idle` 才提交一次 `/run`。已有活动或结束回执时停止；提交结果未知时只查询状态。
 
 | 路由 | 验证 |
 | --- | --- |
 | `POST /run` | 单次启动镜像并检查健康接口、实际镜像摘要、私有出站绑定、HTTP/HTTPS 拦截、伪造任务/代次/凭据拒绝。启动 CCB 接收合成流，检查实际父子进程的 UID、Linux capability 和关键环境变量隔离，等待运行时超时并确认工作区与实例清理。 |
-| `POST /arm-timeout` | 另一次独立启动，返回 202 后保留运行中的实例。持久 Alarm 在五秒后清理。 |
+| `POST /arm-timeout` | 另一次独立启动，返回 202 后保留运行中的实例。持久 Alarm 在五秒后清理。回执区分 Alarm 到达前是否仍在运行，以及是否实际调用销毁。 |
 | `GET /status` | 返回最近一次研究回执。请在启动下一项前保存上一项回执。 |
 
 `/run` 返回 502 时仍应保存回执。每个项目为 true、false 或 null，分别表示满足、观测不符或证据不足。HTTP/HTTPS 仅认私有拦截器返回的固定标记。TLS 或连接失败保留 null。当前探针没有独立的非 HTTP 外网 canary，`nonHttpEgressDenied` 保留 null。无真实供应商请求，不能证明模型兼容性。非零 UID 与 capability 位分开判定。Cloudflare 对 `durable_object` 调度下的进程能力有单独限制说明。[Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/) · [出站规则](https://developers.cloudflare.com/containers/configuration/outbound-traffic/)

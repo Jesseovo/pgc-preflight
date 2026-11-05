@@ -148,3 +148,26 @@ describe('native probe orchestration with scripted container', () => {
     expect(s.getAlarm()).toBeNull();
   });
 });
+
+describe('native probe diagnostics', () => {
+  it('distinguishes an HTTP intercept installation failure without echoing the platform error', async () => {
+    const s = setup();
+    s.container.interceptAllOutboundHttp.mockRejectedValueOnce(new Error('PRIVATE_PLATFORM_DIAGNOSTIC'));
+    const response = await s.post('/run');
+    expect(response.status).toBe(502);
+    const receipt = await response.json();
+    expect(receipt).toMatchObject({ error: 'http_intercept_failed', checks: { destroyInvoked: true, containerDestroyed: true } });
+    expect(JSON.stringify(receipt)).not.toContain('PRIVATE_PLATFORM_DIAGNOSTIC');
+    expect(s.container.exec).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed timeout verdict when the alarm only observes an already stopped container', async () => {
+    const s = setup();
+    expect((await s.post('/arm-timeout')).status).toBe(202);
+    s.container.running = false;
+    await s.runner.alarm();
+    expect(s.data.get('receipt')).toMatchObject({ state: 'failed', cleanup: 'alarm',
+      checks: { wasRunningBeforeAlarm: false, destroyInvoked: false, alarmCleanup: false, containerDestroyed: true } });
+    expect(s.container.destroy).not.toHaveBeenCalled();
+  });
+});

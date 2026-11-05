@@ -3,7 +3,7 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { setTimeout as wait } from 'node:timers/promises';
+import { awaitIdleResearchWorker, observeResearchAction } from './harness-native-probe-run-state.mjs';
 
 // A fresh research bearer exists only in this process and the research Worker
 // Secret. Never pass it in argv, return it, or write it into a local receipt.
@@ -35,7 +35,7 @@ await mkdir(out, { recursive: true, mode: 0o700 });
 const bearer = randomBytes(32).toString('hex');
 const report = { schemaVersion: 1, worker: config.name, image: config.vars.RESEARCH_IMAGE,
   startedAt: new Date().toISOString(), providerCalls: 0, secretConfigured: false,
-  network: null, timeout: null, overallIsolationAccepted: false };
+  preflight: null, network: null, timeout: null, overallIsolationAccepted: false };
 async function save() {
   const text = JSON.stringify(report, null, 2).replaceAll(bearer, '[redacted]') + '\n';
   await writeFile(resolve(out, 'native-probe-run.json'), text, { mode: 0o600 });
@@ -54,39 +54,35 @@ async function configureSecret() {
     child.stdin.end(bearer);
   });
 }
-async function request(path, method) {
+async function request(path, method, timeoutMs) {
+  let httpStatus = null;
   try {
     const response = await fetch(new URL(path, url), { method, redirect: 'manual',
-      headers: { Authorization: 'Bearer ' + bearer }, signal: AbortSignal.timeout(115_000) });
+      headers: { Authorization: 'Bearer ' + bearer }, signal: AbortSignal.timeout(timeoutMs) });
+    httpStatus = response.status;
     const chunks = []; let bytes = 0;
     for await (const chunk of response.body ?? []) {
       bytes += chunk.byteLength;
       if (bytes > 512_000) throw new Error('Response exceeds research limit');
       chunks.push(chunk);
     }
-    return { httpStatus: response.status, receipt: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
+    return { httpStatus, receipt: JSON.parse(Buffer.concat(chunks).toString('utf8')) };
   } catch {
-    return { httpStatus: null, receipt: null, executionState: 'unknown' };
+    return { httpStatus, receipt: null, executionState: 'unknown' };
   }
-}
-async function settle(first) {
-  let current = first;
-  const end = Date.now() + 105_000;
-  while (Date.now() < end && (current.receipt === null || current.receipt.state === 'running')) {
-    await wait(2000);
-    current = await request('/status', 'GET');
-  }
-  return current;
 }
 await save();
 try {
   await configureSecret();
   report.secretConfigured = true; await save();
-  console.log('Research credential configured; starting one fixed synthetic run.');
-  report.network = await settle(await request('/run', 'POST')); await save();
-  if (report.network.receipt?.checks?.containerDestroyed === true) {
-    console.log('First container closed; checking alarm cleanup.');
-    report.timeout = await settle(await request('/arm-timeout', 'POST')); await save();
+  report.preflight = await awaitIdleResearchWorker(request); await save();
+  if (report.preflight.outcome === 'ready') {
+    console.log('Research Worker confirmed idle; starting one fixed synthetic run.');
+    report.network = await observeResearchAction(request, '/run', 'run'); await save();
+    if (report.network.receipt?.action === 'run' && report.network.receipt.checks?.containerDestroyed === true) {
+      console.log('First container closed; checking alarm cleanup.');
+      report.timeout = await observeResearchAction(request, '/arm-timeout', 'arm-timeout'); await save();
+    }
   }
 } catch {
   report.executionError = 'research_runner_failed';
@@ -95,7 +91,7 @@ try {
   await save();
 }
 console.log(JSON.stringify({ worker: config.name, receipt: resolve(out, 'native-probe-run.json'),
-  networkState: report.network?.receipt?.state ?? 'unknown', timeoutState: report.timeout?.receipt?.state ?? 'not-run',
+  preflight: report.preflight?.outcome ?? 'not-run', networkState: report.network?.receipt?.state ?? 'unknown', timeoutState: report.timeout?.receipt?.state ?? 'not-run',
   providerCalls: 0, overallIsolationAccepted: false }));
-if (!report.secretConfigured || !report.network?.receipt || report.network.receipt.state === 'running' ||
-    report.network.receipt.checks?.containerDestroyed !== true || report.timeout?.receipt?.checks?.containerDestroyed !== true) process.exitCode = 1;
+if (!report.secretConfigured || report.preflight?.outcome !== 'ready' || !report.network?.receipt || report.network.receipt.state === 'running' ||
+    report.network.receipt.checks?.containerDestroyed !== true || report.timeout?.receipt?.checks?.alarmCleanup !== true) process.exitCode = 1;
