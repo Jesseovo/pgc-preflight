@@ -108,8 +108,8 @@ export function modelTransport(config: ModelRuntime, options: { maxTokens?: numb
     const anthropic = config.protocol === 'anthropic';
     // Creation stages have an explicit Opus budget contract. Keep configured
     // effort for other purposes; a shared profile must not override this one.
-    const creationEffort = anthropic && /^claude-opus-5-5$/i.test(config.model) && options.purpose === 'game' && options.outputEffort === 'low';
-    const effort = creationEffort ? 'low' : config.effort && config.effort !== 'auto' ? config.effort : options.outputEffort || options.reasoningEffort || inferred.effort;
+    const creationEffort = anthropic && /^claude-opus-5-5$/i.test(config.model) && options.purpose === 'game' ? options.outputEffort : undefined;
+    const effort = creationEffort || (config.effort && config.effort !== 'auto' ? config.effort : options.outputEffort || options.reasoningEffort || inferred.effort);
     const deepseek = !anthropic && new URL(config.baseUrl).hostname === 'api.deepseek.com';
     // Riffle's Anthropic stream relay is intermittently unavailable. Short
     // tasks are safer as one bounded JSON response; long artifacts retain

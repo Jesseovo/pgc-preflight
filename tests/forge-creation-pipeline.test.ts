@@ -61,6 +61,7 @@ function modelOutput(build:any,polish:any){
     const result=runtime.generation?.id.endsWith(':build')?build:polish;
     expect(request.maxAttempts).toBe(1);
     expect(request.requiredProfile).toBe('opus');
+    expect(request.outputEffort).toBe('high');
     expect(request.validate?.(result)).toEqual([]);
     if(runtime.generation?.id.endsWith(':polish'))expect((request.user as any[]).filter(part=>part.type==='image')).toHaveLength(4);
     return result;

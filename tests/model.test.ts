@@ -94,18 +94,18 @@ describe('模型传输',()=>{
     expect(bodies[0]).toMatchObject({thinking:{type:'adaptive'},output_config:{effort:'medium'}});
   });
 
-  it('制作阶段的 Opus low 优先于共享配置 high，其他用途保持原强度',async()=>{
+  it('制作阶段的 Opus high 优先于共享配置 low，其他用途保持原强度',async()=>{
     const bodies:any[]=[],metrics:any[]=[];
     vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init?:RequestInit)=>{
       bodies.push(JSON.parse(String(init?.body)));
       return Response.json({content:[{type:'text',text:'READY'}],stop_reason:'end_turn'});
     }));
-    const opus={...config,protocol:'anthropic' as const,model:'claude-opus-5-5',effort:'high' as const};
-    await modelTransport(opus,{purpose:'game',outputEffort:'low',maxTokens:32768,onMetrics:async value=>{metrics.push(value);}})([]);
+    const opus={...config,protocol:'anthropic' as const,model:'claude-opus-5-5',effort:'low' as const};
+    await modelTransport(opus,{purpose:'game',outputEffort:'high',maxTokens:32768,onMetrics:async value=>{metrics.push(value);}})([]);
     await modelTransport(opus,{purpose:'review',outputEffort:'low'})([]);
-    expect(bodies[0]).toMatchObject({max_tokens:32768,thinking:{type:'adaptive'},output_config:{effort:'low'}});
-    expect(metrics[0].effort).toBe('low');
-    expect(bodies[1].output_config.effort).toBe('high');
+    expect(bodies[0]).toMatchObject({max_tokens:32768,thinking:{type:'adaptive'},output_config:{effort:'high'}});
+    expect(metrics[0].effort).toBe('high');
+    expect(bodies[1].output_config.effort).toBe('low');
   });
 
   it('修复尾随逗号时保留字符串里的逗号、括号和转义引号',()=>{
