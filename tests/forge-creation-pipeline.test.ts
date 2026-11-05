@@ -150,7 +150,11 @@ describe('staged creation evidence and publication',()=>{
     await creationPipelineAlarm(s.state,s.env,s.id);
     expect(s.row().status).toBe('running');
     expect(complete).toHaveBeenCalledTimes(1);
+    expect(s.env.captureReview).not.toHaveBeenCalled();
     await creationPipelineAlarm(s.state,s.env,s.id);
+    expect(s.row().status).toBe('running');
+    expect(complete).toHaveBeenCalledTimes(1);
+    for(let i=0;i<8&&s.row().status==='running';i++){const before=vi.mocked(complete).mock.calls.length;await creationPipelineAlarm(s.state,s.env,s.id);expect(vi.mocked(complete).mock.calls.length-before).toBeLessThanOrEqual(1);}
     expect(s.row()).toMatchObject({status:'done',phase:'done'});
     expect(complete).toHaveBeenCalledTimes(2);
     expect(s.env.captureReview).toHaveBeenCalledTimes(2);

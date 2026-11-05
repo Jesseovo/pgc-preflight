@@ -213,7 +213,9 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     cp.output=output;cp.phase='output';
     // A transient checkpoint failure cannot trigger a fresh paid request.
     try{await putCheckpoint(storage,cp);}catch{await putCheckpoint(storage,cp);}
-    return true;
+    // Give browser acquisition its own alarm lifetime; model stages may use
+    // the full twelve minutes, and browser capacity can wait four more.
+    await storage.setAlarm(Date.now()+100);return false;
   }
   if(cp.phase==='output'){
     await persistStage(DB,row,cp);
@@ -229,7 +231,9 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     if(cp.stage==='build'||cp.stage==='polish'&&cp.output.selfCheck?.requestRepair){
       const next:Stage=cp.stage==='build'?'polish':'repair';
       cp={...cp,stage:next,phase:'ready',previous:cp.output,previousCapture:cp.capture,output:undefined,capture:undefined,versionId:undefined};
-      await putCheckpoint(storage,cp);return true;
+      // Each paid stage has its own bounded alarm invocation, rather than
+      // accumulating two twelve-minute calls in one event lifetime.
+      await putCheckpoint(storage,cp);await storage.setAlarm(Date.now()+100);return false;
     }
     cp.phase='publish';await putCheckpoint(storage,cp);return true;
   }
