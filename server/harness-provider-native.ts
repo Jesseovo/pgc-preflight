@@ -31,10 +31,17 @@ type NativeConfig = {
   notBefore: number; expiresAt: number; researchDatabaseId: string; productionDatabaseId: string;
 };
 type NativeStage = 'armed' | 'running' | 'cleanup_pending' | 'passed' | 'failed' | 'unknown';
+const runtimeFailures = ['deadline_exceeded', 'cancelled', 'invalid_ccb_output', 'ccb_incomplete', 'ccb_start_failed',
+  'workspace_cleanup_failed', 'model_request_denied', 'model_request_failed', 'model_stream_incomplete'] as const;
+type NativeRuntimeStatus = {
+  state: 'failed' | 'cancelled' | 'succeeded'; failure: typeof runtimeFailures[number] | null;
+  modelTurns?: number; outputTokens?: number;
+};
 type NativeReceipt = {
   state: NativeStage; fixtureId: string; image: string; candidateVersion: string; sourceHash: string;
   modelContractHash: string; releaseReady: false; failure?: string; completedAt?: number;
   modelTurns?: number; outputTokens?: number; containerDestroyed?: boolean;
+  runtime?: NativeRuntimeStatus; transitions?: { admitted: number; completed: number };
 };
 type Latch = { config: NativeConfig; receipt: NativeReceipt; requestIds: string[]; completedTurns: number; cleanupAttempts: number; verified?: true };
 type Plan = Parameters<typeof createHarnessRun>[1] & {
@@ -59,6 +66,8 @@ const json = (value: unknown, status = 200) => Response.json(value, { status, he
 const deny = () => json({ error: 'research_route_denied' }, 404);
 const fail = (code: string) => new NativeFailure(code);
 const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+const boundedCount = (value: unknown, max: number): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= max;
 const exactKeys = (value: unknown, keys: readonly string[]): value is Record<string, unknown> =>
   isObject(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 const same = (a: unknown, b: unknown) => canonicalHarness(a) === canonicalHarness(b);
@@ -67,6 +76,15 @@ const fromHex = (value: string) => Uint8Array.from(value.match(/../g) ?? [], ite
 const identity = ({ taskId, generation }: NativeConfig) => ({ taskId, generation });
 const slotName = ({ taskId, generation }: NativeConfig) => `${taskId}:${generation}`;
 const limits = { maxTotalOutputTokens: OPUS_RESEARCH_TOTAL_CAP, maxModelTurns: OPUS_RESEARCH_TURN_CAP, maxRepairs: 0 };
+
+function terminalRuntimeStatus(status: Record<string, unknown>): NativeRuntimeStatus | undefined {
+  if (status.state !== 'failed' && status.state !== 'cancelled' && status.state !== 'succeeded') return undefined;
+  return {
+    state: status.state, failure: runtimeFailures.find(code => code === status.failure) ?? null,
+    ...(boundedCount(status.modelTurns, OPUS_RESEARCH_TURN_CAP) && { modelTurns: status.modelTurns }),
+    ...(boundedCount(status.outputTokens, OPUS_RESEARCH_TOTAL_CAP) && { outputTokens: status.outputTokens }),
+  };
+}
 class NativeFailure extends Error {
   constructor(readonly code: string) { super(code); }
 }
@@ -390,10 +408,12 @@ export class ProviderNativeRunnerHost {
         await tx.put('research-latch', latch);
         await tx.setAlarm(config.expiresAt);
       });
+      const observation: Pick<NativeReceipt, 'runtime'> = {};
       try {
-        await this.run(config);
+        await this.run(config, observation);
       } catch (error) {
         const current = await storage.get('research-latch') as Latch;
+        Object.assign(current.receipt, observation);
         current.receipt.failure = error instanceof NativeFailure ? error.code : 'research_execution_failed';
         await this.cleanup(current);
       }
@@ -403,7 +423,7 @@ export class ProviderNativeRunnerHost {
     await this.cleanup(latch);
   }
 
-  private async run(config: NativeConfig) {
+  private async run(config: NativeConfig, observation: Pick<NativeReceipt, 'runtime'>) {
     const planResponse = await signedBrokerRequest(this.env, config, PROVIDER_RESEARCH_PLAN, 'plan', '', new Uint8Array(),
       AbortSignal.timeout(Math.min(5000, Math.max(1, config.expiresAt - Date.now()))));
     if (!planResponse.ok) throw fail('broker_plan_unavailable');
@@ -429,9 +449,10 @@ export class ProviderNativeRunnerHost {
     });
     if (start.status !== 202) throw fail('research_runtime_start_rejected');
     void start.body?.cancel().catch(() => {});
-    const outputTokens = await this.waitForCompletion(config, session);
+    const outputTokens = await this.waitForCompletion(config, session, observation);
     const latch = await this.ctx.storage.get('research-latch') as Latch;
     await this.verifySettlement(config, latch, outputTokens);
+    Object.assign(latch.receipt, observation);
     latch.verified = true;
     await this.cleanup(latch);
   }
@@ -458,13 +479,15 @@ export class ProviderNativeRunnerHost {
     throw fail('research_runtime_unavailable');
   }
 
-  private async waitForCompletion(config: NativeConfig, session: RuntimeSession) {
+  private async waitForCompletion(config: NativeConfig, session: RuntimeSession, observation: Pick<NativeReceipt, 'runtime'>) {
     while (Date.now() < config.expiresAt) {
       const response = await this.runtime(config, session, '/v1/status');
       if (!response.ok) throw fail('research_runtime_status_unknown');
       const status = await readJson(response, 4096);
       if (!isObject(status) || status.runId !== session.runId) throw fail('research_runtime_status_unknown');
       if (status.state === 'running') { await wait(1000); continue; }
+      const terminal = terminalRuntimeStatus(status);
+      if (terminal) observation.runtime = terminal;
       if (status.state !== 'succeeded' || status.modelTurns !== OPUS_RESEARCH_TURN_CAP ||
           typeof status.outputTokens !== 'number' || !Number.isSafeInteger(status.outputTokens) ||
           status.outputTokens <= 0 || status.outputTokens > OPUS_RESEARCH_TOTAL_CAP) throw fail('research_runtime_incomplete');
@@ -505,6 +528,9 @@ export class ProviderNativeRunnerHost {
     const db = this.env.PROVIDER_RESEARCH_DB;
     const storage = this.ctx.storage;
     receipt.state = 'cleanup_pending';
+    if (boundedCount(latch.requestIds.length, OPUS_RESEARCH_TURN_CAP) && boundedCount(latch.completedTurns, latch.requestIds.length)) {
+      receipt.transitions = { admitted: latch.requestIds.length, completed: latch.completedTurns };
+    }
     latch.cleanupAttempts++;
     await storage.transaction(async (tx: any) => {
       await tx.put('research-latch', latch);

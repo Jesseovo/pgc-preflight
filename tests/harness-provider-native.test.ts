@@ -103,7 +103,8 @@ function fixtureStream(first: boolean) {
     event('message_delta', { delta: { stop_reason: first ? 'tool_use' : 'end_turn' }, usage: { output_tokens: 7 } }) + event('message_stop');
 }
 
-async function nativeSetup(options: { mismatchVersion?: boolean; disconnectProvider?: boolean; cancelDownstream?: boolean } = {}) {
+async function nativeSetup(options: { mismatchVersion?: boolean; disconnectProvider?: boolean; cancelDownstream?: boolean;
+  rejectContinuation?: boolean; rejectFirstStreamLocally?: boolean; runtimeStatusOverrides?: Record<string, unknown> } = {}) {
   const sqlite = new DatabaseSync(':memory:');
   const capacity = new DatabaseSync(':memory:');
   sqlite.exec(providerResearchSchema());
@@ -123,7 +124,8 @@ async function nativeSetup(options: { mismatchVersion?: boolean; disconnectProvi
   const manifest = opusResearchFixtureManifest(config);
   // The full pinned matcher has its own byte-level tests. Here a real broker
   // and real ledger use a compact synthetic wire fixture to exercise routing.
-  manifest.requestMatches = async (_body, _model, context) => context.run.modelTurns === 0 || !!await context.readPriorAssistantDigest();
+  manifest.requestMatches = async (_body, _model, context) => context.run.modelTurns === 0 ||
+    !options.rejectContinuation && !!await context.readPriorAssistantDigest();
   let modelCalls = 0;
   const modelFetch = vi.fn<typeof fetch>(async (): Promise<Response> => {
     if (options.disconnectProvider) throw new Error('Synthetic disconnect before response');
@@ -157,6 +159,9 @@ async function nativeSetup(options: { mismatchVersion?: boolean; disconnectProvi
   let outbound: ((request: Request) => Promise<Response>) | undefined;
   let runtimeStart: { envelope: { runId: string }; lease: string } | undefined;
   let runtimeState = 'running';
+  let runtimeFailure: string | undefined;
+  let runtimeModelTurns = 0;
+  let runtimeOutputTokens = 0;
   const tools = OPUS_RESEARCH_TOOLS.map(name => ({ name, description: 'Synthetic', input_schema: { type: 'object' } }));
   const requestIds = [
     'build-0-10000000-0000-4000-8000-000000000011',
@@ -190,26 +195,35 @@ async function nativeSetup(options: { mismatchVersion?: boolean; disconnectProvi
               messages: [{ role: 'user', content: 'Synthetic native test' }], tools,
             }),
           });
+          runtimeModelTurns++;
           const response = await outbound!(toGateway());
           if (id === requestIds[0]) {
             const prematureContinuation = await outbound!(toGateway(requestIds[1]));
             expect(prematureContinuation.status).toBe(404);
           }
-          if (!response.ok) { runtimeState = 'failed'; break; }
+          if (!response.ok) { runtimeState = 'failed'; runtimeFailure = 'model_request_failed'; break; }
           if (options.cancelDownstream) {
             await response.body!.cancel();
             expect((await outbound!(toGateway(requestIds[1]))).status).toBe(404);
             runtimeState = 'failed';
+            runtimeFailure = 'model_stream_incomplete';
             break;
           }
           await response.text();
+          if (options.rejectFirstStreamLocally) {
+            runtimeState = 'failed';
+            runtimeFailure = 'model_stream_incomplete';
+            break;
+          }
+          runtimeOutputTokens += 7;
           const duplicate = await outbound!(toGateway());
           expect(duplicate.status).toBe(404);
         }
         if (runtimeState === 'running') runtimeState = 'succeeded';
         return Response.json({ state: 'running' }, { status: 202 });
       }
-      if (path === '/v1/status') return Response.json({ state: runtimeState, runId: runtimeStart?.envelope.runId, modelTurns: 2, outputTokens: 14 });
+      if (path === '/v1/status') return Response.json({ state: runtimeState, runId: runtimeStart?.envelope.runId,
+        failure: runtimeFailure, modelTurns: runtimeModelTurns, outputTokens: runtimeOutputTokens, ...options.runtimeStatusOverrides });
       if (path === '/v1/result') return Response.json({ state: runtimeState, runId: runtimeStart?.envelope.runId, modelTurns: 2, outputTokens: 14, files: [
         { path: 'game.html', encoding: 'utf8', content: OPUS_RESEARCH_HTML, sha256: await harnessHash(OPUS_RESEARCH_HTML) },
         { path: 'record.json', encoding: 'utf8', content: OPUS_RESEARCH_RECORD, sha256: OPUS_RESEARCH_WIRE.recordSha256 },
@@ -251,6 +265,8 @@ describe('isolated native provider research adapter', () => {
       await s.host.alarm();
       const receipt = await (await s.control('/status')).json();
       expect(receipt).toMatchObject({ state: 'passed', releaseReady: false, modelTurns: 2, outputTokens: 14, containerDestroyed: true });
+      expect(receipt).toMatchObject({ runtime: { state: 'succeeded', failure: null, modelTurns: 2, outputTokens: 14 },
+        transitions: { admitted: 2, completed: 2 } });
       expect(JSON.stringify(receipt)).not.toContain(OPUS_RESEARCH_RECORD);
       expect(s.brokerFetch).toHaveBeenCalledTimes(3);
       expect(s.modelFetch).toHaveBeenCalledTimes(2);
@@ -406,6 +422,41 @@ describe('isolated native provider research adapter', () => {
       expect(['failed', 'unknown']).toContain(receipt.state);
       expect(receipt.containerDestroyed).toBe(true);
       expect(s.modelFetch).toHaveBeenCalledOnce();
+    } finally { s.close(); }
+  });
+
+  it.each([
+    { name: 'a first-stream runtime rejection after upstream completion', options: { rejectFirstStreamLocally: true },
+      runtime: { state: 'failed', failure: 'model_stream_incomplete', modelTurns: 1, outputTokens: 0 }, transitions: { admitted: 1, completed: 1 } },
+    { name: 'a second request rejected before the provider ledger', options: { rejectContinuation: true },
+      runtime: { state: 'failed', failure: 'model_request_failed', modelTurns: 2, outputTokens: 7 }, transitions: { admitted: 2, completed: 1 } },
+  ])('records $name without replaying the first provider call', async ({ options, runtime, transitions }) => {
+    const s = await nativeSetup(options);
+    try {
+      expect((await s.control('/run')).status).toBe(202);
+      await s.host.alarm();
+      expect(await (await s.control('/status')).json()).toMatchObject({
+        state: 'failed', failure: 'research_runtime_incomplete', runtime, transitions, containerDestroyed: true,
+      });
+      expect(s.modelFetch).toHaveBeenCalledOnce();
+      expect(s.sqlite.prepare('SELECT state,attempts,finish_reason FROM harness_requests').all()).toEqual([
+        { state: 'completed', attempts: 1, finish_reason: 'tool_use' },
+      ]);
+    } finally { s.close(); }
+  });
+
+  it('discards unknown failure text, unrecognized properties, and invalid counters from the runtime receipt', async () => {
+    const untrustedText = 'untrusted synthetic model text';
+    const s = await nativeSetup({ rejectFirstStreamLocally: true, runtimeStatusOverrides: {
+      failure: untrustedText, modelTurns: 3, outputTokens: -1, content: untrustedText,
+    } });
+    try {
+      expect((await s.control('/run')).status).toBe(202);
+      await s.host.alarm();
+      const receipt = await (await s.control('/status')).json();
+      expect(receipt.runtime).toEqual({ state: 'failed', failure: null });
+      expect(receipt.transitions).toEqual({ admitted: 1, completed: 1 });
+      expect(JSON.stringify(receipt)).not.toContain(untrustedText);
     } finally { s.close(); }
   });
 

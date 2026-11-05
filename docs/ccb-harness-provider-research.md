@@ -27,6 +27,8 @@
 
 停止提交研究任务，先核对容器、研究账本和生产活跃任务。用同一 Deployments API 提交 A 100% 单版本部署，省略 `force`。读回 A-only，确认普通生产路径和资产可用，原 B 覆盖不再选中候选。若管理操作结果未知，先读取活动部署。隔离实测的原 Secret 在回滚后仍有效，候选 Secret 对 A 不可用。
 
+若刷新后的 A 已含本任务旧研究 Secret，而 B 为同名研究 Secret 换了新值，恢复可能返回 `10220`。只在错误明确仅列出本任务研究 Secret、当前仍是本次精确 A100/B0、最新仍为本次 B、A 的原模块和正常绑定未变、平台付费任务为零时，才可在已授权恢复范围内使用 `?force=true` 选择同一个 A。这不修改 Secret 值或其他资源；结果仍须读回确认。任何正常平台 Secret 被列出、其他发布出现或来源不明时停止，不能把 `force` 当作通用恢复手段。[部署 API 的 force 参数](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
+
 DO 的实例标识在隔离测试的版本切换前后发生过变化，SQLite 数据仍在。采样无法区分部署重置与空闲回收。转发带版本覆盖头的原请求还曾让同一 DO 执行 B。候选因此不把普通请求转给原应用，维护窗口仍应避开活动付费任务。
 
 待 Runner 完成或清理容器并保留脱敏回执后，撤销研究凭据，关闭研究入口，按已授权的范围删除独立 Runner、容器应用、DO 命名空间和研究 D1。核对资源删除状态。生产基线 A 和现有资源保留。
