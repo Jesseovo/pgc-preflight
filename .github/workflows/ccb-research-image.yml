@@ -111,7 +111,7 @@ jobs:
               --env PGC_HARNESS_CONTROL_TOKEN=synthetic-offline-probe-only \
               --env PGC_HARNESS_GATEWAY_URL=http://pgc-harness.internal \
               "${startup[@]}" "${RESEARCH_IMAGE}" "${command[@]}" >/dev/null
-            docker exec -i "$probe_name" node --input-type=module - < harness/check-process-privileges.mjs
+            docker exec --user 1000:1000 -i "$probe_name" node --input-type=module - < harness/check-process-privileges.mjs
             docker rm -f "$probe_name" >/dev/null
           done
 

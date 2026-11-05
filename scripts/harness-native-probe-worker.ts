@@ -21,8 +21,21 @@ async function probeStep<T>(code: ProbeErrorCode, operation: () => T | Promise<T
 }
 type Capabilities = { uids: number[] | null; effective: string | null; permitted: string | null; inheritable: string | null; ambient: string | null; bounding: string | null; noNewPrivs: boolean | null };
 type Inspection = { runtime: Capabilities | null; cli: Capabilities | null; childSecretIsolation: boolean | null; workspaceEmpty: boolean };
+const runtimeStartErrors = {
+  '400 Invalid run envelope': 'invalid_envelope',
+  '400 Invalid run request': 'invalid_request',
+  '401 Unauthorized': 'unauthorized',
+  '404 Run not found': 'run_not_found',
+  '404 Not found': 'not_found',
+  '409 Run identity already used': 'run_identity_used',
+  '409 Harness unavailable': 'harness_unavailable',
+  '409 Container belongs to a different task': 'wrong_task',
+} as const;
+type RuntimeStartSignature = keyof typeof runtimeStartErrors;
+type RuntimeStartError = typeof runtimeStartErrors[RuntimeStartSignature];
 type Receipt = {
   image: string; action: Action; state: 'running' | 'passed' | 'failed'; releaseReady: false; error?: ProbeErrorCode;
+  runtimeStart?: { httpStatus: number; error?: RuntimeStartError };
   checks: Record<string, Check>; processes?: Pick<Inspection, 'runtime' | 'cli'>; cleanup?: 'request' | 'alarm';
 };
 type Active = { action: Action; taskId: string; generation: string; lease: string; runId: string; control: string; deadlineAt: number; image: string };
@@ -51,6 +64,38 @@ async function hasEmptyBody(request: Request): Promise<boolean> {
   } finally {
     clearTimeout(timer);
     // Reject promptly even when cancellation of a stalled input cannot finish.
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+async function runtimeStartError(response: Response): Promise<RuntimeStartError | undefined> {
+  if (!response.body || response.body.locked) return undefined;
+  const reader = response.body.getReader();
+  const bytes = new Uint8Array(256);
+  let length = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const read = async () => {
+    for (let chunk = 0; chunk < 16; chunk++) {
+      const { done, value } = await reader.read();
+      if (done) {
+        const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length)));
+        const error = parsed?.error;
+        if (typeof error !== 'string') return undefined;
+        const signature = `${response.status} ${error}` as RuntimeStartSignature;
+        return Object.hasOwn(runtimeStartErrors, signature) ? runtimeStartErrors[signature] : undefined;
+      }
+      if (length + value.byteLength > bytes.byteLength) return undefined;
+      bytes.set(value, length);
+      length += value.byteLength;
+    }
+    return undefined;
+  };
+  try {
+    const deadline = new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 250); });
+    return await Promise.race([read().catch(() => undefined), deadline]);
+  } finally {
+    clearTimeout(timer);
     void reader.cancel().catch(() => {});
     reader.releaseLock();
   }
@@ -130,21 +175,25 @@ export class NativeProbeOutbound extends WorkerEntrypoint<Env, HarnessOutboundSc
 const inspectScript = String.raw`
 import fs from 'node:fs';
 const read = (path) => { try { return fs.readFileSync(path, 'utf8'); } catch { return null; } };
-function proc(entry) {
-  const base = '/proc/' + entry;
-  const cmd = read(base + '/cmdline');
-  if (!cmd) return null;
-  const args = cmd.split('\0');
-  const role = args.includes('/opt/harness/runtime.mjs') ? 'runtime' : args.includes('/opt/ccb/dist/cli-node.js') ? 'cli' : null;
-  if (!role) return null;
+const readlink = (path) => { try { return fs.readlinkSync(path); } catch { return null; } };
+function proc(pid) {
+  const base = '/proc/' + pid;
   const status = read(base + '/status');
   const field = (name) => status?.match(new RegExp('^' + name + ':\\s*([^\\s]+)', 'm'))?.[1] ?? null;
+  const state = field('State');
+  const ppid = field('PPid');
+  if (!ppid || !state || /^[ZXx]$/.test(state)) return null;
+  return { pid, base, status, field, ppid, exe: readlink(base + '/exe') };
+}
+function inspect(entry, role) {
+  if (!entry) return null;
+  const { base, status, field } = entry;
   const uids = status?.match(/^Uid:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/m)?.slice(1).map(Number) ?? null;
   const noNewPrivs = field('NoNewPrivs');
   const hex = (name) => { const v = field(name); return /^[0-9a-f]{8,32}$/.test(v ?? '') ? v : null; };
   const environment = read(base + '/environ');
   const parsed = environment === null ? null : new Map(environment.split('\0').filter(x=>x.includes('=')).map(x=>[x.slice(0,x.indexOf('=')),x.slice(x.indexOf('=')+1)]));
-  return { role, capabilities: { uids, effective: hex('CapEff'), permitted: hex('CapPrm'), inheritable: hex('CapInh'), ambient: hex('CapAmb'),
+  return { capabilities: { uids, effective: hex('CapEff'), permitted: hex('CapPrm'), inheritable: hex('CapInh'), ambient: hex('CapAmb'),
     bounding: hex('CapBnd'), noNewPrivs: noNewPrivs === null ? null : noNewPrivs === '1' },
     isolated: parsed === null ? null : role === 'runtime' ? parsed.has('PGC_HARNESS_CONTROL_TOKEN') &&
       !parsed.has('SETTINGS_KEY') && !parsed.has('HARNESS_RESEARCH_TOKEN') && !parsed.has('ANTHROPIC_API_KEY') && !parsed.has('OPENAI_API_KEY') :
@@ -152,9 +201,16 @@ function proc(entry) {
       !parsed.has('SETTINGS_KEY') && !parsed.has('HARNESS_RESEARCH_TOKEN') &&
       parsed.get('ANTHROPIC_API_KEY') === 'pgc-loopback-only' && parsed.get('OPENAI_API_KEY') === 'pgc-loopback-only' };
 }
-const entries = fs.readdirSync('/proc').filter(name=>/^\d+$/.test(name)).slice(0,128).map(proc).filter(Boolean);
-const runtime = entries.find(entry=>entry.role==='runtime');
-const cli = entries.find(entry=>entry.role==='cli');
+const pids = fs.readdirSync('/proc').filter(name=>/^\d+$/.test(name) && Number(name)!==process.pid);
+const entries = pids.length <= 128 ? pids.map(proc).filter(Boolean) : [];
+const runtimes = entries.filter(({ base }) => read(base + '/cmdline')?.split('\0').includes('/opt/harness/runtime.mjs'));
+const parent = runtimes.length === 1 ? runtimes[0] : null;
+// CCB rewrites its process title and therefore /proc/<pid>/cmdline on Linux.
+// The trusted runtime spawns only CCB, using its own Node executable.
+const children = parent ? entries.filter(entry => entry.ppid === parent.pid) : [];
+const child = children.length === 1 && parent?.exe && children[0].exe === parent.exe ? children[0] : null;
+const runtime = inspect(parent, 'runtime');
+const cli = inspect(child, 'cli');
 const isolated = runtime?.isolated == null || cli?.isolated == null ? null : runtime.isolated && cli.isolated;
 const workspaceEmpty = !fs.readdirSync('/tmp').some(name=>name.startsWith('pgc-ccb-'));
 console.log(JSON.stringify({runtime:runtime?.capabilities??null,cli:cli?.capabilities??null,childSecretIsolation:isolated,workspaceEmpty}));
@@ -329,8 +385,12 @@ export class NativeProbeRunner {
     const envelopeSha256 = await sha(canonical(envelope));
     const start = await probeStep('runtime_start_unavailable', () =>
       this.runtime(active, '/v1/start', { envelope, envelopeSha256, lease: active.lease }));
+    receipt.runtimeStart = { httpStatus: start.status };
     receipt.checks.runtimeAccepted = start.status === 202;
-    if (!receipt.checks.runtimeAccepted) throw new ProbeFailure('runtime_start_rejected');
+    if (!receipt.checks.runtimeAccepted) {
+      receipt.runtimeStart.error = await runtimeStartError(start);
+      throw new ProbeFailure('runtime_start_rejected');
+    }
     await this.ctx.storage.put('receipt', receipt);
     let inspection: Inspection | null = null;
     while (Date.now() < deadlineAt - 2000) {

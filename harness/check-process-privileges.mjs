@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, readlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { setTimeout as wait } from 'node:timers/promises';
 import { canonical, sha256 } from '/opt/harness/envelope.mjs';
@@ -15,20 +15,53 @@ const headers = {
 };
 const timeoutMs = 15_000;
 
-async function findProcess(path) {
-  for (const name of await readdir('/proc')) {
-    if (!/^\d+$/.test(name)) continue;
-    const base = `/proc/${name}`;
-    const cmdline = await readFile(`${base}/cmdline`, 'utf8').catch(() => '');
-    if (!cmdline.split('\0').includes(path)) continue;
-    const status = await readFile(`${base}/status`, 'utf8');
-    const fields = Object.fromEntries(status.split('\n').flatMap(line => {
-      const match = /^(\w+):\s*(.*)$/.exec(line);
-      return match ? [[match[1], match[2]]] : [];
-    }));
-    return fields;
+async function processIds() {
+  return (await readdir('/proc')).filter(name => /^\d+$/.test(name));
+}
+
+async function liveProcess(pid) {
+  const status = await readFile(`/proc/${pid}/status`, 'utf8').catch(error => {
+    if (error.code === 'ENOENT' || error.code === 'ESRCH') return '';
+    throw error;
+  });
+  const fields = Object.fromEntries(status.split('\n').flatMap(line => {
+    const match = /^(\w+):\s*(.*)$/.exec(line);
+    return match ? [[match[1], match[2]]] : [];
+  }));
+  return fields.Pid === pid && fields.State && !/^[ZXx]\b/.test(fields.State) ? fields : null;
+}
+
+async function findRuntime() {
+  const processes = [];
+  for (const pid of await processIds()) {
+    const cmdline = await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '');
+    if (!cmdline.split('\0').includes('/opt/harness/runtime.mjs')) continue;
+    const candidate = await liveProcess(pid);
+    if (candidate) processes.push(candidate);
   }
-  throw new Error(`Missing live process ${path}`);
+  assert.equal(processes.length, 1, 'Expected one live harness runtime');
+  return processes[0];
+}
+
+async function findCli(runtime) {
+  // Pinned CCB overwrites argv through process.title before making the
+  // synthetic model request. The harness starts only one direct child, via
+  // process.execPath with the fixed CCB entry point. Verify that live child
+  // and its executable while the synthetic gateway holds its response open.
+  const children = [];
+  for (const pid of await processIds()) {
+    if (pid === String(process.pid)) continue;
+    const candidate = await liveProcess(pid);
+    if (candidate?.PPid === runtime.Pid) children.push(candidate);
+  }
+  assert.equal(children.length, 1, 'Expected one live direct CCB child during the synthetic request');
+  const [cli] = children;
+  const [runtimeExe, cliExe] = await Promise.all([
+    readlink(`/proc/${runtime.Pid}/exe`),
+    readlink(`/proc/${cli.Pid}/exe`),
+  ]);
+  assert.equal(cliExe, runtimeExe, 'The direct CCB child must run the same Node executable');
+  return cli;
 }
 
 function checkPrivileges(fields) {
@@ -95,7 +128,7 @@ function finish(response) {
 try {
   await ready();
   assert.equal((await fetch(api + '/v1/health', { signal: AbortSignal.timeout(1000) })).status, 401);
-  const runtime = await findProcess('/opt/harness/runtime.mjs');
+  const runtime = await findRuntime();
   // The actual parent must stay up and keep the default Inspector socket
   // closed after a same-container signal.
   process.kill(Number(runtime.Pid), 'SIGUSR1');
@@ -127,9 +160,11 @@ try {
   } finally {
     timeout.abort();
   }
-  const cli = await findProcess('/opt/ccb/dist/cli-node.js');
-  assert.equal(cli.PPid, runtime.Pid);
-  const summary = { runtime: checkPrivileges(runtime), cli: checkPrivileges(cli), signalInspectorBlocked: true, syntheticRequests };
+  const cli = await findCli(runtime);
+  const summary = {
+    runtime: checkPrivileges(runtime), cli: checkPrivileges(cli),
+    cliIdentity: 'unique-live-direct-node-child', signalInspectorBlocked: true, syntheticRequests,
+  };
   finish(response);
 
   const deadline = Date.now() + timeoutMs;

@@ -1,5 +1,8 @@
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
+import { canonical, validateStart } from '../harness/envelope.mjs';
 import { scopeHarnessOutbound } from '../server/harness-outbound-scope';
+import { canonicalHarness } from '../server/harness-policy';
 
 vi.mock('cloudflare:workers', () => ({
   WorkerEntrypoint: class {
@@ -27,6 +30,13 @@ function streamPost(url: string, stream: 'empty' | 'data' | 'stalled') {
 }
 
 describe('native harness research boundary', () => {
+  it('uses the same closed canonical JSON for worker and image envelope objects', () => {
+    const envelope = { taskId: 'task', files: [{ path: 'input/file.txt', content: 'text' }], effort: 'low' };
+    const known = '{"effort":"low","files":[{"content":"text","path":"input/file.txt"}],"taskId":"task"}';
+    expect(canonical(envelope)).toBe(known);
+    expect(canonicalHarness(envelope)).toBe(known);
+  });
+
   it('denies an explicit wrong task, generation, bearer, key and any non-gateway route', () => {
     const mismatches: Record<string, string>[] = [
       { 'x-pgc-harness-task': 'task-b' }, { 'x-pgc-harness-generation': 'generation-b' },
@@ -106,7 +116,9 @@ describe('native harness research boundary', () => {
   });
 });
 
-function setup({ privileged = false } = {}) {
+function setup({ privileged = false, runtimeNow = Date.now, startResponse }: {
+  privileged?: boolean; runtimeNow?: () => number; startResponse?: () => Response;
+} = {}) {
   const data = new Map<string, unknown>();
   let alarm: number | null = null;
   interface MemoryStorage {
@@ -139,8 +151,10 @@ function setup({ privileged = false } = {}) {
       const path = new URL(request.url).pathname;
       if (path === '/v1/health') return Response.json({ status: 'ready' });
       if (path === '/v1/start') {
-        const body = await request.json() as { lease: string };
-        await runner.fetch(new Request(internal + '/observed', { method: 'POST', headers: { Authorization: 'Bearer ' + body.lease } }));
+        const verified = validateStart(await request.json(), runtimeNow());
+        if (!verified) return Response.json({ error: 'Invalid run envelope' }, { status: 400 });
+        if (startResponse) return startResponse();
+        await runner.fetch(new Request(internal + '/observed', { method: 'POST', headers: { Authorization: 'Bearer ' + verified.lease } }));
         return Response.json({}, { status: 202 });
       }
       if (path === '/v1/status') return Response.json({ state: 'failed', failure: 'deadline_exceeded' });
@@ -159,6 +173,39 @@ function setup({ privileged = false } = {}) {
 }
 
 describe('native probe orchestration with scripted container', () => {
+  it('identifies the renamed CLI by its unique live direct Node parentage', async () => {
+    const s = setup();
+    await s.post('/run');
+    const script = s.container.exec.mock.calls[1][0][3].replace("import fs from 'node:fs';", '');
+    const processes = new Map([
+      ['10', { ppid: 1, title: '/opt/harness/runtime.mjs', env: 'PGC_HARNESS_CONTROL_TOKEN=fixture' }],
+      ['11', { ppid: 10, title: 'claude', env: 'ANTHROPIC_API_KEY=pgc-loopback-only\0OPENAI_API_KEY=pgc-loopback-only' }],
+      ['12', { ppid: 10, title: 'inspector', env: '' }],
+      ['13', { ppid: 1, title: 'claude', env: '' }],
+    ]);
+    const inspect = () => {
+      let output;
+      runInNewContext(script, {
+        process: { pid: 12 }, console: { log: (data: string) => { output = JSON.parse(data); } },
+        fs: {
+          readdirSync: (path: string) => path === '/proc' ? [...processes.keys()] : [],
+          readlinkSync: () => '/usr/local/bin/node',
+          readFileSync: (path: string) => {
+            const [, , pid, field] = path.split('/');
+            const item = processes.get(pid)!;
+            if (field === 'status') return `State:\tS (sleeping)\nPPid:\t${item.ppid}\nUid:\t1000\t1000\t1000\t1000\n`;
+            if (field === 'cmdline') return item.title;
+            return item.env;
+          },
+        },
+      });
+      return output;
+    };
+    expect(inspect()).toMatchObject({ cli: { uids: [1000, 1000, 1000, 1000] }, childSecretIsolation: true });
+    processes.get('13')!.ppid = 10;
+    expect(inspect()).toMatchObject({ cli: null, childSecretIsolation: null });
+  });
+
   it('enforces empty stream handling again on the Durable Object boundary', async () => {
     const s = setup();
     const url = internal + '/arm-timeout';
@@ -178,6 +225,7 @@ describe('native probe orchestration with scripted container', () => {
     expect(response.status).toBe(502);
     const receipt = await response.json();
     expect(receipt).toMatchObject({ state: 'failed', releaseReady: false, cleanup: 'request',
+      runtimeStart: { httpStatus: 202 },
       checks: { runtimeBoot: true, cliReachedFixture: true, privateGateway: true, crossTaskDenied: true,
         nonRootUid: true, privilegeDrop: false, nonHttpEgressDenied: null, runtimeDeadline: true, workspaceRemoved: true, containerDestroyed: true } });
     expect(s.container.start).toHaveBeenCalledWith(expect.objectContaining({ image, enableInternet: false }));
@@ -203,6 +251,30 @@ describe('native probe orchestration with scripted container', () => {
 });
 
 describe('native probe diagnostics', () => {
+  it('records the allowlisted rejection when runtime validation sees an expired envelope', async () => {
+    const s = setup({ runtimeNow: () => Date.now() + 30_000 });
+    const response = await s.post('/run');
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ error: 'runtime_start_rejected',
+      runtimeStart: { httpStatus: 400, error: 'invalid_envelope' },
+      checks: { runtimeAccepted: false, containerDestroyed: true } });
+    expect(s.container.exec).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    () => Response.json({ error: 'PRIVATE_PLATFORM_DIAGNOSTIC' }, { status: 400 }),
+    () => Response.json({ error: 'Invalid run envelope', secret: 'PRIVATE_PLATFORM_DIAGNOSTIC'.repeat(20) }, { status: 400 }),
+    () => new Response(new ReadableStream({ cancel: () => new Promise(() => {}) }), { status: 400 }),
+  ])('keeps unexpected, oversized or stalled rejection bodies out of the receipt', async startResponse => {
+    const s = setup({ startResponse });
+    const response = await s.post('/run');
+    expect(response.status).toBe(502);
+    const receipt = await response.json();
+    expect(receipt.runtimeStart).toEqual({ httpStatus: 400 });
+    expect(receipt.error).toBe('runtime_start_rejected');
+    expect(JSON.stringify(receipt)).not.toContain('PRIVATE_PLATFORM_DIAGNOSTIC');
+  });
+
   it('distinguishes an HTTP intercept installation failure without echoing the platform error', async () => {
     const s = setup();
     s.container.interceptAllOutboundHttp.mockRejectedValueOnce(new Error('PRIVATE_PLATFORM_DIAGNOSTIC'));

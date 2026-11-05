@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { validateStart } from '../harness/envelope.mjs';
 import {
   authorizeHarnessTask, HarnessHost, harnessMaterialFiles, harnessResultText, readHarnessPrivate,
 } from '../server/harness-host';
@@ -64,7 +65,9 @@ function mockedContainer() {
   const fetchRuntime = vi.fn(async (request: Request) => {
     const { pathname } = new URL(request.url);
     if (pathname === '/v1/start') {
-      startBody = await request.json() as StartBody;
+      const candidate = await request.json() as StartBody;
+      if (!validateStart(candidate, Date.now())) return Response.json({ error: 'Invalid run envelope' }, { status: 400 });
+      startBody = candidate;
       return Response.json({ state: 'running' }, { status: 202 });
     }
     if (pathname === '/v1/status') {
@@ -299,6 +302,11 @@ describe('harness phase recovery, ledger and cleanup', () => {
     expect(container.posts()).toHaveLength(1);
     expect(container.body?.envelopeSha256).toBe(await harnessHash(canonicalHarness(container.body!.envelope)));
     expect(container.body?.envelope.imagePaths).toEqual(['input/image-1.png']);
+    expect(validateStart(container.body, Date.now())).toMatchObject({
+      run: { purpose: 'game', effort: 'high', maxOutputTokens: 64_000, maxTotalOutputTokens: 256_000 },
+      images: [{ type: 'image', source: { media_type: 'image/png', data: image } }],
+      outputs: ['game.html', 'record.json'],
+    });
     expect(container.state.start).toHaveBeenCalledWith(expect.objectContaining({
       enableInternet: false, instance: 'standard-1', image: imageReference,
       env: { PGC_HARNESS_CONTROL_TOKEN: expect.any(String), PGC_HARNESS_GATEWAY_URL: 'http://pgc-harness.internal' },
