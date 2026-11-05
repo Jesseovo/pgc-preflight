@@ -217,3 +217,169 @@ describe('staged creation evidence and publication',()=>{
     expect(s.env.captureReview).not.toHaveBeenCalled();
   });
 });
+
+function enableHarness(s: ReturnType<typeof setup>, limits: Partial<typeof import('../server/harness-policy').HARNESS_GAME_LIMITS> = {}) {
+  const policy = {
+    version: 1, engine: 'ccb', engineCommit: '963e0013184ecc1521289a0fc7d5da4bb6e45356',
+    image: `registry.cloudflare.com/${'1'.repeat(32)}/fixture@sha256:${'2'.repeat(64)}`, releaseHash: 'a'.repeat(64),
+    family: 'forge', purpose: 'game', modelContractHash: 'b'.repeat(64),
+    limits: { maxOutputTokens: 64_000, maxTotalOutputTokens: 256_000, maxModelTurns: 24, maxDurationMs: 40 * 60_000, maxRepairs: 2, ...limits },
+  };
+  s.sqlite.prepare('UPDATE forge_tasks SET harness_policy=? WHERE id=?').run(JSON.stringify(policy), s.id);
+  const finish = vi.fn(async (_request: Request) => Response.json({ ok: true }));
+  const env = { ...s.env, HARNESS_RUNNER: { idFromName: (id: string) => id, get: () => ({ fetch: finish }) } };
+  return { env, finish, policy };
+}
+
+async function allocateHarnessFixture(runtime: Parameters<typeof complete>[0]){
+  const execution=runtime.harnessExecution;
+  if(execution?.onAllocated){
+    const startedAt=execution.deadlineAt-execution.policy.limits.maxDurationMs;
+    await execution.onAllocated({startedAt,taskDeadlineAt:execution.deadlineAt,stageDeadlineAt:Math.min(execution.deadlineAt,startedAt+12*60_000)});
+  }
+}
+
+describe('opt-in harness game stages', () => {
+  it('shares a locked source and deadline, reuses the four actual images, and caps evidenced repairs at two', async () => {
+    const s = setup('platform');
+    const { env, finish, policy } = enableHarness(s);
+    const deadlineByStage: number[] = [];
+    const phases: string[] = [];
+    const sourceHash = await digest(s.row().input_snapshot);
+    vi.mocked(complete).mockImplementation(async (runtime, _cfg, request) => {
+      await allocateHarnessFixture(runtime);
+      const execution = runtime.harnessExecution!;
+      const stage = execution.phase;
+      phases.push(stage);
+      deadlineByStage.push(execution.deadlineAt);
+      expect(execution).toMatchObject({ taskId: s.id, ownerId: 'owner', sourceHash, policy });
+      expect(runtime.generation!.capacityReserved).toBe(false);
+      expect(runtime.generation!.deadline).toBeLessThanOrEqual(execution.deadlineAt);
+      expect(runtime.generation!.deadline - Date.now()).toBeLessThanOrEqual(12 * 60_000);
+      expect(request).toMatchObject({ maxTokens: 64_000, outputEffort: 'high', maxAttempts: 1 });
+      await runtime.generation!.onStart();
+      if (stage === 'build') return output(stage);
+      const previous = { polish: 'build', repair: 'polish', repair2: 'repair' }[stage]!;
+      expect(execution.previousHtml).toBe(html(previous));
+      expect((request.user as any[]).filter(part => part.type === 'image')).toHaveLength(4);
+      expect(JSON.stringify(request.user)).toContain(`原图证据 ID：${previous}:shot-2`);
+      const needsRepair = selfCheck([finding({ resolved: false, evidenceRefs: [`${previous}:shot-2`] })], true);
+      if (stage === 'repair2') {
+        expect(request.validate!(output(stage, { selfCheck: needsRepair }))).toContain('selfCheck');
+        return output(stage, { selfCheck: selfCheck() });
+      }
+      const result = output(stage, { selfCheck: needsRepair });
+      expect(request.validate!(result)).toEqual([]);
+      return result;
+    });
+    for (let i = 0; i < 12 && ['queued','running'].includes(s.row().status); i++) await creationPipelineAlarm(s.state, env, s.id);
+    expect(phases).toEqual(['build', 'polish', 'repair', 'repair2']);
+    expect(new Set(deadlineByStage).size).toBe(1);
+    expect(s.row()).toMatchObject({ status: 'done', phase: 'done' });
+    expect(s.env.captureReview).toHaveBeenCalledTimes(4);
+    for (const stage of phases) {
+      const capture = await creationEvidence(s.DB, 'owner', 1, s.id, stage);
+      expect(capture.shots).toHaveLength(4);
+      expect(capture.shots[0].data).toBe('data:image/jpeg;base64,YQ==');
+    }
+    expect(finish).toHaveBeenCalledTimes(1);
+    expect(await finish.mock.calls[0][0].json()).toEqual({ outcome: 'completed' });
+  });
+
+  it('keeps the completed stage when actual browser work exceeds the shared task deadline', async () => {
+    vi.useFakeTimers();
+    try {
+      const s = setup('platform');
+      const { env, finish } = enableHarness(s, { maxDurationMs: 2_000 });
+      vi.mocked(complete).mockImplementationOnce(async runtime => {
+        await allocateHarnessFixture(runtime);
+        await runtime.generation!.onStart();
+        return output('build');
+      });
+      await creationPipelineAlarm(s.state, env, s.id);
+      s.env.captureReview.mockImplementationOnce(async () => {
+        vi.setSystemTime(Date.now() + 2_001);
+        return raw();
+      });
+      await creationPipelineAlarm(s.state, env, s.id);
+      expect(s.row()).toMatchObject({ status: 'error', error: expect.stringContaining('总时限') });
+      expect(s.sqlite.prepare('SELECT stage,evidence_hash FROM forge_creation_stages').get()).toEqual({ stage: 'build', evidence_hash: null });
+      expect(complete).toHaveBeenCalledTimes(1);
+      expect(await finish.mock.calls[0][0].json()).toEqual({ outcome: 'failed' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects the second repair on the member Agent protocol', async () => {
+    const s = setup();
+    const result = output('repair2', { selfCheck: selfCheck() });
+    await expect(recordAgentCreationStage(s.DB, s.row(), await stagePayload('repair2', result))).rejects.toThrow('阶段或模型名称无效');
+    await expect(validateAgentCreationCompletion(s.DB, s.row(), 'repair2')).rejects.toThrow('至少包含 build 和 polish');
+  });
+
+  it('fails a restarted in-flight harness phase closed without another model call', async () => {
+    const s = setup('platform');
+    const { env, finish } = enableHarness(s);
+    await advanceCreationPipeline(s.state, env, s.id);
+    const cp = JSON.parse(await s.storage.get('creation:0'));
+    await s.storage.put('creation:0', JSON.stringify({ ...cp, phase: 'started' }));
+    await creationPipelineAlarm(s.state, env, s.id);
+    expect(s.row()).toMatchObject({ status: 'error', error: expect.stringContaining('模型结果未知') });
+    expect(complete).not.toHaveBeenCalled();
+    expect(await finish.mock.calls[0][0].json()).toEqual({ outcome: 'failed' });
+  });
+});
+
+it('retains stage artifacts but waits for a durable harness finish before publishing', async () => {
+  const s = setup('platform');
+  const { env, finish } = enableHarness(s);
+  finish.mockImplementationOnce(async () => Response.json({ error: 'settlement unavailable' }, { status: 503 }));
+  vi.mocked(complete).mockImplementation(async runtime => {
+    await allocateHarnessFixture(runtime);
+    await runtime.generation!.onStart();
+    return runtime.harnessExecution!.phase === 'build' ? output('build') : output('polish', { selfCheck: selfCheck() });
+  });
+  for (let i = 0; i < 8 && finish.mock.calls.length === 0; i++) await creationPipelineAlarm(s.state, env, s.id);
+  expect(finish).toHaveBeenCalledTimes(1);
+  expect(s.row().status).toBe('running');
+  expect(s.sqlite.prepare('SELECT stage FROM forge_creation_stages ORDER BY stage').all()).toEqual([{ stage: 'build' }, { stage: 'polish' }]);
+  expect(s.sqlite.prepare('SELECT product_html FROM topics WHERE id=1').get()).toEqual({ product_html: null });
+  await creationPipelineAlarm(s.state, env, s.id);
+  expect(s.row().status).toBe('done');
+  expect(complete).toHaveBeenCalledTimes(2);
+  expect(finish).toHaveBeenCalledTimes(2);
+});
+
+it('keeps definite capacity waits outside the shared game deadline without marking a model start',async()=>{
+  vi.useFakeTimers();
+  try{
+    const s=setup('platform');
+    const {env}=enableHarness(s);
+    const {HarnessCapacityWait}=await import('../server/harness-execution');
+    let expectedDeadline=0;
+    vi.mocked(complete)
+      .mockImplementationOnce(async()=>{throw new HarnessCapacityWait('等待隔离执行名额…');})
+      .mockImplementationOnce(async runtime=>{
+        expectedDeadline=runtime.harnessExecution!.deadlineAt;
+        await allocateHarnessFixture(runtime);
+        await runtime.generation!.onStart();
+        return output('build');
+      })
+      .mockImplementationOnce(async runtime=>{
+        expect(runtime.harnessExecution!.deadlineAt).toBe(expectedDeadline);
+        await runtime.generation!.onStart();
+        return output('polish',{selfCheck:selfCheck()});
+      });
+    await creationPipelineAlarm(s.state,env,s.id);
+    expect(s.row()).toMatchObject({status:'running',phase:'build:waiting',started_at:null,model_started_at:null});
+    expect(JSON.parse(await s.storage.get('creation:0')).phase).toBe('ready');
+    expect(s.alarm.at).toBe(Date.now()+5000);
+    vi.setSystemTime(Date.now()+41*60_000);
+    const allocatedAt=Date.now();
+    for(let i=0;i<7&&s.row().status==='running';i++)await creationPipelineAlarm(s.state,env,s.id);
+    expect(s.row()).toMatchObject({status:'done',started_at:new Date(allocatedAt).toISOString()});
+    expect(expectedDeadline).toBe(allocatedAt+40*60_000);
+    expect(complete).toHaveBeenCalledTimes(3);
+  }finally{vi.useRealTimers();}
+});

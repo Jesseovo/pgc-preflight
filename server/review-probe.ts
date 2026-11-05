@@ -37,13 +37,15 @@ function installReviewProbe() {
 }
 
 /** Capture the browser viewport, including DOM, CSS, WebGL and every canvas layer. */
-export async function captureReview(browser: Browser, html: string, options: {denyExternal?:boolean} = {}) {
+export async function captureReview(browser: Browser, html: string, options: {denyExternal?:boolean; deadlineAt?:number} = {}) {
   const context = await browser.createBrowserContext();
+  const remaining = () => (options.deadlineAt ?? Infinity) - Date.now();
   let expired = false;
-  const deadline = setTimeout(() => { expired = true; void context.close().catch(() => {}); }, 65000);
+  const deadline = setTimeout(() => { expired = true; void context.close().catch(() => {}); }, Math.max(0, Math.min(65000, remaining())));
   const sources = options.denyExternal ? '' : [...RESOURCE_HOSTS].map(host => `https://${host}`).join(' ');
   const allowed = (url:string)=>resourceAllowed(url)&&(!options.denyExternal||/^(data:|blob:|about:blank$)/i.test(url));
   try {
+    if (remaining() <= 0) { expired = true; throw new Error('Capture deadline'); }
     const frames = [];
     let shotNumber=0;
     // Chromium touch gestures share browser input state. Run viewports in order
@@ -110,6 +112,7 @@ export async function captureReview(browser: Browser, html: string, options: {de
         action: { id:`baseline-${spec.ratio}-tap`,startedAt:new Date(tappedAt).toISOString(),ratio: spec.ratio, type: 'tap', ...point, target, count: 1, note: '浏览器触摸事件；仅记录执行动作，未确认游戏已开局。此后未再操作。' } });
       await page.close();
     }
+    if (remaining() <= 0) { expired = true; throw new Error('Capture deadline'); }
     return {
       shots: frames.flatMap(frame => frame.shots),
       probe: {

@@ -7,6 +7,8 @@ import { deviceOwnerAllowed, failDeviceReview, readReviewInput, stamp } from './
 import { updateReviewProgress } from './review-jobs';
 import { captureFor } from './cloud-review-capture';
 import {recordReviewTiming,markReviewExecution,recordReviewConfiguration,hashReviewConfiguration,type ReviewTimingPhase} from './review-timing';
+import {harnessExecutionFor,finishHarnessTask} from './harness-execution';
+import {harnessHash,canonicalHarness} from './harness-policy';
 
 type Phase = 'prepared' | 'review-started' | 'draft-ready' | 'verify-started' | 'final-ready';
 type Checkpoint = { deadline: number; config: any; request: any; images: any[]; probe: any; title: string; topic_id: number | null; draft?: any; result?: any; materialRef?:string };
@@ -118,6 +120,7 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
     const data = await load(storage), result = data.result;
     await recordConfiguration(DB,id,data,row.rules_snapshot);
     const score = reportScore(result);
+    if(row.harness_policy)await finishHarnessTask(env,id,'completed');
     if ((data.request.reportSchemaVersion ?? 1) === 1 && score !== null) result.verdict = consistentVerdict(result.verdict, score);
     await timed(DB,id,'persist',()=>DB.batch([
       DB.prepare(`INSERT OR IGNORE INTO reviews(owner_id,title,topic_id,score,result,probe,shots,created_at,job_id,rules_snapshot) SELECT owner_id,title,?,?,?,?,?,?,id,rules_snapshot FROM review_jobs WHERE id=? AND status='running' AND model_executor='platform'`).bind(data.topic_id, score, JSON.stringify(result), JSON.stringify({...data.probe,evidenceOrigin:'admin-upload'}), JSON.stringify(data.images), stamp(), id),
@@ -159,7 +162,8 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
     const data = await load(storage);
     await recordConfiguration(DB,id,data,row.rules_snapshot);
     if (Date.now() >= data.deadline) throw new Error('审核处理时限已到，未发布评分，请重试。');
-    const runtime = { ...env, ownerId:row.owner_id, modelStore:{get:async()=>data.config} };
+    const harnessExecution=harnessExecutionFor(row,'review',phase==='prepared'?'review':'review_verify',await harnessHash(canonicalHarness({request:data.request,images:data.images})),data.deadline);
+    const runtime = { ...env,harnessExecution, ownerId:row.owner_id, modelStore:{get:async()=>data.config} };
     const request = { ...data.request, deadline:data.deadline, idempotencyKey:`pgc-review-${id}`,
       // A slow initial progress write must not replace the verification message.
       onWait:async(message:string)=>{await DB.prepare("UPDATE review_jobs SET error=?,updated_at=? WHERE id=? AND status='running' AND stage=?").bind(message,stamp(),id,phase==='prepared'?'review':'verify').run();},
@@ -186,6 +190,7 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
     } else throw new Error('审核阶段不正确，未发布评分。');
   } catch (error) {
     await failDeviceReview(DB,id,(error as Error).message||'审核未完成，请重试。');
+    if(row.harness_policy)await finishHarnessTask(env,id,'failed').catch(()=>{});
     await markReviewExecution(DB,id,'error').catch(()=>{});
     await clear(storage);
   } finally { clearInterval(heartbeat); }

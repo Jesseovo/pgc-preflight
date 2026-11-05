@@ -1,0 +1,266 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createHarness } from '../harness/runtime.mjs';
+import { canonical, fileEntry, sha256 } from '../harness/envelope.mjs';
+import { inspectStream } from '../harness/model-bridge.mjs';
+
+const controlToken = 'synthetic-control-token-for-test-only';
+const lease = 'synthetic-model-lease-for-test-only';
+const screenshot = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQYV2NgAAIAAAUAAYoz4wQAAAAASUVORK5CYII=';
+const html = '<!doctype html><html><body>before</body></html>';
+const fixture = String.raw`
+import { readFile, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { Socket } from 'node:net';
+const configPath = process.argv[process.argv.indexOf('--mcp-config') + 1];
+const server = JSON.parse(await readFile(configPath, 'utf8')).mcpServers.pgc_workspace;
+const body = JSON.parse(Buffer.concat(await Array.fromAsync(process.stdin)).toString()).message;
+const fixture = body.content.at(-1).text;
+const api = process.env.ANTHROPIC_BASE_URL;
+const model = process.argv[process.argv.indexOf('--model') + 1];
+const isOpenAI = process.env.CLAUDE_CODE_USE_OPENAI === '1';
+if (process.env.PGC_HARNESS_CONTROL_TOKEN || process.env.PGC_HARNESS_GATEWAY_URL ||
+    process.env.ANTHROPIC_API_KEY !== 'pgc-loopback-only' ||
+    Object.keys(process.env).some(key => /SECRET|PGC_HARNESS_CONTROL|PGC_HARNESS_GATEWAY/.test(key))) process.exit(2);
+async function forbidden(operation, code) {
+  try { await operation(); } catch (error) { if (error.code === code) return; }
+  process.exit(12);
+}
+await forbidden(() => readFile('/pgc-forbidden-host-fixture'), 'ERR_ACCESS_DENIED');
+await forbidden(() => writeFile('/pgc-forbidden-host-fixture', 'not allowed'), 'ERR_ACCESS_DENIED');
+await forbidden(() => spawnSync(process.execPath, ['--version']), 'ERR_ACCESS_DENIED');
+await forbidden(() => new Socket().connect({ host: '127.0.0.1', port: 1 }), 'PGC_CCB_NETWORK_DENIED');
+if ((await fetch(api + '/v1/messages/count_tokens', { method: 'POST', body: '{}' })).status !== 403 ||
+    (await fetch(server.url, { method: 'POST', body: '{}' })).status !== 403) process.exit(13);
+let rpc = 0;
+async function call(name, args) {
+  const res = await fetch(server.url, {
+    method: 'POST', headers: { ...server.headers, 'content-type': 'application/json' },
+    body: JSON.stringify({jsonrpc:'2.0',id:++rpc,method:'tools/call',params:{name,arguments:args}}),
+  });
+  return (await res.json()).result;
+}
+const modelURL = api + (isOpenAI ? '/v1/chat/completions' : '/v1/messages?beta=true');
+let turn = randomUUID();
+const ask = async messages => {
+  const res = await fetch(modelURL, {
+    method:'POST', headers:{'x-pgc-ccb-turn':turn, 'content-type':'application/json'},
+    body:JSON.stringify({model,max_tokens:64000,stream:true,messages,
+      ...(isOpenAI ? {enable_thinking:true,chat_template_kwargs:{thinking:true}}
+        : {metadata:{user_id:'ignore-private-identity'}})}),
+  });
+  return { status: res.status, text: await res.text() };
+};
+const result = text => console.log(JSON.stringify({type:'result', subtype:'success', is_error:false, result:text}));
+const response = await ask([body]);
+if (response.status !== 200) process.exit(3);
+if (fixture === 'game with capture') {
+  const duplicate = await ask([body]);
+  if (duplicate.status !== 409) process.exit(4);
+  const denied = await call('write', {path:'../outside',content:'blocked'});
+  if (!denied.isError) process.exit(5);
+  const deniedInput = await call('write', {path:'input/game.html',content:'blocked'});
+  if (!deniedInput.isError) process.exit(6);
+  const read = await call('read', {path:'game.html'});
+  if (!read.content[0].text.includes('before')) process.exit(7);
+  if ((await call('patch', {path:'game.html', oldText:'before',newText:'after'})).isError) process.exit(8);
+  const capture = await call('capture', {});
+  if (capture.isError || capture.content[1].type !== 'image' || capture.content[0].text.includes(capture.content[1].data)) process.exit(9);
+  const picture = capture.content[1];
+  const messages = [body, {role:'user',content:[{type:'tool_result',tool_use_id:'synthetic',content:[
+    {type:'text', text:capture.content[0].text},
+    {type:'image',source:{type:'base64', media_type:picture.mimeType,data:picture.data}},
+  ]}]}];
+  turn = randomUUID();
+  if ((await ask(messages)).status !== 200) process.exit(10);
+  const record = {requirements:[],decisions:[],coreChanges:[],selfCheck:[]};
+  if ((await call('write', {path:'record.json',content:JSON.stringify(record)})).isError) process.exit(11);
+  result('The game is ready.');
+} else {
+  console.log(JSON.stringify({type:'assistant',message:{content:[{type:'thinking',thinking:'private synthetic thinking'}]}}));
+  result('Synthetic result.');
+}
+`;
+
+const syntheticSSE = (protocol: string, reason: string, tokens: number) => protocol === 'openai'
+  ? `data: ${JSON.stringify({ choices: [{ finish_reason: reason }], usage: { completion_tokens: tokens } })}\n\ndata: [DONE]\n\n`
+  : `data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: reason }, usage: { output_tokens: tokens } })}\n\ndata: {"type":"message_stop"}\n\n`;
+
+type Gateway = (request: IncomingMessage, response: ServerResponse, body: any) => void;
+
+describe('CCB Node runtime boundary', () => {
+  let directory: string;
+  let childFixture: string;
+  let gateway: ReturnType<typeof createServer>;
+  let runtime: ReturnType<typeof createHarness>;
+  let base: string;
+
+  beforeEach(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'pgc-runtime-test-'));
+    childFixture = join(directory, 'ccb-fixture.mjs');
+    await writeFile(childFixture, fixture);
+  });
+
+  afterEach(async () => {
+    runtime?.close();
+    gateway?.close();
+    gateway?.closeAllConnections();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  async function serve(handler: Gateway) {
+    gateway = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(chunk as Buffer);
+      handler(request, response, JSON.parse(Buffer.concat(chunks).toString()));
+    });
+    await new Promise<void>(resolve => gateway.listen(0, '127.0.0.1', resolve));
+    const address = gateway.address();
+    if (!address || typeof address === 'string') throw new Error('Invalid test gateway');
+    runtime = createHarness({ controlToken, gatewayURL: `http://127.0.0.1:${address.port}`, fixtureCli: childFixture, smokeCli: undefined });
+    base = `http://127.0.0.1:${(await runtime.listen(0, '127.0.0.1') as { port: number }).port}`;
+  }
+
+  const run = (fields: Record<string, unknown> = {}) => ({
+    runId: 'synthetic-run', taskId: 'synthetic-task', generation: 'synthetic-generation',
+    phase: 'review', purpose: 'review', protocol: 'openai', model: 'deepseek-chat', effort: 'low',
+    deadlineAt: Date.now() + 20_000, maxOutputTokens: 64_000, maxTotalOutputTokens: 64_000,
+    maxModelTurns: 3, maxRepairs: 0, repair: 0, vision: false,
+    prompt: 'synthetic review', systemPrompt: 'Controlled test input.', files: [], ...fields,
+  });
+
+  function call(path: string, request?: unknown, runId = 'synthetic-run') {
+    return fetch(base + path, {
+      method: request ? 'POST' : 'GET',
+      headers: { authorization: `Bearer ${controlToken}`, 'content-type': 'application/json', 'x-pgc-harness-run': runId },
+      ...(request ? { body: JSON.stringify(request) } : {}),
+    });
+  }
+
+  function start(envelope: ReturnType<typeof run>, envelopeSha256 = sha256(canonical(envelope))) {
+    return call('/v1/start', { envelope, envelopeSha256, lease });
+  }
+
+  async function done() {
+    await expect.poll(async () => (await (await call('/v1/status')).json()).state, { timeout: 6000 })
+      .not.toBe('running');
+    return (await call('/v1/result')).json();
+  }
+
+  it('locks the envelope, model, provider cap and private output to one idempotent run', async () => {
+    const observed: any[] = [];
+    await serve((request, response, body) => {
+      observed.push({ headers: request.headers, url: request.url, body });
+      response.setHeader('content-type', 'text/event-stream');
+      response.end(syntheticSSE('openai', 'stop', 22));
+    });
+    const envelope = run();
+    expect((await fetch(base + '/v1/status')).status).toBe(401);
+    expect((await start(envelope, 'a'.repeat(64))).status).toBe(400);
+    expect((await start(envelope)).status).toBe(202);
+    expect((await start(envelope)).status).toBe(200);
+    expect((await start({ ...envelope, prompt: 'changed' })).status).toBe(409);
+    const result = await done();
+    expect(result).toMatchObject({ state: 'succeeded', modelTurns: 1, outputTokens: 22, text: 'Synthetic result.' });
+    expect(JSON.stringify(result)).not.toContain('private synthetic thinking');
+    expect(result.files).toEqual([fileEntry('result.txt', 'Synthetic result.')]);
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({
+      url: '/v1/chat/completions', body: { max_tokens: 64000, model: 'deepseek-chat' },
+      headers: { authorization: `Bearer ${lease}`, 'x-pgc-harness-generation': 'synthetic-generation' },
+    });
+    expect(observed[0].body).not.toHaveProperty('enable_thinking');
+    expect((await call('/v1/result', undefined, 'another-run')).status).toBe(404);
+  });
+
+  it('keeps the full game and record, runs only scoped workspace tools and preserves original screenshot bytes', async () => {
+    const modelCalls: any[] = [];
+    const browserCalls: any[] = [];
+    await serve((request, response, body) => {
+      if (request.url === '/v1/tools') {
+        browserCalls.push(body);
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ inputHash: body.arguments.inputHash, shots: [{ id: 'viewport-1', data: `data:image/png;base64,${screenshot}` }] }));
+      } else {
+        modelCalls.push(body);
+        response.setHeader('content-type', 'text/event-stream');
+        response.end(syntheticSSE('anthropic', modelCalls.length === 1 ? 'tool_use' : 'end_turn', 22));
+      }
+    });
+    expect((await start(run({
+      phase: 'polish', purpose: 'game', protocol: 'anthropic', model: 'claude-opus-5-5', effort: 'high', vision: true,
+      prompt: 'game with capture', files: [fileEntry('input/game.html', html)],
+    }))).status).toBe(202);
+    const result = await done();
+    const patched = html.replace('before', 'after');
+    expect(result).toMatchObject({ state: 'succeeded', modelTurns: 2, outputTokens: 44 });
+    expect(result.files[0]).toEqual(fileEntry('game.html', patched));
+    expect(result.files[1].path).toBe('record.json');
+    expect(browserCalls).toHaveLength(1);
+    expect(browserCalls[0]).toMatchObject({ name: 'capture', arguments: { inputHash: sha256(patched), html: patched } });
+    expect(modelCalls).toHaveLength(2);
+    expect(modelCalls[0]).toMatchObject({ thinking: { type: 'adaptive' }, output_config: { effort: 'high' } });
+    expect(modelCalls[0]).not.toHaveProperty('metadata');
+    expect(modelCalls[1].max_tokens).toBe(64_000 - 22);
+    expect(modelCalls[1].messages[1].content[0].content[1].source.data).toBe(screenshot);
+  });
+
+  it('cancels the active request and refuses cross-task reuse', async () => {
+    let calls = 0;
+    await serve((_request, response) => {
+      calls++;
+      response.setHeader('content-type', 'text/event-stream');
+      response.flushHeaders();
+    });
+    expect((await start(run())).status).toBe(202);
+    await expect.poll(() => calls).toBe(1);
+    expect((await call('/v1/cancel', {})).status).toBe(200);
+    expect(await done()).toMatchObject({ state: 'cancelled', failure: 'cancelled', modelTurns: 1 });
+    expect((await start(run({ runId: 'other-run', taskId: 'other-task' }))).status).toBe(409);
+    expect(calls).toBe(1);
+  });
+
+  it('accepts a declared OpenAI tool name split across native stream chunks', () => {
+    const stream = inspectStream('openai', new Set(['mcp__pgc_workspace__read']));
+    const encoder = new TextEncoder();
+    for (const name of ['mcp__pgc_', 'workspace__read']) {
+      stream.push(encoder.encode(`data: ${JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, type: 'function', function: { name } }] } }],
+      })}\n\n`));
+    }
+    stream.push(encoder.encode(syntheticSSE('openai', 'tool_calls', 12)));
+    expect(stream.finish()).toEqual({ usage: 12, reason: 'tool_calls' });
+  });
+
+  it.each(['anthropic', 'openai'])('blocks unadvertised shell tool injections in %s streams', async protocol => {
+    let calls = 0;
+    await serve((_request, response) => {
+      calls++;
+      response.setHeader('content-type', 'text/event-stream');
+      const forged = protocol === 'anthropic'
+        ? { type: 'content_block_start', content_block: { type: 'tool_use', name: 'Bash' } }
+        : { choices: [{ delta: { tool_calls: [{ index: 0, type: 'function', function: { name: 'Bash' } }] } }] };
+      response.end(`data: ${JSON.stringify(forged)}\n\n` +
+        syntheticSSE(protocol, protocol === 'anthropic' ? 'tool_use' : 'tool_calls', 22));
+    });
+    expect((await start(run({ protocol }))).status).toBe(202);
+    expect(await done()).toMatchObject({ state: 'failed', failure: 'model_stream_incomplete', modelTurns: 1 });
+    expect(calls).toBe(1);
+  });
+
+  it('fails incomplete model output without issuing a replacement request', async () => {
+    let calls = 0;
+    await serve((_request, response) => {
+      calls++;
+      response.setHeader('content-type', 'text/event-stream');
+      response.end('data: {"choices":[{"finish_reason":null}]}\n\n');
+    });
+    expect((await start(run())).status).toBe(202);
+    expect(await done()).toMatchObject({ state: 'failed', failure: 'model_stream_incomplete', modelTurns: 1 });
+    expect(calls).toBe(1);
+  });
+});

@@ -4,6 +4,8 @@ import {failForgeTask, FORGE_TASK_LIMIT_MS, type ForgeTask} from './forge-tasks'
 import {memberStore} from './storage';
 import {claimCreationModel} from './model-capacity';
 import {creationPipelineAlarm} from './forge-creation-pipeline';
+import {harnessExecutionFor,finishHarnessTask} from './harness-execution';
+import {harnessHash} from './harness-policy';
 
 async function requireCreationAccess(env:ForgeEnv,owner:string){
   if(owner==='admin')return; // historical platform tasks only
@@ -19,7 +21,7 @@ export async function executeForgeTask(env: ForgeEnv, id: string) {
   try{
     await requireCreationAccess(env,pending.owner_id||'admin');
     const job:ForgeJob=JSON.parse(pending.payload);
-    reservation=await claimCreationModel(env.DB,await env.modelStore.get(),env.SETTINGS_KEY,job.type==='game'?'game':'create',id);
+    reservation=pending.harness_policy?{config:await env.modelStore.get(),reserved:false,lease:{release:async()=>{}}}:await claimCreationModel(env.DB,await env.modelStore.get(),env.SETTINGS_KEY,job.type==='game'?'game':'create',id);
   }catch(error){await failForgeTask(env,pending,error instanceof Error?error.message:'模型配置无法读取。');return;}
   if(!reservation){await env.DB.prepare("UPDATE forge_tasks SET detail='制作模型并发已满，等待空闲 Key 名额…',updated_at=? WHERE id=? AND status='queued'").bind(at,id).run();return;}
   const row: ForgeTask | null = await env.DB.prepare("UPDATE forge_tasks SET status='running',started_at=?,updated_at=?,detail='正在准备生成材料…' WHERE id=? AND executor='platform' AND status='queued' RETURNING *").bind(at,at,id).first();
@@ -31,7 +33,8 @@ export async function executeForgeTask(env: ForgeEnv, id: string) {
     await requireCreationAccess(env,row.owner_id||'admin');
     const job: ForgeJob = JSON.parse(row.payload);
     const config=reservation.config;
-    const result = await processForgeJob({...env,modelStore:{get:async()=>config,set:async()=>{throw new Error('任务模型快照不可修改。');}},ownerId:row.owner_id||'admin',generationSnapshot:row.input_snapshot?JSON.parse(row.input_snapshot):null,generation:{id,deadline:Date.now()+12*60000,
+    const harnessExecution=harnessExecutionFor(row,'forge',row.kind,await harnessHash(row.input_snapshot||'null'),Date.now()+12*60000);
+    const result = await processForgeJob({...env,harnessExecution,modelStore:{get:async()=>config,set:async()=>{throw new Error('任务模型快照不可修改。');}},ownerId:row.owner_id||'admin',generationSnapshot:row.input_snapshot?JSON.parse(row.input_snapshot):null,generation:{id,deadline:Date.now()+12*60000,
       capacityReserved:reservation.reserved,onUncertain:()=>{uncertain=true;},
       onStart:async()=>{
         await requireCreationAccess(env,row.owner_id||'admin');
@@ -42,6 +45,7 @@ export async function executeForgeTask(env: ForgeEnv, id: string) {
     // Artifact HTML and briefs live on topics, not in a second task copy.
     const version=await env.DB.prepare('SELECT id,topic_id,disposition FROM artifact_versions WHERE task_id=?').bind(id).first();
     const saved = version?{id:version.topic_id,version_id:version.id,disposition:version.disposition}:['preview','suggest','tag','mechanism-check'].includes(job.type) ? result : {id:'id' in job ? job.id : undefined};
+    if(row.harness_policy)await finishHarnessTask(env,id,'completed');
     await env.DB.prepare("UPDATE forge_tasks SET status='done',result=?,detail='已完成',error='',updated_at=? WHERE id=? AND status='running'").bind(JSON.stringify(saved),new Date().toISOString(),id).run();
   } catch (error) {
     await failForgeTask(env,row,error instanceof Error ? error.message : '生成未完成，请手动重试。');

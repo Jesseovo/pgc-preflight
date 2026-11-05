@@ -8,16 +8,20 @@ import {captureFor} from './cloud-review-capture';
 import {digest,canonicalJson,stamp,problem} from './review-device-state';
 import {failForgeTask} from './forge-tasks';
 import {parseProductionOutput} from './forge-production-output';
+import {finishHarnessTask,HarnessCapacityWait,harnessExecutionFor} from './harness-execution';
+import {parseHarnessPolicy} from './harness-policy';
+import {HARNESS_MAX_REQUEST_MS} from './harness-protocol';
 
-type Stage='build'|'polish'|'repair';
-type Checkpoint={model?:string|null;phase:string;stage:Stage;snapshot:any;config:any;output?:any;capture?:any;previous?:any;previousCapture?:any;versionId?:string;createdAt:number;stageStartedAt?:number;failure?:string};
+type AgentStage='build'|'polish'|'repair';
+type Stage=AgentStage|'repair2';
+type Checkpoint={model?:string|null;phase:string;stage:Stage;snapshot:any;config:any;output?:any;capture?:any;previous?:any;previousCapture?:any;versionId?:string;createdAt:number;stageStartedAt?:number;harnessDeadlineAt?:number;failure?:string};
 const schemas={build:GAME_BUILD_SCHEMA,polish:GAME_POLISH_SCHEMA,repair:GAME_REPAIR_SCHEMA};
-const labels={build:'完整玩法与内容',polish:'美术与交互精修',repair:'定向修复'};
+const labels={build:'完整玩法与内容',polish:'美术与交互精修',repair:'定向修复',repair2:'第二次定向修复'};
 const strings=(x:any,max=100)=>Array.isArray(x)&&x.length<=max&&x.every(v=>typeof v==='string'&&v.length<=12000);
 const allowed=(value:any,keys:string[])=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(k=>keys.includes(k));
 
 // Structural/evidence validation only. No score, taste, or defect inference.
-export function validateCreationOutput(value:any,stage:Stage,capture?:any,previous?:any):string[]{
+export function validateCreationOutput(value:any,stage:Stage,capture?:any,previous?:any,mayRequestRepair=stage==='polish'):string[]{
   if(!allowed(value,['html','requirements','decisions','coreChanges',...(stage==='build'?[]:['selfCheck'])])||typeof value.html!=='string'||!value.html.trim())return ['html'];
   if(!Array.isArray(value.requirements)||!value.requirements.length||value.requirements.length>100||value.requirements.some((r:any)=>!allowed(r,['id','text','status','evidence','reason'])||typeof r.id!=='string'||!r.id.trim()||typeof r.text!=='string'||!r.text.trim()||!['implemented','unverified','deferred'].includes(r.status)||['evidence','reason'].some(k=>k in r&&typeof r[k]!=='string')))return ['requirements'];
   if(new Set(value.requirements.map((r:any)=>r.id)).size!==value.requirements.length)return ['requirements.id'];
@@ -27,7 +31,7 @@ export function validateCreationOutput(value:any,stage:Stage,capture?:any,previo
   if(previous?.requirements?.some((r:any)=>!requirements.has(r.id)))return ['requirements must retain prior IDs'];
   if(previous?.coreChanges?.some((change:string)=>!value.coreChanges.includes(change)))return ['coreChanges must retain prior changes'];
   const check=value.selfCheck,refs=new Set([...(capture?.shots||[]).map((s:any)=>s.id),...(capture?.probe?.actions||[]).map((a:any)=>a.id)]);
-  if(!allowed(check,['findings','unverified','changes','requestRepair'])||!Array.isArray(check.findings)||check.findings.length>50||!strings(check.unverified)||!strings(check.changes)||typeof check.requestRepair!=='boolean'||stage==='repair'&&check.requestRepair)return ['selfCheck'];
+  if(!allowed(check,['findings','unverified','changes','requestRepair'])||!Array.isArray(check.findings)||check.findings.length>50||!strings(check.unverified)||!strings(check.changes)||typeof check.requestRepair!=='boolean'||!mayRequestRepair&&check.requestRepair)return ['selfCheck'];
   for(const f of check.findings){
     if(!allowed(f,['kind','id','phenomenon','trigger','cause','minimalChange','retest','evidenceRefs','coreChange','resolved'])||!['confirmed','experience','unverified'].includes(f.kind)||['id','phenomenon','trigger','cause','minimalChange','retest'].some(k=>typeof f[k]!=='string')||!f.id.trim()||!f.phenomenon.trim()||!strings(f.evidenceRefs,32)||f.evidenceRefs.some((r:string)=>!refs.has(r))||typeof f.coreChange!=='boolean'||typeof f.resolved!=='boolean')return ['selfCheck.findings'];
     if(f.kind!=='unverified'&&!f.evidenceRefs.length)return ['selfCheck.findings.evidenceRefs'];
@@ -170,8 +174,14 @@ export async function creationPipelineAlarm(state:any,env:any,id:string){
 export async function advanceCreationPipeline(state:any,env:any,id:string){
   const DB=env.DB,storage=state.storage;
   const row=await DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
-  if(!row||row.executor!=='platform'||row.creative_version!==2||row.kind!=='game'||!['queued','running'].includes(row.status)){await storage.deleteAll();return false;}
+  if(!row||row.executor!=='platform'||row.creative_version!==2||row.kind!=='game'){await storage.deleteAll();return false;}
+  if(!['queued','running'].includes(row.status)){
+    if(row.harness_policy)await finishHarnessTask(env,id,row.status==='done'?'completed':'failed');
+    await storage.deleteAll();return false;
+  }
   let cp=await getCheckpoint(storage);
+  let harness;
+  try{harness=parseHarnessPolicy(row.harness_policy);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
   try{await access(env,row);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
   if((!cp||cp.phase==='ready')&&Date.now()-Date.parse(row.created_at)>86400000){await failForgeTask(env,row,'制作等待超过 24 小时；已完成版本保留，请明确重试。');await storage.deleteAll();return false;}
   if(!cp){
@@ -179,20 +189,30 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     const snapshot=JSON.parse(row.input_snapshot||'null');
     if(!snapshot?.topic?.brief_md?.trim()){await failForgeTask(env,row,'完整制作需要先生成策划书。');await storage.deleteAll();return false;}
     const config=await env.modelStore.get(),profiles=Object.fromEntries(Object.entries(modelProfiles(config)).filter(([,profile])=>profile?.vision!==false));
-    const visualConfig=config&&Object.keys(profiles).length?{...config,profiles}:null;
-    if(!activeModelProfile(visualConfig,'game')){await failForgeTask(env,row,'完整制作与精修需要已启用并支持视觉的 Claude Opus 5.5。');await storage.deleteAll();return false;}
+    const visualConfig=harness?config:config&&Object.keys(profiles).length?{...config,profiles}:null;
+    const selected=activeModelProfile(visualConfig,'game');
+    if(!selected||selected.profile.vision===false){await failForgeTask(env,row,'完整制作与精修需要已启用并支持视觉的 Claude Opus 5.5。');await storage.deleteAll();return false;}
     cp={phase:'ready',stage:'build',snapshot,config:visualConfig,createdAt:Date.now()};
     await putCheckpoint(storage,cp);
-    await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(stamp(),stamp(),stamp(),id).run();
+    await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(harness?null:stamp(),stamp(),stamp(),id).run();
     return true;
   }
-  if(row.status==='queued')await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(stamp(),stamp(),stamp(),id).run();
+  if(row.status==='queued')await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(harness?null:stamp(),stamp(),stamp(),id).run();
+  const deadlineAt=cp.harnessDeadlineAt;
+  const awaitingAllocation=harness&&cp.stage==='build'&&deadlineAt===undefined;
+  const expired=()=>deadlineAt!==undefined&&Date.now()>=deadlineAt;
+  const deadlineFailure='制作任务已到达总时限；已完成的阶段版本保留，未自动重发模型请求。';
+  if(expired()){
+    if(cp.phase==='output')await persistStage(DB,row,cp);
+    if(cp.phase==='captured')await persistEvidence(DB,row,cp);
+    await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;
+  }
   if(cp.phase==='started'||cp.phase==='failed'){
     await failForgeTask(env,row,cp.phase==='started'?'制作阶段中断，模型结果未知；已完成版本保留，未自动重发请求。':cp.failure||'制作阶段失败；已完成版本保留，请明确重试。');await storage.deleteAll();return false;
   }
   if(cp.phase==='ready'){
-    let lease:any;
-    try{lease=await claimCreationModel(DB,cp.config,env.SETTINGS_KEY,'game',`${id}:${cp.stage}`);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
+    let lease:Awaited<ReturnType<typeof claimCreationModel>>;
+    try{lease=harness?{config:cp.config,reserved:false,lease:{release:async()=>{}}}:await claimCreationModel(DB,cp.config,env.SETTINGS_KEY,'game',`${id}:${cp.stage}`);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
     if(!lease){await progress(DB,id,`${cp.stage}:waiting`,'等待制作模型名额…',Date.now());await storage.setAlarm(Date.now()+5000);return false;}
     let uncertain=false,output:any;
     let timer:ReturnType<typeof setInterval>|undefined;
@@ -200,19 +220,39 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
       const active=activeModelProfile(lease.config,'game');if(!active)throw new Error('制作模型未配置。');
       // Freeze a single selected profile, including key/config, for all stages.
       if(cp.stage==='build')cp.config={...active.profile,activeProfile:active.id,profiles:{[active.id]:active.profile},routes:{create:active.id,review:active.id}};
-      cp.phase='started';cp.stageStartedAt=Date.now();await putCheckpoint(storage,cp);await storage.setAlarm(Date.now()+14*60000);
-      await progress(DB,id,`${cp.stage}:model`,labels[cp.stage],cp.stageStartedAt);
+      cp.phase='started';cp.stageStartedAt=Date.now();await putCheckpoint(storage,cp);
+      const stageDeadline=Math.min(deadlineAt??Infinity,cp.stageStartedAt+HARNESS_MAX_REQUEST_MS);
+      await storage.setAlarm(Math.min(deadlineAt??Infinity,cp.stageStartedAt+14*60000));
+      await progress(DB,id,`${cp.stage}:${awaitingAllocation?'waiting':'model'}`,awaitingAllocation?'等待隔离执行名额…':labels[cp.stage],cp.stageStartedAt);
       timer=setInterval(()=>{void DB.prepare("UPDATE forge_tasks SET updated_at=? WHERE id=? AND status='running'").bind(stamp(),id).run().catch(()=>{});},30000);
       const s=cp.snapshot;
       const input={topic:s.topic,brief:s.topic.brief_md,styleSvg:s.topic.preview_svg||'',assetHtml:s.topic.assets_html||'',html:cp.previous?.html,capture:cp.previousCapture,selfCheck:cp.previous?.selfCheck,requirements:cp.previous?.requirements,decisions:cp.previous?.decisions,coreChanges:cp.previous?.coreChanges};
-      const runtime={...env,modelStore:{get:async()=>cp!.config},generation:{id:`${id}:${cp.stage}`,capacityReserved:lease.reserved,deadline:Date.now()+12*60000,onUncertain:()=>{uncertain=true;},onStart:async()=>{await access(env,row);const update=await DB.prepare("UPDATE forge_tasks SET model_started_at=coalesce(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(stamp(),stamp(),id).run();if(!update.meta.changes)throw new Error('制作任务已停止。');},onWait:async(message:string)=>progress(DB,id,`${cp!.stage}:model`,`${labels[cp!.stage]} · ${message}`)}};
+      const harnessExecution=harness?harnessExecutionFor(row,'forge',cp.stage,await digest(row.input_snapshot||'null'),deadlineAt??cp.stageStartedAt+harness.limits.maxDurationMs):undefined;
+      if(harnessExecution&&cp.previous?.html)harnessExecution.previousHtml=cp.previous.html;
+      if(harnessExecution&&awaitingAllocation)harnessExecution.onAllocated=async clock=>{
+        cp!.harnessDeadlineAt=clock.taskDeadlineAt;cp!.stageStartedAt=clock.startedAt;
+        await putCheckpoint(storage,cp!);
+        await storage.setAlarm(Math.min(clock.taskDeadlineAt,clock.stageDeadlineAt+2*60000));
+        await DB.prepare("UPDATE forge_tasks SET started_at=?,phase='build:model',phase_started_at=?,updated_at=? WHERE id=? AND status='running'").bind(new Date(clock.startedAt).toISOString(),new Date(clock.startedAt).toISOString(),stamp(),id).run();
+      };
+      const runtime={...env,harnessExecution,modelStore:{get:async()=>cp!.config},generation:{id:`${id}:${cp.stage}`,capacityReserved:lease.reserved,deadline:stageDeadline,onUncertain:()=>{uncertain=true;},onStart:async()=>{await access(env,row);const update=await DB.prepare("UPDATE forge_tasks SET model_started_at=coalesce(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(stamp(),stamp(),id).run();if(!update.meta.changes)throw new Error('制作任务已停止。');},onWait:async(message:string)=>progress(DB,id,`${cp!.stage}:model`,`${labels[cp!.stage]} · ${message}`)}};
       // Newly queued tasks lock the approved 64k policy. A pre-upgrade task
       // without that declaration retains its former 32,768-token ceiling.
-      const budget=s.platform_creation_policy?.version===1&&s.platform_creation_policy?.maxTokens===64000?64000:32768;
-      const result=await complete(runtime,s.cfg,{system:gameStageSystem(cp.stage,'framed'),user:gameStageUser(cp.stage,input,'framed'),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous),maxTokens:budget,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
+      const legacyBudget=s.platform_creation_policy?.version===1&&s.platform_creation_policy?.maxTokens===64000?64000:32768;
+      const budget=harness?.limits.maxOutputTokens??legacyBudget;
+      const remainingRepairs=cp.stage==='polish'?(harness?.limits.maxRepairs??1):cp.stage==='repair'?Math.max(0,(harness?.limits.maxRepairs??1)-1):0;
+      const promptStage=cp.stage==='repair2'?'repair':cp.stage;
+      const result=await complete(runtime,s.cfg,{system:gameStageSystem(promptStage,'framed',remainingRepairs),user:gameStageUser(promptStage,input,'framed'),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous,remainingRepairs>0),maxTokens:budget,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
+      if(harness&&cp.harnessDeadlineAt===undefined)throw new Error('Harness 启动时间未保存，未重复发起模型请求。');
       const html=await prepareArtifact('game',result.html,s);
       output={...result,html};
-    }catch(e){cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await storage.deleteAll();return false;}
+    }catch(e){
+      if(e instanceof HarnessCapacityWait&&cp.stage==='build'&&cp.harnessDeadlineAt===undefined){
+        cp.phase='ready';cp.stageStartedAt=undefined;await putCheckpoint(storage,cp);
+        await progress(DB,id,'build:waiting',e.message,Date.now());await storage.setAlarm(Date.now()+5000);return false;
+      }
+      cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await storage.deleteAll();return false;
+    }
     finally{clearInterval(timer);if(!uncertain)await lease.lease.release().catch(()=>{});}
     cp.output=output;cp.phase='output';
     // A transient checkpoint failure cannot trigger a fresh paid request.
@@ -225,15 +265,21 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     await persistStage(DB,row,cp);
     await progress(DB,id,`${cp.stage}:capture`,`${labels[cp.stage]}已保存，正在采集三种手机比例…`,Date.now());
     let capture:any,error:any;
-    for(let attempt=0;attempt<2;attempt++)try{capture=await (env.captureReview||captureFor({...env,creationCaptureStrict:true}))(cp.output.html,async(message:string)=>progress(DB,id,`${cp!.stage}:capture`,message));break;}catch(e){error=e;}
-    if(!capture){await failForgeTask(env,row,`采集未完成，已保存阶段版本：${error instanceof Error?error.message:'环境不可用'}`);await storage.deleteAll();return false;}
+    for(let attempt=0;attempt<2&&!expired();attempt++)try{
+      capture=await (env.captureReview||captureFor({...env,creationCaptureStrict:true}))(cp.output.html,async(message:string)=>progress(DB,id,`${cp!.stage}:capture`,message),deadlineAt);
+      break;
+    }catch(e){error=e;}
+    if(!capture||expired()){await failForgeTask(env,row,expired()?deadlineFailure:`采集未完成，已保存阶段版本：${error instanceof Error?error.message:'环境不可用'}`);await storage.deleteAll();return false;}
     try{cp.capture=await lockCreationCapture(capture,cp.stage,cp.output.html);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
     cp.phase='captured';await putCheckpoint(storage,cp);return true;
   }
   if(cp.phase==='captured'){
     await persistEvidence(DB,row,cp);
-    if(cp.stage==='build'||cp.stage==='polish'&&cp.output.selfCheck?.requestRepair){
-      const next:Stage=cp.stage==='build'?'polish':'repair';
+    const requestsRepair=cp.output.selfCheck?.requestRepair===true;
+    const next:Stage|null=cp.stage==='build'?'polish':
+      cp.stage==='polish'&&requestsRepair?'repair':
+      cp.stage==='repair'&&requestsRepair&&(harness?.limits.maxRepairs??0)>1?'repair2':null;
+    if(next){
       cp={...cp,stage:next,phase:'ready',previous:cp.output,previousCapture:cp.capture,output:undefined,capture:undefined,versionId:undefined};
       // Each paid stage has its own bounded alarm invocation, rather than
       // accumulating two twelve-minute calls in one event lifetime.
@@ -241,7 +287,13 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     }
     cp.phase='publish';await putCheckpoint(storage,cp);return true;
   }
-  if(cp.phase==='publish'){await publish(DB,row,cp);await storage.deleteAll();return false;}
+  if(cp.phase==='publish'){
+    if(harness){
+      await finishHarnessTask(env,id,'completed');
+      if(expired()){await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;}
+    }
+    await publish(DB,row,cp);await storage.deleteAll();return false;
+  }
   throw new Error('未知制作检查点。');
 }
 
@@ -265,7 +317,7 @@ export async function creationEvidence(DB:any,owner:string,topicId:number,taskId
 
 export async function recordAgentCreationStage(DB:any,row:any,payload:any,deviceTokenHash?:string){
   if(row.kind!=='game'||row.creative_version!==2||row.executor!=='agent'||row.status!=='running')throw problem('此任务不接受分阶段制作回传。',409);
-  const stage:Stage=payload.stage;
+  const stage:AgentStage=payload.stage;
   if(!['build','polish','repair'].includes(stage)||payload.model!=null&&(typeof payload.model!=='string'||!payload.model.trim()||payload.model.length>160))throw problem('阶段或模型名称无效。');
   const snapshot=JSON.parse(row.input_snapshot),previousStage=stage==='polish'?'build':stage==='repair'?'polish':null;
   let previous:any,previousCapture:any;
@@ -286,7 +338,7 @@ export async function recordAgentCreationStage(DB:any,row:any,payload:any,device
   await DB.prepare(`UPDATE forge_tasks SET phase=?,detail=?,updated_at=?,phase_started_at=CASE WHEN phase IS NOT ? THEN ? ELSE phase_started_at END
     WHERE id=? AND status='running' AND NOT EXISTS(SELECT 1 FROM forge_creation_stages WHERE task_id=?
       AND CASE stage WHEN 'build' THEN 1 WHEN 'polish' THEN 2 ELSE 3 END > ?)`).bind(`${stage}:captured`,`${labels[stage]}与实际采集已保存。`,stamp(),`${stage}:captured`,stamp(),row.id,row.id,['build','polish','repair'].indexOf(stage)+1).run();
-  const next:Stage|null=stage==='build'?'polish':stage==='polish'&&payload.output.selfCheck?.requestRepair?'repair':null;
+  const next:AgentStage|null=stage==='build'?'polish':stage==='polish'&&payload.output.selfCheck?.requestRepair?'repair':null;
   return {stage,version_id:cp.versionId,content_hash:capture.inputHash,evidence_hash:capture.hash,...(next?{nextMaterials:{stage:next,system:gameStageSystem(next),user:gameStageUser(next,{topic:snapshot.topic,brief:snapshot.topic.brief_md,styleSvg:snapshot.topic.preview_svg||'',assetHtml:snapshot.topic.assets_html||'',html,capture,selfCheck:cp.output.selfCheck,requirements:cp.output.requirements,decisions:cp.output.decisions,coreChanges:cp.output.coreChanges}),schema:schemas[next]}}:{nextMaterials:null,complete:{result:{stage},model:cp.model}})};
 }
 

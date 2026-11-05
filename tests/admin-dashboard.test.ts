@@ -314,3 +314,119 @@ describe('管理员概览、作品及任务专用接口',()=>{
     expect(fetcher).toHaveBeenCalledTimes(1);expect(s.sqlite.prepare('SELECT status FROM forge_tasks WHERE id=?').get(next.task.id)).toEqual({status:'error'});expect(s.sqlite.prepare('SELECT product_html FROM topics WHERE id=2').get()).toEqual({product_html:old});
   });
 });
+
+describe('safe task-linked harness usage',()=>{
+  it('returns only confirmed usage on authorized task reads, without reading the ledger for old tasks',async()=>{
+    const s=await setup();
+    s.topic(1,'a');
+    s.topic(2,'b');
+    s.task('old-task',1,'a','done');
+    s.preparedSql.length=0;
+    const legacy=await s.data('tasks');
+    expect(legacy.items[0]).not.toHaveProperty('harness');
+    expect(s.preparedSql.some(sql=>/\bFROM harness_(?:runs|requests)\b/.test(sql))).toBe(false);
+
+    const {createHarnessRun,lockHarnessModel,reserveHarnessRequest,forwardHarnessRequest,finishHarnessRequest}=await import('../server/harness-ledger');
+    const {CCB_ENGINE_COMMIT,HARNESS_GAME_LIMITS}=await import('../server/harness-policy');
+    const profile={model:'fixture-provider-model',baseUrl:'https://fixture.invalid',protocol:'openai' as const,
+      encryptedKey:'PRIVATE_HARNESS_KEY',enabled:true,updatedAt:today};
+    const policy=(family:'forge'|'review',purpose:string)=>JSON.stringify({version:1,engine:'ccb',engineCommit:CCB_ENGINE_COMMIT,
+      family,purpose,image:`registry.cloudflare.com/${'1'.repeat(32)}/fixture@sha256:${'2'.repeat(64)}`,releaseHash:'1'.repeat(64),modelContractHash:'2'.repeat(64),limits:{...HARNESS_GAME_LIMITS,debug:'PRIVATE_HARNESS_POLICY'}});
+    s.task('harness-task',1,'a','done','platform',{harness_policy:policy('forge','brief')});
+    s.task('wrong-owner',2,'b','done','platform',{harness_policy:policy('forge','brief')});
+    s.sqlite.prepare("INSERT INTO review_jobs(id,owner_id,title,filename,status,stage,created_at,updated_at,executor,model_executor,harness_policy) VALUES('harness-review','admin','Fixture','fixture.html','done','done',?,?,'cloud','platform',?)").run(today,today,policy('review','review'));
+    const create=async(taskId:string,ownerId:string,purpose:'brief'|'review')=>{
+      const model=(await lockHarnessModel({...profile,activeProfile:'fixture',profiles:{fixture:profile}},purpose))!;
+      return (await createHarnessRun(s.DB,{taskId,ownerId,generation:'private-generation',actor:ownerId==='admin'?'admin':'star',
+        sourceHash:'3'.repeat(64),snapshot:{private:'PRIVATE_HARNESS_SNAPSHOT'},model}))!;
+    };
+    const forge=await create('harness-task','a','brief');
+    const review=await create('harness-review','admin','review');
+    const id={...forge.run,requestId:'brief-1'};
+    await reserveHarnessRequest(s.DB,id,'4'.repeat(64),1000);
+    await forwardHarnessRequest(s.DB,id);
+    await finishHarnessRequest(s.DB,id,{state:'completed',outputTokens:400});
+    const reviewId={...review.run,requestId:'review-1'};
+    await reserveHarnessRequest(s.DB,reviewId,'4'.repeat(64),1000);
+    await forwardHarnessRequest(s.DB,reviewId);
+    await finishHarnessRequest(s.DB,reviewId,{state:'unknown',errorCode:'stream_incomplete'});
+    // Deliberately mismatch the ledger owner of a selected task ID.
+    s.sqlite.prepare("UPDATE forge_tasks SET owner_id='b' WHERE id='harness-task'").run();
+    expect((await s.data('tasks/creation/harness-task')).task.harness.usage).toBeNull();
+    s.sqlite.prepare("UPDATE forge_tasks SET owner_id='a' WHERE id='harness-task'").run();
+
+    s.preparedSql.length=0;
+    const list=await s.data('tasks');
+    const task=list.items.find((row:any)=>row.id==='harness-task');
+    const audit=list.items.find((row:any)=>row.id==='harness-review');
+    expect(task.harness.usage).toEqual({status:'active',failureCode:null,startedAt:forge.run.startedAt,endedAt:null,
+      modelTurns:1,outputTokens:400,reservedTokens:0});
+    expect(audit.harness.usage).toMatchObject({status:'unknown',failureCode:'stream_incomplete',modelTurns:1,outputTokens:0,reservedTokens:1000});
+    expect(s.preparedSql.filter(sql=>/FROM harness_runs/.test(sql))).toHaveLength(2);
+    expect(s.preparedSql.filter(sql=>/FROM harness_runs/.test(sql)).every(sql=>sql.includes('r.task_id IN'))).toBe(true);
+    const adminDetail=await s.data('tasks/creation/harness-task');
+    expect(adminDetail.task.harness).toEqual(task.harness);
+    expect((await s.call('tasks/creation/harness-task','GET','a')).status).toBe(403);
+
+    const memberCookie=s.request('tasks','GET','a').headers.get('Cookie')!;
+    const own=await worker.fetch(new Request('https://dashboard.test/api/forge/generation-jobs/harness-task',{headers:{Cookie:memberCookie}}),s.env,{waitUntil(){}});
+    expect((await own.json() as any).harness).toEqual(task.harness);
+    const forbidden=await worker.fetch(new Request('https://dashboard.test/api/forge/generation-jobs/wrong-owner',{headers:{Cookie:memberCookie}}),s.env,{waitUntil(){}});
+    expect(forbidden.status).toBe(404);
+    const adminCookie=s.request('tasks').headers.get('Cookie')!;
+    const auditResponse=await worker.fetch(new Request('https://dashboard.test/api/forge/review/jobs/harness-review',{headers:{Cookie:adminCookie}}),s.env,{waitUntil(){}});
+    expect(auditResponse.status).toBe(200);
+    const publicAudit=await auditResponse.json() as any;
+    expect(publicAudit.harness).toEqual(audit.harness);
+    const deniedAudit=await worker.fetch(new Request('https://dashboard.test/api/forge/review/jobs/harness-review',{headers:{Cookie:memberCookie}}),s.env,{waitUntil(){}});
+    expect([403,404]).toContain(deniedAudit.status);
+    const serialized=JSON.stringify({list,adminDetail,publicAudit});
+    for(const privateValue of [forge.lease,review.lease,'PRIVATE_HARNESS','private-generation','fixture-provider-model','profileHash','sourceHash','snapshotHash','registry.cloudflare.com'])
+      expect(serialized).not.toContain(privateValue);
+  });
+});
+
+it('keeps legacy admin and member task reads usable before the harness policy columns exist',async()=>{
+  const s=await setup();
+  s.topic(1,'a');
+  s.task('legacy-task',1,'a','done');
+  s.sqlite.exec('ALTER TABLE forge_tasks DROP COLUMN harness_policy; ALTER TABLE review_jobs DROP COLUMN harness_policy');
+  s.preparedSql.length=0;
+  expect((await s.data('tasks')).items[0]).not.toHaveProperty('harness');
+  expect((await s.data('tasks/creation/legacy-task')).task).not.toHaveProperty('harness');
+  const cookie=s.request('tasks','GET','a').headers.get('Cookie')!;
+  const response=await worker.fetch(new Request('https://dashboard.test/api/forge/generation-jobs',{headers:{Cookie:cookie}}),s.env,{waitUntil(){}});
+  expect(response.status).toBe(200);
+  expect((await response.json() as any[])[0]).not.toHaveProperty('harness');
+  expect(s.preparedSql.some(sql=>/\bFROM harness_(?:runs|requests)\b/.test(sql))).toBe(false);
+});
+
+it('evaluates the current harness gate when an administrator explicitly starts a retry',async()=>{
+  const s=await setup();
+  s.topic(1,'a');s.topic(2,'a');
+  s.task('old-basic',1);
+  s.sqlite.exec("INSERT INTO review_pilot_members(member_id,pilot_enabled,creator_account,revision,updated_at) VALUES('a',1,'',1,'now')");
+  const store=configStore(s.DB);
+  await saveConfig({model:'fixture-provider-model',baseUrl:'https://fixture.invalid',protocol:'openai',apiKey:'synthetic-key'},store,s.env.SETTINGS_KEY);
+  const {CCB_ENGINE_COMMIT,modelContractHash}=await import('../server/harness-policy');
+  const contract=await modelContractHash(await store.get(),'brief');
+  s.env.HARNESS_ROLLOUT='pilot';
+  s.env.HARNESS_RUNNER={idFromName:(id:string)=>id,get:()=>({fetch:s.dispatch})};
+  expect((await s.call('tasks/creation/old-basic/retry','POST')).ok).toBe(false);
+  expect(s.sqlite.prepare("SELECT count(*) n FROM forge_tasks WHERE retry_of='old-basic'").get()).toEqual({n:0});
+  s.env.HARNESS_RELEASE=JSON.stringify({engineCommit:CCB_ENGINE_COMMIT,rightsConfirmed:true,providerCompatibilityVerified:true,
+    comparisonAccepted:true,isolationVerified:true,evidenceHash:'1'.repeat(64),compatibleModelContracts:[contract],
+    image:`registry.cloudflare.com/${'1'.repeat(32)}/fixture@sha256:${'5'.repeat(64)}`});
+  const enabled=await s.call('tasks/creation/old-basic/retry','POST');
+  expect(enabled.status).toBe(202);
+  const {task}=await enabled.json() as any;
+  expect(task.harness).toMatchObject({engine:'ccb',usage:null});
+  const {harness_policy}=s.sqlite.prepare('SELECT harness_policy FROM forge_tasks WHERE id=?').get(task.id) as {harness_policy:string};
+  expect(s.sqlite.prepare("SELECT harness_policy FROM forge_tasks WHERE id='old-basic'").get()).toEqual({harness_policy:null});
+  s.task('old-harness',2,'a','error','platform',{harness_policy});
+  s.env.HARNESS_ROLLOUT='off';
+  const disabled=await s.call('tasks/creation/old-harness/retry','POST');
+  expect(disabled.status).toBe(202);
+  expect((await disabled.json() as any).task).not.toHaveProperty('harness');
+  expect(s.sqlite.prepare("SELECT harness_policy FROM forge_tasks WHERE id='old-harness'").get()).toEqual({harness_policy});
+});

@@ -8,6 +8,7 @@ import {reviewReportErrors,reportScore} from './review-report';
 import {enqueueReview,recoverInterruptedReviews} from './review-jobs';
 import {withHumanReviews} from './human-review';
 import {reviewDay} from './review-usage';
+import {publicHarnessFields,readPublicHarnessUsage,withOptionalHarnessPolicy} from './harness-task-status';
 
 const paths=new Set(['/api/admin/review-rules','/api/admin/workspace','/api/admin/public-data','/api/admin/review-upload','/api/admin/review-import']);
 const json=(v:any,status=200)=>Response.json(v,{status,headers:{'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
@@ -35,11 +36,18 @@ export async function adminWorkspaceApi(request:Request,env:any):Promise<Respons
         all(DB,"SELECT * FROM forge_tasks WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 300",owner,owner),
         all(DB,"SELECT id,owner_id,name,revoked,expires_at,last_seen,'creation' AS scope FROM forge_agents WHERE (?='' OR owner_id=?) UNION ALL SELECT id,owner_id,name,revoked,expires_at,last_seen,'review' AS scope FROM review_devices WHERE (?='' OR owner_id=?)",owner,owner,owner,owner),
         all(DB,"SELECT * FROM vocab_suggestions WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200",owner,owner),store.list(),
-        all(DB,"SELECT id,owner_id,title,filename,status,stage,error,result_id,model_executor,quota_charged,created_at,updated_at FROM review_jobs WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200",owner,owner),
+        withOptionalHarnessPolicy(policy=>all(DB,`SELECT id,owner_id,title,filename,status,stage,error,result_id,model_executor,quota_charged,created_at,updated_at${policy} FROM review_jobs WHERE (?='' OR owner_id=?) ORDER BY created_at DESC LIMIT 200`,owner,owner)),
         all(DB,"SELECT id,owner_id,job_id,title,score,model_executor,agent_id,model,created_at FROM reviews WHERE (?='' OR owner_id=?) ORDER BY id DESC LIMIT 200",owner,owner),
         all(DB,"SELECT id,owner_id,subject,data,updated_at,1 AS has_product,product_status,product_error FROM topics WHERE product_html IS NOT NULL AND trim(product_html)<>'' AND (?='' OR owner_id=?) ORDER BY updated_at DESC,id DESC LIMIT 300",owner,owner),
       ]);
-      return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),products:products.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,tasks:tasks.map(publicCreatorTask),agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),reviewJobs:await withHumanReviews(DB,reviewJobs,true),reviews:await withHumanReviews(DB,reviews)});
+      const [forgeUsage,reviewUsage,humanJobs,humanReports]=await Promise.all([
+        readPublicHarnessUsage(DB,'forge',tasks),readPublicHarnessUsage(DB,'review',reviewJobs),
+        withHumanReviews(DB,reviewJobs,true),withHumanReviews(DB,reviews),
+      ]);
+      return json({topics:topics.map((t:any)=>({...t,data:JSON.parse(t.data)})),products:products.map((t:any)=>({...t,data:JSON.parse(t.data)})),games,
+        tasks:tasks.map((task:any)=>({...publicCreatorTask(task),...publicHarnessFields(task.harness_policy,forgeUsage.get(task.id))})),
+        agents:agents.map((d:any)=>({...d,online:!d.revoked&&Date.parse(d.expires_at)>Date.now()&&Date.now()-Date.parse(d.last_seen||'')<90000})),suggestions:suggestions.map((s:any)=>({...s,words:JSON.parse(s.words)})),members:members.map(publicMember),
+        reviewJobs:humanJobs.map(({harness_policy,...job})=>({...job,...publicHarnessFields(harness_policy,reviewUsage.get(job.id))})),reviews:humanReports});
     }
     if(url.pathname.endsWith('/public-data')){
       if(request.method==='GET'){

@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { Badge, Button, Card, Field, Select } from '../../components/ui';
 import { copyText } from '../../lib/api';
+import { harnessUsageLabel } from '../../../harness-status';
 import { dimensionLabels, dims, displayDate, isActive, stageLabels, taskStatus, type Executor, type Idea, type Task, type Topic } from './model';
 
 export function ExecutorPicker({value, onChange}: {value: Executor; onChange: (value: Executor) => void}) {
@@ -35,14 +36,15 @@ export function TaskProgress({task}: {task: Task}) {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [active, waiting]);
-  const started = Date.parse(task.started_at || task.created_at || '');
+  const started = task.harness ? task.harness.usage?.startedAt ?? NaN : Date.parse(task.started_at || task.created_at || '');
   const seconds = Number.isFinite(started) ? Math.max(0, Math.floor((now - started) / 1000)) : null;
   return <div className="creator-task-progress">
     <div className="row"><Badge tone={task.status === 'error' ? 'danger' : active ? 'warning' : 'sage'}>{label}</Badge>{task.executor && <span className="small muted">{task.executor === 'agent' ? '个人 Agent' : '平台'}</span>}
-      {task.phase && task.phase !== 'done' && <span className="small">{task.phase.split(':').map(phase => stageLabels[phase] || ({model: '模型生成', ready: '准备材料', output: '保存阶段结果', captured: '采集已保存', publish: '保存最终版本'} as Record<string, string>)[phase] || phase).join(' · ')}</span>}
+      {task.phase && task.phase !== 'done' && <span className="small">{task.phase.split(':').map(phase => stageLabels[phase] || ({model: '模型生成', waiting: '等待名额', ready: '准备材料', output: '保存阶段结果', captured: '采集已保存', publish: '保存最终版本'} as Record<string, string>)[phase] || phase).join(' · ')}</span>}
       {active && !waiting && seconds !== null && <span className="small muted" aria-label="经过时间">{Math.floor(seconds / 60)} 分 {seconds % 60} 秒</span>}
     </div>
     {active && !waiting && task.executor === 'platform' && <progress aria-label="后台创作任务进度"/>}
+    {task.harness && <small className="muted">{harnessUsageLabel(task.harness)}</small>}
     {message && <p className={task.error ? 'small danger-text' : 'small muted'}>{message}</p>}
     {task.updated_at && <small className="muted">最近更新 {displayDate(task.updated_at)}</small>}
   </div>;

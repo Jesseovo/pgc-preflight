@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="960" viewBox="0 0 540 960" aria-label="微缩温室样板图">
+  <rect width="540" height="960" fill="#133a36"/>
+  <rect x="26" y="28" width="488" height="106" rx="20" fill="none" stroke="#96e0aa" stroke-width="3"/>
+  <text x="48" y="86" fill="#96e0aa" font-size="30">微缩温室</text>
+  <rect x="26" y="158" width="488" height="530" rx="26" fill="none" stroke="#96e0aa" stroke-width="3"/>
+  <g transform="translate(270 402) scale(2)">
+    <path d="M0 22c-32 0-46-20-46-49 30 0 46 18 46 36 0-22 15-40 45-40C45-2 28 22 0 22z" fill="#96e0aa" fill-rule="evenodd"/>
+    <path d="M-6 5h12v41h-12z" fill="#ffc57d"/>
+  </g>
+  <rect x="26" y="725" width="488" height="126" rx="22" fill="#ffc57d"/>
+  <text x="270" y="802" fill="#133a36" font-size="27" text-anchor="middle">切换分区阀门</text>
+  <path d="M48 903h444" stroke="#96e0aa" stroke-width="3"/>
+</svg>

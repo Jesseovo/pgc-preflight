@@ -287,30 +287,31 @@ ${CREATIVE_MATERIALS}
 - requirements 逐条列 {id,text,status,evidence?,reason?}：沿用制作需求 ID，没有现成 ID 时用 R1、R2…稳定编号；状态为 implemented / unverified / deferred。implemented 表示代码实现，不声称运行验证；evidence 只填源码或实际采集依据。未验证和未完成分别写原因。不要漏掉设计后段。精修或定向修复保留前一阶段全部需求 ID，可以根据证据更新状态。coreChanges 累积保留此前每条原文，可追加新条目。
 - 完整实现已确认的玩法内容。没有行数或极简首版限制。`;
 
-const GAME_EVIDENCE_BOUNDARY = `【证据边界】
+const gameEvidenceBoundary = (repairBudget, continuation = false) => `【证据边界】
 - 视口图实际送达时，使用图像和动作 ID 引用，说明现象、触发条件、可能根因、最小改动和如何复测。若模型不支持视觉而未送图，只能根据实际运行记录和源码，不能引用未看到的图或宣称已验证外观。区分已确认的问题、体验建议和待验证事项。只改源码可以说明改了哪里，不能声称在输出的新 HTML 上已复测。
 - 单次触摸及持续动画不是输入成功证明；不同视口是独立采样，不拼成一局。没执行对应手势、结算重开、前后台、长期节奏、熟练/新手、挂机/重复操作的，列为未验证。音频节点不是试听证据；未实际试听写「未试听」，无设备和帧时测量写「未测真机性能」。不得根据未测项捏造缺陷、通过或评分。
 - selfCheck 字段为 {findings,unverified,changes,requestRepair}。findings 每项填 {id,kind,phenomenon,trigger,evidenceRefs,cause,minimalChange,retest,coreChange,resolved}；kind 为 confirmed / experience / unverified。evidenceRefs 只填实际材料 ID。resolved 指本次针对明确根因改了代码，运行复测由后续采集验证；retest 写需要验证的步骤，不能把它表述成已完成。
-- 仅当采集中有可复现证据、问题尚未解决且最小修复不涉及核心设计时，才可 requestRepair=true；不能因证据不足、纯体验或希望多打磨一次而要求付费修复。至多一次定向修复。核心设计争议明确交成员确认。`;
+- 仅当采集中有可复现证据、问题尚未解决且最小修复不涉及核心设计时，才可 requestRepair=true；不能因证据不足、纯体验或希望多打磨一次而要求付费修复。${continuation ? "本阶段之后只允许最后一次定向修复。" : repairBudget > 1 ? "当前任务最多进行两次定向修复。" : "至多一次定向修复。"}核心设计争议明确交成员确认。`;
 
 /**
  * @param {"build"|"polish"|"repair"} stage
  * @param {"json"|"framed"} format
+ * @param {number} remainingRepairs
  */
-export function gameStageSystem(stage, format = "json") {
+export function gameStageSystem(stage, format = "json", remainingRepairs = stage === "polish" ? 1 : 0) {
   const delivery = format === "json" ? "，以 JSON 的 html 字段交付" : "";
   const common = `你是 PGC 游戏制作者。制作完整的单文件可玩 HTML${delivery}。${GAME_STAGE_COMMON}`;
   if (stage === "build") return `${common}
 本阶段制作可运行版本：完整打通规则、操作、阶段推进、胜负、风险奖励、得分、重开、BGM、音效和存储容错。集中维护调参区；优先清晰可验证的实现，不在此阶段虚报试听、试玩或性能。
 ${gameStageFormat(stage, format)}`;
   if (stage === "polish") return `${common}
-本阶段精修：从上一版 HTML 和实际采集出发，保持玩法、输入、胜负和资产库，深化媒介纹理、轮廓、待机和状态反馈、HUD、混音与随进度变化的音色。把能从输入复现的基础问题一并最小修正；整理保留的要求与待复测事项。
-${GAME_EVIDENCE_BOUNDARY}
-${gameStageFormat(stage, format)}`;
+本阶段精修：从上一版 HTML 和实际采集出发，保持玩法、输入、胜负和资产库，深化媒介纹理、轮廓、待机和状态反馈、HUD、混音与随进度变化的音色。把能从输入复现的基础问题一并最小修正；整理保留的要求与待复测事项。${remainingRepairs === 0 ? " requestRepair 必须为 false，已无后续自动修复轮次。" : ""}
+${gameEvidenceBoundary(remainingRepairs)}
+${gameStageFormat(stage, format, remainingRepairs > 0)}`;
   if (stage === "repair") return `${common}
-本阶段只处理已指出的、可从最新采集复现的非核心问题。先用采集确认触发和根因，再做最小修复；不能证实就保持现状并标记待验证。保留已经正常的设计和资产。requestRepair 必须为 false，不继续自动返工。
-${GAME_EVIDENCE_BOUNDARY}
-${gameStageFormat(stage, format)}`;
+本阶段只处理已指出的、可从最新采集复现的非核心问题。先用采集确认触发和根因，再做最小修复；不能证实就保持现状并标记待验证。保留已经正常的设计和资产。${remainingRepairs > 0 ? "若仍有可复现且未解决的非核心问题，可按证据边界明确请求最后一次定向修复。" : "requestRepair 必须为 false，不继续自动返工。"}
+${gameEvidenceBoundary(remainingRepairs, remainingRepairs > 0)}
+${gameStageFormat(stage, format, remainingRepairs > 0)}`;
   throw new Error("未知的游戏制作阶段。");
 }
 
@@ -342,9 +343,10 @@ const gameRecordBoundary = "不能写进 HTML 注释、脚本、DOM 或可访问
 /**
  * @param {"build"|"polish"|"repair"} stage
  * @param {"json"|"framed"} format
+ * @param {boolean} mayRequestRepair
  */
-function gameStageFormat(stage, format) {
-  const schema = {build: GAME_BUILD_SCHEMA, polish: GAME_POLISH_SCHEMA, repair: GAME_REPAIR_SCHEMA}[stage];
+function gameStageFormat(stage, format, mayRequestRepair = stage === "polish") {
+  const schema = stage === "build" ? GAME_BUILD_SCHEMA : mayRequestRepair ? GAME_POLISH_SCHEMA : GAME_REPAIR_SCHEMA;
   if (format === "framed") {
     const recordFields = Object.fromEntries(Object.entries(schema.properties).filter(([name]) => name !== "html"));
     const required = schema.required.filter(name => name !== "html");

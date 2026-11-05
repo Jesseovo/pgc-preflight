@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>极地滑索素材</title>
+<canvas width="160" height="160"></canvas>
+<script id="game-assets">
+const GAME_ASSETS = {
+  sled(ctx, x, y, size) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(size / 100, size / 100);
+    ctx.fillStyle = '#87e8f4';
+    ctx.fill(new Path2D('M-42 -2h84v25l-17 12h-50l-17 -12zm8 -26h68v14h-68z'), 'evenodd');
+    ctx.fillStyle = '#ff927d';
+    ctx.fill(new Path2D('M-22 8h44v10h-44z'));
+    ctx.restore();
+  }
+};
+</script>
+<script>
+GAME_ASSETS.sled(document.querySelector('canvas').getContext('2d'), 80, 80, 140);
+</script>
+</html>

@@ -1,8 +1,10 @@
+import type { PublicHarnessTask } from '../../../harness-status';
+
 export const forge = '/api/forge';
 export const dims = ['subject', 'medium', 'gesture', 'structure', 'mood'] as const;
 export type Dim = typeof dims[number];
 export const dimensionLabels = { subject: '题材', medium: '美术媒介', gesture: '手势', structure: '挑战结构', mood: '情绪基调' };
-export const stageLabels: Record<string, string> = { expand: '扩写', brief: '简报', preview: '样板图', assets: '美术资产', game: '游戏成品', product: '游戏成品', build: '制作', polish: '精修', repair: '定向修复', capture: '采集', suggest: '词库建议', tag: '作品打标签', 'mechanism-check': '机制查重' };
+export const stageLabels: Record<string, string> = { expand: '扩写', brief: '简报', preview: '样板图', assets: '美术资产', game: '游戏成品', product: '游戏成品', build: '制作', polish: '精修', repair: '定向修复', repair2: '第二次定向修复', capture: '采集', suggest: '词库建议', tag: '作品打标签', 'mechanism-check': '机制查重' };
 export type Kind = 'expand' | 'brief' | 'preview' | 'assets' | 'game';
 export type Executor = 'agent' | 'platform';
 export type Idea = Partial<Record<Dim | 'title' | 'logline' | 'core_loop' | 'controls' | 'twist' | 'progression' | 'art_direction' | 'audio' | 'why_addictive' | 'risks' | 'strength' | 'action' | 'rule' | 'dup_of', string>> & {
@@ -46,6 +48,7 @@ export interface Task {
   scope?: string;
   status: string;
   executor?: Executor;
+  harness?: PublicHarnessTask;
   detail?: string;
   error?: string;
   phase?: string;

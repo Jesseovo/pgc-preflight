@@ -29,6 +29,7 @@ import {ownedTopic,reserveDraw,publicSettings,versionList,saveArtifact,inputSnap
 import {currentHumanReview,withHumanReviews} from './human-review';
 import { cleanGameHtml } from './game-generation';
 import {enqueueForgeTask, recoverForgeTasks, readForgeTask, publicForgeTask, type ForgeRunnerBinding} from './forge-tasks';
+import {readPublicHarnessUsage,withOptionalHarnessPolicy} from './harness-task-status';
 
 const TEXT_DEFAULTS = { redlines: DEFAULT_REDLINES, template: DEFAULT_TEMPLATE, template_f: DEFAULT_TEMPLATE_F };
 // Model credentials and model selection belong to /admin. Forge only stores
@@ -70,6 +71,10 @@ export interface ForgeEnv {
   memberMode?:boolean;
   creativeVersion?:1|2;
   CREATIVE_V2_ROLLOUT?:string;
+  HARNESS_ROLLOUT?:string;
+  HARNESS_RELEASE?:string;
+  HARNESS_RUNNER?:ForgeRunnerBinding;
+  harnessExecution?:import('./harness-execution').HarnessExecution;
   modelExecutor?:'agent'|'platform';
   generationSnapshot?:any;
   ADMIN_PASSWORD: string;
@@ -206,10 +211,14 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
       if(env.memberMode&&!await first(env,'SELECT id FROM forge_tasks WHERE id=? AND owner_id=?',b,ownerId))throw new HttpError(404,'生成任务不存在。');
       const row=await readForgeTask(env,b);
       if(!row||(env.memberMode&&row.owner_id!==ownerId))throw new HttpError(404,'生成任务不存在。');
-      return publicForgeTask(row);
+      const usage=await readPublicHarnessUsage(env.DB,'forge',[row]);
+      return publicForgeTask(row,usage.get(row.id));
     }
     await recoverForgeTasks(env);
-    return (await all(env,"SELECT id,executor,owner_id,kind,scope,status,detail,error,result,created_at,started_at,updated_at,creative_version,phase,phase_started_at FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100",new Date(Date.now()-86400000).toISOString(),ownerId,ownerId)).map(publicForgeTask);
+    const since=new Date(Date.now()-86400000).toISOString();
+    const rows=await withOptionalHarnessPolicy(policy=>all(env,`SELECT id,executor,owner_id,kind,scope,status,detail,error,result,created_at,started_at,updated_at,creative_version,phase,phase_started_at${policy} FROM forge_tasks WHERE (status IN ('queued','running') OR updated_at > ?) AND (?='admin' OR owner_id=?) ORDER BY created_at DESC LIMIT 100`,since,ownerId,ownerId));
+    const usage=await readPublicHarnessUsage(env.DB,'forge',rows);
+    return rows.map(row=>publicForgeTask(row,usage.get(row.id)));
   }
   if(a==='review'&&b==='usage'&&!c&&method==='GET')return reviewUsage(env.DB,ownerId);
   if(a==='review'&&b==='worker-status'&&!c&&method==='GET')return deviceStatus(env.DB,ownerId);
