@@ -4,12 +4,16 @@
 
 即使候选只接收 0% 常规流量，向 `pgc-preflight` 上传候选并改变活动部署列表也属于生产配置变更。既有发布计划把生产变更安排在验收之后，这次提前加入研究候选须单独确认，并安排在没有活跃平台付费任务的时段。真实模型兼容性测试已在原方案中获授权，无需重复索取模型 Key 或另行扩大模型调用范围。
 
+本轮临时研究配置已获用户确认。此授权不代表允许跳过质量验收、合并 main 或切换灰测。执行记录及实际结果保存在私有 JSON 中；准备完成和本地合成通过都不等于真实渠道兼容通过。
+
 ## 准备
 
 1. 读取生产活动部署和最新上传版本。两者须指向同一个基线 A，且活动部署只有 A 100%。冻结生产上传窗口，避免校验后有其他版本改变绑定或资产继承来源。记录 A 的模块哈希、绑定资源、DO 命名空间、迁移标签、兼容日期和标志、资产配置及触发器设置。发现漂移时停止并重新采集。
 2. 本地运行 `scripts/prepare-harness-provider-candidate.ts --baseline <私有基线目录> --out <私有候选目录>`，两目录均位于 ignored 的 `artifacts/`。核对 `candidate-package.json` 和全部模块 SHA-256。原 `worker.js` 字节不变。新入口保留 `CreatorFeedbackRunner`、`ForgeRunner`、`ReviewControlPlane`、`ReviewRunner` 四个命名导出以及原 `scheduled`、`queue` 处理器，替换候选的默认 `fetch`。
 3. 为研究 Runner 新建独立 D1，先用 `scripts/harness-provider-research-schema.ts` 生成并检查 schema，再只对该研究库应用。准备固定镜像摘要、任务 ID、代次、模型合同哈希及生效和过期时间。为 broker 和 Runner 配置同一个新生成的 256 位 HMAC Secret，Runner 控制端另用一把独立 Secret。凭据仅经内存或 Secret 输入管道传递，禁止进入配置、参数、日志和回执。
 4. 核对研究配置中声明的两个 D1 ID，也从 Cloudflare 读回两处实际绑定资源 ID。候选 `DB` 须指向原生产 D1，候选 `HARNESS_RESEARCH_DB` 与 Runner `PROVIDER_RESEARCH_DB` 须指向同一个独立研究 D1。运行时无法通过配置中声明的 ID 确认实际绑定。研究账本、遥测和工具续轮摘要只写研究库。候选读取生产模型配置，真实请求通过生产 `model_throttle` 和 `model_slots` 协调同 Key 的容量，会写入这些表并使用共享额度。
+5. 独立 Native Worker 将代码、配置和两把研究 Secret 在同一次部署中提交。使用 `--secrets-file /dev/stdin` 从内存管道输入，不先发布缺少 Secret 的版本；仅对这个独立研究 Worker 使用即时 DO 更新。签名状态响应分别提供外层和 DO 的版本及固定诊断阶段，执行前两者必须等于刚部署的版本，DO 阶段必须为 `ready`。Cloudflare 的 DO 默认可能延后更新，外层版本号不能证明内部对象已经更新。[DO 更新说明](https://developers.cloudflare.com/changelog/product/durable-objects/)
+6. 一旦发现其他发布改变活动版本或最新上传版本，停止后续生产变更，不恢复先前的基线。协调完成后重新冻结当前版本、模块、绑定与资产。若基线已带研究专用绑定，逐项确认其归属和原值，仅在候选中显式替换；禁止重复名称或顺带移除其他绑定。检查空闲窗口后，须再次核对基线及剩余测试时间。
 
 ## 上传与验证
 
