@@ -15,7 +15,7 @@ RUN bun /tmp/patch-ccb.mjs /opt/ccb --archive /tmp/ccb.tar.gz \
 FROM node:24.16.0-bookworm-slim@sha256:2c87ef9bd3c6a3bd4b472b4bec2ce9d16354b0c574f736c476489d09f560a203
 WORKDIR /opt/harness
 COPY --from=bundle /bundle/ /opt/ccb/
-COPY envelope.mjs model-bridge.mjs network-lock.mjs runtime.mjs workspace.mjs /opt/harness/
+COPY envelope.mjs game-html.mjs model-bridge.mjs network-lock.mjs runtime.mjs workspace.mjs /opt/harness/
 USER node
 EXPOSE 8080
 ENTRYPOINT ["node", "/opt/harness/runtime.mjs"]

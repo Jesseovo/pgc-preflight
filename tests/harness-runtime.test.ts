@@ -9,11 +9,13 @@ import { inspectStream } from '../harness/model-bridge.mjs';
 import { validateCreationOutput } from '../server/forge-creation-pipeline';
 import { parseProductionOutput } from '../server/forge-production-output';
 import { harnessResultText } from '../server/harness-host';
+import { prepareArtifact } from '../server/forge-workspace';
 
 const controlToken = 'synthetic-control-token-for-test-only';
 const lease = 'synthetic-model-lease-for-test-only';
 const screenshot = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVQYV2NgAAIAAAUAAYoz4wQAAAAASUVORK5CYII=';
-const html = '<!doctype html><html><body>before</body></html>';
+const html = '<!doctype html><html><head><meta name="viewport" content="width=device-width"><link href="https://example.invalid/style.css"></head><body>before<script src="https://example.invalid/game.js"></script><script>document.body.onclick=()=>{}</script></body></html>\n';
+const captureId = `tool-${'a'.repeat(64)}:shot:1`;
 const fixture = String.raw`
 import { readFile, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -69,10 +71,23 @@ if (fixture === 'game with capture') {
   const deniedInput = await call('write', {path:'input/game.html',content:'blocked'});
   if (!deniedInput.isError) process.exit(6);
   const read = await call('read', {path:'game.html'});
-  if (!read.content[0].text.includes('before')) process.exit(7);
-  if ((await call('patch', {path:'game.html', oldText:'before',newText:'after'})).isError) process.exit(8);
+  const original = JSON.parse(read.content[0].text);
+  if (!original.content.includes('before')) process.exit(7);
+  if ((await call('write', {path:'game.html', content:'<!doctype html><html><body>unfinished'})).isError) process.exit(17);
+  const incomplete = await call('capture', {});
+  if (!incomplete.isError || !incomplete.content[0].text.includes('game.html is not ready')) process.exit(18);
+  if ((await call('write', {path:'game.html', content:original.content})).isError) process.exit(19);
+  const patched = await call('patch', {path:'game.html', oldText:'before',newText:'after'});
+  if (patched.isError) process.exit(8);
   const capture = await call('capture', {});
   if (capture.isError || capture.content[1].type !== 'image' || capture.content[0].text.includes(capture.content[1].data)) process.exit(9);
+  const details = JSON.parse(capture.content[0].text);
+  const prepared = JSON.parse((await call('read', {path:'game.html'})).content[0].text);
+  const immutable = JSON.parse((await call('read', {path:'input/game.html'})).content[0].text);
+  if (details.workspacePreparation?.beforeSha256 !== JSON.parse(patched.content[0].text).sha256 ||
+      details.workspacePreparation?.afterSha256 !== prepared.sha256 || details.inputHash !== prepared.sha256 ||
+      prepared.content.endsWith('\n') || prepared.content.includes('example.invalid') ||
+      immutable.content !== original.content) process.exit(20);
   const picture = capture.content[1];
   const messages = [body, {role:'user',content:[{type:'tool_result',tool_use_id:'synthetic',content:[
     {type:'text', text:capture.content[0].text},
@@ -82,7 +97,10 @@ if (fixture === 'game with capture') {
   if ((await ask(messages)).status !== 200) process.exit(10);
   const record = {
     requirements:[{id:'goal',text:'Polish',status:'implemented'}],decisions:[],coreChanges:[],
-    selfCheck:{findings:[],unverified:[],changes:[],requestRepair:false},
+    selfCheck:{findings:[{
+      id:'issue',kind:'confirmed',phenomenon:'Fixture overlap',trigger:'After touch',cause:'Hint position',
+      minimalChange:'Move the hint',retest:'Repeat touch',evidenceRefs:[details.shots[0].id],coreChange:false,resolved:false,
+    }],unverified:[],changes:[],requestRepair:true},
   };
   if ((await call('write', {path:'record.json',content:JSON.stringify(record)})).isError) process.exit(11);
   result('The game is ready.');
@@ -190,14 +208,14 @@ describe('CCB Node runtime boundary', () => {
     expect((await call('/v1/result', undefined, 'another-run')).status).toBe(404);
   });
 
-  it('keeps the full game and record, runs only scoped workspace tools and preserves original screenshot bytes', async () => {
+  it('captures the platform-prepared HTML and accepts repair references only for its saved bytes', async () => {
     const modelCalls: any[] = [];
     const browserCalls: any[] = [];
     await serve((request, response, body) => {
       if (request.url === '/v1/tools') {
         browserCalls.push(body);
         response.setHeader('content-type', 'application/json');
-        response.end(JSON.stringify({ inputHash: body.arguments.inputHash, shots: [{ id: 'viewport-1', data: `data:image/png;base64,${screenshot}` }] }));
+        response.end(JSON.stringify({ inputHash: body.arguments.inputHash, shots: [{ id: captureId, data: `data:image/png;base64,${screenshot}` }] }));
       } else {
         modelCalls.push(body);
         response.setHeader('content-type', 'text/event-stream');
@@ -210,14 +228,27 @@ describe('CCB Node runtime boundary', () => {
     }))).status).toBe(202);
     const result = await done();
     const patched = html.replace('before', 'after');
+    const saved = await prepareArtifact('game', patched, { creative_version: 2 });
+    expect(saved).not.toContain('example.invalid');
+    expect(saved.endsWith('\n')).toBe(false);
     expect(result).toMatchObject({ state: 'succeeded', modelTurns: 2, outputTokens: 44 });
-    expect(result.files[0]).toEqual(fileEntry('game.html', patched));
+    expect(result.files[0]).toEqual(fileEntry('game.html', saved));
     expect(result.files[1].path).toBe('record.json');
     const parsed = parseProductionOutput(await harnessResultText(result, 'game'));
-    expect(validateCreationOutput(parsed, 'polish')).toEqual([]);
-    expect(parsed).toMatchObject({ html: patched, selfCheck: { requestRepair: false } });
+    const preparedOutput = { ...parsed, html: await prepareArtifact('game', parsed.html, { creative_version: 2 }) };
+    expect(preparedOutput.html).toBe(saved);
     expect(browserCalls).toHaveLength(1);
-    expect(browserCalls[0]).toMatchObject({ name: 'capture', arguments: { inputHash: sha256(patched), html: patched } });
+    expect(browserCalls[0]).toMatchObject({ name: 'capture', arguments: { inputHash: sha256(preparedOutput.html), html: preparedOutput.html } });
+    const evidence = [{
+      evidenceId: captureId.slice(0, -7), evidenceHash: 'b'.repeat(64), origin: 'harness-browser-tool', tool: 'capture',
+      inputHash: browserCalls[0].arguments.inputHash, actions: [],
+      shots: [{ id: captureId, data: `data:image/png;base64,${screenshot}`, sha256: sha256(Buffer.from(screenshot, 'base64')) }],
+    }];
+    expect(validateCreationOutput(preparedOutput, 'polish', undefined, undefined, true, evidence, sha256(preparedOutput.html))).toEqual([]);
+    const editedOutput = { ...preparedOutput, html: preparedOutput.html.replace('after', 'edited after evidence') };
+    expect(validateCreationOutput(editedOutput, 'polish', undefined, undefined, true, evidence, sha256(editedOutput.html))).toEqual([
+      'selfCheck.requestRepair requires an evidenced unresolved finding on a current HTML version',
+    ]);
     expect(modelCalls).toHaveLength(2);
     expect(modelCalls[0]).toMatchObject({ thinking: { type: 'adaptive' }, output_config: { effort: 'high' } });
     expect(modelCalls[0]).not.toHaveProperty('metadata');

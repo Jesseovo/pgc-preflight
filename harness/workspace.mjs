@@ -1,4 +1,5 @@
 import { fileEntry, LIMITS, sha256 } from './envelope.mjs';
+import { cleanGameHtml } from './game-html.mjs';
 
 const string = { type: 'string' };
 const integer = { type: 'integer', minimum: 0 };
@@ -8,8 +9,8 @@ const tools = [
   { name: 'read', description: 'Read UTF-8 text using zero-based character offsets. Read successive chunks using nextOffset. Images are included directly in the user message.', properties: { path: string, offset: integer }, required: ['path'] },
   { name: 'write', description: 'Write a complete UTF-8 artifact to an allowed output path.', properties: { path: string, content: string }, required: ['path', 'content'] },
   { name: 'patch', description: 'Replace one exact, unique UTF-8 string in an existing output artifact. Include enough context to identify exactly one occurrence.', properties: { path: string, oldText: string, newText: string }, required: ['path', 'oldText', 'newText'] },
-  { name: 'capture', description: 'Capture and probe the exact current game.html in an isolated mobile browser. Inspect the returned original viewport images and probe evidence.', properties: {}, required: [] },
-  { name: 'play-start', description: 'Start an isolated mobile play session for the exact current game.html and return its first viewport image.', properties: {}, required: [] },
+  { name: 'capture', description: 'Apply the platform HTML preparation to game.html, then capture and probe the exact prepared file in an isolated mobile browser. Inspect the returned original viewport images and probe evidence.', properties: {}, required: [] },
+  { name: 'play-start', description: 'Apply the platform HTML preparation to game.html, then start an isolated mobile play session for the exact prepared file and return its first viewport image.', properties: {}, required: [] },
   { name: 'play-act', description: 'Perform one bounded play round against the original session. Specify actions such as tap (x,y), hold, drag with optional timed path points, multi-touch, wait, or restart per the platform play schema.', properties: { sessionId: string, round: { type: 'object' } }, required: ['sessionId', 'round'] },
   { name: 'play-finish', description: 'Finish a mobile play session and lock its evidence.', properties: { sessionId: string }, required: ['sessionId'] },
   { name: 'play-close', description: 'Close the isolated mobile play session.', properties: { sessionId: string }, required: ['sessionId'] },
@@ -57,10 +58,15 @@ export async function workspaceResponse(context, request, gateway) {
       })) return error('Invalid tool arguments');
 
   if (remoteTools.has(name)) {
+    let plan;
     try {
-      return respond(await browserTool(context, gateway, name, id, args));
-    } catch {
-      return output({ error: 'Browser tool could not complete with verified evidence' }, true);
+      plan = planBrowserTool(context, name, id, args);
+      return respond(await browserTool(context, gateway, name, id, args, plan));
+    } catch (error) {
+      return output({
+        error: error instanceof GamePreparationError ? error.message : 'Browser tool could not complete with verified evidence',
+        ...(plan?.workspacePreparation && { workspacePreparation: plan.workspacePreparation }),
+      }, true);
     }
   }
   if (name === 'list') {
@@ -97,17 +103,48 @@ export async function workspaceResponse(context, request, gateway) {
 
 const imageData = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/;
 
-async function browserTool(context, gateway, name, id, args) {
+class GamePreparationError extends Error {}
+
+function planBrowserTool(context, name, id, args) {
   if (context.abort.signal.aborted || (typeof id !== 'number' && typeof id !== 'string') ||
       context.browserToolIds.has(id) || context.browserToolIds.size >= 32) throw new Error('Browser tool denied');
-  const { run } = context;
-  const opening = name === 'capture' || name === 'play-start';
-  const entry = opening ? context.files.get('game.html') : null;
-  const inputHash = opening ? entry?.sha256 : context.browserSessions.get(args.sessionId);
   const { browserBudget } = context;
-  if (!inputHash || (opening && browserBudget.screenshots >= 12) ||
+  const opening = name === 'capture' || name === 'play-start';
+  if ((opening && browserBudget.screenshots >= 12) ||
       (name === 'capture' && (browserBudget.captures >= 3 || browserBudget.screenshots > 8))) throw new Error('Browser tool input unavailable');
+  if (!opening) {
+    const inputHash = context.browserSessions.get(args.sessionId);
+    if (!inputHash) throw new Error('Browser tool input unavailable');
+    return { inputHash };
+  }
 
+  const path = 'game.html';
+  const original = context.files.get(path);
+  if (original?.encoding !== 'utf8' || !context.outputs.includes(path)) {
+    throw new GamePreparationError('Write a complete game.html before requesting browser evidence.');
+  }
+  let html;
+  try {
+    html = cleanGameHtml(original.content);
+  } catch (error) {
+    throw new GamePreparationError(`game.html is not ready for browser evidence. ${error.message}`);
+  }
+  // Keep the platform's cleanup unchanged and refuse unusual input whose
+  // prepared bytes would still change on the platform's final validation.
+  if (cleanGameHtml(html) !== html) {
+    throw new GamePreparationError('HTML preparation is not stable. Remove malformed external markup before testing game.html.');
+  }
+  if (html === original.content) return { entry: original, inputHash: original.sha256 };
+  const entry = fileEntry(path, html);
+  context.files.set(path, entry);
+  return {
+    entry, inputHash: entry.sha256,
+    workspacePreparation: { path, beforeSha256: original.sha256, afterSha256: entry.sha256 },
+  };
+}
+
+async function browserTool(context, gateway, name, id, args, { entry, inputHash, workspacePreparation }) {
+  const { run, browserBudget } = context;
   const invocation = `tool-${sha256(JSON.stringify([run.runId, id])).slice(0, 48)}`;
   context.browserToolIds.add(id);
   if (name === 'capture') browserBudget.captures++;
@@ -165,5 +202,5 @@ async function browserTool(context, gateway, name, id, args) {
   browserBudget.screenshots += images.length;
   if (browserBudget.screenshots > 12) throw new Error('Original screenshot budget exceeded');
   if ((name === 'capture' || name === 'play-start') && images.length === 0) throw new Error('Missing original viewport images');
-  return { content: [{ type: 'text', text: JSON.stringify(metadata) }, ...images] };
+  return { content: [{ type: 'text', text: JSON.stringify({ ...metadata, ...(workspacePreparation && { workspacePreparation }) }) }, ...images] };
 }
