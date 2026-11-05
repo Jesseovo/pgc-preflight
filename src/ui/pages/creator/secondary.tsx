@@ -10,16 +10,17 @@ export function Preferences({userId, executor, onExecutor}: ExecutorProps & {use
   const {notify} = useApp();
   const source = useResource<Rules>(`${forge}/settings`);
   const key = `forge-draw-size-${userId}`;
-  const [size, setSize] = useState(() => storageGet(key, true) ?? '');
+  const [size, setSize] = useState<string | null>(() => storageGet(key, true) || null);
+  const drawSize = size ?? source.data?.draw_size ?? '12';
   const action = useAction();
   return <section className="page creator-page">
     <PageHeader title="规则与偏好" eyebrow="工作台设置" description="公共规范由管理员维护。个人抽签偏好只保存在当前浏览器。"/>
     <Card className="creator-secondary-card"><h2>个人创作偏好</h2>
       <div className="creator-project-columns"><form className="stack" onSubmit={event => {
         event.preventDefault();
-        const value = Math.max(1, Math.min(40, Number(size || source.data?.draw_size) || 12));
+        const value = Number(drawSize);
         setSize(String(value)); storageSet(key, String(value), true); notify('抽签偏好已保存', 'success');
-      }}><Field label="原版抽签每次数量" hint="机制候选每次保留一组种子。"><Input type="number" min={1} max={40} value={size || source.data?.draw_size || 12} onChange={event => setSize(event.target.value)}/></Field>
+      }}><Field label="原版抽签每次数量" hint="机制候选每次保留一组种子。"><Input type="number" inputMode="numeric" min={1} max={40} step={1} required value={drawSize} onChange={event => setSize(event.target.value)}/></Field>
         <div><Button type="submit" size="sm">保存偏好</Button></div>
       </form><div className="stack"><ExecutorPicker value={executor} onChange={onExecutor}/><p className="small muted">平台游戏制作使用 Claude Opus 5.5。个人 Agent 由你选择模型和工具。</p></div></div>
     </Card>

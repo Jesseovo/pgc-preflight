@@ -22,7 +22,8 @@ export function Discover({userId, executor, onExecutor, state, tasks, refreshTas
   const [requirements, setRequirements] = useState('');
   const [subject, setSubject] = useState('');
   const [locks, setLocks] = useState<Partial<Record<Dim, string>>>({});
-  const [size, setSize] = useState(() => storageGet(`forge-draw-size-${userId}`, true) || '');
+  const [size, setSize] = useState<string | null>(() => storageGet(`forge-draw-size-${userId}`, true) || null);
+  const drawSize = size ?? rules.data?.draw_size ?? '12';
   const [selected, setSelected] = useState<number[]>([]);
   const [generated, setGenerated] = useState<Topic[]>([]);
   const drawAction = useAction();
@@ -61,7 +62,7 @@ export function Discover({userId, executor, onExecutor, state, tasks, refreshTas
     } finally { refreshTasks(); source.reload(); }
   });
   const draw = (custom: boolean) => drawAction.run(async () => {
-    const input = {subject: custom ? subject.trim() : '', locks, requirements: requirements.trim(), ...(modern ? {creative_version: 2} : {n: custom ? 1 : Number(size || rules.data?.draw_size || 12)})};
+    const input = {subject: custom ? subject.trim() : '', locks, requirements: requirements.trim(), ...(modern ? {creative_version: 2} : {n: custom ? 1 : Number(drawSize)})};
     const key = JSON.stringify(input);
     if (request.current?.key !== key) request.current = {key, id: crypto.randomUUID()};
     const rows = await api<Topic[]>(`${forge}/draw`, {method: 'POST', body: {...input, request_id: request.current.id}});
@@ -89,10 +90,10 @@ export function Discover({userId, executor, onExecutor, state, tasks, refreshTas
           <option value="">随机</option>{vocab.data?.filter(word => word.dim === dim && word.enabled && (modern || !word.used)).map(word => <option key={word.id} value={word.word}>{word.word}</option>)}
         </Select></Field>)}</div>
         <Field label="补充创作要求" hint="随选题保存，供后续创作任务读取。"><Textarea rows={3} maxLength={12000} value={requirements} onChange={event => setRequirements(event.target.value)} placeholder="想服务的玩家、操作限制、美术氛围…"/></Field>
-        <div className="row">
-          {modern === false && <Field label="数量"><Input className="creator-count" type="number" min={1} max={40} value={size || rules.data?.draw_size || '12'} onChange={event => setSize(event.target.value)}/></Field>}
-          <Button disabled={!drawable} onClick={() => void draw(false)}>{drawAction.busy ? '保存中…' : '抽一批'}</Button>
-        </div>
+        <form className="row" onSubmit={event => {event.preventDefault(); void draw(false);}}>
+          {modern === false && <Field label="数量"><Input className="creator-count" type="number" inputMode="numeric" min={1} max={40} step={1} required value={drawSize} onChange={event => setSize(event.target.value)}/></Field>}
+          <Button type="submit" disabled={!drawable}>{drawAction.busy ? '保存中…' : '抽一批'}</Button>
+        </form>
         <form className="row creator-custom" onSubmit={event => {event.preventDefault(); void draw(true);}}><Field label="也可以用自己的主题"><Input maxLength={200} value={subject} onChange={event => setSubject(event.target.value)} placeholder="例如：午夜修补玩具"/></Field><Button type="submit" variant="outline" disabled={!drawable || !subject.trim()}>创建自定义选题</Button></form>
       </Card>
       <Card className="creator-draw-guide"><div className="creator-step-no">01—03</div><h2>从灵感到项目</h2><ol><li>抽签或自定义一个主题。</li><li>明确发起扩写，比较玩法和实现风险。</li><li>{modern ? '查看查重记录，选择并登记机制。' : '将想做的选题加入项目。'}</li></ol>
