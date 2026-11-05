@@ -20,7 +20,7 @@ async function probeStep<T>(code: ProbeErrorCode, operation: () => T | Promise<T
   try { return await operation(); } catch { throw new ProbeFailure(code); }
 }
 type Capabilities = { uids: number[] | null; effective: string | null; permitted: string | null; inheritable: string | null; ambient: string | null; bounding: string | null; noNewPrivs: boolean | null };
-type Inspection = { runtime: Capabilities | null; cli: Capabilities | null; childSecretIsolation: boolean | null; workspaceEmpty: boolean };
+type Inspection = { runtime: Capabilities | null; cli: Capabilities | null; childSecretIsolation: boolean | null; workspaceEmpty: boolean; noLiveChildren: Check };
 const runtimeStartErrors = {
   '400 Invalid run envelope': 'invalid_envelope',
   '400 Invalid run request': 'invalid_request',
@@ -33,14 +33,26 @@ const runtimeStartErrors = {
 } as const;
 type RuntimeStartSignature = keyof typeof runtimeStartErrors;
 type RuntimeStartError = typeof runtimeStartErrors[RuntimeStartSignature];
+const runtimeStates = ['running', 'succeeded', 'failed', 'cancelled'] as const;
+const runtimeFailures = ['deadline_exceeded', 'cancelled', 'invalid_ccb_output', 'ccb_incomplete', 'ccb_start_failed',
+  'workspace_cleanup_failed', 'model_request_denied', 'model_request_failed', 'model_stream_incomplete'] as const;
+type RuntimeCompletion = {
+  state: typeof runtimeStates[number] | 'unknown';
+  failure?: typeof runtimeFailures[number] | 'unknown';
+  observedAfterMs: number;
+};
 type Receipt = {
   image: string; action: Action; state: 'running' | 'passed' | 'failed'; releaseReady: false; error?: ProbeErrorCode;
   runtimeStart?: { httpStatus: number; error?: RuntimeStartError };
+  runtimeCompletion?: RuntimeCompletion;
+  observations?: { processSampleAfterMs?: number; fixtureReachedAfterMs?: number };
   checks: Record<string, Check>; processes?: Pick<Inspection, 'runtime' | 'cli'>; cleanup?: 'request' | 'alarm';
 };
 type Active = { action: Action; taskId: string; generation: string; lease: string; runId: string; control: string; deadlineAt: number; image: string };
 const maxRunMs = 90_000;
 const runtimeRunMs = 24_000;
+const fixtureHeartbeatMs = 1_000;
+const fixtureLifetimeMs = 40_000;
 const internal = 'http://pgc-native-probe.internal';
 const gateway = 'http://pgc-harness.internal';
 const probeName = 'native-research';
@@ -166,10 +178,29 @@ export class NativeProbeOutbound extends WorkerEntrypoint<Env, HarnessOutboundSc
     if (!observed.ok) return deny();
     // Keep the real CLI alive on a synthetic response until its own deadline.
     // No provider is called and no prompt or model output is persisted.
-    return new Response(new ReadableStream<Uint8Array>({
-      start(controller) { controller.enqueue(encoder.encode(': native-research-fixture\n\n')); },
-    }), { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', [probeMarker]: 'fixture' } });
+    return new Response(nativeFixtureStream(), {
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', [probeMarker]: 'fixture' },
+    });
   }
+}
+
+function nativeFixtureStream(): ReadableStream<Uint8Array> {
+  const frame = encoder.encode(': native-research-fixture\n\n');
+  let stop: (() => void) | undefined;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(frame);
+      const heartbeats = setInterval(() => {
+        if ((controller.desiredSize ?? 0) > 0) controller.enqueue(frame);
+      }, fixtureHeartbeatMs);
+      const deadline = setTimeout(() => {
+        stop?.();
+        controller.close();
+      }, fixtureLifetimeMs);
+      stop = () => { clearInterval(heartbeats); clearTimeout(deadline); };
+    },
+    cancel() { stop?.(); },
+  });
 }
 
 const inspectScript = String.raw`
@@ -182,7 +213,8 @@ function proc(pid) {
   const field = (name) => status?.match(new RegExp('^' + name + ':\\s*([^\\s]+)', 'm'))?.[1] ?? null;
   const state = field('State');
   const ppid = field('PPid');
-  if (!ppid || !state || /^[ZXx]$/.test(state)) return null;
+  if (!ppid || !state) return undefined;
+  if (/^[ZXx]$/.test(state)) return null;
   return { pid, base, status, field, ppid, exe: readlink(base + '/exe') };
 }
 function inspect(entry, role) {
@@ -202,7 +234,8 @@ function inspect(entry, role) {
       parsed.get('ANTHROPIC_API_KEY') === 'pgc-loopback-only' && parsed.get('OPENAI_API_KEY') === 'pgc-loopback-only' };
 }
 const pids = fs.readdirSync('/proc').filter(name=>/^\d+$/.test(name) && Number(name)!==process.pid);
-const entries = pids.length <= 128 ? pids.map(proc).filter(Boolean) : [];
+const sampled = pids.length <= 128 ? pids.map(proc) : null;
+const entries = sampled?.filter(Boolean) ?? [];
 const runtimes = entries.filter(({ base }) => read(base + '/cmdline')?.split('\0').includes('/opt/harness/runtime.mjs'));
 const parent = runtimes.length === 1 ? runtimes[0] : null;
 // CCB rewrites its process title and therefore /proc/<pid>/cmdline on Linux.
@@ -213,7 +246,8 @@ const runtime = inspect(parent, 'runtime');
 const cli = inspect(child, 'cli');
 const isolated = runtime?.isolated == null || cli?.isolated == null ? null : runtime.isolated && cli.isolated;
 const workspaceEmpty = !fs.readdirSync('/tmp').some(name=>name.startsWith('pgc-ccb-'));
-console.log(JSON.stringify({runtime:runtime?.capabilities??null,cli:cli?.capabilities??null,childSecretIsolation:isolated,workspaceEmpty}));
+const noLiveChildren = parent && sampled?.every(entry => entry !== undefined) ? children.length === 0 : null;
+console.log(JSON.stringify({runtime:runtime?.capabilities??null,cli:cli?.capabilities??null,childSecretIsolation:isolated,workspaceEmpty,noLiveChildren}));
 `;
 
 const networkScript = String.raw`
@@ -265,10 +299,14 @@ export class NativeProbeRunner {
     if (origin !== internal || search || !configured(this.env)) return deny();
     const storage = this.ctx.storage;
     if (pathname === '/observed' && request.method === 'POST') {
-      const active = await storage.get('active') as Active | undefined;
-      if (!active || Date.now() >= active.deadlineAt || !matches(request.headers.get('authorization'), 'Bearer ' + active.lease)) return deny();
-      await storage.put('observed', true);
-      return json({ ok: true });
+      const observedAt = Date.now();
+      const observed = await storage.transaction(async (tx: any) => {
+        const active = await tx.get('active') as Active | undefined;
+        if (!active || Date.now() >= active.deadlineAt || !matches(request.headers.get('authorization'), 'Bearer ' + active.lease)) return false;
+        if (await tx.get('observed') === undefined) await tx.put('observed', observedAt);
+        return true;
+      });
+      return observed ? json({ ok: true }) : deny();
     }
     if (pathname === '/status' && request.method === 'GET') return json(await storage.get('receipt') ?? { state: 'idle' });
     if (request.method !== 'POST' || !['/run', '/arm-timeout'].includes(pathname) || !await hasEmptyBody(request)) return deny();
@@ -374,7 +412,8 @@ export class NativeProbeRunner {
       receipt.checks[name] = readCheck(network?.[name]);
     }
     receipt.checks.nonHttpEgressDenied = null;
-    const deadlineAt = Date.now() + runtimeRunMs;
+    const submittedAt = Date.now();
+    const deadlineAt = submittedAt + runtimeRunMs;
     const envelope = {
       runId: active.runId, taskId: active.taskId, generation: active.generation, phase: 'probe', purpose: 'brief',
       protocol: 'anthropic', model: 'claude-opus-5-5', effort: 'low', vision: false, deadlineAt,
@@ -393,13 +432,22 @@ export class NativeProbeRunner {
     }
     await this.ctx.storage.put('receipt', receipt);
     let inspection: Inspection | null = null;
+    let processSampleAt: number | undefined;
     while (Date.now() < deadlineAt - 2000) {
       const current = await probeStep('process_exec_failed', () => this.exec<Inspection>(inspectScript));
-      if (current.cli) inspection = current;
-      if (inspection && await this.ctx.storage.get('observed')) break;
+      if (current.cli) {
+        inspection = current;
+        processSampleAt = Date.now();
+      }
+      if (inspection && typeof await this.ctx.storage.get('observed') === 'number') break;
       await wait(350);
     }
-    receipt.checks.cliReachedFixture = Boolean(await this.ctx.storage.get('observed'));
+    const fixtureAt = await this.ctx.storage.get('observed');
+    receipt.checks.cliReachedFixture = typeof fixtureAt === 'number';
+    receipt.observations = {
+      ...(processSampleAt !== undefined && { processSampleAfterMs: Math.max(0, processSampleAt - submittedAt) }),
+      ...(typeof fixtureAt === 'number' && { fixtureReachedAfterMs: Math.max(0, fixtureAt - submittedAt) }),
+    };
     receipt.processes = { runtime: safeCapabilities(inspection?.runtime), cli: safeCapabilities(inspection?.cli) };
     const actual = [receipt.processes.runtime, receipt.processes.cli];
     receipt.checks.nonRootUid = actual.every(p => p?.uids?.length === 4) ? actual.every(p => p!.uids!.every(uid => uid > 0)) : null;
@@ -409,19 +457,27 @@ export class NativeProbeRunner {
       : null;
     receipt.checks.childSecretIsolation = readCheck(inspection?.childSecretIsolation);
     while (Date.now() < Math.min(deadlineAt + 6000, active.deadlineAt)) {
-      const state = await probeStep('runtime_status_unavailable', async () => {
+      const completion = await probeStep('runtime_status_unavailable', async (): Promise<RuntimeCompletion> => {
         const status = await this.runtime(active, '/v1/status');
         if (!status.ok) throw new Error();
-        return await status.json() as { state?: string; failure?: string };
+        const data = await status.json() as { runId?: string; taskId?: string; phase?: string; state?: string; failure?: string };
+        if (data?.runId !== active.runId || data.taskId !== active.taskId || data.phase !== envelope.phase) throw new Error();
+        return {
+          state: runtimeStates.find(value => value === data.state) ?? 'unknown',
+          ...(data.failure !== undefined && { failure: runtimeFailures.find(value => value === data.failure) ?? 'unknown' }),
+          observedAfterMs: Math.max(0, Date.now() - submittedAt),
+        };
       });
-      if (state.state !== 'running') {
-        receipt.checks.runtimeDeadline = state.state === 'failed' && state.failure === 'deadline_exceeded';
+      receipt.runtimeCompletion = completion;
+      if (completion.state !== 'running') {
+        receipt.checks.runtimeDeadline = completion.state === 'failed' && completion.failure === 'deadline_exceeded';
         break;
       }
       await wait(350);
     }
     const cleaned = await probeStep('workspace_exec_failed', () => this.exec<Inspection>(inspectScript));
-    receipt.checks.workspaceRemoved = cleaned.workspaceEmpty === true && cleaned.cli === null;
+    receipt.checks.noLiveChildren = readCheck(cleaned.noLiveChildren);
+    receipt.checks.workspaceRemoved = cleaned.workspaceEmpty === true && cleaned.noLiveChildren === true;
   }
 
   private async cleanup(active: Active, receipt: Receipt, source: 'request' | 'alarm') {

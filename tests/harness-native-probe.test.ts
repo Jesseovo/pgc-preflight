@@ -101,6 +101,32 @@ describe('native harness research boundary', () => {
     await cli.body?.cancel();
   });
 
+  it.each(['cancelled', 'bounded'])('keeps sending fixture heartbeat bytes until %s and clears all timers', async end => {
+    const notified = vi.fn(async () => new Response('ok'));
+    const env = { HARNESS_RESEARCH_TOKEN: token, RESEARCH_IMAGE: image, NATIVE_PROBE: { idFromName: (name: string) => name, get: () => ({ fetch: notified }) } };
+    const outbound = new NativeProbeOutbound({ props: scope }, env);
+    vi.useFakeTimers();
+    try {
+      const cli = await outbound.fetch(request(endpoint, { 'x-pgc-harness-request-id': 'probe-0-' + crypto.randomUUID() }));
+      const reader = cli.body!.getReader();
+      const frame = ': native-research-fixture\n\n';
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe(frame);
+      await vi.advanceTimersByTimeAsync(23_000);
+      expect(new TextDecoder().decode((await reader.read()).value)).toBe(frame);
+      const lateHeartbeat = reader.read();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(new TextDecoder().decode((await lateHeartbeat).value)).toBe(frame);
+      if (end === 'cancelled') {
+        await reader.cancel();
+      } else {
+        await vi.advanceTimersByTimeAsync(16_000);
+        expect(new TextDecoder().decode((await reader.read()).value)).toBe(frame);
+        expect(await reader.read()).toEqual({ done: true, value: undefined });
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('dispatches a genuinely empty stream, and refuses data or a stalled body before dispatch', async () => {
     const fetch = vi.fn(async (_request: Request) => new Response('fixture'));
     const env = { HARNESS_RESEARCH_TOKEN: token, RESEARCH_IMAGE: image, NATIVE_PROBE: { idFromName: (name: string) => name, get: () => ({ fetch }) } };
@@ -116,8 +142,10 @@ describe('native harness research boundary', () => {
   });
 });
 
-function setup({ privileged = false, runtimeNow = Date.now, startResponse }: {
-  privileged?: boolean; runtimeNow?: () => number; startResponse?: () => Response;
+function setup({ privileged = false, runtimeNow = Date.now, startResponse, completion = { state: 'failed', failure: 'deadline_exceeded' },
+  finalNoLiveChildren = true }: {
+  privileged?: boolean; runtimeNow?: () => number; startResponse?: () => Response; completion?: { state: string; failure?: string };
+  finalNoLiveChildren?: boolean | null;
 } = {}) {
   const data = new Map<string, unknown>();
   let alarm: number | null = null;
@@ -136,6 +164,7 @@ function setup({ privileged = false, runtimeNow = Date.now, startResponse }: {
   const masks = { uids: [1000,1000,1000,1000], effective: privileged ? '00000001' : '00000000',
     permitted: '00000000', inheritable: '00000000', ambient: '00000000', bounding: '00000000', noNewPrivs: true };
   let reading = 0, control = '';
+  let runtimeIdentity: { runId: string; taskId: string; phase: string } | undefined;
   let runner: NativeProbeRunner;
   const container = {
     images: { ccb: image },
@@ -154,15 +183,18 @@ function setup({ privileged = false, runtimeNow = Date.now, startResponse }: {
         const verified = validateStart(await request.json(), runtimeNow());
         if (!verified) return Response.json({ error: 'Invalid run envelope' }, { status: 400 });
         if (startResponse) return startResponse();
+        const { runId, taskId, phase } = verified.run;
+        runtimeIdentity = { runId, taskId, phase };
         await runner.fetch(new Request(internal + '/observed', { method: 'POST', headers: { Authorization: 'Bearer ' + verified.lease } }));
         return Response.json({}, { status: 202 });
       }
-      if (path === '/v1/status') return Response.json({ state: 'failed', failure: 'deadline_exceeded' });
+      if (path === '/v1/status') return Response.json({ ...runtimeIdentity, ...completion });
       throw new Error('Unexpected private endpoint');
     } }),
     exec: vi.fn(async (_command: string[], options: { stdin?: unknown }) => {
+      const cli = !options.stdin && reading++ === 0 ? masks : null;
       const result = options.stdin ? { privateGateway: true, httpInterceptDenied: true, httpsInterceptDenied: true, crossTaskDenied: true } :
-        { runtime: masks, cli: reading++ === 0 ? masks : null, childSecretIsolation: true, workspaceEmpty: true };
+        { runtime: masks, cli, childSecretIsolation: true, workspaceEmpty: true, noLiveChildren: cli ? false : finalNoLiveChildren };
       return { exitCode: Promise.resolve(0), output: async () => ({ exitCode: 0, stdout: new TextEncoder().encode(JSON.stringify(result)) }) };
     }),
   };
@@ -183,7 +215,7 @@ describe('native probe orchestration with scripted container', () => {
       ['12', { ppid: 10, title: 'inspector', env: '' }],
       ['13', { ppid: 1, title: 'claude', env: '' }],
     ]);
-    const inspect = () => {
+    const inspect = (unreadablePid?: string) => {
       let output;
       runInNewContext(script, {
         process: { pid: 12 }, console: { log: (data: string) => { output = JSON.parse(data); } },
@@ -193,6 +225,7 @@ describe('native probe orchestration with scripted container', () => {
           readFileSync: (path: string) => {
             const [, , pid, field] = path.split('/');
             const item = processes.get(pid)!;
+            if (field === 'status' && pid === unreadablePid) throw new Error('unreadable');
             if (field === 'status') return `State:\tS (sleeping)\nPPid:\t${item.ppid}\nUid:\t1000\t1000\t1000\t1000\n`;
             if (field === 'cmdline') return item.title;
             return item.env;
@@ -201,9 +234,13 @@ describe('native probe orchestration with scripted container', () => {
       });
       return output;
     };
-    expect(inspect()).toMatchObject({ cli: { uids: [1000, 1000, 1000, 1000] }, childSecretIsolation: true });
+    expect(inspect()).toMatchObject({ cli: { uids: [1000, 1000, 1000, 1000] }, childSecretIsolation: true, noLiveChildren: false });
     processes.get('13')!.ppid = 10;
-    expect(inspect()).toMatchObject({ cli: null, childSecretIsolation: null });
+    expect(inspect()).toMatchObject({ cli: null, childSecretIsolation: null, noLiveChildren: false });
+    processes.delete('11');
+    expect(inspect('13')).toMatchObject({ cli: null, noLiveChildren: null });
+    processes.delete('13');
+    expect(inspect()).toMatchObject({ cli: null, noLiveChildren: true });
   });
 
   it('enforces empty stream handling again on the Durable Object boundary', async () => {
@@ -226,6 +263,8 @@ describe('native probe orchestration with scripted container', () => {
     const receipt = await response.json();
     expect(receipt).toMatchObject({ state: 'failed', releaseReady: false, cleanup: 'request',
       runtimeStart: { httpStatus: 202 },
+      runtimeCompletion: { state: 'failed', failure: 'deadline_exceeded', observedAfterMs: expect.any(Number) },
+      observations: { processSampleAfterMs: expect.any(Number), fixtureReachedAfterMs: expect.any(Number) },
       checks: { runtimeBoot: true, cliReachedFixture: true, privateGateway: true, crossTaskDenied: true,
         nonRootUid: true, privilegeDrop: false, nonHttpEgressDenied: null, runtimeDeadline: true, workspaceRemoved: true, containerDestroyed: true } });
     expect(s.container.start).toHaveBeenCalledWith(expect.objectContaining({ image, enableInternet: false }));
@@ -251,6 +290,28 @@ describe('native probe orchestration with scripted container', () => {
 });
 
 describe('native probe diagnostics', () => {
+  it.each([false, null])('cannot pass workspace cleanup with noLiveChildren=%s even without a recognized CLI', async finalNoLiveChildren => {
+    const s = setup({ finalNoLiveChildren });
+    const response = await s.post('/run');
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ state: 'failed', checks: {
+      runtimeDeadline: true, workspaceRemoved: false, noLiveChildren: finalNoLiveChildren, containerDestroyed: true,
+    } });
+  });
+
+  it.each([
+    ['model_stream_incomplete', 'model_stream_incomplete'],
+    ['PRIVATE_RUNTIME_DIAGNOSTIC', 'unknown'],
+  ])('reports completion separately from the exact deadline check', async (failure, observedFailure) => {
+    const s = setup({ completion: { state: 'failed', failure } });
+    const response = await s.post('/run');
+    expect(response.status).toBe(502);
+    const receipt = await response.json();
+    expect(receipt).toMatchObject({ state: 'failed', checks: { runtimeDeadline: false, containerDestroyed: true },
+      runtimeCompletion: { state: 'failed', failure: observedFailure, observedAfterMs: expect.any(Number) } });
+    expect(JSON.stringify(receipt)).not.toContain('PRIVATE_RUNTIME_DIAGNOSTIC');
+  });
+
   it('records the allowlisted rejection when runtime validation sees an expired envelope', async () => {
     const s = setup({ runtimeNow: () => Date.now() + 30_000 });
     const response = await s.post('/run');
