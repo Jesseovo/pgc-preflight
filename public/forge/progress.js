@@ -4,14 +4,22 @@ export function elapsed(since, until = Date.now()) {
   const seconds = Math.max(0, Math.floor((until - since) / 1000));
   return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, '0')} 秒`;
 }
-export function progressHtml({ label = '正在处理', detail = '', value, total, status = 'running', startedAt, finishedAt } = {}) {
+export function progressState(value, total, status = 'running') {
   const known = Number.isFinite(value) && Number.isFinite(total) && total > 0;
+  const indeterminate = !known && status === 'running';
   const percent = known ? Math.max(0, Math.min(100, value / total * 100)) : 0;
+  const caption = known ? `${value} / ${total}` : status === 'running' ? '处理中' :
+    status === 'waiting' ? '等待继续' : status === 'done' ? '已完成' : '未完成';
+  return { known, indeterminate, percent, caption };
+}
+export function progressHtml({ label = '正在处理', detail = '', value, total, status = 'running', startedAt, finishedAt } = {}) {
+  if (typeof document !== 'undefined') getService();
+  const { known, indeterminate, percent, caption } = progressState(value, total, status);
   const showElapsed = Number.isFinite(startedAt) && status === 'running';
   const waitedMinutes = showElapsed ? Math.floor((Date.now() - startedAt) / 60000) : 0;
   const elapsedText = waitedMinutes ? `约 ${waitedMinutes} 分钟` : '';
   const elapsedMarkup = showElapsed ? `<time data-progress-since="${startedAt}" aria-label="${elapsedText ? `已等待 ${escape(elapsedText)}` : '任务正在处理中'}">${elapsedText ? `已等待 ${escape(elapsedText)}` : ''}</time>` : '';
-  return `<div class="pgc-progress is-${status}"><div class="pgc-progress-heading"><strong>${escape(label)}</strong><span>${known ? `${value} / ${total}` : status === 'running' ? '处理中' : status === 'waiting' ? '等待继续' : status === 'done' ? '已完成' : '未完成'}</span></div><div class="pgc-progress-track ${known ? 'is-counted' : status === 'running' ? 'is-indeterminate' : ''}" role="progressbar" aria-label="${escape(label)}" ${known ? `aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${value}"` : ''} aria-valuetext="${escape(detail || label)}"><span style="${known ? `transform:scaleX(${percent / 100})` : ''}"></span></div><div class="pgc-progress-caption"><span>${escape(detail)}</span>${elapsedMarkup}</div></div>`;
+  return `<div class="pgc-progress is-${status}"><div class="pgc-progress-heading"><strong>${escape(label)}</strong><span>${caption}</span></div><div class="pgc-progress-track ${known ? 'is-counted' : indeterminate ? 'is-indeterminate' : ''}" role="progressbar" aria-label="${escape(label)}" ${known ? `aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${value}"` : ''} aria-valuetext="${escape(detail || label)}"><span style="${known ? `transform:scaleX(${percent / 100})` : ''}"></span></div><div class="pgc-progress-caption"><span>${escape(detail)}</span>${elapsedMarkup}</div></div>`;
 }
 
 function installStyles(doc) {
@@ -20,13 +28,7 @@ function installStyles(doc) {
   link.rel = 'stylesheet'; link.href = new URL('./progress.css', import.meta.url).href;
   link.dataset.pgcProgressStyle = ''; doc.head.append(link);
 }
-let host = window;
-try { if (parent !== window && parent.location.origin === location.origin) host = parent; } catch {}
-installStyles(document);
-if(!document.querySelector('link[href="/forge/experience.css"]')){const link=document.createElement('link');link.rel='stylesheet';link.href='/forge/experience.css';document.head.append(link);}
-installStyles(host.document);
-
-function createService() {
+function createService(host) {
   const doc = host.document;
   const tasks = new Map();
   const documents = new Map([[doc, null]]);
@@ -94,9 +96,24 @@ function createService() {
     },
   };
 }
-const service = host.__pgcProgress || (host.__pgcProgress = createService());
-service.register(document);
-export const startTask = (label, options) => service.start(label, { ...options, owner: document });
+let service;
+function getService() {
+  if (service) return service;
+  let host = window;
+  try { if (parent !== window && parent.location.origin === location.origin) host = parent; } catch {}
+  installStyles(document);
+  if (!document.querySelector('link[href="/forge/experience.css"]')) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/forge/experience.css';
+    document.head.append(link);
+  }
+  installStyles(host.document);
+  service = host.__pgcProgress || (host.__pgcProgress = createService(host));
+  service.register(document);
+  return service;
+}
+export const startTask = (label, options) => getService().start(label, { ...options, owner: document });
 export async function withProgress(label, work, options) {
   const task = startTask(label, { tray: false, ...options });
   try { const result = await work(task); task.done(); return result; }

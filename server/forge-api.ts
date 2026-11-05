@@ -260,9 +260,15 @@ export async function dispatch(method, route, request, env, ownerId, ctx?:any) {
     case "POST expand": return expand(env, await body(request), ctx);
     case "GET topics": return listTopics(env, new URL(request.url).searchParams);
     case "GET products": return listProducts(env);
+    case "GET topics/:id/preview-thumbnail": {
+      if(route.length!==3)throw new HttpError(404,'接口不存在。');
+      const row=await first(env,"SELECT preview_svg FROM topics WHERE id=? AND (?='admin' OR owner_id=?)",id,ownerId,ownerId);
+      if(!row?.preview_svg?.trim())throw new HttpError(404,'样板图尚未生成或无权访问。');
+      return new Response(row.preview_svg,{headers:{'Content-Type':'image/svg+xml; charset=utf-8','Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','Cross-Origin-Resource-Policy':'same-origin','Content-Security-Policy':"sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none';"}});
+    }
     case "GET topics/:id": {
       if(new URL(request.url).searchParams.get('summary')==='1'){
-        const row=await first(env,`SELECT id,owner_id,subject,medium,gesture,structure,mood,status,data,score,note,updated_at,content_revision,expand_status,expand_error,brief_status,brief_error,assets_status,assets_error,product_status,product_error,brief_md IS NOT NULL AS has_brief,preview_svg IS NOT NULL AS has_preview,assets_html IS NOT NULL AS has_assets,product_html IS NOT NULL AS has_product FROM topics WHERE id=? AND (?='admin' OR owner_id=?)`,id,ownerId,ownerId);
+        const row=await first(env,`SELECT id,owner_id,creative_version,origin,subject,medium,gesture,structure,mood,status,data,score,note,requirements,updated_at,content_revision,expand_status,expand_error,brief_status,brief_error,assets_status,assets_error,product_status,product_error,brief_md IS NOT NULL AS has_brief,preview_svg IS NOT NULL AS has_preview,assets_html IS NOT NULL AS has_assets,product_html IS NOT NULL AS has_product FROM topics WHERE id=? AND (?='admin' OR owner_id=?)`,id,ownerId,ownerId);
         if(!row)throw new HttpError(404,'选题不存在');return hydrate(row);
       }
       if(env.FORGE_RUNNER)await recoverForgeTasks(env,id);
@@ -595,7 +601,7 @@ async function listTopics(env, params) {
   const limit = Math.min(Number(params.get("limit")) || 100, 500);
   const marks = statuses.map(() => "?").join(",");
   const rows = await all(env, `SELECT id, creative_version, origin, batch, subject, medium, gesture, structure, mood, status, data, score, note, created_at, updated_at,
-      preview_svg IS NOT NULL AS has_preview, expand_status, expand_error, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
+      (preview_svg IS NOT NULL AND trim(preview_svg)<>'') AS has_preview, expand_status, expand_error, brief_md IS NOT NULL AS has_brief, brief_status, brief_error,
       assets_html IS NOT NULL AS has_assets, assets_status, assets_error,
       product_html IS NOT NULL AS has_product, product_status, product_error
     FROM topics WHERE status IN (${marks}) AND (?='admin' OR owner_id=?) ORDER BY score DESC, id DESC LIMIT ?`, ...statuses,env.ownerId||'admin',env.ownerId||'admin', limit);
@@ -604,7 +610,7 @@ async function listTopics(env, params) {
 
 async function listProducts(env) {
   const rows = await all(env, `SELECT id, creative_version, origin, subject, medium, gesture, structure, mood, status, data, score, note, updated_at,
-      product_html IS NOT NULL AS has_product, product_status, product_error
+      product_html IS NOT NULL AS has_product, product_status, product_error, (preview_svg IS NOT NULL AND trim(preview_svg)<>'') AS has_preview
     FROM topics WHERE (product_html IS NOT NULL OR product_status IN ('queued', 'running', 'error')) AND (?='admin' OR owner_id=?)
     ORDER BY updated_at DESC, id DESC LIMIT 300`,env.ownerId||'admin',env.ownerId||'admin');
   return rows.map(hydrate);

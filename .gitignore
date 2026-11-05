@@ -12,3 +12,5 @@ public/forge-agent.md
 .DS_Store
 .local-settings.json
 .local-members.json
+
+dist-ui/

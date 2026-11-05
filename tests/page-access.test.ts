@@ -53,7 +53,7 @@ describe('检查台的登录前置', () => {
     await updateMember(member.id, { star: true }, store);
     expect(await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets)).toBe(null);
     expect((await guardCheckPage(page('/', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/forge/');
-    expect((await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/forge/');
+    expect((await guardReviewPage(page('/review', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/forge/?tab=review');
     await updateMember(member.id, { star: false }, store);
     expect((await guardForgePage(page('/forge', `pgc_member=${memberToken}`), store, secrets))?.headers.get('Location')).toBe('/');
   });
@@ -61,10 +61,11 @@ describe('检查台的登录前置', () => {
     const store=memoryStore();
     const member=await createMember({username:'starcreator',password:'test-only-password',star:true},store);
     const token=await memberLogin('starcreator','test-only-password',store,secrets.SETTINGS_KEY),cookie=`pgc_member=${token}`;
-    for(const path of ['/forge/app.js','/forge/review-sheet.js','/forge/%61pp.js'])expect(await guardPrivateAsset(page(path,cookie),store,secrets),path).toBe(null);
-    for(const path of ['/assets/admin-abc123.js','/assets/%61dmin-abc123.js','/assets/admin-abc123.js.map','/assets/model-panel-abc123.js','/assets/model-panel-abc123.js.map'])expect((await guardPrivateAsset(page(path,cookie),store,secrets))?.status,path).toBe(403);
+    for(const path of ['/forge/app.js','/forge/review-sheet.js','/forge/%61pp.js','/assets/ui-creator-abc123.js','/assets/%75i-creator-abc123.js.map'])expect(await guardPrivateAsset(page(path,cookie),store,secrets),path).toBe(null);
+    for(const path of ['/assets/admin-abc123.js','/assets/%61dmin-abc123.js','/assets/admin-abc123.js.map','/assets/model-panel-abc123.js','/assets/model-panel-abc123.js.map','/assets/ui-admin-abc123.js','/assets/%75i-admin-abc123.js.map'])expect((await guardPrivateAsset(page(path,cookie),store,secrets))?.status,path).toBe(403);
     await updateMember(member.id,{star:false},store);
     expect((await guardPrivateAsset(page('/forge/app.js',cookie),store,secrets))?.status).toBe(403);
+    expect((await guardPrivateAsset(page('/assets/ui-creator-abc123.js',cookie),store,secrets))?.status).toBe(403);
     expect(await guardPrivateAsset(page('/forge/member-review.js',cookie),store,secrets)).toBe(null);
   });
   it('成员和未登录用户不能读取管理脚本，管理员可读，审核共享资源不受影响', async () => {
@@ -72,7 +73,7 @@ describe('检查台的登录前置', () => {
     await createMember({ username: 'creator03', password: 'test-only-password' }, store);
     const memberToken = await memberLogin('creator03', 'test-only-password', store, secrets.SETTINGS_KEY);
     const adminToken = await login(secrets.ADMIN_PASSWORD, secrets);
-    for (const path of ['/forge/app.js', '/forge/review-sheet.js', '/forge/%61pp.js', '/assets/admin-abc123.js', '/assets/%61dmin-abc123.js', '/assets/admin-abc123.js.map','/assets/model-panel-abc123.js','/assets/model-panel-abc123.js.map']) {
+    for (const path of ['/forge/app.js', '/forge/review-sheet.js', '/forge/%61pp.js', '/assets/admin-abc123.js', '/assets/%61dmin-abc123.js', '/assets/admin-abc123.js.map','/assets/model-panel-abc123.js','/assets/model-panel-abc123.js.map', '/assets/ui-admin-abc123.js', '/assets/%75i-admin-abc123.js.map', '/assets/ui-creator-abc123.js', '/assets/%75i-creator-abc123.js.map']) {
       for (const cookie of ['', `pgc_member=${memberToken}`]) {
         const response = await guardPrivateAsset(page(path, cookie), store, secrets);
         expect(response?.status, path).toBe(403);
@@ -80,7 +81,7 @@ describe('检查台的登录前置', () => {
       }
       expect(await guardPrivateAsset(page(path, `pgc_admin=${adminToken}`), store, secrets)).toBe(null);
     }
-    for (const path of ['/forge/member-review.js', '/forge/review-workspace.js', '/forge/review-capture.js', '/forge/style.css', '/forge/progress.js', '/assets/login-abc123.js']) {
+    for (const path of ['/forge/member-review.js', '/forge/review-workspace.js', '/forge/review-capture.js', '/forge/style.css', '/forge/progress.js', '/assets/login-abc123.js', '/assets/ui-common-abc123.js']) {
       expect(await guardPrivateAsset(page(path), store, secrets)).toBe(null);
     }
   });

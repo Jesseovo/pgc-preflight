@@ -150,6 +150,34 @@ describe('管理员概览、作品及任务专用接口',()=>{
     expect(s.sqlite.prepare('SELECT count(*) n FROM forge_tasks WHERE retry_of=?').get('original-failed')).toMatchObject({n:1});expect(s.fetcher).not.toHaveBeenCalled();
   });
 
+  it('重试完整制作保留原流程和高思考预算，以新任务重新开始而不复制阶段',async()=>{
+    const s=await setup();
+    const oldGame='<!doctype html><html>OLD_V2_RETRY_GAME</html>';
+    s.topic(1,'a',today,{creative_version:2,brief_md:'原策划书',product_html:oldGame});
+    const job={type:'game',id:1,creative_version:2,requestId:'original-request',regenerate:true};
+    const snapshot=await inputSnapshot(s.DB,'a',job);
+    expect(snapshot).toMatchObject({creative_version:2,platform_creation_policy:{version:1,effort:'high',maxTokens:64000}});
+    const lockedInput=JSON.stringify(snapshot);
+    s.task('failed-v2',1,'a','error','platform',{kind:'game',scope:'a:game:1',payload:JSON.stringify(job),creative_version:2,input_snapshot:lockedInput,
+      phase:'polish:model',phase_started_at:today,started_at:today,model_started_at:today});
+    s.sqlite.prepare("INSERT INTO forge_creation_stages(task_id,stage,owner_id,topic_id,version_id,content_hash,self_check,created_at) VALUES('failed-v2','build','a',1,'original-stage','original-hash','{}',?)").run(today);
+    const original=s.sqlite.prepare("SELECT * FROM forge_tasks WHERE id='failed-v2'").get();
+
+    const response=await s.call('tasks/creation/failed-v2/retry','POST');
+    expect(response.status).toBe(202);
+    const {task}=await response.json() as {task:{id:string}};
+    expect(task.id).not.toBe('failed-v2');
+    const saved=s.sqlite.prepare('SELECT creative_version,input_snapshot,payload,status,phase,phase_started_at,started_at,model_started_at FROM forge_tasks WHERE id=?').get(task.id);
+    expect(saved).toMatchObject({creative_version:2,payload:JSON.stringify({...job,requestId:task.id}),
+      status:'queued',phase:null,phase_started_at:null,started_at:null,model_started_at:null});
+    expect(saved?.input_snapshot === lockedInput).toBe(true);
+    expect(s.sqlite.prepare('SELECT task_id,stage FROM forge_creation_stages').all()).toEqual([{task_id:'failed-v2',stage:'build'}]);
+    expect(s.sqlite.prepare("SELECT * FROM forge_tasks WHERE id='failed-v2'").get()).toEqual(original);
+    expect(s.sqlite.prepare('SELECT product_html,product_request_id FROM topics WHERE id=1').get()).toEqual({product_html:oldGame,product_request_id:task.id});
+    expect(s.dispatch).toHaveBeenCalledTimes(1);
+    expect(s.fetcher).not.toHaveBeenCalled();
+  });
+
   it('活动scope冲突返回现有任务而不转换Agent或修改状态，拒绝越权或缺失原输入',async()=>{
     const s=await setup();s.topic(1);s.task('failed');s.task('active-original',1,'a','running','agent',{detail:'ORIGINAL_ACTIVE_DETAIL'});
     const before=s.sqlite.prepare("SELECT * FROM forge_tasks WHERE id='active-original'").get();
@@ -275,7 +303,8 @@ describe('管理员概览、作品及任务专用接口',()=>{
       s.task(`failed-game-${id}`,id,'a','error','platform',{kind:'game',scope:`a:game:${id}`,payload:JSON.stringify({type:'game',id,requestId:'old-id',regenerate:true}),input_snapshot:JSON.stringify(snapshot)});
     }
     const {task}=await (await s.call('tasks/creation/failed-game-1/retry','POST')).json() as any;
-    const saved=s.sqlite.prepare('SELECT payload,input_snapshot FROM forge_tasks WHERE id=?').get(task.id) as any;
+    const saved=s.sqlite.prepare('SELECT payload,input_snapshot,creative_version FROM forge_tasks WHERE id=?').get(task.id) as any;
+    expect(saved.creative_version).toBe(1);
     expect(JSON.parse(saved.payload)).toEqual({type:'game',id:1,requestId:task.id,regenerate:true});expect(s.sqlite.prepare('SELECT product_html,product_request_id,product_status FROM topics WHERE id=1').get()).toEqual({product_html:old,product_request_id:task.id,product_status:'queued'});
     const html='<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><button>New version</button><script>let score=0;</script></body></html>';
     const fetcher=vi.fn(async()=>Response.json({content:[{type:'text',text:html}],stop_reason:'end_turn'}));vi.stubGlobal('fetch',fetcher);

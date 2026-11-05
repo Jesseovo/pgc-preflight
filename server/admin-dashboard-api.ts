@@ -199,7 +199,8 @@ async function retryCreation(env:any,id:string):Promise<AdminTask> {
   // requestId is an execution/idempotency identity, not a creation input.
   const payload=job.type==='game'?JSON.stringify({...job,requestId:newId}):row.payload;
   const topicGuard=artifactColumns[job.type]?' AND EXISTS(SELECT 1 FROM topics WHERE id=? AND owner_id=?)':'';
-  const insert=DB.prepare(`INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,created_at,updated_at,owner_id,executor,input_snapshot,retry_of,requested_by) SELECT ?,kind,scope,?,'queued','等待后台执行…',?,?,owner_id,'platform',input_snapshot,id,'admin' FROM forge_tasks WHERE id=? AND status='error' AND executor='platform' AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE retry_of=?) AND (owner_id='admin' OR EXISTS(SELECT 1 FROM members m WHERE m.id=forge_tasks.owner_id AND m.enabled=1 AND m.star=1))${topicGuard}`).bind(newId,payload,stamp,stamp,id,id,...(topicGuard?[topicId,owner]:[]));
+  // Preserve the locked workflow version. A new task starts without a saved phase.
+  const insert=DB.prepare(`INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,created_at,updated_at,owner_id,executor,input_snapshot,creative_version,retry_of,requested_by) SELECT ?,kind,scope,?,'queued','等待后台执行…',?,?,owner_id,'platform',input_snapshot,creative_version,id,'admin' FROM forge_tasks WHERE id=? AND status='error' AND executor='platform' AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE retry_of=?) AND (owner_id='admin' OR EXISTS(SELECT 1 FROM members m WHERE m.id=forge_tasks.owner_id AND m.enabled=1 AND m.star=1))${topicGuard}`).bind(newId,payload,stamp,stamp,id,id,...(topicGuard?[topicId,owner]:[]));
   const statements=[insert];
   if(['expand','brief','assets','game'].includes(job.type)){
     const column=job.type==='game'?'product':job.type;

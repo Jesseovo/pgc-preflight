@@ -73,9 +73,30 @@ try{
   for(const cookie of ['',accounts.disabled.cookie])await status('/api/square/games',401,{cookie});
   check('anonymous and disabled sessions cannot read square documents or APIs');
   for(const cookie of [accounts.plain.cookie,accounts.reviewer.cookie,accounts.star.cookie,admin]){
-    const document=await status('/square',200,{cookie});const html=await document.text();assert(html.includes(cookie===admin?'/square/app.js':cookie===accounts.star.cookie?'/forge/app.js':'/forge/member-review.js'));const list=await json('/api/square/games',{cookie});assert.equal(list.total,0);
+    const document=await status('/square',200,{cookie});const html=await document.text();assert.match(html,/<script type="module"[^>]+src="\/assets\/ui-[^"]+\.js"/);assert.ok(html.includes('<div id="app"></div>'));const list=await json('/api/square/games',{cookie});assert.equal(list.total,0);
   }
   check('every enabled login can enter square without canReview, Star or admin role');
+  const builtAssets=await readdir(join(assets,'assets'));
+  const adminChunk=builtAssets.find(name=>/^ui-admin-.*\.js$/.test(name));
+  const creatorChunk=builtAssets.find(name=>/^ui-creator-.*\.js$/.test(name));
+  assert.ok(adminChunk);assert.ok(creatorChunk);
+  for(const [cookie,adminAllowed,creatorAllowed] of [['',false,false],[accounts.plain.cookie,false,false],[accounts.star.cookie,false,true],[admin,true,true]] as const){
+    for(const [name,allowed] of [[adminChunk,adminAllowed],[creatorChunk,creatorAllowed]] as const){
+      const asset=await status('/assets/'+name,allowed?200:403,{cookie});
+      assert.match(asset.headers.get('Cache-Control')||'',/private.*no-store/);
+    }
+  }
+  for(const path of ['/_workbench.html','/ui.html','/ui/index.html'])await status(path,404,{cookie:admin});
+  for(const [path,cookie,destination] of [
+    ['/',admin,'/admin'],['/',accounts.star.cookie,'/forge/'],['/forge.html',accounts.plain.cookie,'/'],
+    ['/review.html?report=fixture',accounts.star.cookie,'/forge/?report=fixture&tab=review'],
+    ['/admin/index.html?view=feedback',admin,'/admin?view=feedback'],
+  ]){const response=await status(path,302,{cookie});assert.equal(response.headers.get('Location'),destination);}
+  for(const [path,cookie] of [['/',accounts.plain.cookie],['/forge/',accounts.star.cookie],['/admin',admin],['/account',accounts.star.cookie]]){
+    const response=await status(path,200,{cookie});assert.ok((await response.text()).includes('<div id="app"></div>'));
+    const head=await status(path,200,{cookie,method:'HEAD'});assert.equal(await head.text(),'');
+  }
+  check('built workbench serves role-correct documents, private chunks, HEAD and legacy links; internal shells cannot bypass guards');
   await status('/api/square/games?scope=manage',403,{cookie:accounts.plain.cookie});
   await status('/api/admin/members',401,{cookie:accounts.plain.cookie});
   await status('/api/forge/review/device/pairing',401,{cookie:accounts.plain.cookie,body:{}});

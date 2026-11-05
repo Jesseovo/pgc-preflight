@@ -46,12 +46,36 @@ describe('Star 工作区迁移与所有权',()=>{
     expect(s.env.modelStore.get).not.toHaveBeenCalled();expect(s.dispatch).not.toHaveBeenCalled();
     expect(s.sqlite.prepare('SELECT product_html FROM topics WHERE id=?').get(id)).toMatchObject({product_html:'AGENT_CHOICE-product'});
   });
-  it('项目摘要不返回游戏和材料原文，跨成员仍拒绝',async()=>{
+  it('项目摘要保留创作协议和初始要求，省略材料原文并隔离成员',async()=>{
     const s=await setup(),id=s.topic('a','SUMMARY');
+    s.sqlite.prepare("UPDATE topics SET creative_version=2,origin='mechanism-choice',requirements=?,preview_svg=? WHERE id=?").run('触摸操作，保留核心规则。','<svg>PRIVATE_STYLE</svg>',id);
     const response=await s.request('a','GET',`topics/${id}?summary=1`);expect(response.status).toBe(200);
-    const value=await response.json() as any;expect(value).toMatchObject({id,has_product:1,has_brief:1,has_assets:1});
-    expect(value.product_html).toBeUndefined();expect(value.brief_md).toBeUndefined();expect(value.assets_html).toBeUndefined();
+    const value=await response.json() as any;expect(value).toMatchObject({id,creative_version:2,origin:'mechanism-choice',requirements:'触摸操作，保留核心规则。',has_product:1,has_brief:1,has_assets:1,has_preview:1});
+    for(const field of ['product_html','brief_md','assets_html','preview_svg'])expect(value[field]).toBeUndefined();
     expect((await s.request('b','GET',`topics/${id}?summary=1`)).status).toBe(404);
+  });
+  it('样板缩略图只读本人图像并保留会话、Star和沙箱边界，不读取模型或返回游戏源码',async()=>{
+    const s=await setup(),id=s.topic('a','THUMBNAIL'),empty=s.topic('a','NO_STYLE');
+    const svg='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#b8d1a1"/></svg>';
+    s.sqlite.prepare('UPDATE topics SET preview_svg=? WHERE id=?').run(svg,id);
+    const result=await s.request('a','GET',`topics/${id}/preview-thumbnail`);
+    expect(result.status).toBe(200);expect(await result.text()).toBe(svg);
+    expect(result.headers.get('Content-Type')).toContain('image/svg+xml');
+    expect(result.headers.get('Content-Security-Policy')).toContain("sandbox; default-src 'none'");
+    expect(result.headers.get('Content-Security-Policy')).not.toContain('allow-scripts');
+    expect(result.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(result.headers.get('Cross-Origin-Resource-Policy')).toBe('same-origin');
+    expect((await s.request('b','GET',`topics/${id}/preview-thumbnail`)).status).toBe(404);
+    expect((await s.request('plain','GET',`topics/${id}/preview-thumbnail`)).status).toBe(403);
+    expect((await s.request('a','GET',`topics/${empty}/preview-thumbnail`)).status).toBe(404);
+    expect((await s.request('a','GET',`topics/${id}/preview-thumbnail`,undefined,{Cookie:''})).status).toBe(401);
+    expect((await s.request('a','GET',`topics/${id}/preview-thumbnail`,undefined,{Authorization:'Bearer invalid'})).status).toBe(403);
+    const products=await(await s.request('a','GET','products')).json() as any[];
+    expect(products.find(item=>item.id===id)).toMatchObject({has_preview:1});
+    expect(JSON.stringify(products)).not.toContain(svg);expect(products[0].product_html).toBeUndefined();
+    expect(s.env.modelStore.get).not.toHaveBeenCalled();expect(s.dispatch).not.toHaveBeenCalled();
+    await updateMember('a',{star:false},s.members);
+    expect((await s.request('a','GET',`topics/${id}/preview-thumbnail`)).status).toBe(403);
   });
   it('Star 网页制作由平台 Opus 执行，重复提交与跨成员访问被隔离，成品保存版本',async()=>{
     const s=await setup(),id=s.topic('a','A_LIVE_CREATION'),other=s.topic('b','B_PRIVATE_CREATION');

@@ -9,18 +9,26 @@ const reviewAssets = new Set([
   '/forge/member-review.js', '/forge/review-workspace.js', '/forge/review-workspace.css',
   '/forge/review-capture.js', '/forge/style.css', '/forge/progress.js', '/forge/progress.css',
 ]);
+const adminChunk = /^\/assets\/(?:admin|model-panel|ui-admin)-[^/]+\.js(?:\.map)?$/;
+const creatorChunk = /^\/assets\/ui-creator-[^/]+\.js(?:\.map)?$/;
+export const privatePageHeaders = { 'Cache-Control': 'private, no-store', Vary: 'Cookie' };
+
+function assetScope(request: Request): 'admin' | 'creator' | null {
+  let pathname: string;
+  try { pathname = decodeURIComponent(new URL(request.url).pathname); } catch { return 'admin'; }
+  if (adminChunk.test(pathname)) return 'admin';
+  if (creatorChunk.test(pathname) || pathname.startsWith('/forge/') && !reviewAssets.has(pathname)) return 'creator';
+  return null;
+}
 export function isPrivateAsset(request: Request): boolean {
-  let pathname;
-  try { pathname = decodeURIComponent(new URL(request.url).pathname); } catch { return true; }
-  return pathname.startsWith('/forge/') && !reviewAssets.has(pathname)
-    || /^\/assets\/(?:admin|model-panel)-[^/]+\.js(?:\.map)?$/.test(pathname);
+  return assetScope(request) !== null;
 }
 export async function guardPrivateAsset(request: Request, members: MemberStore, secrets: AppSecrets): Promise<Response | null> {
-  if (!isPrivateAsset(request)) return null;
+  const scope = assetScope(request);
+  if (!scope) return null;
   const user = await identity(request.headers.get('Cookie'), members, secrets);
-  if (user?.role === 'admin') return null;
-  if(user?.star && !/^\/assets\/(?:admin|model-panel)-/.test(decodeURIComponent(new URL(request.url).pathname))) return null;
-  return new Response('无权访问此资源。', { status: 403, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
+  if (user?.role === 'admin' || scope === 'creator' && user?.star) return null;
+  return new Response('无权访问此资源。', { status: 403, headers: { ...privatePageHeaders, 'Content-Type': 'text/plain; charset=utf-8' } });
 }
 
 // 即使请求同时带有网页会话，设备凭据也不能升级成其他接口的权限。
@@ -31,34 +39,52 @@ export function guardDeviceScope(request: Request): Response | null {
   return Response.json({ error: '此凭据仅用于本人 AI 审核。' }, { status: 403, headers: { 'Cache-Control': 'no-store' } });
 }
 
+export function pageRedirect(location: string) {
+  return new Response(null, { status: 302, headers: { ...privatePageHeaders, Location: location } });
+}
+
+const reviewTabs = new Set(['tasks', 'history', 'devices']);
+function reviewDestination(url: URL, star: boolean) {
+  const params = new URLSearchParams(url.search);
+  const tab = params.get('tab') || '';
+  if (star) {
+    if (reviewTabs.has(tab) && !params.has('reviewTab')) params.set('reviewTab', tab);
+    params.set('tab', 'review');
+  } else if (tab === 'review') params.delete('tab');
+  const query = params.toString();
+  return (star ? '/forge/' : '/') + (query ? '?' + query : '');
+}
+
 // Gate the document itself so the upload workspace never flashes before login.
 export async function guardCheckPage(request: Request, members: MemberStore, secrets: AppSecrets): Promise<Response | null> {
-  const { pathname } = new URL(request.url);
-  if (!['/', '/index.html'].includes(pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
+  const url = new URL(request.url);
+  if (!['/', '/index.html'].includes(url.pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
   const user = await identity(request.headers.get('Cookie'), members, secrets);
-  // The root is the member review surface after login. Administrators use
-  // the management console. Star members use their personal workbench.
-  if (user?.role === 'member' && user.star) return new Response(null,{status:302,headers:{Location:'/forge/', 'Cache-Control':'private, no-store',Vary:'Cookie'}});
+  if (user?.role === 'member' && user.star) {
+    const tab = url.searchParams.get('tab') || '';
+    const review = tab === 'review' || reviewTabs.has(tab) || ['report', 'reportId', 'task', 'job', 'reviewTab'].some(key => url.searchParams.has(key));
+    return pageRedirect(review ? reviewDestination(url, true) : '/forge/' + url.search);
+  }
   if (user?.role === 'member') return null;
-  if (user?.role === 'admin') return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
-  return new Response(null, { status: 302, headers: { Location: '/login', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
+  return pageRedirect(user?.role === 'admin' ? '/admin' + url.search : '/login');
 }
 
 export async function guardForgePage(request: Request, members: MemberStore, secrets: AppSecrets): Promise<Response | null> {
-  const { pathname } = new URL(request.url);
-  if (!['/forge', '/forge/', '/forge/index.html'].includes(pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
+  const url = new URL(request.url);
+  if (!['/forge', '/forge/', '/forge/index.html'].includes(url.pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
   const user = await identity(request.headers.get('Cookie'), members, secrets);
   if (user?.star) return null;
-  return new Response(null, { status: 302, headers: { Location: user?.role==='admin'?'/admin':user?'/':'/login', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
+  if (user?.role === 'admin') return pageRedirect('/admin' + url.search);
+  if (user?.role === 'member') return pageRedirect(reviewDestination(url, false));
+  return pageRedirect('/login');
 }
 
 export async function guardReviewPage(request: Request, members: MemberStore, secrets: AppSecrets): Promise<Response | null> {
-  const { pathname } = new URL(request.url);
-  if (!['/review', '/review/'].includes(pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
+  const url = new URL(request.url);
+  if (!['/review', '/review/'].includes(url.pathname) || !['GET', 'HEAD'].includes(request.method)) return null;
   const user = await identity(request.headers.get('Cookie'), members, secrets);
-  if (user?.role === 'member') return new Response(null, { status: 302, headers: { Location: user.star?'/forge/':'/', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
-  if (user?.role === 'admin') return new Response(null, { status: 302, headers: { Location: '/admin', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
-  return new Response(null, { status: 302, headers: { Location: '/login', 'Cache-Control': 'private, no-store', Vary: 'Cookie' } });
+  if (user?.role === 'member') return pageRedirect(reviewDestination(url, !!user.star));
+  return pageRedirect(user?.role === 'admin' ? '/admin' + url.search : '/login');
 }
 
 // The square is shared by every enabled, signed-in account, independently of
@@ -67,8 +93,7 @@ export async function guardSquarePage(request: Request, members: MemberStore, se
   let pathname:string;
   try { pathname = decodeURIComponent(new URL(request.url).pathname); } catch { return null; }
   if (!['/square', '/square/', '/square.html', '/square/index.html'].includes(pathname)) return null;
-  const headers = { 'Cache-Control': 'private, no-store', Vary: 'Cookie' };
-  if (request.headers.has('Authorization')) return new Response('请使用网页登录游戏广场。', { status: 403, headers });
+  if (request.headers.has('Authorization')) return new Response('请使用网页登录游戏广场。', { status: 403, headers: privatePageHeaders });
   const user = await identity(request.headers.get('Cookie'), members, secrets);
-  return user ? null : new Response(null, { status: 302, headers: { ...headers, Location: '/login' } });
+  return user ? null : pageRedirect('/login');
 }

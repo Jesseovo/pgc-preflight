@@ -9,7 +9,8 @@ import {configStore,memberStore} from './storage';
 import type {Database} from './storage';
 import {authApi} from './auth-api';
 import {identity} from './members';
-import {guardCheckPage,guardForgePage,guardReviewPage,guardSquarePage,guardPrivateAsset,guardDeviceScope,isPrivateAsset} from './page-access';
+import {guardPrivateAsset,guardDeviceScope,isPrivateAsset,privatePageHeaders} from './page-access';
+import {serveWorkbench} from './ui-entry';
 import {forgeApi, type ForgeJob} from './forge-api';
 import {purgeReviewInputs,scheduleCloudReview} from './review-jobs';
 import {captureFor} from './cloud-review-capture';
@@ -110,39 +111,15 @@ const app = {
       headers.set('Cache-Control','no-cache');
       return new Response(response.body,{status:response.status,headers});
     }
-    const redirect = await guardSquarePage(request, members, env) || await guardForgePage(request, members, env) || await guardReviewPage(request, members, env) || await guardCheckPage(request, members, env);
-    if (redirect) return redirect;
-    const privateAsset=await guardPrivateAsset(request,members,env);
-    if(privateAsset)return privateAsset;
-    if(['/square','/square/','/square.html','/square/index.html'].includes(decodeURIComponent(url.pathname))){
-      if(url.pathname!=='/square')return new Response(null,{status:302,headers:{Location:'/square','Cache-Control':'private, no-store',Vary:'Cookie'}});
-      const user=await identity(request.headers.get('Cookie'),members,env);
-      const documentPath=user?.role==='member'?(user.star?'/forge/':'/review'):'/square';
-      const response=await env.ASSETS.fetch(new Request(new URL(documentPath,url),request));
-      const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
-      return new Response(response.body,{status:response.status,headers});
-    }
-    if(['/admin','/admin/'].includes(url.pathname)){
-      const user=await identity(request.headers.get('Cookie'),members,env);
-      if(user?.role!=='admin'){
-        const response=await env.ASSETS.fetch(new Request(new URL('/admin-login',url),request));
-        const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
-        return new Response(response.body,{status:response.status,headers});
-      }
-    }
-    if (url.pathname === '/forge') return env.ASSETS.fetch(new Request(new URL('/forge/index.html', url), request));
-    // Cloudflare Assets clean URLs redirect a direct `/review.html` fetch to
-    // `/review`. Read the canonical asset path here so a member visiting `/`
-    // does not bounce between the two guarded routes.
-    if (url.pathname === '/review') return env.ASSETS.fetch(new Request(new URL('/review', url), request));
-    if (url.pathname === '/' || url.pathname === '/index.html') {
-      const user = await identity(request.headers.get('Cookie'), members, env);
-      if (user?.role === 'member') return env.ASSETS.fetch(new Request(new URL('/review', url), request));
-    }
-    const response=await env.ASSETS.fetch(request);
-    if(isPrivateAsset(request)||['/admin','/admin/'].includes(url.pathname)){
-      const headers=new Headers(response.headers);headers.set('Cache-Control','private, no-store');headers.set('Vary','Cookie');
-      return new Response(response.body,{status:response.status,headers});
+    const workbench = await serveWorkbench(request, members, env, env.ASSETS);
+    if (workbench) return workbench;
+    const privateAsset = await guardPrivateAsset(request, members, env);
+    if (privateAsset) return privateAsset;
+    const response = await env.ASSETS.fetch(request);
+    if (isPrivateAsset(request)) {
+      const headers = new Headers(response.headers);
+      for (const [name, value] of Object.entries(privatePageHeaders)) headers.set(name, value);
+      return new Response(response.body, { status: response.status, headers });
     }
     return response;
   },
