@@ -279,6 +279,47 @@ describe('isolated native provider research adapter', () => {
     } finally { s.close(); }
   });
 
+  it('returns the separately bound DO version and rejection stage only after control authentication', async () => {
+    const s = await nativeSetup();
+    const origin = 'https://synthetic-control.example.workers.dev';
+    const runnerVersion = '10000000-0000-4000-8000-000000000071';
+    const workerVersion = '10000000-0000-4000-8000-000000000072';
+    const runnerEnv = { ...s.env, PROVIDER_NATIVE_VERSION: { id: runnerVersion } };
+    const runner = new ProviderNativeRunnerHost({ storage: { get: async () => undefined } }, runnerEnv);
+    let runnerUrl = 'http://pgc-provider-native.internal/status';
+    const fetchRunner = vi.fn(() => runner.fetch(new Request(runnerUrl)));
+    s.env.PROVIDER_NATIVE_RUNNER = { idFromName: name => name, get: () => ({ fetch: fetchRunner }) };
+    s.env.PROVIDER_NATIVE_PUBLIC_CONTROL_ORIGIN = origin;
+    s.env.PROVIDER_NATIVE_VERSION = { id: workerVersion };
+    const stage = (response: Response) => response.headers.get('x-pgc-native-research-runner-stage');
+    const request = async (authenticated: boolean) => handleProviderNativeControl(new Request(origin + '/status', {
+      headers: authenticated ? await signProviderNativeControl(s.config, controlKey, '/status', Date.now(), origin) : undefined,
+    }), s.env, true);
+    try {
+      const unsigned = await request(false);
+      expect(unsigned.status).toBe(404);
+      expect(stage(unsigned)).toBeNull();
+      expect(unsigned.headers.has('x-pgc-native-research-runner-version')).toBe(false);
+      expect(fetchRunner).not.toHaveBeenCalled();
+
+      const signed = await request(true);
+      expect(signed.status).toBe(200);
+      expect(stage(signed)).toBe('ready');
+      expect(signed.headers.get('x-pgc-native-research-version')).toBe(workerVersion);
+      expect(signed.headers.get('x-pgc-native-research-runner-version')).toBe(runnerVersion);
+
+      runnerUrl = 'http://wrong.internal/status';
+      expect(stage(await request(true))).toBe('origin');
+      runnerUrl = 'http://pgc-provider-native.internal/unexpected';
+      expect(stage(await request(true))).toBe('route');
+      runnerEnv.PROVIDER_NATIVE_CONTROL_KEY = '';
+      const badConfig = await request(true);
+      expect(badConfig.status).toBe(404);
+      expect(stage(badConfig)).toBe('configuration');
+      expect(await badConfig.json()).toEqual({ error: 'research_route_denied' });
+    } finally { s.close(); }
+  });
+
   it('accepts signed public status through the actual workerd entry and distinguishes auth from DO dispatch', async () => {
     const s = await nativeSetup();
     const origin = 'https://synthetic-control.example.workers.dev';
@@ -312,6 +353,8 @@ describe('isolated native provider research adapter', () => {
       expect(status.headers.get('x-pgc-native-research-control')).toBe('hmac-v1');
       expect(status.headers.get('x-pgc-native-research-version')).toMatch(/^[a-f0-9-]{36}$/);
       expect(stage(status)).toBe('runner');
+      expect(status.headers.get('x-pgc-native-research-runner-version')).toBe(status.headers.get('x-pgc-native-research-version'));
+      expect(status.headers.get('x-pgc-native-research-runner-stage')).toBe('ready');
       expect(await status.json()).toEqual({ state: 'idle', releaseReady: false });
       expect(stage(await read())).toBe('headers');
       expect(stage(await read(await signed('/status', brokerKey)))).toBe('signature');
@@ -324,6 +367,7 @@ describe('isolated native provider research adapter', () => {
       const noContainer = await post();
       expect(noContainer.status).toBe(404);
       expect(stage(noContainer)).toBe('runner');
+      expect(noContainer.headers.get('x-pgc-native-research-runner-stage')).toBe('route');
       expect(await (await read(await signed('/status'))).json()).toEqual({ state: 'idle', releaseReady: false });
     } finally { await runtime.dispose(); s.close(); }
   }, 30_000);

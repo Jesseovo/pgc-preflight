@@ -43,6 +43,7 @@ type Plan = Parameters<typeof createHarnessRun>[1] & {
 type RuntimeSession = { control: string; runId: string };
 type NativePath = '/run' | '/status';
 type NativeControlStage = 'configuration' | 'origin' | 'route' | 'headers' | 'timestamp' | 'signature' | 'body' | 'dispatch' | 'runner';
+type NativeRunnerStage = 'configuration' | 'origin' | 'route' | 'ready';
 const maxCleanupAttempts = 3;
 
 const internal = 'http://pgc-provider-native.internal';
@@ -297,18 +298,29 @@ export class ProviderNativeRunnerHost {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const isModelTransition = ['/forward', '/completed'].includes(url.pathname);
+    const identify = (response: Response, stage: NativeRunnerStage) => {
+      if (isModelTransition) return response;
+      const headers = new Headers(response.headers);
+      headers.set('x-pgc-native-research-runner-stage', stage);
+      const version = this.env.PROVIDER_NATIVE_VERSION?.id;
+      if (version && uuidPattern.test(version)) headers.set('x-pgc-native-research-runner-version', version);
+      return new Response(response.body, { status: response.status, headers });
+    };
     const config = configured(this.env);
-    if (!config || url.origin !== internal || url.search || url.hash) return deny();
+    if (!config) return identify(deny(), 'configuration');
+    if (url.origin !== internal) return identify(deny(), 'origin');
+    if (url.search || url.hash) return identify(deny(), 'route');
     const storage = this.ctx.storage;
     if (url.pathname === '/status' && request.method === 'GET') {
       const latch = await storage.get('research-latch') as Latch | undefined;
-      return json(latch?.receipt ?? { state: 'idle', releaseReady: false });
+      return identify(json(latch?.receipt ?? { state: 'idle', releaseReady: false }), 'ready');
     }
-    if (['/forward', '/completed'].includes(url.pathname) && request.method === 'POST') {
+    if (isModelTransition && request.method === 'POST') {
       return await this.modelTransition(request, config, url.pathname === '/completed') ? new Response(null, { status: 204 }) : deny();
     }
     if (url.pathname !== '/run' || request.method !== 'POST' || Date.now() < config.notBefore || Date.now() >= config.expiresAt ||
-        this.ctx.container?.images?.ccb !== config.image) return deny();
+        this.ctx.container?.images?.ccb !== config.image) return identify(deny(), 'route');
     const receipt: NativeReceipt = {
       state: 'armed', fixtureId: OPUS_RESEARCH_FIXTURE_ID, image: config.image, candidateVersion: config.candidateVersion,
       sourceHash: OPUS_RESEARCH_WIRE.sourceHash, modelContractHash: config.modelContractHash, releaseReady: false,
@@ -319,7 +331,7 @@ export class ProviderNativeRunnerHost {
       await tx.setAlarm(Date.now());
       return true;
     });
-    return claimed ? json(receipt, 202) : json({ error: 'research_already_latched' }, 409);
+    return identify(claimed ? json(receipt, 202) : json({ error: 'research_already_latched' }, 409), 'ready');
   }
 
   private async modelTransition(request: Request, config: NativeConfig, completing: boolean) {
