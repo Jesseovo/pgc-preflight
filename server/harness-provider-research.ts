@@ -242,6 +242,7 @@ export async function handleHarnessProviderResearch(request: Request, options: P
     }), {
       DB, capacityDB, settingsKey, now, authorizeRun, fetcher: options.fetcher, waitUntil: options.waitUntil,
       deadlineAt: manifest.expiresAt, requestIdPrefix: `${manifest.phase}-0-`, expectedModelTurns: run.modelTurns,
+      allowTransportRetry: false,
       loadConfig: async () => {
         const selected = await selectModel();
         return selected && canonicalHarness(selected.model) === canonicalHarness(run.model) ? selected.config : null;

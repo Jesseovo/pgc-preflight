@@ -110,7 +110,7 @@ async function setup() {
   return { ledger, capacity, config, manifest, options, fetcher, loadConfig, signed, plan, register };
 }
 
-afterEach(() => { dbs.splice(0).forEach(db => db.close()); });
+afterEach(() => { vi.useRealTimers(); dbs.splice(0).forEach(db => db.close()); });
 
 describe('isolated provider research broker', () => {
   it('reads the exact selected contract only for authenticated planning and never exports configuration credentials', async () => {
@@ -239,6 +239,31 @@ describe('isolated provider research broker', () => {
     expect(await getHarnessRunSummary(s.ledger.db, run)).toMatchObject({ status: 'unknown', failureCode: 'provider_unknown' });
     const next = await handleHarnessProviderResearch(await s.signed({ lease, id: 'probe-0-ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee' }), s.options);
     expect(next.status).toBe(401);
+    expect(s.fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([429, 503])('makes one upstream HTTP request for a definite %s rejection and preserves shared cooldown', async status => {
+    vi.useFakeTimers();
+    const s = await setup();
+    const { lease, run } = await s.register();
+    const before = Date.now();
+    s.fetcher.mockResolvedValueOnce(Response.json({ error: { code: status === 503 ? 'KEY_QUEUE_FULL' : 'KEY_RATE_LIMIT' } }, {
+      status, headers: { 'Retry-After': '41' },
+    }));
+    const pending = handleHarnessProviderResearch(await s.signed({ lease }), s.options);
+    await vi.waitFor(() => expect(s.fetcher).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(45_000);
+    const response = await pending;
+    expect(response.status).toBe(status);
+    expect(await response.json()).toMatchObject({ error: { message: 'provider_rejected' } });
+    expect(await getHarnessRunSummary(s.ledger.db, run)).toMatchObject({ status: 'failed', failureCode: 'provider_rejected',
+      modelTurns: 1, reservedTokens: 0 });
+    expect(s.ledger.sqlite.prepare('SELECT attempts,http_status,state FROM harness_requests').get()).toEqual({ attempts: 1, http_status: status, state: 'failed' });
+    expect(s.capacity.sqlite.prepare('SELECT count(*) AS count FROM model_slots').get()).toEqual({ count: 0 });
+    const cooldown = Number(s.capacity.sqlite.prepare('SELECT cooldown_until FROM model_throttle').get()?.cooldown_until);
+    if (status === 429) expect(cooldown).toBeGreaterThanOrEqual(before + 41_000);
+    else expect(cooldown).toBe(0);
+    expect((await handleHarnessProviderResearch(await s.signed({ lease, id: 'probe-0-ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee' }), s.options)).status).toBe(401);
     expect(s.fetcher).toHaveBeenCalledOnce();
   });
 

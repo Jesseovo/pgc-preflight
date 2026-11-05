@@ -49,6 +49,7 @@ export interface HarnessGatewayOptions {
   deadlineAt?: number;
   requestIdPrefix?: string;
   expectedModelTurns?: number;
+  allowTransportRetry?: boolean;
 }
 
 function errorResponse(code: GatewayErrorCode, status: number, protocol: HarnessModelPolicy['protocol'] | null = null): Response {
@@ -470,7 +471,8 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
         void upstream.body?.cancel().catch(() => {});
         const wait = Math.max(throttled ? 30_000 : 5_000, retryAfterMs(upstream.headers.get('retry-after'), now()) ?? 0);
         if (throttled) await throttle.cooldown(wait);
-        if (attempt === 0 && now() + wait < reservation.deadlineAt && await rearmHarnessRequest(db, id)) {
+        if (options.allowTransportRetry !== false && attempt === 0 && now() + wait < reservation.deadlineAt &&
+            await rearmHarnessRequest(db, id)) {
           await pauseModel(wait, signal);
           continue;
         }
