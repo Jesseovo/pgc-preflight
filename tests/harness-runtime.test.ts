@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createHarness } from '../harness/runtime.mjs';
 import { canonical, fileEntry, sha256 } from '../harness/envelope.mjs';
 import { inspectStream } from '../harness/model-bridge.mjs';
+import { validateCreationOutput } from '../server/forge-creation-pipeline';
+import { parseProductionOutput } from '../server/forge-production-output';
+import { harnessResultText } from '../server/harness-host';
 
 const controlToken = 'synthetic-control-token-for-test-only';
 const lease = 'synthetic-model-lease-for-test-only';
@@ -77,9 +80,19 @@ if (fixture === 'game with capture') {
   ]}]}];
   turn = randomUUID();
   if ((await ask(messages)).status !== 200) process.exit(10);
-  const record = {requirements:[],decisions:[],coreChanges:[],selfCheck:[]};
+  const record = {
+    requirements:[{id:'goal',text:'Polish',status:'implemented'}],decisions:[],coreChanges:[],
+    selfCheck:{findings:[],unverified:[],changes:[],requestRepair:false},
+  };
   if ((await call('write', {path:'record.json',content:JSON.stringify(record)})).isError) process.exit(11);
   result('The game is ready.');
+} else if (fixture === 'build game') {
+  if ((await call('write', {path:'game.html',content:'<!doctype html><html><body>Build</body></html>'})).isError) process.exit(14);
+  const record = {requirements:[{id:'goal',text:'Build',status:'implemented'}],decisions:[],coreChanges:[]};
+  if ((await call('write', {path:'record.json',content:JSON.stringify(record)})).isError) process.exit(15);
+  turn = randomUUID();
+  if ((await ask([body])).status !== 200) process.exit(16);
+  result('The complete build is ready.');
 } else {
   console.log(JSON.stringify({type:'assistant',message:{content:[{type:'thinking',thinking:'private synthetic thinking'}]}}));
   result('Synthetic result.');
@@ -141,7 +154,7 @@ describe('CCB Node runtime boundary', () => {
     });
   }
 
-  function start(envelope: ReturnType<typeof run>, envelopeSha256 = sha256(canonical(envelope))) {
+  function start(envelope: Record<string, unknown>, envelopeSha256 = sha256(canonical(envelope))) {
     return call('/v1/start', { envelope, envelopeSha256, lease });
   }
 
@@ -200,6 +213,9 @@ describe('CCB Node runtime boundary', () => {
     expect(result).toMatchObject({ state: 'succeeded', modelTurns: 2, outputTokens: 44 });
     expect(result.files[0]).toEqual(fileEntry('game.html', patched));
     expect(result.files[1].path).toBe('record.json');
+    const parsed = parseProductionOutput(await harnessResultText(result, 'game'));
+    expect(validateCreationOutput(parsed, 'polish')).toEqual([]);
+    expect(parsed).toMatchObject({ html: patched, selfCheck: { requestRepair: false } });
     expect(browserCalls).toHaveLength(1);
     expect(browserCalls[0]).toMatchObject({ name: 'capture', arguments: { inputHash: sha256(patched), html: patched } });
     expect(modelCalls).toHaveLength(2);
@@ -207,6 +223,39 @@ describe('CCB Node runtime boundary', () => {
     expect(modelCalls[0]).not.toHaveProperty('metadata');
     expect(modelCalls[1].max_tokens).toBe(64_000 - 22);
     expect(modelCalls[1].messages[1].content[0].content[1].source.data).toBe(screenshot);
+  });
+
+  it('accepts the build record without selfCheck and keeps all sixteen game evidence images', async () => {
+    const modelCalls: any[] = [];
+    await serve((_request, response, body) => {
+      modelCalls.push(body);
+      response.setHeader('content-type', 'text/event-stream');
+      response.end(syntheticSSE('anthropic', modelCalls.length === 1 ? 'tool_use' : 'end_turn', 22));
+    });
+    const images = Array.from({ length: 17 }, (_, index) => ({
+      path: `input/fixture-${index + 1}.png`, content: screenshot, encoding: 'base64',
+      sha256: sha256(Buffer.from(screenshot, 'base64')),
+    }));
+    const build = run({
+      phase: 'build', purpose: 'game', protocol: 'anthropic', model: 'claude-opus-5-5', effort: 'high', vision: true,
+      prompt: 'build game', files: images, imagePaths: images.map(image => image.path),
+    });
+    expect((await start(build)).status).toBe(400);
+    expect((await start({ ...build, imagePaths: images.slice(0, 16).map(image => image.path) })).status).toBe(202);
+    const result = await done();
+    expect(result).toMatchObject({ state: 'succeeded', modelTurns: 2 });
+    const parsed = parseProductionOutput(await harnessResultText(result, 'game'));
+    expect(validateCreationOutput(parsed, 'build')).toEqual([]);
+    expect(parsed).toEqual({
+      html: '<!doctype html><html><body>Build</body></html>',
+      requirements: [{ id: 'goal', text: 'Build', status: 'implemented' }], decisions: [], coreChanges: [],
+    });
+    expect(modelCalls).toHaveLength(2);
+    for (const body of modelCalls) {
+      const images = body.messages[0].content.filter((block: any) => block.type === 'image');
+      expect(images).toHaveLength(16);
+      expect(images.every((image: any) => image.source.data === screenshot)).toBe(true);
+    }
   });
 
   it('cancels the active request and refuses cross-task reuse', async () => {

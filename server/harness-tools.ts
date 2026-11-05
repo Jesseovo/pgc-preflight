@@ -7,6 +7,8 @@ import { canonicalHarness, harnessHash } from './harness-policy';
 import { problem } from './review-device-state';
 
 const stateKey = 'harness-browser-state';
+const completedKey = 'harness-browser-completed';
+const invocationKey = (id: string) => `harness-browser-call:${id}`;
 const maxInvocations = 32;
 const maxEvidenceCharacters = 12 * 1024 * 1024;
 const htmlLimit = 2 * 1024 * 1024;
@@ -16,8 +18,19 @@ const hashPattern = /^[a-f0-9]{64}$/;
 const toolNames = ['capture', 'play-start', 'play-act', 'play-finish', 'play-close'] as const;
 type ToolName = typeof toolNames[number];
 type JSONRecord = Record<string, unknown>;
-type Shot = AdaptivePlay['shots'][number];
-type Session = { id: string; inputHash: string; browserId?: string };
+type Shot = Omit<AdaptivePlay['shots'][number], 'actionRefs'> & { actionRefs?: (string | number)[] };
+type Session = { id: string; inputHash: string; browserId?: string; shotIds?: [string, string][]; actionIds?: string[] };
+export type HarnessBrowserEvidence = JSONRecord & {
+  evidenceId: string;
+  evidenceHash: string;
+  tool: ToolName;
+  origin: 'harness-browser-tool';
+  contextOrigin: 'creator-self-check';
+  sourceBlind: false;
+  inputHash: string;
+  shots: (Omit<Shot, 'id' | 'actionRefs'> & { id: string; sourceId: string; sha256: string; actionRefs: string[] })[];
+  actions: (JSONRecord & { id: string; sourceId: string | number })[];
+};
 type ToolState = {
   shots: number;
   rounds: number;
@@ -132,16 +145,75 @@ function within<T>(promise: Promise<T>, deadlineAt: number, expired: () => void)
   ]).finally(() => clearTimeout(timer));
 }
 
-async function seal(inputHash: string, result: JSONRecord, shots: Shot[] = []) {
-  const images = await Promise.all(shots.map(async shot => {
+async function seal(input: ToolInput, result: JSONRecord, sourceShots: Shot[] = [], session?: Session): Promise<HarnessBrowserEvidence> {
+  const { id: callId, inputHash, name: tool } = input;
+  const evidenceId = `tool-${await harnessHash(canonicalHarness([callId, inputHash]))}`;
+  const shotIds = new Map(session?.shotIds);
+  const priorActions = session?.actionIds ?? [];
+  const actionIds = new Map<string | number, string>(priorActions.map((id, index) => [index + 1, id]));
+  const probe = isObject(result.probe) ? result.probe : null;
+  const summary = isObject(result.summary) ? result.summary : null;
+  const rawActions: unknown[] = Array.isArray(probe?.actions) ? probe.actions : Array.isArray(summary?.actions) ? summary.actions : [];
+  const shotSources = sourceShots.map((shot, index) => {
+    if (typeof shot.id !== 'string' || shotIds.has(shot.id)) throw new Error('Invalid source viewport identifier');
+    const id = `${evidenceId}:shot:${index + 1}`;
+    shotIds.set(shot.id, id);
+    return { sourceId: shot.id, id };
+  });
+  const actionSources = rawActions.map((action, index) => {
+    if (!isObject(action)) throw new Error('Invalid source action');
+    const sourceId = probe ? action.id : index + 1;
+    if (typeof sourceId !== 'string' && typeof sourceId !== 'number') throw new Error('Invalid source action identifier');
+    if (index < priorActions.length) return { sourceId, id: priorActions[index] };
+    if (actionIds.has(sourceId)) throw new Error('Duplicate source action identifier');
+    const id = `${evidenceId}:action:${index - priorActions.length + 1}`;
+    actionIds.set(sourceId, id);
+    return { sourceId, id };
+  });
+  const shotRef = (value: unknown) => {
+    const id = typeof value === 'string' ? shotIds.get(value) : undefined;
+    if (!id) throw new Error('Unresolved source viewport reference');
+    return id;
+  };
+  const actionRefs = (values: unknown): string[] => {
+    if (!Array.isArray(values)) return [];
+    return values.map(value => {
+      const id = actionIds.get(value);
+      if (!id) throw new Error('Unresolved source action reference');
+      return id;
+    });
+  };
+  const images = await Promise.all(sourceShots.map(async (shot, index) => {
     const match = /^data:image\/(?:jpeg|png);base64,([A-Za-z0-9+/]+={0,2})$/.exec(shot.data);
     if (!match) throw new Error('Invalid browser viewport image');
     const bytes = Uint8Array.from(atob(match[1]), code => code.charCodeAt(0));
     const digest = await crypto.subtle.digest('SHA-256', bytes);
     const sha256 = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-    return { ...shot, sha256 };
+    return { ...shot, ...shotSources[index], actionRefs: actionRefs(shot.actionRefs), sha256 };
   }));
-  const evidence = { inputHash, ...result, shots: images };
+  const actions = rawActions.map((value, index) => {
+    const action = value as JSONRecord;
+    return {
+      ...action, ...actionSources[index],
+      ...(typeof action.beforeImageId === 'string' && action.beforeImageId ? { beforeImageId: shotRef(action.beforeImageId) } : {}),
+      ...(typeof action.afterImageId === 'string' && action.afterImageId ? { afterImageId: shotRef(action.afterImageId) } : {}),
+    };
+  });
+  const observations = Array.isArray(probe?.observations) ? probe.observations.map(value => {
+    if (!isObject(value)) throw new Error('Invalid source observation');
+    return { ...value, id: shotRef(value.id), sourceId: value.id, actionRefs: actionRefs(value.actionRefs) };
+  }) : undefined;
+  if (session) {
+    session.shotIds = [...shotIds];
+    if (summary) session.actionIds = actionSources.map(action => action.id);
+  }
+  const evidence = {
+    ...result,
+    evidenceId, tool, origin: 'harness-browser-tool' as const, contextOrigin: 'creator-self-check' as const,
+    sourceBlind: false as const, inputHash, shots: images, actions: actions.slice(priorActions.length),
+    ...(probe && { probe: { ...probe, actions, ...(observations && { observations }) } }),
+    ...(summary && { summary: { ...summary, actions } }),
+  };
   return { ...evidence, evidenceHash: await harnessHash(canonicalHarness(evidence)) };
 }
 
@@ -157,13 +229,27 @@ export class HarnessTools {
     this.deps = deps ?? toolDependencies(env);
   }
 
-  async execute(value: unknown, deadlineAt: number): Promise<JSONRecord> {
+  async readResults(): Promise<HarnessBrowserEvidence[]> {
+    const completed = await this.storage.get<string[]>(completedKey) ?? [];
+    if (!Array.isArray(completed) || completed.length > maxInvocations || new Set(completed).size !== completed.length ||
+        !completed.every(identifier)) throw new Error('Invalid completed browser evidence index');
+    const results = [];
+    for (const id of completed) {
+      const key = invocationKey(id);
+      const invocation = await this.storage.get<Invocation>(key);
+      if (invocation?.status !== 'done' || !invocation.parts) throw new Error('Missing completed browser evidence');
+      results.push(await this.readResult(key, invocation.parts));
+    }
+    return results;
+  }
+
+  async execute(value: unknown, deadlineAt: number): Promise<HarnessBrowserEvidence> {
     if (this.closing || this.busy) throw problem('该任务已有浏览器工具正在处理。', 409);
     this.busy = true;
     try {
       if (!Number.isSafeInteger(deadlineAt) || Date.now() >= deadlineAt) throw problem('任务已到达总时限。', 504);
       const input = await parseInput(value);
-      const key = `harness-browser-call:${input.id}`;
+      const key = invocationKey(input.id);
       const hash = await harnessHash(canonicalHarness(value));
       const known = await this.storage.get<Invocation>(key);
       if (known) {
@@ -227,7 +313,7 @@ export class HarnessTools {
           state.activeMs = saved.activeMs + consumed;
         }
         if (name === 'play-finish' || name === 'play-close') delete state.session;
-        await this.saveResult(key, hash, state, result);
+        await this.saveResult(input.id, hash, state, result);
         return result;
       } catch (error) {
         if (!capturing) await within(this.closeLive(), Math.min(deadlineAt, Date.now() + 5000), () => {}).catch(() => {});
@@ -245,12 +331,12 @@ export class HarnessTools {
   }
 
   private async perform(input: ToolInput, state: ToolState, remaining: number, shotCount: number,
-    deadlineAt: number, closed: () => boolean): Promise<JSONRecord> {
+    deadlineAt: number, closed: () => boolean): Promise<HarnessBrowserEvidence> {
     const { name, args, inputHash } = input;
     if (name === 'capture') {
       const result = await this.deps.capture(args.html as string, undefined, deadlineAt, { activeBudgetMs: remaining });
       if (result.shots.length !== shotCount || !('captureRuntimeMs' in result)) throw new Error('Incomplete three-ratio capture');
-      return seal(inputHash, {
+      return seal(input, {
         contextOrigin: 'creator-self-check', sourceBlind: false, captureRuntimeMs: result.captureRuntimeMs, probe: result.probe,
       }, result.shots as unknown as Shot[]);
     }
@@ -269,49 +355,61 @@ export class HarnessTools {
       this.live = { session, browser, play };
       await play.start();
       if (play.shots.length !== 1) throw new Error('Missing initial browser viewport');
-      return seal(inputHash, { sessionId: session.id, contextOrigin: 'creator-self-check', sourceBlind: false, viewport: { width: 360, height: 780 }, playMs: play.playMs }, play.shots);
+      return seal(input, { sessionId: session.id, contextOrigin: 'creator-self-check', sourceBlind: false, viewport: { width: 360, height: 780 }, playMs: play.playMs }, play.shots, session);
     }
     if (name === 'play-close') {
       const closed = this.live ? await this.closeLive() : session.browserId
         ? await this.deps.closeOwn(session.browserId).then(() => true, () => false) : true;
       if (!closed) throw problem('隔离浏览器关闭尚未确认。', 503);
-      return seal(inputHash, { sessionId: session.id, closed: true });
+      return seal(input, { sessionId: session.id, closed: true });
     }
     const play = this.live!.play;
     if (name === 'play-finish') {
       const summary = play.summary();
       if (!await this.closeLive()) throw new Error('Browser close not confirmed');
-      return seal(inputHash, { sessionId: session.id, summary });
+      return seal(input, { sessionId: session.id, summary }, [], session);
     }
     const offset = play.shots.length;
     await play.act(args.round);
     const shots = play.shots.slice(offset);
     if (!shots.length || shots.length > shotCount) throw new Error('Browser screenshot reservation mismatch');
-    return seal(inputHash, { sessionId: session.id, summary: play.summary() }, shots);
+    return seal(input, { sessionId: session.id, summary: play.summary() }, shots, session);
   }
 
-  private async saveResult(key: string, hash: string, state: ToolState, result: JSONRecord) {
+  private async saveResult(id: string, hash: string, state: ToolState, result: HarnessBrowserEvidence) {
+    const key = invocationKey(id);
     const text = JSON.stringify(result);
     if (text.length > maxEvidenceCharacters) throw new Error('Browser evidence exceeds storage limit');
     await this.storage.transaction(async tx => {
       if (this.closing) throw problem('工具调用已中止。', 409);
+      const completed = await tx.get<string[]>(completedKey) ?? [];
+      if (completed.length >= maxInvocations || completed.includes(id)) throw new Error('Invalid completed browser evidence index');
       let parts = 0;
       for (let offset = 0; offset < text.length; offset += 24000) {
         await tx.put(`${key}:${parts++}`, text.slice(offset, offset + 24000));
       }
       await tx.put(stateKey, state);
       await tx.put<Invocation>(key, { hash, status: 'done', parts });
+      await tx.put(completedKey, [...completed, id]);
     });
   }
 
-  private async readResult(key: string, parts: number) {
+  private async readResult(key: string, parts: number): Promise<HarnessBrowserEvidence> {
+    if (!Number.isSafeInteger(parts) || parts < 1 || parts > Math.ceil(maxEvidenceCharacters / 24000)) {
+      throw problem('原工具调用的证据不完整；不会重新执行。', 409);
+    }
     const chunks = [];
     for (let i = 0; i < parts; i++) {
       const part = await this.storage.get<string>(`${key}:${i}`);
       if (typeof part !== 'string') throw problem('原工具调用的证据不完整；不会重新执行。', 409);
       chunks.push(part);
     }
-    return JSON.parse(chunks.join('')) as JSONRecord;
+    const result = JSON.parse(chunks.join('')) as HarnessBrowserEvidence;
+    const { evidenceHash, ...evidence } = result;
+    if (!hashPattern.test(evidenceHash) || await harnessHash(canonicalHarness(evidence)) !== evidenceHash) {
+      throw problem('原工具调用的证据摘要不一致；不会重新执行。', 409);
+    }
+    return result;
   }
 
   private async closeLive() {

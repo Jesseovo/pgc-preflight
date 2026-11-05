@@ -229,7 +229,8 @@ export class HarnessHost {
       const result=await this.containerFetch(meta,'/v1/result');if(!result.ok)throw new Error('harness_result_failed');
       const data=await result.json() as any;if(data.runId!==meta.runId)throw new Error('harness_result_conflict');
       const text=await harnessResultText(data,meta.policy.purpose);
-      await storeHarnessPrivate(this.ctx.storage,`result:${meta.phase}`,{text,materialHash:meta.materialHash,outputHash:await harnessHash(text)});
+      const evidence=meta.policy.purpose==='game'?await this.tools.readResults():[];
+      await storeHarnessPrivate(this.ctx.storage,`result:${meta.phase}`,{text,materialHash:meta.materialHash,outputHash:await harnessHash(text),evidence,evidenceHash:await harnessHash(canonicalHarness(evidence))});
       await this.destroy();meta.state='succeeded';await this.save(meta);await recordHarnessEvent(this.env.DB,meta,'artifact');
     }else if(value.state!=='running'){meta.error='harness_runtime_failed';await this.stop(meta,'failed');}
   }

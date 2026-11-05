@@ -96,7 +96,7 @@ export function validateStart(input, now) {
 
   const images = [];
   if (env.imagePaths !== undefined) {
-    if (env.vision === false || !Array.isArray(env.imagePaths) || env.imagePaths.length > 12 ||
+    if (env.vision === false || !Array.isArray(env.imagePaths) || env.imagePaths.length > (game ? 16 : 12) ||
         new Set(env.imagePaths).size !== env.imagePaths.length) return null;
     for (const path of env.imagePaths) {
       const entry = files.get(path);

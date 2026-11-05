@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import type { Browser } from 'puppeteer-core';
 import { describe, expect, it, vi } from 'vitest';
 import { HarnessTools } from '../server/harness-tools';
-import { harnessHash } from '../server/harness-policy';
+import { canonicalHarness, harnessHash } from '../server/harness-policy';
 import { AdaptivePlay, playActionCaptureCount, validatePlayActions } from '../scripts/review-adaptive';
 
 class TestStorage {
@@ -22,7 +23,9 @@ class TestStorage {
 const html = '<!doctype html><title>Synthetic test</title>';
 const another = '<!doctype html><title>New synthetic version</title>';
 const screenshot = 'data:image/jpeg;base64,/9j/2Q==';
-const shot = (index: number) => ({ id: `shot-${index}`, label: 'Original viewport', data: screenshot });
+const shot = (index: number, actionRefs: (string | number)[] = []) => ({
+  id: `shot-${index}`, label: 'Original viewport', data: screenshot, actionRefs,
+});
 const deadline = () => Date.now() + 10_000;
 const call = (name: string, id: string, args: Record<string, unknown>) => ({ name, id, arguments: args });
 const version = async (input: string) => ({ html: input, inputHash: await harnessHash(input) });
@@ -34,12 +37,19 @@ function fixture(storage = new TestStorage()) {
     await acquired('exact-acquired-browser');
     return { close: closeBrowser } as unknown as Browser;
   });
-  const capture = vi.fn(async (_html: string, _onWait?: unknown, _deadline?: number, _creation?: { activeBudgetMs: number }) => ({ shots: Array.from({ length: 4 }, (_, i) => shot(i + 1)), probe: { loaded: {} }, captureRuntimeMs: 26_000 }));
+  const capture = vi.fn(async (_html: string, _onWait?: unknown, _deadline?: number, _creation?: { activeBudgetMs: number }) => ({
+    shots: Array.from({ length: 4 }, (_, i) => shot(i + 1, i === 0 ? [] : ['touch'])),
+    probe: {
+      loaded: {}, actions: [{ id: 'touch', type: 'tap' }],
+      observations: Array.from({ length: 4 }, (_, i) => ({ id: `shot-${i + 1}`, actionRefs: i === 0 ? [] : ['touch'] })),
+    }, captureRuntimeMs: 26_000,
+  }));
   const act = vi.fn();
   const play = vi.fn((_browser: Browser, _html: string, inputHash: string, _remaining: number) => ({
     closed: false,
     playMs: 0,
     shots: [] as ReturnType<typeof shot>[],
+    actions: [] as { beforeImageId: string; afterImageId: string }[],
     async start() {
       this.playMs = 1100;
       this.shots.push(shot(1));
@@ -47,11 +57,13 @@ function fixture(storage = new TestStorage()) {
     async act(round: { actions: unknown[] }) {
       act(round);
       const actions = validatePlayActions(round.actions, 24);
-      for (let i = 0; i < playActionCaptureCount(actions); i++) this.shots.push(shot(this.shots.length + 1));
+      const beforeImageId = this.shots.at(-1)!.id;
+      for (let i = 0; i < playActionCaptureCount(actions); i++) this.shots.push(shot(this.shots.length + 1, [this.actions.length + 1]));
+      this.actions.push({ beforeImageId, afterImageId: this.shots.at(-1)!.id });
       this.playMs += 200;
     },
     summary() {
-      return { contextOrigin: 'creator-self-check', sourceBlind: false, inputHash, playMs: this.playMs, modelWaitMs: 1500 };
+      return { contextOrigin: 'creator-self-check', sourceBlind: false, inputHash, playMs: this.playMs, modelWaitMs: 1500, actions: this.actions };
     },
     async close() { this.closed = true; },
   }));
@@ -70,13 +82,27 @@ describe('Harness isolated browser tools', () => {
     const original = await first.tools.execute(operation, deadline());
     expect(original).toMatchObject({ inputHash: material.inputHash, contextOrigin: 'creator-self-check', sourceBlind: false });
     expect(original.shots).toHaveLength(4);
-    expect((original.shots as { data: string; sha256: string }[])[0]).toMatchObject({ data: screenshot, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(original.shots[0]).toMatchObject({
+      id: `${original.evidenceId}:shot:1`, sourceId: 'shot-1', data: screenshot,
+      sha256: createHash('sha256').update(Buffer.from(screenshot.split(',')[1], 'base64')).digest('hex'),
+    });
+    expect(original.actions[0]).toMatchObject({ id: `${original.evidenceId}:action:1`, sourceId: 'touch' });
+    expect(original.shots[1].actionRefs).toEqual([original.actions[0].id]);
+    expect(original.probe).toMatchObject({ observations: [{ id: original.shots[0].id, sourceId: 'shot-1' },
+      { id: original.shots[1].id, actionRefs: [original.actions[0].id] }, {}, {}] });
+    const { evidenceHash, ...record } = original;
+    expect(evidenceHash).toBe(await harnessHash(canonicalHarness(record)));
     const resumed = fixture(first.storage);
     expect(await resumed.tools.execute(operation, deadline())).toEqual(original);
     expect(resumed.capture).not.toHaveBeenCalled();
     await expect(resumed.tools.execute(call('capture', 'capture-1', changed), deadline())).rejects.toMatchObject({ status: 409 });
-    await resumed.tools.execute(call('capture', 'capture-2', changed), deadline());
-    await resumed.tools.execute(call('capture', 'capture-3', material), deadline());
+    const second = await resumed.tools.execute(call('capture', 'capture-2', changed), deadline());
+    const third = await resumed.tools.execute(call('capture', 'capture-3', material), deadline());
+    expect(second.shots[0].sourceId).toBe(original.shots[0].sourceId);
+    expect(second.shots[0].id).not.toBe(original.shots[0].id);
+    expect(third.inputHash).toBe(original.inputHash);
+    expect(third.shots[0].id).not.toBe(original.shots[0].id);
+    expect(await fixture(first.storage).tools.readResults()).toEqual([original, second, third]);
     await expect(resumed.tools.execute(call('play-start', 'start-after-budget', material), deadline())).rejects.toMatchObject({ status: 409 });
     expect(resumed.capture).toHaveBeenCalledTimes(2);
     expect(resumed.capture.mock.calls[0]).toMatchObject([another, undefined, expect.any(Number), { activeBudgetMs: 154_000 }]);
@@ -95,15 +121,30 @@ describe('Harness isolated browser tools', () => {
     const actionCall = call('play-act', 'round', { ...session, round });
     const result = await tools.execute(actionCall, deadline());
     expect(result.shots).toHaveLength(3);
+    expect(result.actions).toEqual([{
+      id: `${result.evidenceId}:action:1`, sourceId: 1, beforeImageId: started.shots[0].id,
+      afterImageId: result.shots[2].id,
+    }]);
+    expect(result.shots.every(shot => shot.actionRefs[0] === result.actions[0].id)).toBe(true);
     expect(result.summary).toMatchObject({ contextOrigin: 'creator-self-check', sourceBlind: false, playMs: 1300, modelWaitMs: 1500 });
     expect(act).toHaveBeenCalledExactlyOnceWith(round);
     expect(await tools.execute(actionCall, deadline())).toEqual(result);
     await expect(tools.execute(call('play-act', 'wrong-input', { ...session, inputHash: (await version(another)).inputHash, round }), deadline())).rejects.toMatchObject({ status: 409 });
+    const next = await tools.execute(call('play-act', 'second-round', {
+      ...session, round: { hypothesis: 'Check another input.', actions: [{ type: 'tap', x: 12, y: 23 }] },
+    }), deadline());
+    expect(next.actions).toEqual([{
+      id: `${next.evidenceId}:action:1`, sourceId: 2, beforeImageId: result.shots[2].id,
+      afterImageId: next.shots[0].id,
+    }]);
     const finished = await tools.execute(call('play-finish', 'finish', session), deadline());
     expect(finished.shots).toEqual([]);
+    expect(finished.actions).toEqual([]);
+    expect(finished.summary).toMatchObject({ actions: [...result.actions, ...next.actions] });
+    expect(await tools.readResults()).toEqual([started, result, next, finished]);
     expect(closeBrowser).toHaveBeenCalledOnce();
     await tools.execute(call('play-start', 'second-version', await version(another)), deadline());
-    expect(play.mock.calls[1][3]).toBe(180_000 - 1300);
+    expect(play.mock.calls[1][3]).toBe(180_000 - 1500);
     await tools.close();
     expect(closeBrowser).toHaveBeenCalledTimes(2);
   });
@@ -134,9 +175,22 @@ describe('Harness isolated browser tools', () => {
     await next.tools.close();
   });
 
+  it('fails closed on corrupted completed evidence without another browser call', async () => {
+    const { tools, capture, storage } = fixture();
+    const material = await version(html);
+    const request = call('capture', 'saved', material);
+    await tools.execute(request, deadline());
+    const part = await storage.get<string>('harness-browser-call:saved:0');
+    expect(part).toContain('Original viewport');
+    await storage.put('harness-browser-call:saved:0', part!.replace('Original viewport', 'Unverified viewport'));
+    await expect(tools.readResults()).rejects.toMatchObject({ status: 409 });
+    await expect(tools.execute(request, deadline())).rejects.toMatchObject({ status: 409 });
+    expect(capture).toHaveBeenCalledOnce();
+  });
+
   it('withholds captures that overrun the shared active-browser time', async () => {
     const { tools, capture, storage } = fixture();
-    capture.mockResolvedValueOnce({ shots: Array.from({ length: 4 }, (_, i) => shot(i + 1)), probe: { loaded: {} }, captureRuntimeMs: 180_001 });
+    capture.mockResolvedValueOnce({ shots: Array.from({ length: 4 }, (_, i) => shot(i + 1)), probe: { loaded: {}, actions: [], observations: [] }, captureRuntimeMs: 180_001 });
     const material = await version(html);
     await expect(tools.execute(call('capture', 'over-time', material), deadline())).rejects.toMatchObject({ status: 502 });
     await expect(tools.execute(call('play-start', 'past-time', material), deadline())).rejects.toMatchObject({ status: 409 });
@@ -151,6 +205,7 @@ describe('Harness isolated browser tools', () => {
     await expect(tools.execute(operation, Date.now() + 80)).rejects.toMatchObject({ status: 504 });
     await expect(tools.execute(operation, deadline())).rejects.toMatchObject({ status: 409 });
     expect(capture).toHaveBeenCalledOnce();
+    expect(await tools.readResults()).toEqual([]);
   });
 
   it('labels creator observations as source-aware without allowing a blind first-look record', async () => {

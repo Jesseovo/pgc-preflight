@@ -1,6 +1,8 @@
 # CCB Harness 研究镜像与发布准备
 
-[研究工作流](../.github/workflows/ccb-research-image.yml) 接受手动 `workflow_dispatch`，并在 `codex/ccb-harness-integration` 分支的相关文件变更时运行。它在 GitHub Linux x64 运行器执行合成运行时、网关、账本、宿主恢复和评估回归，按 `harness/Dockerfile` 构建 CCB `963e0013184ecc1521289a0fc7d5da4bb6e45356` 的 Linux amd64 镜像。在 `--network none` 下验证镜像内的 CCB CLI 和带鉴权的容器健康接口，并检查运行用户。普通分支构建的镜像留在该次运行器内；手动指定 `publish_image=true` 时，使用专用 `CLOUDFLARE_API_TOKEN` Secret 推送私有 Cloudflare Registry，保存镜像摘要回执。手动触发要求工作流已经存在于默认分支。[GitHub 手动触发说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
+[研究工作流](../.github/workflows/ccb-research-image.yml) 接受手动 `workflow_dispatch`，并在 `codex/ccb-harness-integration` 分支的相关文件变更时运行。它在 GitHub Linux x64 运行器执行完整测试与构建，按 `harness/Dockerfile` 构建 CCB `963e0013184ecc1521289a0fc7d5da4bb6e45356` 的 Linux amd64 镜像。在 `--network none` 下验证镜像内的 CCB CLI 和带鉴权的容器健康接口，并检查运行用户。普通分支构建的镜像留在该次运行器内；手动指定 `publish_image=true` 时，使用专用 `CLOUDFLARE_API_TOKEN` Secret 推送私有 Cloudflare Registry，保存镜像摘要回执。
+
+本仓库已验证按工作流 ID 指定研究分支可以手动触发，无需为上传研究镜像先合并 main：`gh workflow run 408014453 --repo Jesseovo/pgc-preflight --ref codex/ccb-harness-integration -f publish_image=true`。执行前必须先配置专用 Secret，并确认分支指向待验证提交。GitHub 网页是否显示手动运行按钮不作为触发能力的依据。
 
 镜像上传仅限上述手动选项；本流程不执行远程迁移、Worker 发布或生产灰度。仓库工作流只使用只读仓库权限，checkout 不保留凭据。构建和协议回归无法证明真实供应商兼容性、Cloudflare 出站拦截效果、生产使用权或对照质量。
 

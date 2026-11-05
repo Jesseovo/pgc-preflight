@@ -3,7 +3,7 @@ import type {ModelPurpose} from './settings';
 import {HARNESS_MAX_REQUEST_MS} from './harness-protocol';
 
 type HarnessClock={startedAt:number;taskDeadlineAt:number;stageDeadlineAt:number};
-export type HarnessExecution={taskId:string;ownerId:string;family:HarnessFamily;phase:string;sourceHash:string;policy:HarnessPolicy;deadlineAt:number;previousHtml?:string;onAllocated?:(clock:HarnessClock)=>Promise<void>};
+export type HarnessExecution={taskId:string;ownerId:string;family:HarnessFamily;phase:string;sourceHash:string;policy:HarnessPolicy;deadlineAt:number;previousHtml?:string;onAllocated?:(clock:HarnessClock)=>Promise<void>;onEvidence?:(evidence:any[])=>Promise<void>};
 export class HarnessCapacityWait extends Error {}
 type Environment={HARNESS_RUNNER?:HarnessBinding;harnessExecution?:HarnessExecution;modelStore:{get():Promise<any>}};
 type Completion={system:string;user:unknown;schema?:unknown;purpose?:ModelPurpose;maxTokens?:number;deadline?:number;onWait?:(message:string)=>Promise<void>;onStart?:()=>Promise<void>};
@@ -22,7 +22,7 @@ export async function harnessCompletion(env:Environment,request:Completion):Prom
   if(contract!==execution.policy.modelContractHash)throw new Error('Harness 模型配置与任务锁定版本不同。');
   const materials={system:request.system,user:request.user,...(request.schema?{schema:request.schema}:{}),...(execution.previousHtml?{previousHtml:execution.previousHtml}:{})};
   const materialHash=await harnessHash(canonicalHarness(materials));
-  const {onAllocated,...identity}=execution;
+  const {onAllocated,onEvidence,...identity}=execution;
   let deadlineAt=Math.min(execution.deadlineAt,request.deadline??Infinity,Date.now()+HARNESS_MAX_REQUEST_MS);
   const binding=env.HARNESS_RUNNER,stub=binding.get(binding.idFromName(execution.taskId));
   // For the first game stage, capacity rejection must leave the original task
@@ -63,6 +63,10 @@ export async function harnessCompletion(env:Environment,request:Completion):Prom
       if(!result.ok)throw new Error('Harness 已完成的结果尚未保存；未重新调用模型。');
       const body=await result.json() as any;
       if(body.materialHash!==materialHash||typeof body.text!=='string'||await harnessHash(body.text)!==body.outputHash)throw new Error('Harness 结果与锁定材料不符。');
+      if(onEvidence){
+        if(!Array.isArray(body.evidence)||await harnessHash(canonicalHarness(body.evidence))!==body.evidenceHash)throw new Error('Harness 补测证据未完整锁定。');
+        await onEvidence(body.evidence);
+      }
       return body.text;
     }
     if(['failed','cancelled','unknown','expired'].includes(status.state))throw new Error(status.error||'Harness 未完成，已保留可用产物。');

@@ -10,8 +10,8 @@ import { canonicalHarness, CCB_ENGINE_COMMIT, harnessHash, modelContractHash, ne
 import type { ModelConfig } from '../server/settings';
 import { buildHarnessConfig } from '../scripts/prepare-harness-release';
 
-const tool = vi.hoisted(() => ({ close: vi.fn(async () => {}), execute: vi.fn(async (_body: unknown, _deadline: number) => ({ ok: true })) }));
-vi.mock('../server/harness-tools', () => ({ HarnessTools: class { close = tool.close; execute = tool.execute; } }));
+const tool = vi.hoisted(() => ({ close: vi.fn(async () => {}), execute: vi.fn(async (_body: unknown, _deadline: number) => ({ ok: true })),readResults:vi.fn(async()=>[]) }));
+vi.mock('../server/harness-tools', () => ({ HarnessTools: class { close = tool.close; execute = tool.execute; readResults=tool.readResults; } }));
 
 const opened: DatabaseSync[] = [];
 const sourceHash = '1'.repeat(64);
@@ -520,4 +520,27 @@ it('returns a reschedule signal only for an explicit capacity refusal and does n
   expect(fetch).toHaveBeenCalledTimes(2);
   expect(request.onStart).not.toHaveBeenCalled();
   expect(execution.onAllocated).not.toHaveBeenCalled();
+});
+
+it('locks supplemental evidence before artifact validation and refuses a changed evidence manifest',async()=>{
+  const {gamePolicy}=await setup();
+  const {complete}=await import('../server/forge-llm');
+  const evidence=[{evidenceId:'tool-fixture',inputHash:sourceHash,shots:[]}];
+  let materialHash='',seen:any[]|undefined,tampered=false;
+  const fetch=vi.fn(async(request:Request)=>{
+    const path=new URL(request.url).pathname;
+    if(path==='/start'){materialHash=(await request.json() as any).materialHash;return Response.json({state:'running'});}
+    if(path==='/status')return Response.json({state:'succeeded'});
+    const text='{"ok":true}';
+    return Response.json({text,outputHash:await harnessHash(text),materialHash,evidence:tampered?[]:evidence,evidenceHash:await harnessHash(canonicalHarness(evidence))});
+  });
+  const execution=harnessExecutionFor({id:'game',owner_id:'owner',executor:'platform',harness_policy:gamePolicy},'forge','build',sourceHash,Date.now()+60_000)!;
+  execution.onEvidence=async value=>{seen=value;};
+  const env={SETTINGS_KEY:'unused',modelStore:{get:async()=>config},harnessExecution:execution,HARNESS_RUNNER:{idFromName:(id:string)=>id,get:()=>({fetch})}};
+  const validate=vi.fn(()=>seen?.[0]?.evidenceId==='tool-fixture'?[]:['evidence missing']);
+  await expect(complete(env,{}, {system:'Synthetic',user:'Locked',purpose:'game',schema:{},validate})).resolves.toEqual({ok:true});
+  expect(validate).toHaveBeenCalledTimes(1);
+  tampered=true;seen=undefined;
+  await expect(complete(env,{}, {system:'Synthetic',user:'Locked',purpose:'game',schema:{},validate})).rejects.toThrow('Harness');
+  expect(seen).toBeUndefined();expect(validate).toHaveBeenCalledTimes(1);
 });

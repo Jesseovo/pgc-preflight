@@ -142,9 +142,17 @@ interface CheckRecord {
   task_id: string; stage: string; version_id?: string; content_hash?: string; evidence_hash?: string; created_at?: string;
   self_check?: {model?: string; coreChanges?: string[]; decisions?: string[]; requirements?: {id: string; text: string; status: string; reason?: string; evidence?: string}[];
     judgedInputHash?: string; judgedEvidenceHash?: string;
+    harnessEvidenceHash?: string;
     selfCheck?: {findings?: Finding[]; unverified?: string[]; changes?: string[]; requestRepair?: boolean}};
 }
-interface Evidence { shots?: {data: string; label?: string; id: string}[]; probe?: unknown }
+interface EvidenceShot {data: string; label?: string; id: string}
+interface Evidence {
+  inputHash?: string;
+  shots?: EvidenceShot[];
+  probe?: unknown;
+  harnessEvidence?: {evidenceId: string; tool: string; inputHash: string; evidenceHash: string; shots: EvidenceShot[]; [key: string]: unknown}[];
+}
+const isViewportImage=(shot:EvidenceShot)=>/^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/]+={0,2}$/.test(shot.data);
 
 export function ProjectChecks({id, onVersion}: {id: number; onVersion: (id: string) => void}) {
   const source = useResource<CheckRecord[]>(`${forge}/topics/${id}/creation-checks`);
@@ -165,7 +173,7 @@ function CreationRecord({topicId, record, onVersion}: {topicId: number; record: 
   return <Card className="creator-check stack">
     <div className="spread row"><div><h3>{stageLabels[record.stage] || record.stage}</h3><p className="small muted">{displayDate(record.created_at)}{check?.model ? ` · ${check.model}` : ''}</p></div>
       <div className="row">{record.version_id && <Button variant="outline" size="sm" onClick={() => onVersion(record.version_id!)}>打开此阶段版本</Button>}
-        {record.evidence_hash && <Button variant="outline" size="sm" onClick={() => setShow(open => !open)}>{show ? '收起原始采集' : '查看本阶段原始采集'}</Button>}</div></div>
+        {(record.evidence_hash || check?.harnessEvidenceHash) && <Button variant="outline" size="sm" onClick={() => setShow(open => !open)}>{show ? '收起原始采集' : '查看本阶段原始采集'}</Button>}</div></div>
     {check?.coreChanges?.length ? <div className="creator-callout"><strong>核心改动 · 待你核对</strong><ul>{check.coreChanges.map((change, index) => <li key={index}>{change}</li>)}</ul></div> : null}
     {check?.requirements?.length ? <details className="creator-disclosure" open={check.requirements.some(item => item.status === 'deferred') || undefined}><summary>制作需求清单</summary><ul>{check.requirements.map(item => <li key={item.id}><b>{item.id}</b> · {item.text} <Badge tone={item.status === 'implemented' ? 'neutral' : 'warning'}>{({implemented: '模型声明已实现', unverified: '待验证', deferred: '已暂缓'} as Record<string, string>)[item.status] || item.status}</Badge>{item.reason && <p>{item.reason}</p>}{item.evidence && <p className="small muted">引用 · {item.evidence}</p>}</li>)}</ul></details> : null}
     {findings.length > 0 && <div><h4>模型自检发现</h4><ul>{findings.map(finding => <li key={finding.id}><Badge tone={finding.kind === 'confirmed' ? 'sage' : 'warning'}>{({confirmed: '自检确认', experience: '体验', unverified: '待验证'} as Record<string, string>)[finding.kind] || finding.kind}</Badge> {finding.phenomenon}
@@ -180,9 +188,19 @@ function CreationRecord({topicId, record, onVersion}: {topicId: number; record: 
     </dl></details>
     {show && <div className="stack">
       {evidence.error ? <ErrorState error={evidence.error} onRetry={evidence.reload}/> : evidence.loading && !evidence.data ? <Loading label="正在读取原始采集"/> : null}
-      {evidence.data && <><div className="creator-card-grid">{evidence.data.shots?.filter(shot => /^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/]+={0,2}$/.test(shot.data)).map(shot => <figure key={shot.id} className="creator-evidence">
+      {evidence.data && <><div className="creator-card-grid">{evidence.data.shots?.filter(isViewportImage).map(shot => <figure key={shot.id} className="creator-evidence">
         <img src={shot.data} alt={shot.label || '原始视口截图'} loading="lazy"/><figcaption>{shot.label || '原始视口截图'} · {shot.id}</figcaption>
-      </figure>)}</div><JsonDetails value={evidence.data.probe} label="采集动作、日志与视口记录"/></>}
+      </figure>)}</div>{evidence.data.probe != null && <JsonDetails value={evidence.data.probe} label="采集动作、日志与视口记录"/>}
+        {evidence.data.harnessEvidence?.length ? <div className="stack"><h4>Harness 试玩补测原图</h4>
+          {evidence.data.harnessEvidence.map(({shots, ...supplement}) => <details className="creator-disclosure" key={supplement.evidenceId}>
+            <summary>{supplement.tool} · {shots.length} 张原图</summary>
+            <p className="small muted">{supplement.inputHash === evidence.data?.inputHash ? '对应本阶段产物' : '对应先前或中间版本'} · HTML SHA-256 <code>{supplement.inputHash}</code></p>
+            <div className="creator-card-grid">{shots.filter(isViewportImage).map(shot => <figure key={shot.id} className="creator-evidence">
+              <img src={shot.data} alt={shot.label || '补测视口截图'} loading="lazy"/><figcaption>{shot.label || '补测视口截图'} · {shot.id}</figcaption>
+            </figure>)}</div>
+            <JsonDetails value={supplement} label="补测动作、日志和记录摘要"/>
+          </details>)}
+        </div> : null}</>}
     </div>}
     <JsonDetails value={check} label="查看自检原始记录"/>
   </Card>;

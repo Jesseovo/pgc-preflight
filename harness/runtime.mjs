@@ -128,8 +128,10 @@ function resultArtifacts(context, terminal) {
     if (files.length !== 2 || !/<(?:!doctype\s+html|html(?:\s|>))/i.test(files[0].content)) return null;
     try {
       const record = JSON.parse(files[1].content);
+      const fields = ['requirements', 'decisions', 'coreChanges'];
+      if (run.phase !== 'build') fields.push('selfCheck');
       if (!record || typeof record !== 'object' || Array.isArray(record) ||
-          !['requirements', 'decisions', 'coreChanges', 'selfCheck'].every(key => Object.hasOwn(record, key))) return null;
+          Object.keys(record).length !== fields.length || !fields.every(key => Object.hasOwn(record, key))) return null;
     } catch {
       return null;
     }

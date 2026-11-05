@@ -2,7 +2,7 @@ import {afterEach,describe,expect,it,vi} from 'vitest';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,readdirSync} from 'node:fs';
 import {advanceCreationPipeline,completeAgentCreation,creationChecks,creationEvidence,creationPipelineAlarm,lockCreationCapture,recordAgentCreationStage,validateAgentCreationCompletion,validateCreationOutput} from '../server/forge-creation-pipeline';
-import {digest} from '../server/review-device-state';
+import {digest,canonicalJson} from '../server/review-device-state';
 import {complete} from '../server/forge-llm';
 
 vi.mock('../server/forge-llm',()=>({complete:vi.fn()}));
@@ -382,4 +382,104 @@ it('keeps definite capacity waits outside the shared game deadline without marki
     expect(expectedDeadline).toBe(allocatedAt+40*60_000);
     expect(complete).toHaveBeenCalledTimes(3);
   }finally{vi.useRealTimers();}
+});
+
+async function toolEvidence(htmlText:string, letter='a'){
+  const evidenceId=`tool-${letter.repeat(64)}`,id=`${evidenceId}:shot:1`;
+  const record={evidenceId,tool:'play-start',origin:'harness-browser-tool',contextOrigin:'creator-self-check',sourceBlind:false,
+    inputHash:await digest(htmlText),shots:[{id,label:'实际浏览器补图',data:'data:image/jpeg;base64,YQ==',sha256:await digest('a'),actionRefs:[]}],actions:[]};
+  return {...record,evidenceHash:await digest(canonicalJson(record))};
+}
+
+it('retains verified supplemental browser evidence and exposes exact versions and original images',async()=>{
+  const s=setup('platform');
+  const {env}=enableHarness(s);
+  const prior=await toolEvidence(html('build'));
+  const extra=await toolEvidence(html('polish'),'b');
+  vi.mocked(complete).mockImplementation(async(runtime,_cfg,request)=>{
+    await allocateHarnessFixture(runtime);
+    await runtime.generation!.onStart();
+    const execution=runtime.harnessExecution!;
+    if(execution.phase==='build'){
+      await execution.onEvidence!([prior]);
+      return output('build');
+    }
+    expect((request.user as any[]).filter(part=>part.type==='image')).toHaveLength(5);
+    expect(JSON.stringify(request.user)).toContain(prior.shots[0].id);
+    expect(JSON.stringify(request.user)).toContain(prior.inputHash);
+    await expect(execution.onEvidence!([extra])).rejects.toThrow('不能省略或替换');
+    await execution.onEvidence!([prior,extra]);
+    const supported=output('polish',{selfCheck:selfCheck([finding({evidenceRefs:[extra.shots[0].id]})])});
+    expect(request.validate!(supported)).toEqual([]);
+    const fake=output('polish',{selfCheck:selfCheck([finding({evidenceRefs:[extra.shots[0].id+'-invented']})])});
+    expect(request.validate!(fake)).toContain('selfCheck.findings');
+    return supported;
+  });
+  for(let i=0;i<8&&['queued','running'].includes(s.row().status);i++)await creationPipelineAlarm(s.state,env,s.id);
+  expect(s.row()).toMatchObject({status:'done'});
+  const records=await creationChecks(s.DB,'owner',1);
+  const polish=records.find((record:any)=>record.stage==='polish');
+  expect(polish.self_check.harnessEvidence).toEqual([
+    expect.objectContaining({evidenceId:prior.evidenceId,inputHash:prior.inputHash,evidenceHash:prior.evidenceHash,matchesOutput:false}),
+    expect.objectContaining({evidenceId:extra.evidenceId,inputHash:extra.inputHash,evidenceHash:extra.evidenceHash,matchesOutput:true}),
+  ]);
+  expect(JSON.stringify(polish)).not.toContain('data:image');
+  const capture=await creationEvidence(s.DB,'owner',1,s.id,'polish');
+  expect(capture.shots).toHaveLength(4);
+  expect(capture.harnessEvidence).toEqual([prior,extra]);
+  expect(capture.hash).not.toBe((await lockCreationCapture(raw(),'polish',html('polish'))).hash);
+  await expect(creationEvidence(s.DB,'other',1,s.id,'polish')).rejects.toMatchObject({status:404});
+  s.sqlite.prepare("UPDATE forge_creation_evidence SET content=replace(content,'YQ==','Yg==') WHERE task_id=? AND stage='polish' AND part=-1").run(s.id);
+  await expect(creationEvidence(s.DB,'owner',1,s.id,'polish')).rejects.toMatchObject({status:409});
+});
+
+it('keeps intermediate evidence on its own hash and denies automatic repair based on it alone',async()=>{
+  const s=setup('platform');
+  const {env}=enableHarness(s);
+  const interim=await toolEvidence(html('intermediate'));
+  vi.mocked(complete).mockImplementation(async runtime=>{
+    await allocateHarnessFixture(runtime);
+    await runtime.generation!.onStart();
+    const execution=runtime.harnessExecution!;
+    if(execution.phase==='build')return output('build');
+    await execution.onEvidence!([interim]);
+    return output('polish',{selfCheck:selfCheck([finding({resolved:false,evidenceRefs:[interim.shots[0].id]})],true)});
+  });
+  for(let i=0;i<7&&['queued','running'].includes(s.row().status);i++)await creationPipelineAlarm(s.state,env,s.id);
+  expect(s.row()).toMatchObject({status:'error',error:expect.stringContaining('current HTML version')});
+  expect(complete).toHaveBeenCalledTimes(2);
+  expect(s.sqlite.prepare("SELECT count(*) n FROM forge_creation_stages WHERE stage='repair'").get()).toEqual({n:0});
+});
+
+it('rejects injected supplements and their references on the member protocol while preserving its baseline',async()=>{
+  const s=setup();
+  const member=s.row();
+  const tool=await toolEvidence(html('build'));
+  const build=await stagePayload('build',output('build'));
+  await expect(recordAgentCreationStage(s.DB,member,{...build,capture:{...build.capture,harnessEvidence:[tool]}})).rejects.toThrow('不能回传平台 Harness');
+  await recordAgentCreationStage(s.DB,member,build);
+  const stored=await creationEvidence(s.DB,'owner',1,s.id,'build');
+  expect(stored).not.toHaveProperty('harnessEvidence');
+  expect(stored.hash).toBe((await lockCreationCapture(raw(),'build',html('build'))).hash);
+  const polish=await stagePayload('polish',output('polish',{selfCheck:selfCheck([finding({evidenceRefs:[tool.shots[0].id]})])}));
+  await expect(recordAgentCreationStage(s.DB,member,polish)).rejects.toThrow('selfCheck.findings');
+});
+
+it('keeps genuine supplemental originals available when the independent baseline capture fails',async()=>{
+  const s=setup('platform');
+  const {env}=enableHarness(s);
+  const supplemental=await toolEvidence(html('build'));
+  vi.mocked(complete).mockImplementationOnce(async runtime=>{
+    await allocateHarnessFixture(runtime);
+    await runtime.generation!.onStart();
+    await runtime.harnessExecution!.onEvidence!([supplemental]);
+    return output('build');
+  });
+  s.env.captureReview.mockRejectedValue(new Error('Synthetic capture failure'));
+  await creationPipelineAlarm(s.state,env,s.id);
+  await creationPipelineAlarm(s.state,env,s.id);
+  expect(s.row()).toMatchObject({status:'error',error:expect.stringContaining('采集未完成')});
+  const evidence=await creationEvidence(s.DB,'owner',1,s.id,'build');
+  expect(evidence).toMatchObject({hash:null,shots:[],harnessEvidence:[supplemental]});
+  expect(complete).toHaveBeenCalledTimes(1);
 });

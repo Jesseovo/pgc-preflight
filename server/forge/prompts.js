@@ -382,13 +382,13 @@ const gameFramedReminder = "请按系统给定的 PGC_HTML 和 PGC_RECORD 区块
  * @param {"build"|"polish"|"repair"} stage
  * @param {{topic:any, brief:string, styleSvg?:string, styleImage?:string, assetHtml?:string,
  *   html?:string, capture?:{shots:{id:string,label:string,data:string,actionRefs?:string[]}[],probe:unknown,hash?:string,stage?:string},
- *   requirements?:unknown,decisions?:unknown,coreChanges?:unknown,selfCheck?:unknown}} input
+ *   requirements?:unknown,decisions?:unknown,coreChanges?:unknown,selfCheck?:unknown,harnessEvidence?:Array<{evidenceId:string,inputHash:string,shots:Array<{id:string,data:string}>}>}} input
  * @param {"json"|"framed"} format
  * @returns {Array<{type:"text",text:string}|{type:"image",data:string}>}
  */
 export function gameStageUser(stage, input, format = "json") {
   const gameOutputReminder = format === "framed" ? gameFramedReminder : gameJsonReminder;
-  const { topic, brief, styleSvg, styleImage, assetHtml, html, capture, requirements, decisions, coreChanges, selfCheck } = input;
+  const { topic, brief, styleSvg, styleImage, assetHtml, html, capture, requirements, decisions, coreChanges, selfCheck, harnessEvidence } = input;
   const asset = extractGameAssetScript(assetHtml);
   if (assetHtml && !asset) throw new Error("锁定的美术资产缺少可复用的 GAME_ASSETS 脚本。");
   /** @type {Array<{type:"text",text:string}|{type:"image",data:string}>} */
@@ -409,6 +409,14 @@ export function gameStageUser(stage, input, format = "json") {
   for (const { id, label, data, actionRefs } of shots) {
     parts.push({ type: "text", text: `原图证据 ID：${id}；${label}；动作：${(actionRefs || []).join("、") || "无"}` });
     parts.push({ type: "image", data });
+  }
+  for (const evidence of harnessEvidence || []) {
+    const { shots: toolShots, ...record } = evidence;
+    parts.push({ type: "text", text: `【Harness 试玩补测】${JSON.stringify({...record,shots:toolShots.map(({data,...shot})=>shot)})}\n以上记录只对应 inputHash 指定的 HTML。旧版或中间版证据不能证明新输出已修复。` });
+    for (const shot of toolShots) {
+      parts.push({ type: "text", text: `Harness 原图证据 ID：${shot.id} · HTML SHA-256：${evidence.inputHash}` });
+      parts.push({ type: "image", data: shot.data });
+    }
   }
   parts.push({ type: "text", text: gameOutputReminder });
   return parts;
