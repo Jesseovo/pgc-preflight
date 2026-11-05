@@ -24,6 +24,7 @@ export type ProviderNativeEnv = {
   PROVIDER_RESEARCH_AUTH_KEY: string;
   PROVIDER_NATIVE_FIXTURE: string;
   PROVIDER_NATIVE_PUBLIC_CONTROL_ORIGIN?: string;
+  PROVIDER_NATIVE_VERSION?: { id?: string };
 };
 type NativeConfig = {
   image: string; candidateVersion: string; taskId: string; generation: string; modelContractHash: string;
@@ -41,6 +42,7 @@ type Plan = Parameters<typeof createHarnessRun>[1] & {
 };
 type RuntimeSession = { control: string; runId: string };
 type NativePath = '/run' | '/status';
+type NativeControlStage = 'configuration' | 'origin' | 'route' | 'headers' | 'timestamp' | 'signature' | 'body' | 'dispatch' | 'runner';
 const maxCleanupAttempts = 3;
 
 const internal = 'http://pgc-provider-native.internal';
@@ -184,22 +186,39 @@ function streamWithCompletion(body: ReadableStream<Uint8Array>, requestSignal: A
 /** Public control is closed unless the isolated Worker origin is explicitly configured. */
 export async function handleProviderNativeControl(request: Request, env: ProviderNativeEnv, external = false): Promise<Response> {
   const url = new URL(request.url);
-  const config = configured(env);
   const origin = external ? env.PROVIDER_NATIVE_PUBLIC_CONTROL_ORIGIN : internal;
+  if (!['/run', '/status'].includes(url.pathname)) return deny();
+  const identify = (response: Response, stage: NativeControlStage) => {
+    const headers = new Headers(response.headers);
+    headers.set('x-pgc-native-research-control', 'hmac-v1');
+    headers.set('x-pgc-native-research-stage', stage);
+    const version = env.PROVIDER_NATIVE_VERSION?.id;
+    if (version && uuidPattern.test(version)) headers.set('x-pgc-native-research-version', version);
+    return new Response(response.body, { status: response.status, headers });
+  };
+  const reject = (stage: NativeControlStage) => identify(deny(), stage);
+  if (!origin || external && !/^https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev$/.test(origin)) return reject('configuration');
+  if (url.origin !== origin) return reject('origin');
+  const config = configured(env);
+  if (!config) return reject('configuration');
   const method = url.pathname === '/run' ? 'POST' : 'GET';
-  if (!config || !origin || external && !/^https:\/\/[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev$/.test(origin) || url.origin !== origin || url.search || url.hash || !['/run', '/status'].includes(url.pathname) ||
-      request.method !== method || request.headers.has('authorization') || request.headers.has('cookie')) return deny();
+  if (url.search || url.hash || request.method !== method || request.headers.has('authorization') || request.headers.has('cookie')) return reject('route');
+  const at = Number(request.headers.get('x-pgc-native-research-at'));
+  const signature = request.headers.get('x-pgc-native-research-signature') ?? '';
+  const nonce = request.headers.get('x-pgc-native-research-nonce') ?? '';
+  if (!hexPattern.test(signature) || !uuidPattern.test(nonce)) return reject('headers');
+  if (!Number.isSafeInteger(at) || Math.abs(Date.now() - at) > 30_000) return reject('timestamp');
   try {
-    const at = Number(request.headers.get('x-pgc-native-research-at'));
-    const signature = request.headers.get('x-pgc-native-research-signature') ?? '';
-    const nonce = request.headers.get('x-pgc-native-research-nonce') ?? '';
-    if (!Number.isSafeInteger(at) || Math.abs(Date.now() - at) > 30_000 || !hexPattern.test(signature) || !uuidPattern.test(nonce) ||
-        !await crypto.subtle.verify('HMAC', await controlKey(env.PROVIDER_NATIVE_CONTROL_KEY, 'verify'), fromHex(signature),
-          controlBytes(config, method, origin, url.pathname, at, nonce)) || (await readBytes(request.body, 0)).length !== 0) return deny();
-    return env.PROVIDER_NATIVE_RUNNER.get(env.PROVIDER_NATIVE_RUNNER.idFromName(slotName(config))).fetch(new Request(internal + url.pathname, { method }));
-  } catch {
-    return deny();
-  }
+    if (!await crypto.subtle.verify('HMAC', await controlKey(env.PROVIDER_NATIVE_CONTROL_KEY, 'verify'), fromHex(signature),
+      controlBytes(config, method, origin, url.pathname, at, nonce))) return reject('signature');
+  } catch { return reject('signature'); }
+  try {
+    if ((await readBytes(request.body, 0)).length !== 0) return reject('body');
+  } catch { return reject('body'); }
+  try {
+    const runner = env.PROVIDER_NATIVE_RUNNER.get(env.PROVIDER_NATIVE_RUNNER.idFromName(slotName(config)));
+    return identify(await runner.fetch(new Request(internal + url.pathname, { method })), 'runner');
+  } catch { return identify(json({ error: 'research_runner_unavailable' }, 503), 'dispatch'); }
 }
 
 async function signedBrokerRequest(env: ProviderNativeEnv, config: NativeConfig, path: string, requestId: string,

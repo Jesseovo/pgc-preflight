@@ -1,4 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import { build } from 'esbuild';
+import { Miniflare } from 'miniflare';
 import { describe, expect, it, vi } from 'vitest';
 import { providerResearchSchema } from '../scripts/harness-provider-research-schema';
 import {
@@ -276,6 +278,55 @@ describe('isolated native provider research adapter', () => {
       expect((await handleProviderNativeControl(tampered, s.env, true)).status).toBe(404);
     } finally { s.close(); }
   });
+
+  it('accepts signed public status through the actual workerd entry and distinguishes auth from DO dispatch', async () => {
+    const s = await nativeSetup();
+    const origin = 'https://synthetic-control.example.workers.dev';
+    const workerName = 'harness-provider-native-workerd';
+    const broker = 'local-denied-broker';
+    const className = 'ProviderNativeRunner';
+    const manifest = (contents: string) => ({ mainModule: 'index.js', modules: { 'index.js': { type: 'esm' as const, contents } } });
+    const text = (value: string) => ({ type: 'text' as const, value });
+    const entry = await build({ entryPoints: ['scripts/harness-provider-native-worker.ts'], external: ['cloudflare:workers'],
+      bundle: true, format: 'esm', platform: 'browser', target: 'es2022', write: false });
+    const runtime = new Miniflare({ host: '127.0.0.1', port: 0, cf: false, telemetry: { enabled: false }, workers: [
+      { config: { name: workerName, compatibilityDate: '2026-10-23', manifest: manifest(entry.outputFiles[0].text),
+        exports: { [className]: { type: 'durable-object', storage: 'sqlite' } }, env: {
+          PROVIDER_NATIVE_RUNNER: { type: 'durable-object', worker: workerName, exportName: className },
+          PROVIDER_RESEARCH_DB: { type: 'd1', id: 'native-control-test-db' },
+          PROVIDER_RESEARCH_BROKER: { type: 'worker', worker: broker },
+          PROVIDER_NATIVE_FIXTURE: text(JSON.stringify(s.config)), PROVIDER_NATIVE_PUBLIC_CONTROL_ORIGIN: text(origin),
+          PROVIDER_NATIVE_CONTROL_KEY: text(controlKey), PROVIDER_RESEARCH_AUTH_KEY: text(brokerKey),
+          PROVIDER_NATIVE_VERSION: { type: 'version-metadata' },
+        } } },
+      { config: { name: broker, compatibilityDate: '2026-10-23',
+        manifest: manifest('export default { fetch() { throw new Error("Unexpected provider route"); } }') } },
+    ] });
+    const stage = (response: { headers: { get(name: string): string | null } }) => response.headers.get('x-pgc-native-research-stage');
+    try {
+      const signed = async (path: '/status' | '/run', key = controlKey, at = Date.now()) =>
+        Object.fromEntries(await signProviderNativeControl(s.config, key, path, at, origin));
+      const read = (headers?: Record<string, string>, target = origin) => runtime.dispatchFetch(target + '/status', { headers });
+      const status = await read(await signed('/status'));
+      expect(status.status).toBe(200);
+      expect(status.headers.get('x-pgc-native-research-control')).toBe('hmac-v1');
+      expect(status.headers.get('x-pgc-native-research-version')).toMatch(/^[a-f0-9-]{36}$/);
+      expect(stage(status)).toBe('runner');
+      expect(await status.json()).toEqual({ state: 'idle', releaseReady: false });
+      expect(stage(await read())).toBe('headers');
+      expect(stage(await read(await signed('/status', brokerKey)))).toBe('signature');
+      expect(stage(await read(await signed('/status', controlKey, Date.now() - 31_000)))).toBe('timestamp');
+      expect(stage(await read(await signed('/status'), 'https://wrong.example.workers.dev'))).toBe('origin');
+      const post = async (body?: string) => runtime.dispatchFetch(origin + '/run', { method: 'POST', headers: await signed('/run'), body });
+      expect(stage(await post('unexpected body'))).toBe('body');
+      // There is no container in this local Worker. A bodyless request reaches
+      // the DO and is rejected by its independent image gate.
+      const noContainer = await post();
+      expect(noContainer.status).toBe(404);
+      expect(stage(noContainer)).toBe('runner');
+      expect(await (await read(await signed('/status'))).json()).toEqual({ state: 'idle', releaseReady: false });
+    } finally { await runtime.dispose(); s.close(); }
+  }, 30_000);
 
   it('latches a candidate-version mismatch before allocating a lease or starting a container', async () => {
     const s = await nativeSetup({ mismatchVersion: true });
