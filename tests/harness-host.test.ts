@@ -163,6 +163,16 @@ afterEach(() => {
 });
 
 describe('harness platform policy and authorization', () => {
+  it('preserves explicit full brief, new-topic and review budgets when locking a task', async () => {
+    const {db,gamePolicy}=await setup();
+    const contracts=await Promise.all((['brief','expand','review'] as const).map(purpose=>modelContractHash(config,purpose)));
+    const release={engineCommit:CCB_ENGINE_COMMIT,image:imageReference,rightsConfirmed:true,providerCompatibilityVerified:true,comparisonAccepted:true,isolationVerified:true,evidenceHash:gamePolicy.releaseHash,compatibleModelContracts:contracts};
+    const env={DB:db,modelStore:{get:async()=>config},HARNESS_ROLLOUT:'pilot',HARNESS_RUNNER:{} as any,HARNESS_RELEASE:JSON.stringify(release)};
+    expect((await newHarnessPolicy(env,'admin','forge','brief'))?.limits).toMatchObject({maxOutputTokens:64000,maxTotalOutputTokens:64000});
+    expect((await newHarnessPolicy(env,'admin','forge','expand',24000))?.limits).toMatchObject({maxOutputTokens:24000,maxTotalOutputTokens:24000});
+    expect((await newHarnessPolicy(env,'admin','forge','expand',8000))?.limits.maxTotalOutputTokens).toBe(8000);
+    expect((await newHarnessPolicy(env,'admin','review','review'))?.limits).toMatchObject({maxOutputTokens:16000,maxTotalOutputTokens:32000});
+  });
   it('keeps legacy tasks and unconfigured rollout on the original execution path', async () => {
     const { db, sqlite, gamePolicy } = await setup();
     const get = vi.fn(async () => config);

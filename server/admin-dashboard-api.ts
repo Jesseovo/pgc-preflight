@@ -211,7 +211,7 @@ async function retryCreation(env:any,id:string):Promise<AdminTask> {
   // Preserve the workflow version, but resolve the execution engine for the new task.
   const active=await first(DB,"SELECT id FROM forge_tasks WHERE scope=? AND status IN ('queued','running')",row.scope);
   if(active)return (await taskDetail(DB,'creation',active.id)).task;
-  const harness=owner==='admin'||job.type==='game'&&row.creative_version!==2?null:await newHarnessPolicy(env,owner,'forge',harnessPurpose(job.type));
+  const harness=owner==='admin'||job.type==='game'&&row.creative_version!==2?null:await newHarnessPolicy(env,owner,'forge',harnessPurpose(job.type),job.type==='mechanism-check'?8000:job.type==='expand'&&row.creative_version===2?24000:undefined);
   const insert=DB.prepare(`INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,created_at,updated_at,owner_id,executor,input_snapshot,creative_version,retry_of,requested_by${harness?',harness_policy':''}) SELECT ?,kind,scope,?,'queued','等待后台执行…',?,?,owner_id,'platform',input_snapshot,creative_version,id,'admin'${harness?',?':''} FROM forge_tasks WHERE id=? AND status='error' AND executor='platform' AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE retry_of=?) AND (owner_id='admin' OR EXISTS(SELECT 1 FROM members m WHERE m.id=forge_tasks.owner_id AND m.enabled=1 AND m.star=1))${topicGuard}`).bind(newId,payload,stamp,stamp,...(harness?[JSON.stringify(harness)]:[]),id,id,...(topicGuard?[topicId,owner]:[]));
   const statements=[insert];
   if(['expand','brief','assets','game'].includes(job.type)){

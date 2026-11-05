@@ -22,7 +22,7 @@ export async function enqueueForgeTask(env: ForgeEnv, job: ForgeJob, taskId: str
   if (job.type === 'game') job = {...job, requestId:id};
   const snapshot=await inputSnapshot(env.DB,owner,job);
   if(snapshot.creative_version===2)await requireCreativeV2(env,owner);
-  const policy=job.type==='game'&&snapshot.creative_version!==2?null:await newHarnessPolicy(env,owner,'forge',harnessPurpose(job.type));
+  const policy=job.type==='game'&&snapshot.creative_version!==2?null:await newHarnessPolicy(env,owner,'forge',harnessPurpose(job.type),job.type==='mechanism-check'?8000:job.type==='expand'&&snapshot.creative_version===2?24000:undefined);
   const statements = [env.DB.prepare(`INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,created_at,updated_at,detail,owner_id,executor,input_snapshot,creative_version${policy?',harness_policy':''}) VALUES(?,?,?,?,?,?,'等待后台执行…',?,'platform',?,?${policy?',?':''})`).bind(id,job.type,scope,JSON.stringify(job),at,at,owner,JSON.stringify(snapshot),snapshot.creative_version||1,...(policy?[JSON.stringify(policy)]:[]))];
   const owns = "EXISTS(SELECT 1 FROM forge_tasks WHERE id=? AND status='queued')";
   if (['expand','brief','assets','game'].includes(job.type)) {

@@ -32,7 +32,7 @@ export function parseHarnessPolicy(raw:unknown):HarnessPolicy|null{
 
 // No permissive local default. An engine switch without the release evidence
 // cannot silently enrol existing members or old tasks.
-export async function newHarnessPolicy(env:HarnessEnvironment,ownerId:string,family:HarnessFamily,purpose:ModelPurpose):Promise<HarnessPolicy|null>{
+export async function newHarnessPolicy(env:HarnessEnvironment,ownerId:string,family:HarnessFamily,purpose:ModelPurpose,requestedMaxTokens?:number):Promise<HarnessPolicy|null>{
   if(env.HARNESS_ROLLOUT!=='pilot')return null;
   if(ownerId!=='admin'&&!await env.DB.prepare('SELECT 1 FROM review_pilot_members WHERE member_id=? AND pilot_enabled=1').bind(ownerId).first())return null;
   let release:any;
@@ -40,7 +40,9 @@ export async function newHarnessPolicy(env:HarnessEnvironment,ownerId:string,fam
   if(!env.HARNESS_RUNNER||release?.engineCommit!==CCB_ENGINE_COMMIT||!isHarnessImage(release?.image)||release?.rightsConfirmed!==true||release?.providerCompatibilityVerified!==true||release?.comparisonAccepted!==true||release?.isolationVerified!==true||!/^[a-f0-9]{64}$/.test(release?.evidenceHash||''))throw new Error('Harness 尚未满足授权、隔离和对照验收条件。');
   const config=await env.modelStore.get(),active=activeModelProfile(config,purpose),contract=await modelContractHash(config,purpose);
   if(!active?.profile.enabled||!active.profile.encryptedKey||!Array.isArray(release.compatibleModelContracts)||!release.compatibleModelContracts.includes(contract))throw new Error('当前模型配置尚未完成 Harness 兼容验证，未自动切换模型。');
-  const max=inferenceOptions(active.profile,purpose,purpose==='game'?64_000:undefined).maxTokens;
+  // Match explicit existing caller budgets, including the complete Opus brief.
+  const requested=requestedMaxTokens??(purpose==='game'?64_000:purpose==='brief'&&/opus|claude/i.test(active.profile.model)?64_000:purpose==='review'?/deepseek/i.test(active.profile.model)?24_000:16_000:undefined);
+  const max=inferenceOptions(active.profile,purpose,requested).maxTokens;
   const limits=purpose==='game'?{...HARNESS_GAME_LIMITS,maxOutputTokens:Math.min(64_000,max)}:{maxOutputTokens:max,maxTotalOutputTokens:family==='review'?max*2:max,maxModelTurns:family==='review'?8:6,maxDurationMs:12*60_000,maxRepairs:0};
   return {version:1,engine:'ccb',engineCommit:CCB_ENGINE_COMMIT,image:release.image,releaseHash:release.evidenceHash,family,purpose,modelContractHash:contract,limits};
 }

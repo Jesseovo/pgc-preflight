@@ -184,6 +184,7 @@ export class HarnessHost {
       const old=await this.env.DB.prepare('SELECT generation FROM harness_runs WHERE task_id=?').bind(meta.taskId).first();
       if(old){meta.generation=old.generation;await this.stop(meta,'failed');return response({error:'harness_prior_execution_unknown'},409);}
       const model=await lockHarnessModel(input.config,policy.purpose,input.maxTokens);if(!model)throw new Error('harness_model_invalid');
+      model.maxOutputTokens=Math.min(model.maxOutputTokens,policy.limits.maxOutputTokens);
       const now=Date.now();
       const deadlineAt=allocationWindow?now+policy.limits.maxDurationMs:meta.deadlineAt;
       const allocated=await createHarnessRun(this.env.DB,{...meta,now,deadlineAt,actor:input.family==='review'?'admin':'star',snapshot:policy,model,limits:policy.limits});
