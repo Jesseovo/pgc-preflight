@@ -4,7 +4,7 @@
 
 `ccb-opus-provider-v1` 的旧镜像已完成真实渠道两轮验证，历史回执仍对应旧工具描述和镜像。工作区读取契约更新后，`ccb-opus-provider-v2` 固定新的原生工具数组哈希，沿用同一份合成材料及图片。2026-11-06，PGC 实现 `630303565f44c061c7ed8ad7b992dcc4e9db8929` 与镜像摘要 `sha256:0e95a0406e8dc94b0a4eea1f2cb62ff2a31ff48261d8fca87923d99ebfcec957` 完成 v2 真实两轮验证：每轮一次上游请求，分别以 `tool_use` 和 `end_turn` 结束，输出用量合计 85 Token，工具及产物校验通过。该回执确认 high／adaptive 与 64,000 输出上限参数被接受，没有实际生成 64k 输出，也没有验证完整游戏质量。独立核验确认原版恢复，研究资源清理完成；首次清理失败与后续恢复记录分别保留。详细 JSON 留在 ignored 私有目录。
 
-同批 [DeepSeek 审核通道](ccb-harness-deepseek-research.md) 首次请求收到上游 HTTP 401，未进行第二轮或自动重试。当前累计发出 7 次真实兼容请求，授权上限为 8 次；剩余一次不足以完成一次新的两轮验证。成品对照、完整审核及发布验收仍待完成，线上普通流程保持原版。
+同批 [DeepSeek 审核通道](ccb-harness-deepseek-research.md) 首次请求收到上游 HTTP 401，原失败记录保留。管理员更新凭据后，已在固定镜像和合成材料上完成真实两轮：各一次请求，HTTP 200，分别以 `tool_calls` 和 `stop` 结束，输出合计 91 Token；工具续轮、最终 JSON、账本结算和容器销毁校验通过。当前累计发出 9 次真实兼容请求，已达到用户批准的 9 次上限，无自动模型重试。成品对照、完整审核及发布验收仍待完成，线上普通流程保持原版。
 
 即使候选只接收 0% 常规流量，向 `pgc-preflight` 上传候选并改变活动部署列表也属于生产配置变更。既有发布计划把生产变更安排在验收之后，这次提前加入研究候选须单独确认，并安排在没有活跃平台付费任务的时段。真实模型兼容性测试已在原方案中获授权，无需重复索取模型 Key 或另行扩大模型调用范围。
 
@@ -24,7 +24,7 @@
 1. 经已批准的 Cloudflare 管理凭据，把候选上传到 `POST /accounts/{account}/workers/scripts/pgc-preflight/versions?bindings_inherit=strict`，使用 multipart，逐一附上原始模块和新模块。元数据使用候选入口、A 的兼容配置、`keep_assets: true`、`assets.config` 原样值，以及所有原绑定按名称显式 `inherit`。加入独立 D1、候选专用 HMAC Secret、`PGC_RESEARCH_VERSION` 版本元数据绑定和固定 `PGC_RESEARCH_MANIFEST`。不得带 DO 迁移、触发器更新或全局设置更新。上传前再次确认 A 同时是活动及最新版本。隔离实测验证了这套继承方式。Beta 上传仅传 A 的资产配置、没有资产令牌时，API 返回 10305。
 2. 按 B 的版本 UUID 读回模块、绑定、配置和资产路由。核对所有原模块字节、原绑定资源、实际 D1 ID、四个 DO 类及命名空间、迁移标签、兼容配置，并确认 A 仍独占活动流量。若上传结果未知，先按版本历史和候选哈希核对，勿重复上传。
 3. 用 Deployments API 提交精确的 `strategy: "percentage"`，按顺序列出 A 100 和 B 0，省略 `force`。读回新活动部署的两个 UUID 和精确比例。隔离 Worker 实测接受 0，虽然 API schema 标注最小值 0.01。保留原生产配置和触发器，不使用整体 Wrangler 发布代替单次比例更新。 [部署 API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/deployments/methods/create/)
-4. 在发起付费调用前，确认常规请求仍走 A，版本覆盖无效时回落 A，原资产字节符合基线。外部请求也能指定 B，必须验证无签名请求无法进入研究。B 的 Worker `fetch` 只接受固定研究计划和模型路径；其他进入 Worker 的路径直接拒绝。Cloudflare 可能在运行 Worker 前先返回按原规则公开的静态资产。独立 Runner 使用新的 Service Binding 请求固定 B，并在模型请求前核对计划响应的 HMAC 和实际版本 ID。 [版本覆盖](https://developers.cloudflare.com/workers/versions-and-deployments/version-overrides/)
+4. 在发起付费调用前，确认常规请求仍走 A，版本覆盖无效时回落 A，原资产字节符合基线。候选路由允许最多 120 秒的只读就绪等待，开始和成功时均核对精确的活动部署与最新候选；不能仅凭管理 API 已更新就发模型请求。外部请求也能指定 B，必须验证无签名请求无法进入研究。B 的 Worker `fetch` 只接受固定研究计划和模型路径；其他进入 Worker 的路径直接拒绝。Cloudflare 可能在运行 Worker 前先返回按原规则公开的静态资产。独立 Runner 使用新的 Service Binding 请求固定 B，并在模型请求前核对计划响应的 HMAC 和实际版本 ID。 [版本覆盖](https://developers.cloudflare.com/workers/versions-and-deployments/version-overrides/)
 5. 只在上述核对通过且获得真实模型调用授权后运行固定夹具。核对配置合同、图像与工具、两轮关联、Token 实际用量、受控错误和实例清理。遇到状态未知时保留账本和回执并查询原任务，不重发付费请求。只在私有记录中保存必要的脱敏数据。
 
 ## 回滚与清理
