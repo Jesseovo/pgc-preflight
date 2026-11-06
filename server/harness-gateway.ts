@@ -63,9 +63,23 @@ export interface HarnessNativeUsage {
   finishReason: HarnessFinishReason;
 }
 
+const upstreamErrorCategories = [
+  'KEY_QUEUE_FULL', 'KEY_RATE_LIMIT', 'UPSTREAM_STREAM_ERROR', 'REQUEST_OUTCOME_UNCERTAIN',
+  'overloaded_error', 'service_unavailable', 'api_error',
+] as const;
+type UpstreamErrorCategory = typeof upstreamErrorCategories[number];
+export type HarnessUpstreamErrorResponse = Readonly<{
+  category: UpstreamErrorCategory | 'unrecognized';
+  // Counts only bytes returned to this reader. Zero does not establish that
+  // the upstream produced no body.
+  bytesObserved: number;
+  bodyState: 'no-body' | 'parsed' | 'invalid-json' | 'oversize' | 'read-interrupted';
+}>;
+
 export interface HarnessNativeObserver {
   sent(at: number): void;
   head(status: number, at: number, headers?: Headers): void;
+  errorResponse?(detail: HarnessUpstreamErrorResponse): void;
   bytes(count: number, at: number): void;
   event(value: Record<string, unknown> | '[DONE]', at: number, name?: string): void;
   complete(usage: HarnessNativeUsage): void;
@@ -392,8 +406,15 @@ function upstreamHeaders(protocol: HarnessModelPolicy['protocol'], apiKey: strin
   return headers;
 }
 
-async function isKeyQueueFull(response: Response, signal: AbortSignal): Promise<boolean> {
-  if (response.status !== 503 || !response.body) return false;
+async function inspectUnavailableResponse(response: Response, signal: AbortSignal): Promise<{
+  keyQueueFull: boolean; errorResponse?: HarnessUpstreamErrorResponse;
+}> {
+  if (response.status !== 503) return { keyQueueFull: false };
+  let bytesObserved = 0;
+  const observed = (bodyState: HarnessUpstreamErrorResponse['bodyState'],
+    category: HarnessUpstreamErrorResponse['category'] = 'unrecognized', keyQueueFull = false) =>
+    ({ keyQueueFull, errorResponse: { category, bytesObserved, bodyState } });
+  if (!response.body) return observed('no-body');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let text = '';
@@ -401,13 +422,20 @@ async function isKeyQueueFull(response: Response, signal: AbortSignal): Promise<
     while (true) {
       const part = await abortable(reader.read(), signal);
       if (part.done) break;
+      bytesObserved += part.value.byteLength;
       text += decoder.decode(part.value, { stream: true });
-      if (text.length > 16 * 1024) return false;
+      if (text.length > 16 * 1024) return observed('oversize');
     }
-    const payload = JSON.parse(text + decoder.decode());
-    return object(payload) && object(payload.error) && payload.error.code === 'KEY_QUEUE_FULL';
+    let payload: unknown;
+    try { payload = JSON.parse(text + decoder.decode()); }
+    catch { return observed('invalid-json'); }
+    const error = object(payload) && object(payload.error) ? payload.error : null;
+    const category = upstreamErrorCategories.find(category => category === error?.code) ??
+      upstreamErrorCategories.find(category => category === error?.type);
+    // The diagnostic category does not decide whether a call can be retried.
+    return observed('parsed', category, error?.code === 'KEY_QUEUE_FULL');
   } catch {
-    return false;
+    return observed('read-interrupted');
   } finally {
     void reader.cancel().catch(() => {});
     reader.releaseLock();
@@ -504,8 +532,12 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
       if (upstream.ok) break;
 
       const throttled = upstream.status === 429;
-      const capacity = await isKeyQueueFull(upstream, signal);
-      if (throttled || capacity) {
+      const { keyQueueFull, errorResponse: errorDetail } = await inspectUnavailableResponse(upstream, signal);
+      if (errorDetail) {
+        // Optional telemetry must never change forwarding or settlement.
+        try { observer?.errorResponse?.(errorDetail); } catch {}
+      }
+      if (throttled || keyQueueFull) {
         potentiallyPaid = false;
         void upstream.body?.cancel().catch(() => {});
         const wait = Math.max(throttled ? 30_000 : 5_000, retryAfterMs(upstream.headers.get('retry-after'), now()) ?? 0);

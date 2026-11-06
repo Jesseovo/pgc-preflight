@@ -1,5 +1,5 @@
 import type { EmbeddedAssistantBlock, EmbeddedModelRequest } from './embedded-ccb/types';
-import { handleHarnessModelRequest, type HarnessGatewayOptions, type HarnessNativeObserver, type HarnessNativeUsage } from './harness-gateway';
+import { handleHarnessModelRequest, type HarnessGatewayOptions, type HarnessNativeObserver, type HarnessNativeUsage, type HarnessUpstreamErrorResponse } from './harness-gateway';
 import { harnessSha256, type HarnessRequestIdentity, type HarnessRun } from './harness-ledger';
 import { HARNESS_MODEL_HEADERS, type HarnessFinishReason, type HarnessModelPolicy } from './harness-protocol';
 import { retryAfterMs } from './model-throttle';
@@ -40,6 +40,7 @@ export type EmbeddedHarnessModelDiagnostics = {
   finishedAt: number | null;
   httpStatus: number | null;
   responseHeaders: Readonly<EmbeddedResponseHeaders> | null;
+  errorResponse: HarnessUpstreamErrorResponse | null;
   cancelReason: 'client_disconnected' | 'deadline' | null;
   byteCount: number;
   chunkCount: number;
@@ -394,6 +395,7 @@ function nativeObserver(model: HarnessModelPolicy, diagnostics: EmbeddedHarnessM
       diagnostics.responseHeadAt = at;
       if (headers) responseHeaders = safeResponseHeaders(headers, at).catch(() => null);
     },
+    errorResponse(detail) { diagnostics.errorResponse = Object.freeze({ ...detail }); },
     bytes(count, at) {
       diagnostics.firstByteAt ??= at;
       diagnostics.lastByteAt = at;
@@ -423,7 +425,7 @@ export async function runEmbeddedHarnessModel(request: EmbeddedModelRequest, sco
   options: EmbeddedHarnessGatewayOptions): Promise<EmbeddedHarnessModelResult> {
   const now = options.now ?? Date.now;
   const diagnostics: EmbeddedHarnessModelDiagnostics = { requestSentAt: null, responseHeadAt: null, firstByteAt: null,
-    lastByteAt: null, nativeTerminalAt: null, finishedAt: null, httpStatus: null, responseHeaders: null, cancelReason: null,
+    lastByteAt: null, nativeTerminalAt: null, finishedAt: null, httpStatus: null, responseHeaders: null, errorResponse: null, cancelReason: null,
     byteCount: 0, chunkCount: 0, nativeEventCount: 0 };
   const { model } = scope.run;
   const native = nativeObserver(model, diagnostics);

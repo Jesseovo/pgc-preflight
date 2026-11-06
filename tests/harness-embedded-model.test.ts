@@ -283,6 +283,56 @@ describe('embedded model native gateway', () => {
     for (const privateValue of [providerKey, cfRay, 'malformed private text', 'private=anything']) expect(stored).not.toContain(privateValue);
   });
 
+  it.each([
+    ['known code', JSON.stringify({ error: { code: 'UPSTREAM_STREAM_ERROR', type: 'api_error', message: providerKey } }), 'parsed', 'UPSTREAM_STREAM_ERROR'],
+    ['known type', JSON.stringify({ error: { type: 'service_unavailable', message: providerKey } }), 'parsed', 'service_unavailable'],
+    ['queue marker outside code', JSON.stringify({ error: { type: 'KEY_QUEUE_FULL', message: providerKey } }), 'parsed', 'KEY_QUEUE_FULL'],
+    ['unrecognized code and type', JSON.stringify({ error: { code: providerKey, type: providerKey, message: providerKey } }), 'parsed', 'unrecognized'],
+    ['invalid JSON', '{"error":' + providerKey, 'invalid-json', 'unrecognized'],
+    ['oversize', JSON.stringify({ error: { code: 'KEY_QUEUE_FULL', message: providerKey + 'x'.repeat(16_384) } }), 'oversize', 'unrecognized'],
+    ['empty stream', '', 'invalid-json', 'unrecognized'],
+    ['no readable body', null, 'no-body', 'unrecognized'],
+  ] as const)('preserves unknown 503 accounting for %s and captures only safe details', async (_name, body, bodyState, category) => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(body, { status: 503, headers: { 'Content-Type': 'application/json' } }));
+    const s = await setup(fetcher);
+    const error = await s.call('stage-0-unknown').catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ code: 'provider_unknown', diagnostics: { httpStatus: 503,
+      firstByteAt: null, nativeTerminalAt: null, errorResponse: { bodyState, category,
+        bytesObserved: body === null ? 0 : new TextEncoder().encode(body).byteLength } } });
+    expect(s.requests()).toEqual([expect.objectContaining({ state: 'unknown', attempts: 1, input_tokens: null, output_tokens: null })]);
+    expect(await s.summary()).toMatchObject({ status: 'unknown', outputTokens: 0, reservedTokens: 64_000 });
+    expect(JSON.stringify([error, s.requests()])).not.toContain(providerKey);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts only bytes actually read before a 503 body stream is interrupted', async () => {
+    const chunk = new TextEncoder().encode('{"error":');
+    let reads = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (reads++ === 0) controller.enqueue(chunk);
+        else controller.error(new Error(providerKey));
+      },
+    }, { highWaterMark: 0 }), { status: 503 }));
+    const s = await setup(fetcher);
+    const error = await s.call('stage-0-unknown').catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ code: 'provider_unknown', diagnostics: { errorResponse: {
+      category: 'unrecognized', bodyState: 'read-interrupted', bytesObserved: chunk.byteLength } } });
+    expect(reads).toBe(2);
+    expect(JSON.stringify(error)).not.toContain(providerKey);
+    expect(await s.summary()).toMatchObject({ status: 'unknown', reservedTokens: 64_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('records an explicit queue rejection without retrying in the embedded adapter', async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ error: { code: 'KEY_QUEUE_FULL', message: providerKey } }, { status: 503 }));
+    const s = await setup(fetcher);
+    await expect(s.call('stage-0-queue')).rejects.toMatchObject({ code: 'provider_rejected',
+      diagnostics: { errorResponse: { category: 'KEY_QUEUE_FULL', bodyState: 'parsed' } } });
+    expect(await s.summary()).toMatchObject({ status: 'failed', reservedTokens: 0 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it('honors lease, deadline and vision boundaries before forwarding and never retries HTTP 429', async () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(providerKey, { status: 429, headers: { 'Retry-After': '1' } }));
     const s = await setup(fetcher, { vision: false });
@@ -290,7 +340,7 @@ describe('embedded model native gateway', () => {
     await expect(s.call('stage-0-expired', {}, {}, { deadlineAt: Date.now() - 100 })).rejects.toMatchObject({ code: 'deadline' });
     await expect(s.call('stage-0-vision', { messages: [{ role: 'user', content: [image] }] })).rejects.toMatchObject({ code: 'invalid_request' });
     expect(fetcher).not.toHaveBeenCalled();
-    await expect(s.call('stage-0-first')).rejects.toMatchObject({ code: 'provider_rejected', diagnostics: { httpStatus: 429 } });
+    await expect(s.call('stage-0-first')).rejects.toMatchObject({ code: 'provider_rejected', diagnostics: { httpStatus: 429, errorResponse: null } });
     expect(s.requests()).toEqual([expect.objectContaining({ state: 'failed', attempts: 1 })]);
     expect(fetcher).toHaveBeenCalledTimes(1);
   });

@@ -134,7 +134,7 @@ async function setup(responses: Array<() => Response> = [() => wireText(initialT
     },
   });
   const run = () => sqlite.prepare('SELECT * FROM harness_runs WHERE task_id=?').get(taskId);
-  const requests = () => sqlite.prepare('SELECT generation,request_id,output_cap,input_tokens,output_tokens,state FROM harness_requests ORDER BY rowid').all();
+  const requests = () => sqlite.prepare('SELECT generation,request_id,output_cap,input_tokens,output_tokens,state,attempts FROM harness_requests ORDER BY rowid').all();
   return { DB, sqlite, fetcher, storage, BROWSER, input, makeEnv, run, requests, config };
 }
 
@@ -186,6 +186,24 @@ describe('embedded runtime in the existing task scope', () => {
     await clearHarnessRunnerStorage(verification, s.storage, taskId);
     await expect(finishEmbeddedTask(verification, taskId, 'completed')).resolves.toBeUndefined();
     expect(s.fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('stores only the closed 503 category and observed bytes in the durable diagnostics', async () => {
+    const privateMessage = 'synthetic-provider-key must never appear in the diagnostic row';
+    const payload = { error: { code: 'REQUEST_OUTCOME_UNCERTAIN', type: privateMessage, message: privateMessage } };
+    const s = await setup([() => Response.json(payload, { status: 503 })]);
+    await expect(embeddedHarnessCompletion(s.makeEnv('review'), s.input('review'))).rejects.toThrow('provider_unknown');
+    const row = s.sqlite.prepare('SELECT measurements,failure_code FROM harness_embedded_diagnostics').get() as
+      { measurements: string; failure_code: string };
+    expect(row.failure_code).toBe('provider_unknown');
+    expect(JSON.parse(row.measurements)).toMatchObject({ httpStatus: 503, nativeEventCount: 0, errorResponse: {
+      category: 'REQUEST_OUTCOME_UNCERTAIN', bodyState: 'parsed',
+      bytesObserved: new TextEncoder().encode(JSON.stringify(payload)).byteLength,
+    } });
+    expect(row.measurements).not.toContain('synthetic-provider-key');
+    expect(s.run()).toMatchObject({ status: 'unknown', reserved_tokens: 24_000, output_tokens: 0 });
+    expect(s.requests()).toEqual([expect.objectContaining({ state: 'unknown', output_tokens: null, input_tokens: null, attempts: 1 })]);
+    expect(s.fetcher).toHaveBeenCalledTimes(1);
   });
 
   it('does not recreate a lost context or forward another request after interrupted paid work', async () => {

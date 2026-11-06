@@ -270,16 +270,22 @@ describe('private harness model gateway', () => {
 
   it('bounds and meters a definitely rejected 503 retry using the original upstream key', async () => {
     vi.useFakeTimers();
+    const rejection = { error: { code: 'KEY_QUEUE_FULL', message: '测'.repeat(6500) } };
+    const errorResponse = vi.fn(() => { throw new Error('Synthetic telemetry failure'); });
     const fetcher = vi.fn<typeof fetch>()
-      .mockImplementationOnce(async () => Response.json({ error: { code: 'KEY_QUEUE_FULL' } }, { status: 503 }))
+      .mockImplementationOnce(async () => Response.json(rejection, { status: 503 }))
       .mockImplementationOnce(async () => stream(anthStream));
-    const s = await setup('anthropic', { fetcher });
+    const s = await setup('anthropic', { fetcher, nativeObserver: {
+      sent() {}, head() {}, bytes() {}, event() {}, complete() {}, errorResponse,
+    } });
     const pending = s.send('safe-retry');
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(5000);
     const response = await pending;
     expect(await response.text()).toBe(anthStream);
     expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(errorResponse).toHaveBeenCalledExactlyOnceWith({ category: 'KEY_QUEUE_FULL', bodyState: 'parsed',
+      bytesObserved: new TextEncoder().encode(JSON.stringify(rejection)).byteLength });
     const idempotencyKeys = fetcher.mock.calls.map(([, init]) => new Headers(init?.headers).get('idempotency-key'));
     expect(new Set(idempotencyKeys).size).toBe(1);
     expect(await s.summary()).toMatchObject({ modelTurns: 2, outputTokens: 900, reservedTokens: 0 });
