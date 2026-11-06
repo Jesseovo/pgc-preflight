@@ -25,6 +25,9 @@ function need(value:unknown,message:string):asserts value{if(!value)throw new Er
 
 async function requireTask(env:Environment,execution:HarnessExecution) {
   need(await authorizeHarnessTask(env,execution),'内嵌任务权限已失效。');
+  // An internal host may narrow a task's admission (for example an expiring
+  // single-case validation grant). It can never replace the normal checks.
+  need(!env.harnessExecutionGuard||await env.harnessExecutionGuard(execution),'内嵌任务执行授权已停止。');
   const row=await env.DB.prepare(`SELECT harness_policy FROM ${execution.family==='forge'?'forge_tasks':'review_jobs'} WHERE id=?`).bind(execution.taskId).first();
   need(canonicalHarness(parseHarnessPolicy(row?.harness_policy))===canonicalHarness(execution.policy),'内嵌任务策略与锁定记录不同。');
 }

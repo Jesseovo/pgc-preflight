@@ -290,6 +290,27 @@ describe('embedded runtime in the existing task scope', () => {
     expect(s.fetcher).not.toHaveBeenCalled();
   });
 
+  it('allows the internal admission guard only to narrow normal task permission', async () => {
+    const s=await setup([]),env=s.makeEnv('review');
+    env.harnessExecutionGuard=vi.fn(async()=>false);
+    await expect(embeddedHarnessCompletion(env,s.input('review'))).rejects.toThrow('执行授权已停止');
+    expect(s.requests()).toHaveLength(0);
+    expect(s.fetcher).not.toHaveBeenCalled();
+    env.harnessExecutionGuard=vi.fn(async()=>true);
+    s.sqlite.prepare('UPDATE review_jobs SET owner_id=? WHERE id=?').run('other-member',taskId);
+    await expect(embeddedHarnessCompletion(env,s.input('review'))).rejects.toThrow('权限');
+    expect(env.harnessExecutionGuard).not.toHaveBeenCalled();
+    expect(s.fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the internal admission guard before forwarding a paid request', async()=>{
+    const s=await setup([]),env=s.makeEnv('review');let admitted=true;
+    env.harnessExecutionGuard=async()=>admitted;
+    await expect(embeddedHarnessCompletion(env,{...s.input('review'),onStart:async()=>{admitted=false;}})).rejects.toThrow();
+    expect(s.fetcher).not.toHaveBeenCalled();
+    expect(s.requests()).toHaveLength(0);
+  });
+
   it('rejects unvalidated raw review output before archiving or sealing it', async () => {
     const raw = '{"unexpected":"raw provider output should not be stored"}';
     const s = await setup([() => wireText(raw)]);
