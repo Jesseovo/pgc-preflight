@@ -9,7 +9,7 @@ export interface PublicHarnessUsage {
 }
 
 export interface PublicHarnessTask {
-  engine: 'ccb';
+  engine: 'ccb' | 'ccb-embedded';
   usage: PublicHarnessUsage | null;
 }
 

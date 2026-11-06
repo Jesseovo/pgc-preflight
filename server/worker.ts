@@ -1,3 +1,4 @@
+import {purgeEmbeddedArtifacts} from './harness-embedded-artifacts';
 import puppeteer from '@cloudflare/puppeteer';
 import type { Browser } from 'puppeteer-core';
 import { inspectGame } from './checker';
@@ -134,6 +135,7 @@ const app = {
     await purgeReviewInputs(env);
     await recoverForgeTasks({...env,modelStore:configStore(env.DB)});
     await purgeOldForgeTasks(env.DB);
+    await purgeEmbeddedArtifacts(env.DB);
     await env.DB.prepare('DELETE FROM model_slots WHERE expires_at < ?').bind(Date.now()).run();
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ? AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE forge_tasks.owner_id=topics.owner_id AND executor='agent' AND scope=topics.owner_id||':game:'||topics.id AND status IN ('queued','running'))")

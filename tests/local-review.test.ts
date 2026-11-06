@@ -519,7 +519,7 @@ describe('成员 Agent 本地模型审核协议',()=>{
   it('本地任务不会触发兼容队列或模型alarm，残留alarm也不把本地任务标为失败',async()=>{
     const s=await setup(),job=await s.ready(),evaluate=vi.fn(),put=vi.fn(),setAlarm=vi.fn();
     await processReviewJob(s.env,job.id,evaluate);await executeDeviceReview(s.env,job.id);
-    const state={storage:{put,get:async()=>job.id,setAlarm,getAlarm:async()=>null,deleteAlarm:vi.fn(),deleteAll:vi.fn()}};
+    const state={storage:{put,get:async(key:string)=>key==='jobId'?job.id:undefined,setAlarm,getAlarm:async()=>null,deleteAlarm:vi.fn(),deleteAll:vi.fn()}};
     const runner=new ReviewRunner(state,s.env);expect((await runner.fetch(new Request('https://internal/schedule',{method:'POST',body:job.id}))).status).toBe(409);
     await runner.alarm();expect(put).not.toHaveBeenCalled();expect(setAlarm).not.toHaveBeenCalled();expect(evaluate).not.toHaveBeenCalled();expect(s.modelGet).not.toHaveBeenCalled();
     expect(await getReviewJob(s.env,job.id,'a')).toMatchObject({status:'running',model_executor:'agent'});

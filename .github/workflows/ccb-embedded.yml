@@ -1,0 +1,42 @@
+name: Embedded CCB validation
+
+on:
+  push:
+    branches: [codex/ccb-embedded-core]
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'src/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'migrations/**'
+      - 'package*.json'
+      - '.github/workflows/ccb-embedded.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: embedded-ccb-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.16.0'
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Verify existing Worker bundle without deploying
+        run: npx wrangler deploy --dry-run
+        env:
+          WRANGLER_SEND_METRICS: 'false'

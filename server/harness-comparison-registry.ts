@@ -219,7 +219,7 @@ async function openRegistryAuthority(options: AuthorityOptions) {
         mode === 'either' && ['running', 'done', 'error'].includes(row.status)));
     const policy = parseHarnessPolicy(row.harness_policy);
     need(same(policy, identity.harnessPolicy) && await digest(policy) === admission.policy_sha &&
-      (arm === 'A' ? !policy && !Object.hasOwn(row, 'harness_policy') : policy && policy.image === attestation.B.image && policy.releaseHash === grant.planSha256 &&
+      (arm === 'A' ? !policy && !Object.hasOwn(row, 'harness_policy') : policy?.engine==='ccb' && policy.image === attestation.B.image && policy.releaseHash === grant.planSha256 &&
         policy.modelContractHash === identity.modelContractHash && policy.family === (creation ? 'forge' : 'review') &&
         policy.purpose === (creation ? 'game' : 'review')));
     if (creation) {

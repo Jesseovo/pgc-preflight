@@ -198,7 +198,8 @@ export async function endHarnessRun(db: HarnessDatabase, id: HarnessRunIdentity,
   return outcome === 'done' ? current?.status === 'done' : current?.status === 'failed' || current?.status === 'unknown';
 }
 
-// Call only after the container host confirms this run's container is gone.
+// Call only after the selected executor confirms its resources are closed
+// (container for legacy CCB, original browser plus ended query for embedded CCB).
 export async function releaseHarnessSlot(db: HarnessDatabase, id: HarnessRunIdentity, now = Date.now()): Promise<void> {
   await db.prepare("UPDATE harness_runs SET released_at=? WHERE task_id=? AND generation=? AND status!='active' AND released_at IS NULL")
     .bind(now, id.taskId, id.generation).run();

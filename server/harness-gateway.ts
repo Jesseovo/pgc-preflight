@@ -52,6 +52,23 @@ export interface HarnessGatewayOptions {
   jsonOutput?: boolean;
   expectedModelTurns?: number;
   allowTransportRetry?: boolean;
+  /** Trusted in-process consumer only. The native event values must stay in memory. */
+  nativeObserver?: HarnessNativeObserver;
+}
+
+export interface HarnessNativeUsage {
+  inputTokens?: number;
+  outputTokens: number;
+  reasoningTokens?: number;
+  finishReason: HarnessFinishReason;
+}
+
+export interface HarnessNativeObserver {
+  sent(at: number): void;
+  head(status: number, at: number, headers?: Headers): void;
+  bytes(count: number, at: number): void;
+  event(value: Record<string, unknown> | '[DONE]', at: number, name?: string): void;
+  complete(usage: HarnessNativeUsage): void;
 }
 
 function errorResponse(code: GatewayErrorCode, status: number, protocol: HarnessModelPolicy['protocol'] | null = null): Response {
@@ -231,7 +248,7 @@ class StreamUsage {
     if (this.terminal) throw new StreamError('stream_invalid');
     if (this.protocol === 'openai' && data === '[DONE]') {
       this.terminal = true;
-      return;
+      return '[DONE]' as const;
     }
     let value: unknown;
     try { value = JSON.parse(data); } catch { throw new StreamError('stream_invalid'); }
@@ -267,6 +284,7 @@ class StreamUsage {
       }
       this.usage(value.usage, Boolean(this.finishReason));
     }
+    return value;
   }
 
   outcome() {
@@ -289,7 +307,8 @@ class StreamFrames {
   private event?: string;
   private bytes = 0;
 
-  constructor(private readonly usage: StreamUsage) {}
+  constructor(private readonly usage: StreamUsage,
+    private readonly observe?: (value: Record<string, unknown> | '[DONE]', name?: string) => void) {}
 
   add(bytes?: Uint8Array): { ordinary: string; terminal: string } {
     this.bytes += bytes?.length ?? 0;
@@ -314,7 +333,10 @@ class StreamFrames {
       if (this.frame.length > maxEventCharacters) throw new StreamError('stream_limit');
       offset = end;
       if (!line) {
-        if (this.event === 'error' || this.data.length) this.usage.accept(this.event, this.data.join('\n'));
+        if (this.event === 'error' || this.data.length) {
+          const value = this.usage.accept(this.event, this.data.join('\n'));
+          this.observe?.(value, this.event);
+        }
         (this.usage.terminal ? terminal : ordinary).push(this.frame);
         this.frame = '';
         this.data = [];
@@ -396,6 +418,11 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
   const db = options.DB;
   const capacityDB = options.capacityDB ?? db;
   const now = options.now ?? Date.now;
+  const observer = options.nativeObserver;
+  const observe = (operation: (target: HarnessNativeObserver) => void) => {
+    if (!observer) return;
+    try { operation(observer); } catch { throw new StreamError('stream_invalid'); }
+  };
   let protocol: HarnessModelPolicy['protocol'] | null = null;
   let id: HarnessRequestIdentity | undefined;
   let reserved = false;
@@ -467,10 +494,13 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
       if (!await forwardHarnessRequest(db, id, now(), options.reviewPhase)) throw new GatewayError('budget_or_state', 409);
       signal.throwIfAborted();
       const requestAt = now();
+      observe(target => target.sent(requestAt));
       potentiallyPaid = true;
       upstream = await abortable(fetcher(url, { method: 'POST', headers, body: upstreamBody, redirect: 'manual', signal }), signal);
-      firstResponseMs ??= Math.max(0, now() - requestAt);
+      const headAt = now();
+      firstResponseMs ??= Math.max(0, headAt - requestAt);
       httpStatus = upstream.status;
+      observe(target => target.head(upstream.status, headAt, upstream.headers));
       if (upstream.ok) break;
 
       const throttled = upstream.status === 429;
@@ -506,7 +536,7 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
 
     const reader = upstream.body.getReader();
     const usage = new StreamUsage(protocol, reservation.outputCap);
-    const frames = new StreamFrames(usage);
+    const frames = new StreamFrames(usage, observer ? (value, name) => observe(target => target.event(value, now(), name)) : undefined);
     const finalFrames: string[] = [];
     let finished = false;
     let finalize: Promise<void> | undefined;
@@ -546,10 +576,12 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
           while (!finished) {
             const part = await abortable(reader.read(), signal);
             if (finished) return;
+            if (!part.done) observe(target => target.bytes(part.value.byteLength, now()));
             const parsed = frames.add(part.done ? undefined : part.value);
             if (parsed.terminal) finalFrames.push(parsed.terminal);
             if (part.done) {
               const outcome = usage.outcome();
+              if (outcome.state === 'completed') observe(target => target.complete(outcome));
               if (!await settled(outcome)) throw new StreamError('deadline');
               if (finished) return;
               potentiallyPaid = false;

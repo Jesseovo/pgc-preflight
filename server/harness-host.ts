@@ -20,13 +20,18 @@ export async function authorizeHarnessTask(env:any,run:Pick<HarnessRun,'taskId'|
 
 // Private DO chunks, never a public artifact endpoint. Data is removed within
 // 24 hours even if the caller disappears after its paid request.
-export async function storeHarnessPrivate(storage:any,key:string,value:any){
+export async function storeHarnessPrivate(storage:any,key:string,value:any,commit?:(tx:any)=>Promise<void>){
   const text=JSON.stringify(value);if(new TextEncoder().encode(text).length>24*1024*1024)throw new Error('harness_material_limit');
   await storage.transaction(async(tx:any)=>{
-    const old=await tx.get(`${key}:parts`)||0,count=Math.ceil(text.length/24000);
-    for(let i=0;i<count;i++)await tx.put(`${key}:${i}`,text.slice(i*24000,(i+1)*24000));
+    const old=await tx.get(`${key}:parts`)||0;let count=0;
+    for(let start=0;start<text.length;){
+      let end=Math.min(text.length,start+24000);
+      if(end<text.length&&/[\uD800-\uDBFF]/.test(text[end-1]))end--;
+      await tx.put(`${key}:${count++}`,text.slice(start,end));start=end;
+    }
     for(let i=count;i<old;i++)await tx.delete(`${key}:${i}`);
     await tx.put(`${key}:parts`,count);
+    await commit?.(tx);
   });
 }
 export async function readHarnessPrivate(storage:any,key:string){
@@ -189,7 +194,7 @@ export class HarnessHost {
   private async start(input:any,meta?:Meta):Promise<Response>{
     const policy=parseHarnessPolicy(input.policy);
     const allocationWindow=input.startWindow==='allocation';
-    if(!policy||!phases.includes(input.phase)||!hash.test(input.sourceHash)||!hash.test(input.materialHash)||await harnessHash(canonicalHarness(input.materials))!==input.materialHash||
+    if(!policy||policy.engine!=='ccb'||!phases.includes(input.phase)||!hash.test(input.sourceHash)||!hash.test(input.materialHash)||await harnessHash(canonicalHarness(input.materials))!==input.materialHash||
       (input.startWindow!==undefined&&(!allocationWindow||policy.family!=='forge'||policy.purpose!=='game'||input.phase!=='build'||meta!==undefined))||
       (!allocationWindow&&(!Number.isSafeInteger(input.deadlineAt)||input.deadlineAt<=Date.now()||!Number.isSafeInteger(input.taskDeadlineAt)||input.taskDeadlineAt<input.deadlineAt)))return response({error:'harness_input_invalid'},400);
     if(!await authorizeHarnessTask(this.env,input))return response({error:'harness_task_denied'},403);

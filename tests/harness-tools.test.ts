@@ -40,7 +40,7 @@ function gate() {
 function fixture(storage = new TestStorage()) {
   const disconnect = vi.fn(async () => {});
   const closeOwn = vi.fn(async (_browserId: string) => {});
-  const launch = vi.fn(async (_deadline: number, acquired: (id: string) => Promise<void>, acquiring: () => Promise<void>) => {
+  const launch = vi.fn(async (_deadline: number, acquired: (id: string) => Promise<void>, acquiring: () => Promise<void>, _rejected: () => Promise<void>) => {
     await acquiring();
     await acquired('exact-acquired-browser');
     return { disconnect } as unknown as Browser;
@@ -188,6 +188,40 @@ describe('Harness isolated browser tools', () => {
     expect(next.play.mock.calls[0][3]).toBe(180_000 - 1100);
     expect(await first.storage.get('harness-browser-state')).toMatchObject({ shots: 2, activeMs: 2200 });
     await next.tools.close();
+  });
+
+  it('retries only the known rejected play acquisition and tracks the next exact browser', async () => {
+    const first = fixture();
+    first.launch.mockImplementationOnce(async (_deadline, acquired, acquiring, rejected) => {
+      await acquiring();
+      expect(await first.storage.get('harness-browser-state')).toMatchObject({ session: { acquisitionStarted: true } });
+      await rejected();
+      expect(await first.storage.get('harness-browser-state')).toMatchObject({ session: { acquisitionStarted: false } });
+      await acquiring();
+      await acquired('exact-browser-after-429');
+      return { disconnect: first.disconnect } as unknown as Browser;
+    });
+    const result = await first.tools.execute(call('play-start', 'play-retry', await version(html)), deadline());
+    expect(result.shots).toHaveLength(1);
+    await first.tools.close();
+    expect(first.closeOwn).toHaveBeenCalledExactlyOnceWith('exact-browser-after-429');
+  });
+
+  it('clears a rejected supplemental capture marker before retrying with a new browser', async () => {
+    const first = fixture();
+    const capture = first.capture.getMockImplementation()!;
+    first.capture.mockImplementationOnce(async (source, wait, at, options, lifecycle) => {
+      await lifecycle!.acquiring();
+      expect(await first.storage.get(pendingCaptureKey)).toMatchObject({ invocationId: 'capture-retry' });
+      await lifecycle!.rejected();
+      expect(await first.storage.get(pendingCaptureKey)).toBeNull();
+      return capture(source, wait, at, options, lifecycle);
+    });
+    const result = await first.tools.execute(call('capture', 'capture-retry', await version(html)), deadline());
+    expect(result.shots).toHaveLength(4);
+    expect(await first.storage.get(pendingCaptureKey)).toBeNull();
+    await first.tools.close();
+    expect(first.closeOwn).not.toHaveBeenCalled();
   });
 
   it('retains an unknown or legacy allocation without an ID and refuses to report it closed', async () => {

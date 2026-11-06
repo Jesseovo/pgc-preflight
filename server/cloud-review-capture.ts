@@ -6,9 +6,29 @@ import {recordReviewTiming} from './review-timing';
 
 export type CaptureBrowserLifecycle = {
   acquiring(): Promise<void>;
+  rejected(): Promise<void>;
   acquired(sessionId: string): Promise<void>;
   closed(sessionId: string): Promise<void>;
 };
+
+export class BrowserAcquireRateLimit extends Error {
+  constructor() { super('Browser acquisition rejected by HTTP 429.'); }
+}
+
+/** The pinned Puppeteer acquire implementation constructs this prefix from the
+ * HTTP status before appending the response body. Other errors are ambiguous. */
+export async function acquireTrackedBrowser<T>(
+  acquire: () => Promise<T>, rejected: () => Promise<void>, unknownMessage: string,
+): Promise<T> {
+  try { return await acquire(); }
+  catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith('Unable to create new browser: code: 429: message: ')) {
+      throw new Error(unknownMessage);
+    }
+    await rejected();
+    throw new BrowserAcquireRateLimit();
+  }
+}
 
 type BrowserSessionControl = {
   closeSession?: (sessionId: string) => Promise<{ status?: string } | string>;
@@ -69,12 +89,12 @@ export function captureFor(env: any) {
               ? puppeteer.acquire(env.BROWSER, { guardrails: { allowedDomains: [] }, recording: false })
               : puppeteer.acquire(env.BROWSER);
             await lifecycle.acquiring();
-            // A lost acquire response may have allocated a browser. Keep its
-            // marker and bypass the launch gate's ordinary rate-limit retry.
-            const result = await puppeteer.acquire(env.BROWSER, {
+            // Retire only a proven no-allocation response. A lost response or
+            // invalid payload must retain the marker and stop the launch gate.
+            const result = await acquireTrackedBrowser(() => puppeteer.acquire(env.BROWSER, {
               guardrails: { allowedDomains: [] }, recording: false,
               keep_alive: Math.max(10_000, Math.min(60_000, remaining())),
-            }).catch(() => { throw new Error('截图浏览器申请结果未确认。'); });
+            }), lifecycle.rejected, '截图浏览器申请结果未确认。');
             if (typeof result?.sessionId !== 'string' || !result.sessionId) throw new Error('截图浏览器缺少会话编号。');
             sessionId = result.sessionId;
             await lifecycle.acquired(sessionId);
@@ -83,7 +103,10 @@ export function captureFor(env: any) {
           return connectAcquiredBrowser(acquire, id => {
             if (lifecycle) checkDeadline();
             return puppeteer.connect(env.BROWSER,id);
-          }, onWait);
+          }, onWait).catch(error => {
+            if (!lifecycle || error instanceof BrowserAcquireRateLimit) throw error;
+            throw new Error(sessionId ? '已分配截图浏览器未完成连接。' : '截图浏览器申请结果未确认。');
+          });
         }, onWait, Math.min(240_000, remaining()));
         checkDeadline();
         status = 'ok';

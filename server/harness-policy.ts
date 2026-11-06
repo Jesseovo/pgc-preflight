@@ -3,10 +3,12 @@ import {inferenceOptions} from '../src/model-options';
 import {HARNESS_CCB_COMMIT,isHarnessImage} from './harness-protocol';
 
 export const CCB_ENGINE_COMMIT=HARNESS_CCB_COMMIT;
+export const EMBEDDED_CCB_VERSION='pgc-ccb-embedded-v1';
 export const HARNESS_GAME_LIMITS=Object.freeze({maxOutputTokens:64_000,maxTotalOutputTokens:256_000,maxModelTurns:24,maxDurationMs:40*60_000,maxRepairs:2});
 export type HarnessFamily='forge'|'review';
 export type HarnessLimits={maxOutputTokens:number;maxTotalOutputTokens:number;maxModelTurns:number;maxDurationMs:number;maxRepairs:number};
-export type HarnessPolicy={version:1;engine:'ccb';engineCommit:string;image:string;releaseHash:string;family:HarnessFamily;purpose:ModelPurpose;modelContractHash:string;limits:HarnessLimits};
+type HarnessPolicyBase={engineCommit:string;releaseHash:string;family:HarnessFamily;purpose:ModelPurpose;modelContractHash:string;limits:HarnessLimits};
+export type HarnessPolicy=HarnessPolicyBase&({version:1;engine:'ccb';image:string}|{version:2;engine:'ccb-embedded';coreVersion:typeof EMBEDDED_CCB_VERSION;contextWindowTokens:number});
 export type HarnessBinding={idFromName(name:string):unknown;get(id:unknown):{fetch(request:Request):Promise<Response>}};
 export type HarnessEnvironment={DB:any;HARNESS_ROLLOUT?:string;HARNESS_RELEASE?:string;HARNESS_RUNNER?:HarnessBinding;modelStore:{get():Promise<any>}};
 
@@ -23,9 +25,12 @@ export async function modelContractHash(config:any,purpose:ModelPurpose){
 export function parseHarnessPolicy(raw:unknown):HarnessPolicy|null{
   if(raw==null)return null;
   const p=typeof raw==='string'?JSON.parse(raw):raw as any;
-  if(p?.version!==1||p.engine!=='ccb'||p.engineCommit!==CCB_ENGINE_COMMIT||!isHarnessImage(p.image)||!['forge','review'].includes(p.family)||!/^[a-f0-9]{64}$/.test(p.releaseHash)||!/^[a-f0-9]{64}$/.test(p.modelContractHash)||!p.limits)throw new Error('任务的 Harness 版本或预算记录无效。');
+  const engine=p?.version===1&&p.engine==='ccb'&&isHarnessImage(p.image)||p?.version===2&&p.engine==='ccb-embedded'&&p.coreVersion===EMBEDDED_CCB_VERSION&&Number.isSafeInteger(p.contextWindowTokens)&&p.contextWindowTokens>=8192&&p.contextWindowTokens<=2_000_000&&p.image===undefined;
+  if(!engine||p.engineCommit!==CCB_ENGINE_COMMIT||!['forge','review'].includes(p.family)||!/^[a-f0-9]{64}$/.test(p.releaseHash)||!/^[a-f0-9]{64}$/.test(p.modelContractHash)||!p.limits)throw new Error('任务的 Harness 版本或预算记录无效。');
   for(const [key,cap] of Object.entries(HARNESS_GAME_LIMITS))if(!Number.isSafeInteger(p.limits[key])||p.limits[key]<0||p.limits[key]>cap)throw new Error('任务的 Harness 预算超出已批准范围。');
   if(!p.limits.maxOutputTokens||!p.limits.maxTotalOutputTokens||!p.limits.maxModelTurns||!p.limits.maxDurationMs)throw new Error('Harness 预算不能为空。');
+  if(p.engine==='ccb-embedded'&&(p.limits.maxTotalOutputTokens<p.limits.maxOutputTokens||p.purpose!=='game'&&p.limits.maxRepairs!==0))throw new Error('Harness 总预算或修复预算与任务类型不符。');
+  if(p.engine==='ccb-embedded'&&p.limits.maxOutputTokens>=p.contextWindowTokens)throw new Error('内嵌核心的上下文能力不足以容纳输出预算。');
   if(p.family==='review'&&(p.limits.maxTotalOutputTokens<2*p.limits.maxOutputTokens||p.limits.maxModelTurns<2))throw new Error('Harness 审核必须分别保留初评与复核预算。');
   if(!MODEL_PURPOSES.includes(p.purpose)||p.family==='review'&&p.purpose!=='review'||p.family==='forge'&&['review','review_verify'].includes(p.purpose))throw new Error('Harness 模型分组无效。');
   return p;
@@ -38,18 +43,22 @@ export async function newHarnessPolicy(env:HarnessEnvironment,ownerId:string,fam
   if(ownerId!=='admin'&&!await env.DB.prepare('SELECT 1 FROM review_pilot_members WHERE member_id=? AND pilot_enabled=1').bind(ownerId).first())return null;
   let release:any;
   try{release=JSON.parse(env.HARNESS_RELEASE||'null');}catch{throw new Error('Harness 发布验收记录无效，未改变执行来源。');}
-  if(!env.HARNESS_RUNNER||release?.engineCommit!==CCB_ENGINE_COMMIT||!isHarnessImage(release?.image)||release?.rightsConfirmed!==true||release?.providerCompatibilityVerified!==true||release?.comparisonAccepted!==true||release?.isolationVerified!==true||!/^[a-f0-9]{64}$/.test(release?.evidenceHash||''))throw new Error('Harness 尚未满足授权、隔离和对照验收条件。');
+  const embedded=release?.engine==='ccb-embedded';
+  if(release?.engine!==undefined&&!['ccb','ccb-embedded'].includes(release.engine))throw new Error('Harness 发布内核未知，未改变执行来源。');
+  const executionReady=embedded?release.coreVersion===EMBEDDED_CCB_VERSION&&release.coreParityVerified===true&&/^[a-f0-9]{64}$/.test(release.coreBundleSha256||''):!!env.HARNESS_RUNNER&&isHarnessImage(release?.image);
+  if(!executionReady||release?.engineCommit!==CCB_ENGINE_COMMIT||release?.rightsConfirmed!==true||release?.providerCompatibilityVerified!==true||release?.comparisonAccepted!==true||release?.isolationVerified!==true||!/^[a-f0-9]{64}$/.test(release?.evidenceHash||''))throw new Error('Harness 尚未满足授权、隔离和对照验收条件。');
   const config=await env.modelStore.get(),active=activeModelProfile(config,purpose),contract=await modelContractHash(config,purpose);
   if(!active?.profile.enabled||!active.profile.encryptedKey||!Array.isArray(release.compatibleModelContracts)||!release.compatibleModelContracts.includes(contract))throw new Error('当前模型配置尚未完成 Harness 兼容验证，未自动切换模型。');
   // Match explicit existing caller budgets, including the complete Opus brief.
   const requested=requestedMaxTokens??(purpose==='game'?64_000:purpose==='brief'&&/opus|claude/i.test(active.profile.model)?64_000:purpose==='review'?/deepseek/i.test(active.profile.model)?24_000:16_000:undefined);
   const max=inferenceOptions(active.profile,purpose,requested).maxTokens;
   const limits=purpose==='game'?{...HARNESS_GAME_LIMITS,maxOutputTokens:Math.min(64_000,max)}:{maxOutputTokens:max,maxTotalOutputTokens:family==='review'?max*2:max,maxModelTurns:family==='review'?8:6,maxDurationMs:12*60_000,maxRepairs:0};
-  return {version:1,engine:'ccb',engineCommit:CCB_ENGINE_COMMIT,image:release.image,releaseHash:release.evidenceHash,family,purpose,modelContractHash:contract,limits};
+  const common={engineCommit:CCB_ENGINE_COMMIT,releaseHash:release.evidenceHash,family,purpose,modelContractHash:contract,limits};
+  return parseHarnessPolicy(embedded?{...common,version:2,engine:'ccb-embedded',coreVersion:EMBEDDED_CCB_VERSION,contextWindowTokens:release.contextWindows?.[contract]}:{...common,version:1,engine:'ccb',image:release.image});
 }
 
 export function harnessPurpose(kind:string):ModelPurpose{return ({tag:'tags',suggest:'vocab','mechanism-check':'expand'} as Record<string,ModelPurpose>)[kind]||kind as ModelPurpose;}
 
 export function publicHarnessPolicy(raw:unknown){
-  const p=parseHarnessPolicy(raw);return p?{version:p.version,engine:p.engine,limits:p.limits}:null;
+  const p=parseHarnessPolicy(raw);return p?{version:p.version,engine:p.engine,limits:p.limits,...(p.engine==='ccb-embedded'?{coreVersion:p.coreVersion}:{})}:null;
 }

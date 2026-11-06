@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { reviewReportErrors } from '../server/review-report';
+import { EMBEDDED_CCB_VERSION } from '../server/harness-policy';
 import { HARNESS_CCB_COMMIT as engine, isHarnessImage } from '../server/harness-protocol';
 
 const baseline = '8afbf81c85c785f5d2d071dda9ecedba510b42ab';
@@ -22,9 +23,15 @@ type Kind = typeof recordKinds[number];
 type Ref = { path: string; sha256: string };
 type Checklist = { id: string; metric: 'core' | typeof metrics[number]; criterion: string };
 type Model = { name: string; config: Ref };
-type Settings = {
-  creationModel: Model; reviewModel: Model; rulesVersion: string; rules: Ref; calibration: Ref; harnessCommit: string; harnessImage: string;
+type SettingsBase = {
+  creationModel: Model; reviewModel: Model; rulesVersion: string; rules: Ref; calibration: Ref; harnessCommit: string;
 };
+export type EmbeddedComparisonIdentity = {
+  engine: 'ccb-embedded'; coreVersion: typeof EMBEDDED_CCB_VERSION; coreBundleSha256: string;
+};
+type ContainerSettings = SettingsBase & { engine?: never; harnessImage: string };
+type EmbeddedSettings = SettingsBase & EmbeddedComparisonIdentity;
+type Settings = ContainerSettings | EmbeddedSettings;
 type FrozenCase = { id: string; checklist: Checklist[]; materials: Record<string, string>; materialSha256: string };
 type Frozen = {
   schemaVersion: 1; frozenAt: string; cases: FrozenCase[]; settings: Settings | null;
@@ -39,6 +46,7 @@ type JudgmentState = 'verified' | 'failed' | 'unknown' | 'disputed';
 type Stage = {
   phase: string; status: 'completed' | 'failed'; startedAt: string; finishedAt: string;
   inputTokens: number | null; outputTokens: number | null; usageEvidence: Ref | null; failure: string | null;
+  embeddedComparison?: EmbeddedComparisonIdentity;
 };
 type ControllerUsage = { turns: number; repairs: number; evidence: Ref };
 type Creation = {
@@ -132,18 +140,30 @@ async function model(directory: string, value: unknown): Promise<Model> {
   return { name: code(data.name, 'model name'), config: await reference(directory, data.config, 'model configuration snapshot') };
 }
 async function settings(directory: string, value: unknown): Promise<Settings> {
-  const data = object(value, ['creationModel', 'reviewModel', 'rulesVersion', 'rules', 'calibration', 'harnessCommit', 'harnessImage'], 'settings');
+  const embedded = value !== null && typeof value === 'object' && (value as RecordData).engine === 'ccb-embedded';
+  const data = object(value, ['creationModel', 'reviewModel', 'rulesVersion', 'rules', 'calibration', 'harnessCommit',
+    ...(embedded ? ['engine', 'coreVersion', 'coreBundleSha256'] : ['harnessImage'])], 'settings');
   const creationModel = await model(directory, data.creationModel);
   need(creationModel.name === 'claude-opus-5-5', 'Creation requires the locked Claude Opus 5.5 model');
   const harnessCommit = str(data.harnessCommit, 'harness implementation commit');
   need(/^[a-f0-9]{40}$/.test(harnessCommit), 'Use the full harness implementation commit');
   const harnessImage = data.harnessImage;
-  need(isHarnessImage(harnessImage), 'Freeze the exact Cloudflare registry image digest');
+  let identity: EmbeddedComparisonIdentity | { harnessImage: string };
+  if (embedded) {
+    need(data.coreVersion === EMBEDDED_CCB_VERSION, 'Freeze the supported embedded CCB core version');
+    identity = { engine: 'ccb-embedded', coreVersion: data.coreVersion, coreBundleSha256: hash(data.coreBundleSha256, 'embedded core bundle') };
+  } else {
+    need(isHarnessImage(harnessImage), 'Freeze the exact Cloudflare registry image digest');
+    identity = { harnessImage };
+  }
   return {
-    creationModel, reviewModel: await model(directory, data.reviewModel), rulesVersion: code(data.rulesVersion, 'rules version'), harnessCommit, harnessImage,
+    creationModel, reviewModel: await model(directory, data.reviewModel), rulesVersion: code(data.rulesVersion, 'rules version'), harnessCommit, ...identity,
     rules: await reference(directory, data.rules, 'rules snapshot'),
     calibration: await reference(directory, data.calibration, 'calibration snapshot'),
   };
+}
+function embeddedIdentity(lock: Settings | null): EmbeddedComparisonIdentity | null {
+  return lock?.engine === 'ccb-embedded' ? { engine: lock.engine, coreVersion: lock.coreVersion, coreBundleSha256: lock.coreBundleSha256 } : null;
 }
 function fixedPaths(directory: string) {
   return {
@@ -156,15 +176,16 @@ function fixedPaths(directory: string) {
   };
 }
 function frozenWorkflows(lock: Settings | null) {
+  const implementation = embeddedIdentity(lock) ?? { image: lock && 'harnessImage' in lock ? lock.harnessImage : null };
   return {
     creation: {
       A: { implementationCommit: baseline, path: 'published-platform-v2', thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000 },
-      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000,
+      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, ...implementation, thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000,
         taskMaxOutputTokens: 256_000, taskMaxMs: 2_400_000, maxTurns: 24, maxRepairs: 2 },
     },
     review: {
       A: { implementationCommit: baseline, path: 'original-admin', mode: 'basic' },
-      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, path: 'new-admin', mode: 'basic' },
+      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, ...implementation, path: 'new-admin', mode: 'basic' },
     },
   };
 }
@@ -250,16 +271,30 @@ async function openRegistry(directory: string) {
   need(manifest.schemaVersion === 1 && Array.isArray(manifest.cases) &&
     JSON.stringify(manifest.cases.map(item => item?.id)) === JSON.stringify(cases), 'Frozen registry must contain the six registered cases in order');
   const validatedSettings = manifest.settings ? await settings(directory, manifest.settings) : null;
-  for (const item of manifest.cases) {
+  const embedded = embeddedIdentity(validatedSettings);
+  let checklists: FrozenCase[] | undefined;
+  if (embedded) {
+    const workflows = frozenWorkflows(validatedSettings);
+    need(isDeepStrictEqual(manifest.creation, workflows.creation) && isDeepStrictEqual(manifest.review, workflows.review),
+      'Frozen embedded workflows differ from the registered engine or budget');
+    checklists = JSON.parse(await readFile(join(fixtureRoot, 'checklists.json'), 'utf8')) as FrozenCase[];
+  }
+  for (const [index, item] of manifest.cases.entries()) {
+    if (checklists) {
+      const materials = Object.fromEntries(materialNames.map(name => [name, item.materials[name]]));
+      need(Object.keys(item.materials).length === materialNames.length && sha(jsonBytes(materials)) === item.materialSha256 &&
+        isDeepStrictEqual(item.checklist, checklists[index].checklist), 'Frozen embedded materials or checklist differ from the registered cases');
+    }
     for (const name of materialNames) {
       need(sha(await regularFileBytes(join(paths.materials, item.id, name))) === item.materials?.[name], 'Frozen material hash mismatch');
+      if (embedded) need(sha(await readFile(join(fixtureRoot, item.id, name))) === item.materials[name],
+        'Frozen embedded material differs from the fixed case fixture');
     }
   }
   return { directory, paths, manifest, manifestSha256, mapping, validatedSettings };
 }
 
-/** Read the sealed inputs required by the planner, without exposing the blind mapping or results. */
-export async function readFrozenComparison(directory: string, indexPath: string) {
+async function readFrozenComparisonInputs(directory: string, indexPath: string) {
   const registry = await openRegistry(directory);
   const { manifest, manifestSha256, validatedSettings } = registry;
   need(validatedSettings, 'Freeze model and rules snapshots before planning');
@@ -293,6 +328,19 @@ export async function readFrozenComparison(directory: string, indexPath: string)
   return { manifestSha256, materialIndexSha256: archived.sha256, cases: registeredCases,
     settings: validatedSettings, workflows, baseline, engine };
 }
+/** Read the sealed inputs required by the legacy container planner. */
+export async function readFrozenComparison(directory: string, indexPath: string) {
+  const frozen = await readFrozenComparisonInputs(directory, indexPath);
+  need(frozen.settings.engine === undefined, 'Container comparison planner cannot use an embedded registry');
+  return { ...frozen, settings: frozen.settings };
+}
+
+/** Read sealed embedded inputs without exposing the blind mapping or results. */
+export async function readFrozenEmbeddedComparison(directory: string, indexPath: string) {
+  const frozen = await readFrozenComparisonInputs(directory, indexPath);
+  need(frozen.settings.engine === 'ccb-embedded', 'Embedded comparison requires an embedded registry');
+  return { ...frozen, settings: frozen.settings };
+}
 type Registry = Awaited<ReturnType<typeof openRegistry>>;
 function oneCase(registry: Registry, caseId: unknown) {
   const item = registry.manifest.cases.find(row => row.id === caseId);
@@ -303,10 +351,22 @@ function oneArm(arm: unknown): Arm {
   need(arm === 'A' || arm === 'B', 'Unknown arm');
   return arm;
 }
-function provenance(registry: Registry, value: unknown) {
+function recordIdentityKeys(registry: Registry) {
+  return embeddedIdentity(registry.validatedSettings) ? ['embeddedComparison'] : [];
+}
+function checkRecordIdentity(registry: Registry, record: RecordData) {
+  const identity = embeddedIdentity(registry.validatedSettings);
+  if (identity) {
+    need(isDeepStrictEqual(record.embeddedComparison, identity), 'Record differs from the frozen embedded comparison identity');
+    need(!Object.hasOwn(record, 'image'), 'Embedded comparison records cannot declare a container image');
+  } else {
+    need(!Object.hasOwn(record, 'embeddedComparison'), 'Container comparison records cannot declare an embedded identity');
+  }
+}
+function provenance(registry: Registry, value: RecordData) {
   need(registry.manifest.settings, 'Freeze model and rules snapshots before importing actual results');
-  const record = value as RecordData;
-  need(record.manifestSha256 === registry.manifestSha256, 'Import does not reference the frozen manifest');
+  need(value.manifestSha256 === registry.manifestSha256, 'Import does not reference the frozen manifest');
+  checkRecordIdentity(registry, value);
   return registry.manifest.settings;
 }
 function statusOf(value: unknown): RunStatus {
@@ -331,6 +391,7 @@ function usage(value: unknown, label: string) {
   return value as number | null;
 }
 async function stage(registry: Registry, value: RecordData, window: ReturnType<typeof timing>) {
+  checkRecordIdentity(registry, value);
   const { status, startedAt, finishedAt, failure } = timing(value, window.startedAt ?? registry.manifest.frozenAt);
   need(status !== 'missing' && startedAt && finishedAt && window.finishedAt && Date.parse(finishedAt) <= Date.parse(window.finishedAt),
     'Stage timing is outside the actual run window');
@@ -338,7 +399,9 @@ async function stage(registry: Registry, value: RecordData, window: ReturnType<t
   const outputTokens = usage(value.outputTokens, 'output');
   const usageEvidence = value.usageEvidence === null ? null : await reference(registry.directory, value.usageEvidence, 'usage evidence');
   need((inputTokens === null && outputTokens === null) || usageEvidence, 'Actual token totals require an evidence reference');
-  return { phase: code(value.phase, 'phase'), status, startedAt, finishedAt, failure, inputTokens, outputTokens, usageEvidence };
+  const identity = embeddedIdentity(registry.validatedSettings);
+  return { phase: code(value.phase, 'phase'), status, startedAt, finishedAt, failure, inputTokens, outputTokens, usageEvidence,
+    ...(identity ? { embeddedComparison: identity } : {}) };
 }
 const stageKeys = ['phase', 'status', 'startedAt', 'finishedAt', 'failure', 'inputTokens', 'outputTokens', 'usageEvidence'];
 
@@ -346,13 +409,14 @@ function implementation(registry: Registry, arm: Arm) {
   return arm === 'A' ? baseline : registry.manifest.settings?.harnessCommit;
 }
 function armImage(registry: Registry, arm: Arm, image: unknown) {
-  const locked = arm === 'B' ? registry.manifest.settings?.harnessImage : undefined;
+  const settings = registry.validatedSettings;
+  const locked = arm === 'B' && settings?.engine === undefined ? settings?.harnessImage : undefined;
   need(image === locked, 'Run image differs from the frozen arm');
 }
 
 async function creation(registry: Registry, raw: unknown) {
   const data = object(raw, ['manifestSha256', 'caseId', 'arm', 'implementationCommit', 'image', 'materialSha256', 'modelConfigSha256',
-    'status', 'startedAt', 'finishedAt', 'failure', 'stages', 'html', 'blindSafe', 'attachments', 'controllerUsage'], 'creation run');
+    'status', 'startedAt', 'finishedAt', 'failure', 'stages', 'html', 'blindSafe', 'attachments', 'controllerUsage', ...recordIdentityKeys(registry)], 'creation run');
   const frozen = provenance(registry, data);
   const item = oneCase(registry, data.caseId);
   const arm = oneArm(data.arm);
@@ -360,7 +424,8 @@ async function creation(registry: Registry, raw: unknown) {
   need(data.implementationCommit === implementation(registry, arm) && data.materialSha256 === item.materialSha256 &&
     data.modelConfigSha256 === frozen.creationModel.config.sha256, 'Creation does not use the frozen implementation, material or model');
   const window = timing(data, registry.manifest.frozenAt);
-  const stages = await Promise.all(list(data.stages, 'creation stages').map(value => stage(registry, object(value, stageKeys, 'creation stage'), window)));
+  const stages = await Promise.all(list(data.stages, 'creation stages').map(value => stage(registry,
+    object(value, [...stageKeys, ...recordIdentityKeys(registry)], 'creation stage'), window)));
   const html = data.html === null ? null : await reference(registry.directory, data.html, 'exact delivered HTML');
   const attachments = await refs(registry.directory, data.attachments, 'private creation attachments');
   let controllerUsage: ControllerUsage | null = null;
@@ -400,7 +465,30 @@ function recordPath(registry: Registry, kind: Kind, key: string) {
   return join(registry.paths.records, `${kind}.${key}.json`);
 }
 async function load<T>(registry: Registry, kind: Kind, key: string): Promise<T | null> {
-  try { return await json(recordPath(registry, kind, key)) as T; }
+  try {
+    const path = recordPath(registry, kind, key);
+    const identity = embeddedIdentity(registry.validatedSettings);
+    const value = identity ? JSON.parse((await regularFileBytes(path)).toString('utf8')) as RecordData : await json(path);
+    if (identity) {
+      need(value && typeof value === 'object' && !Array.isArray(value), 'Invalid saved embedded comparison record');
+      const saved = value as RecordData;
+      provenance(registry, saved);
+      if (kind === 'creation' || kind === 'review') {
+        const arm = oneArm(saved.arm);
+        need(runKey(oneCase(registry, saved.caseId).id, arm) === key && saved.implementationCommit === implementation(registry, arm),
+          'Saved embedded result belongs to another arm or implementation');
+        const stages = kind === 'creation' ? list(saved.stages, 'saved creation stages') : [saved.initial, saved.verify].filter(stage => stage !== null);
+        for (const phase of stages) {
+          need(phase && typeof phase === 'object' && !Array.isArray(phase), 'Invalid saved embedded execution stage');
+          checkRecordIdentity(registry, phase as RecordData);
+        }
+      } else {
+        const expectedKey = kind === 'review-input' ? saved.caseId : kind === 'prerequisite' ? saved.name : saved.packetId;
+        need(expectedKey === key, 'Saved embedded record belongs to another slot');
+      }
+    }
+    return value as T;
+  }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
@@ -408,15 +496,17 @@ async function load<T>(registry: Registry, kind: Kind, key: string): Promise<T |
 }
 function runKey(caseId: string, arm: Arm) { return `${caseId}.${arm}`; }
 
-async function reviewInput(registry: Registry, raw: unknown) {
+async function reviewInput(registry: Registry, raw: unknown, saved = false) {
   const data = object(raw, ['manifestSha256', 'caseId', 'htmlSha256', 'probe', 'shots', 'evidenceSha256', 'blindSafe',
-    'observerId', 'observerType', 'independent', 'catalogExhaustive', 'catalog', 'catalogEvidence', 'disputes'], 'paired review input');
+    'observerId', 'observerType', 'independent', 'catalogExhaustive', 'catalog', 'catalogEvidence', 'disputes', ...recordIdentityKeys(registry),
+    ...(saved ? ['html', 'lockedAt'] : [])], 'paired review input');
   provenance(registry, data);
   const { id } = oneCase(registry, data.caseId);
   const selected = await load<Creation>(registry, 'creation', runKey(id, 'B'));
   need(selected?.status === 'completed' && selected.html && selected.html.sha256 === data.htmlSha256 && selected.blindSafe,
     'Paired review requires the exact blind-safe completed B HTML; no substitute');
   const html = await reference(registry.directory, selected.html, 'selected review HTML');
+  if (saved) need(isDeepStrictEqual(await reference(registry.directory, data.html, 'saved review HTML'), html), 'Saved review HTML differs from the selected artifact');
   const probe = await reference(registry.directory, data.probe, 'locked basic probe');
   await readBasicProbe(registry.directory, probe);
   const shots = await Promise.all(list(data.shots, 'locked viewport screenshots').map(value => reference(registry.directory, value, 'locked viewport screenshot')));
@@ -432,14 +522,14 @@ async function reviewInput(registry: Registry, raw: unknown) {
     return { id: code(critical.id, 'critical issue'), observation: str(critical.observation, 'critical observation'),
       evidence: await refs(registry.directory, critical.evidence, 'critical issue evidence', 1) };
   })), 'critical issue');
-  const lockedAt = new Date().toISOString();
+  const lockedAt = saved ? date(data.lockedAt, 'locked review evidence time') : new Date().toISOString();
   need(Date.parse(selected.finishedAt!) <= Date.parse(lockedAt), 'Review input cannot be locked before the selected creation finishes');
   return { ...data, caseId: id, observerId, lockedAt, html, probe, shots, evidenceSha256, catalog, catalogEvidence, disputes: disputes(data.disputes) };
 }
 
 async function review(registry: Registry, raw: unknown) {
   const data = object(raw, ['manifestSha256', 'caseId', 'arm', 'implementationCommit', 'image', 'status', 'startedAt', 'finishedAt',
-    'failure', 'initial', 'verify', 'initialReport', 'finalReport', 'blindSafe', 'attachments'], 'review run');
+    'failure', 'initial', 'verify', 'initialReport', 'finalReport', 'blindSafe', 'attachments', ...recordIdentityKeys(registry)], 'review run');
   const frozen = provenance(registry, data);
   const { id } = oneCase(registry, data.caseId);
   const arm = oneArm(data.arm);
@@ -452,7 +542,7 @@ async function review(registry: Registry, raw: unknown) {
   async function phase(rawPhase: unknown, phaseName: 'initial' | 'verify') {
     if (rawPhase === null) return null;
     const info = object(rawPhase, [...stageKeys, 'htmlSha256', 'evidenceSha256', 'modelConfigSha256', 'rulesSha256', 'calibrationSha256', 'image',
-      ...(phaseName === 'verify' ? ['initialReportSha256'] : [])], 'review stage');
+      ...recordIdentityKeys(registry), ...(phaseName === 'verify' ? ['initialReportSha256'] : [])], 'review stage');
     armImage(registry, arm, info.image);
     need(input && info.phase === phaseName && info.htmlSha256 === input.html.sha256 && info.evidenceSha256 === input.evidenceSha256 &&
       info.modelConfigSha256 === frozen.reviewModel.config.sha256 && info.rulesSha256 === frozen.rules.sha256 &&
@@ -605,7 +695,7 @@ const judgmentKeys = ['manifestSha256', 'packetId', 'packetSha256', 'observerId'
   'coverageComplete', 'coverageEvidence', 'disputes'];
 async function judgment(registry: Registry, raw: unknown, kind: RunKind) {
   const fields = kind === 'creation' ? ['checks', 'criticalDefects', 'unapprovedCoreChanges'] : ['mandatoryRemediations', 'criticalHits'];
-  const data = object(raw, [...judgmentKeys, ...fields], 'independent judgment');
+  const data = object(raw, [...judgmentKeys, ...fields, ...recordIdentityKeys(registry)], 'independent judgment');
   provenance(registry, data);
   const observerId = independent(data);
   need(data.blind === true && data.coverageComplete === true, 'Independent blinded judgment and complete coverage must be attested');
@@ -635,7 +725,7 @@ async function judgment(registry: Registry, raw: unknown, kind: RunKind) {
     mandatoryRemediations: await findings(registry.directory, data.mandatoryRemediations, 'mandatory remediation') } };
 }
 async function prerequisite(registry: Registry, raw: unknown) {
-  const data = object(raw, ['manifestSha256', 'name', 'confirmed', 'observerId', 'confirmedAt', 'evidence'], 'prerequisite');
+  const data = object(raw, ['manifestSha256', 'name', 'confirmed', 'observerId', 'confirmedAt', 'evidence', ...recordIdentityKeys(registry)], 'prerequisite');
   provenance(registry, data);
   need(data.name === 'rightsConfirmed' || data.name === 'providerCompatibilityVerified', 'Unknown prerequisite');
   need(data.confirmed === true && Date.parse(date(data.confirmedAt, 'confirmation time')) >= Date.parse(registry.manifest.frozenAt),
@@ -707,9 +797,11 @@ type RunSummary = {
 };
 export async function report(directory: string) {
   const registry = await openRegistry(directory);
+  const embeddedComparison = embeddedIdentity(registry.validatedSettings);
   const rows: { caseId: string; reviewInput: ReviewInput | null; runs: RunSummary[] }[] = [];
   for (const item of registry.manifest.cases) {
-    const input = await load<ReviewInput>(registry, 'review-input', item.id);
+    const savedInput = await load<ReviewInput>(registry, 'review-input', item.id);
+    const input = savedInput && embeddedComparison ? await reviewInput(registry, savedInput, true) : savedInput;
     const runs = await Promise.all(arms.map(async arm => {
       const key = runKey(item.id, arm);
       const savedCreation = await load<Creation>(registry, 'creation', key);
@@ -719,14 +811,20 @@ export async function report(directory: string) {
       for (const stage of [savedReview?.initial, savedReview?.verify]) {
         if (stage) armImage(registry, arm, stage.image);
       }
-      const created = savedCreation ?? emptyRun;
-      const reviewed = savedReview ?? emptyRun;
+      const created = savedCreation ? embeddedComparison ? await creation(registry, savedCreation) : savedCreation : emptyRun;
+      const reviewed = savedReview ? embeddedComparison ? await review(registry, savedReview) : savedReview : emptyRun;
       const createId = registry.mapping.find(row => row.caseId === item.id && row.arm === arm && row.kind === 'creation')!.id;
       const reviewId = registry.mapping.find(row => row.caseId === item.id && row.arm === arm && row.kind === 'review')!.id;
       const creationJudgment = await load<CreationJudgment & { packetSha256: string }>(registry, 'creation-judgment', createId);
       const reviewJudgment = await load<ReviewJudgment & { packetSha256: string }>(registry, 'review-judgment', reviewId);
-      if (creationJudgment) await validatePacket(registry, createId, creationJudgment.packetSha256);
-      if (reviewJudgment) await validatePacket(registry, reviewId, reviewJudgment.packetSha256);
+      if (creationJudgment) {
+        if (embeddedComparison) await judgment(registry, creationJudgment, 'creation');
+        else await validatePacket(registry, createId, creationJudgment.packetSha256);
+      }
+      if (reviewJudgment) {
+        if (embeddedComparison) await judgment(registry, reviewJudgment, 'review');
+        else await validatePacket(registry, reviewId, reviewJudgment.packetSha256);
+      }
       return { arm, creation: created, creationElapsedMs: elapsedMs(created), withinHarnessBudget: arm === 'B' ? budget(created) : null,
         review: reviewed, reviewElapsedMs: elapsedMs(reviewed), creationJudgment, reviewJudgment };
     }));
@@ -737,6 +835,10 @@ export async function report(directory: string) {
   }
   const rights = await load(registry, 'prerequisite', 'rightsConfirmed');
   const provider = await load(registry, 'prerequisite', 'providerCompatibilityVerified');
+  if (embeddedComparison) {
+    if (rights) await prerequisite(registry, rights);
+    if (provider) await prerequisite(registry, provider);
+  }
   await verifyReferences(registry, { rows, rights, provider });
 
   const byArm = arms.map(arm => {
@@ -794,7 +896,8 @@ export async function report(directory: string) {
   const prereqs = { rightsConfirmed: Boolean(rights), providerCompatibilityVerified: Boolean(provider) };
   const quality = !compared || !check.knownHarnessBudget ? 'not-ready' : Object.values(check).every(Boolean) ? 'passed' : 'failed';
   return { manifestSha256: registry.manifestSha256, cases: rows, arms: byArm,
-    registration: { settingsFrozen: Boolean(registry.manifest.settings), materialIndexSha256: registry.manifest.materialIndexSha256 ?? null },
+    registration: { settingsFrozen: Boolean(registry.manifest.settings), materialIndexSha256: registry.manifest.materialIndexSha256 ?? null,
+      ...(embeddedComparison ? { embeddedComparison } : {}) },
     registered: { creationRuns: 12, reviewPairs: 6, reviewRuns: 12 }, prerequisites: prereqs,
     prerequisiteEvidence: { rights, provider }, controlCeiling, improvedQualityMetrics: improved, checks: check, quality,
     releaseReady: quality === 'passed' && Object.values(prereqs).every(Boolean), modelCalls: 0,

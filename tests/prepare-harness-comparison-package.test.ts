@@ -69,6 +69,8 @@ test('binds the emitted modules and source receipts while keeping the package pr
   expect(JSON.parse(await readFile(join(output, 'package.json'), 'utf8'))).toEqual(receipt);
   expect(receipt).toMatchObject({
     kind: 'unactivated-formal-comparison-package', baseVersion: version,
+    sourceCommit: 'd67553ff2e42d716ae08c5d1e670521a368749c9', sourceWorkingTreeClean: true,
+    B: '630303565f44c061c7ed8ad7b992dcc4e9db8929',
     authorization: null, activationAllowed: false, deployed: false, qualityAcceptance: false,
     productionMutations: 0, providerCalls: 0, resourcesCreated: 0,
     compatibilityDate: '2026-10-23', privateWorkerFlags: ['nodejs_compat', 'enable_request_signal'],

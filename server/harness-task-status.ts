@@ -15,7 +15,7 @@ export function publicHarnessFields(rawPolicy: string | null | undefined, usage?
   const policy = rawPolicy ? publicHarnessPolicy(rawPolicy) : null;
   if (!policy) return {};
   const { maxOutputTokens, maxTotalOutputTokens, maxModelTurns, maxDurationMs, maxRepairs } = policy.limits;
-  return { harness: { version: policy.version, engine: policy.engine,
+  return { harness: { version: policy.version, engine: policy.engine,...(policy.engine==='ccb-embedded'?{coreVersion:policy.coreVersion}:{}),
     limits: { maxOutputTokens, maxTotalOutputTokens, maxModelTurns, maxDurationMs, maxRepairs }, usage: usage ?? null } };
 }
 

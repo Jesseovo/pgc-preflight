@@ -130,7 +130,7 @@ describe('成员设备授权及既有平台审核兼容',()=>{
   it('运行中断的alarm不会重放状态未知的模型请求；撤销设备立即失效',async()=>{
     const s=setup();const device=await s.device('a');const j=await s.legacySubmit();await s.claim();
     s.sqlite.prepare('UPDATE review_jobs SET evidence_ready=1,model_execution_started_at=?,model_started_at=? WHERE id=?').run('started','started',j.id);
-    const state={storage:{get:async()=>j.id,deleteAlarm:vi.fn(),deleteAll:vi.fn()}};
+    const state={storage:{get:async(key:string)=>key==='jobId'?j.id:undefined,deleteAlarm:vi.fn(),deleteAll:vi.fn()}};
     await new ReviewRunner(state,s.env).alarm();expect(generateReview).not.toHaveBeenCalled();
     expect(await (await s.call('job',{id:j.id})).json()).toMatchObject({status:'error',quota_charged:1});
     s.sqlite.prepare('UPDATE review_devices SET revoked=1 WHERE id=?').run(device);

@@ -4,10 +4,12 @@ import {readFileSync,readdirSync} from 'node:fs';
 import {advanceCreationPipeline,completeAgentCreation,creationChecks,creationEvidence,creationPipelineAlarm,lockCreationCapture,recordAgentCreationStage,validateAgentCreationCompletion,validateCreationOutput} from '../server/forge-creation-pipeline';
 import {digest,canonicalJson} from '../server/review-device-state';
 import {complete} from '../server/forge-llm';
+import {encryptKey} from '../server/settings';
+import {CCB_ENGINE_COMMIT,EMBEDDED_CCB_VERSION,modelContractHash} from '../server/harness-policy';
 
-vi.mock('../server/forge-llm',()=>({complete:vi.fn()}));
+vi.mock('../server/forge-llm',async original=>({...await original<typeof import('../server/forge-llm')>(),complete:vi.fn()}));
 const databases:DatabaseSync[]=[];
-afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.resetAllMocks();});
+afterEach(()=>{databases.splice(0).forEach(db=>db.close());vi.resetAllMocks();vi.restoreAllMocks();vi.unstubAllGlobals();});
 const html=(name:string)=>`<!doctype html><html><head><meta name="viewport" content="width=device-width"></head><body>${name}<script>document.body.onclick=()=>{}</script></body></html>`;
 const at='2026-11-05T00:00:00.000Z';
 const output=(name:string,extra={})=>({html:html(name),requirements:[{id:'goal',text:'Show the goal',status:'implemented'}],decisions:[],coreChanges:[],...extra});
@@ -484,4 +486,62 @@ it('keeps genuine supplemental originals available when the independent baseline
   const evidence=await creationEvidence(s.DB,'owner',1,s.id,'build');
   expect(evidence).toMatchObject({hash:null,shots:[],harnessEvidence:[supplemental]});
   expect(complete).toHaveBeenCalledTimes(1);
+});
+
+
+it('restores a sealed embedded build after the outer checkpoint fails and keeps the stage at task expiry', async()=>{
+  const s=setup('platform');
+  const actual=await vi.importActual<typeof import('../server/forge-llm')>('../server/forge-llm');
+  vi.mocked(complete).mockImplementation(actual.complete);
+  s.profile.baseUrl='https://riffle-api.pages.dev';
+  s.profile.encryptedKey=await encryptKey('synthetic-opus-key',s.env.SETTINGS_KEY);
+  const config=await s.env.modelStore.get();
+  s.sqlite.prepare('INSERT INTO settings(id,value,updated_at) VALUES(?,?,?)').run('model',JSON.stringify(config),new Date().toISOString());
+  const policy={version:2,engine:'ccb-embedded',engineCommit:CCB_ENGINE_COMMIT,coreVersion:EMBEDDED_CCB_VERSION,
+    contextWindowTokens:200_000,releaseHash:'a'.repeat(64),family:'forge',purpose:'game',modelContractHash:await modelContractHash(config,'game'),
+    limits:{maxOutputTokens:64_000,maxTotalOutputTokens:256_000,maxModelTurns:24,maxDurationMs:40*60_000,maxRepairs:2}};
+  s.sqlite.prepare('UPDATE forge_tasks SET harness_policy=? WHERE id=?').run(JSON.stringify(policy),s.id);
+  const {html:game,...record}=output('Sealed build');
+  const event=(type:string,value={})=>`event: ${type}\ndata: ${JSON.stringify({type,...value})}\n\n`;
+  const start=(id:string)=>event('message_start',{message:{id,role:'assistant',model:'claude-opus-5-5',content:[],usage:{input_tokens:10,output_tokens:0}}});
+  const stop=(reason:string)=>event('message_delta',{delta:{stop_reason:reason},usage:{output_tokens:20}})+event('message_stop');
+  const writes=[['game.html',game],['record.json',JSON.stringify(record)]].map(([path,content],index)=>
+    event('content_block_start',{index,content_block:{type:'tool_use',id:`fixture-write-${index}`,name:'write',input:{path,content,expectedSha256:null}}})+
+    event('content_block_stop',{index})).join('');
+  const acknowledgement=event('content_block_start',{index:0,content_block:{type:'text',text:'Saved both files.'}})+event('content_block_stop',{index:0});
+  const bodies=[start('synthetic-tool-turn')+writes+stop('tool_use'),start('synthetic-final-turn')+acknowledgement+stop('end_turn')];
+  let now=Date.now();
+  const clock=vi.spyOn(Date,'now').mockImplementation(()=>now);
+  const fetcher=vi.fn(async(url:URL)=>{
+    expect(String(url)).toBe('https://riffle-api.pages.dev/v1/messages');
+    const body=bodies.shift();if(!body)throw new Error('Unexpected provider invocation');
+    now+=8000; // Advance beyond Riffle's shared start interval without a real wait.
+    return new Response(body,{headers:{'content-type':'text/event-stream'}});
+  });
+  vi.stubGlobal('fetch',fetcher);
+  const put=s.storage.put;
+  const failures=vi.spyOn(s.storage,'put').mockImplementation(async(key,value)=>{
+    if(key==='creation:0'&&typeof value==='string'&&JSON.parse(value).phase==='output')throw new Error('Synthetic outer checkpoint interruption');
+    return put(key,value);
+  });
+  await creationPipelineAlarm(s.state,s.env,s.id);
+  expect(s.row(),s.row().error).toMatchObject({status:'running'});
+  expect(JSON.parse(await s.storage.get('creation:0')).phase).toBe('started');
+  const meta=await s.storage.get('embedded-harness-meta');
+  expect(meta).toMatchObject({state:'succeeded',phase:'build'});
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(s.sqlite.prepare('SELECT count(*) AS count FROM forge_creation_stages').get()).toMatchObject({count:0});
+  failures.mockRestore();
+
+  now=meta.deadlineAt+1;
+  try{
+    await creationPipelineAlarm(s.state,s.env,s.id);
+    await creationPipelineAlarm(s.state,s.env,s.id);
+  }finally{clock.mockRestore();}
+  expect(s.row()).toMatchObject({status:'error',error:expect.stringContaining('总时限')});
+  expect(s.sqlite.prepare('SELECT stage,content_hash,evidence_hash FROM forge_creation_stages').all()).toEqual([
+    {stage:'build',content_hash:await digest(game),evidence_hash:null},
+  ]);
+  expect(s.env.captureReview).not.toHaveBeenCalled();
+  expect(fetcher).toHaveBeenCalledTimes(2);
 });

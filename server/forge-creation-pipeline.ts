@@ -7,10 +7,12 @@ import {claimCreationModel} from './model-capacity';
 import {captureFor} from './cloud-review-capture';
 import {digest,canonicalJson,stamp,problem} from './review-device-state';
 import {failForgeTask} from './forge-tasks';
+import {ModelOutputError} from './model';
 import {parseProductionOutput} from './forge-production-output';
-import {finishHarnessTask,HarnessCapacityWait,harnessExecutionFor} from './harness-execution';
+import {finishHarnessTask,HarnessCapacityWait,harnessExecutionFor,clearHarnessRunnerStorage,hasEmbeddedPhaseSeal,EmbeddedHarnessSealError,embeddedCleanupOnlyKey} from './harness-execution';
 import {parseHarnessPolicy} from './harness-policy';
 import {HARNESS_MAX_REQUEST_MS} from './harness-protocol';
+import {captureEmbeddedBaseline} from './harness-embedded-capture';
 
 type AgentStage='build'|'polish'|'repair';
 type Stage=AgentStage|'repair2';
@@ -126,7 +128,7 @@ export async function lockCreationCapture(raw:any,stage:Stage,html:string,harnes
 async function access(env:any,row:any){
   if(row.owner_id==='admin')return;
   const member=await memberStore(env.DB).byId(row.owner_id);
-  if(!member?.enabled||!member.star)throw new Error('账号已停用或 Star 权限已撤销，制作已停止。');
+  if(!member?.enabled||!member.star)throw problem('账号已停用或 Star 权限已撤销，制作已停止。',403);
 }
 async function putCheckpoint(storage:any,cp:Checkpoint){
   const text=JSON.stringify(cp);
@@ -237,34 +239,42 @@ export async function creationPipelineAlarm(state:any,env:any,id:string){
     if(Number.isInteger(status)&&status>=400&&status<500)try{
       const row=await env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
       if(row)await failForgeTask(env,row,(error as Error).message);
-      await state.storage.deleteAll();return;
+      await clearHarnessRunnerStorage(env,state.storage,id);return;
     }catch{/* A transient database failure uses the checkpoint recovery path. */}
     const since=await state.storage.get('creationRecoverySince')||Date.now();
-    if(Date.now()-since>86400000){const row=await env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();if(row)await failForgeTask(env,row,'制作检查点恢复超过 24 小时，未自动重放模型。');await state.storage.deleteAll();return;}
+    if(Date.now()-since>86400000){const row=await env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();if(row)await failForgeTask(env,row,'制作检查点恢复超过 24 小时，未自动重放模型。');await clearHarnessRunnerStorage(env,state.storage,id);return;}
     await state.storage.put('creationRecoverySince',since);await state.storage.setAlarm(Date.now()+30000);
   }
 }
 export async function advanceCreationPipeline(state:any,env:any,id:string){
+  env={...env,harnessStorage:state.storage};
   const DB=env.DB,storage=state.storage;
   const row=await DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
-  if(!row||row.executor!=='platform'||row.creative_version!==2||row.kind!=='game'){await storage.deleteAll();return false;}
+  if(!row||row.executor!=='platform'||row.creative_version!==2||row.kind!=='game'){await clearHarnessRunnerStorage(env,storage,id);return false;}
   if(!['queued','running'].includes(row.status)){
-    if(row.harness_policy)await finishHarnessTask(env,id,row.status==='done'?'completed':'failed');
-    await storage.deleteAll();return false;
+    await clearHarnessRunnerStorage(env,storage,id,row.harness_policy?(row.status==='done'?'completed':'failed'):undefined);
+    return false;
+  }
+  if(await storage.get(embeddedCleanupOnlyKey)){
+    await failForgeTask(env,row,'制作检查点已超过私有材料保留期，未重放模型请求。');
+    await clearHarnessRunnerStorage(env,storage,id);return false;
   }
   let cp=await getCheckpoint(storage);
   let harness;
-  try{harness=parseHarnessPolicy(row.harness_policy);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
-  try{await access(env,row);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
-  if((!cp||cp.phase==='ready')&&Date.now()-Date.parse(row.created_at)>86400000){await failForgeTask(env,row,'制作等待超过 24 小时；已完成版本保留，请明确重试。');await storage.deleteAll();return false;}
+  try{harness=parseHarnessPolicy(row.harness_policy);}catch(e){await failForgeTask(env,row,(e as Error).message);await clearHarnessRunnerStorage(env,storage,id);return false;}
+  try{await access(env,row);}catch(e){
+    if((e as {status?:number})?.status!==403)throw e;
+    await failForgeTask(env,row,(e as Error).message);await clearHarnessRunnerStorage(env,storage,id);return false;
+  }
+  if((!cp||cp.phase==='ready')&&Date.now()-Date.parse(row.created_at)>86400000){await failForgeTask(env,row,'制作等待超过 24 小时；已完成版本保留，请明确重试。');await clearHarnessRunnerStorage(env,storage,id);return false;}
   if(!cp){
-    if(row.model_started_at){await failForgeTask(env,row,'制作模型结果未知，未自动重复生成。');await storage.deleteAll();return false;}
+    if(row.model_started_at){await failForgeTask(env,row,'制作模型结果未知，未自动重复生成。');await clearHarnessRunnerStorage(env,storage,id);return false;}
     const snapshot=JSON.parse(row.input_snapshot||'null');
-    if(!snapshot?.topic?.brief_md?.trim()){await failForgeTask(env,row,'完整制作需要先生成策划书。');await storage.deleteAll();return false;}
+    if(!snapshot?.topic?.brief_md?.trim()){await failForgeTask(env,row,'完整制作需要先生成策划书。');await clearHarnessRunnerStorage(env,storage,id);return false;}
     const config=await env.modelStore.get(),profiles=Object.fromEntries(Object.entries(modelProfiles(config)).filter(([,profile])=>profile?.vision!==false));
     const visualConfig=harness?config:config&&Object.keys(profiles).length?{...config,profiles}:null;
     const selected=activeModelProfile(visualConfig,'game');
-    if(!selected||selected.profile.vision===false){await failForgeTask(env,row,'完整制作与精修需要已启用并支持视觉的 Claude Opus 5.5。');await storage.deleteAll();return false;}
+    if(!selected||selected.profile.vision===false){await failForgeTask(env,row,'完整制作与精修需要已启用并支持视觉的 Claude Opus 5.5。');await clearHarnessRunnerStorage(env,storage,id);return false;}
     cp={phase:'ready',stage:'build',snapshot,config:visualConfig,createdAt:Date.now()};
     await putCheckpoint(storage,cp);
     await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(harness?null:stamp(),stamp(),stamp(),id).run();
@@ -275,31 +285,36 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
   const awaitingAllocation=harness&&cp.stage==='build'&&deadlineAt===undefined;
   const expired=()=>deadlineAt!==undefined&&Date.now()>=deadlineAt;
   const deadlineFailure='制作任务已到达总时限；已完成的阶段版本保留，未自动重发模型请求。';
-  if(expired()&&cp.phase!=='captured'&&cp.phase!=='publish'){
+  const recovering=cp.phase==='started'&&harness?.engine==='ccb-embedded'&&await hasEmbeddedPhaseSeal(storage,id,cp.stage);
+  if(expired()&&!recovering&&cp.phase!=='captured'&&cp.phase!=='publish'){
     if(cp.phase==='output')await persistStage(DB,row,cp);
-    await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;
+    await failForgeTask(env,row,deadlineFailure);await clearHarnessRunnerStorage(env,storage,id);return false;
   }
-  if(cp.phase==='started'||cp.phase==='failed'){
-    await failForgeTask(env,row,cp.phase==='started'?'制作阶段中断，模型结果未知；已完成版本保留，未自动重发请求。':cp.failure||'制作阶段失败；已完成版本保留，请明确重试。');await storage.deleteAll();return false;
+  if((cp.phase==='started'&&!recovering)||cp.phase==='failed'){
+    await failForgeTask(env,row,cp.phase==='started'?'制作阶段中断，模型结果未知；已完成版本保留，未自动重发请求。':cp.failure||'制作阶段失败；已完成版本保留，请明确重试。');await clearHarnessRunnerStorage(env,storage,id);return false;
   }
-  if(cp.phase==='ready'){
+  if(cp.phase==='ready'||recovering){
     let lease:Awaited<ReturnType<typeof claimCreationModel>>;
-    try{lease=harness?{config:cp.config,reserved:false,lease:{release:async()=>{}}}:await claimCreationModel(DB,cp.config,env.SETTINGS_KEY,'game',`${id}:${cp.stage}`);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
+    try{lease=harness?{config:cp.config,reserved:false,lease:{release:async()=>{}}}:await claimCreationModel(DB,cp.config,env.SETTINGS_KEY,'game',`${id}:${cp.stage}`);}catch(e){await failForgeTask(env,row,(e as Error).message);await clearHarnessRunnerStorage(env,storage,id);return false;}
     if(!lease){await progress(DB,id,`${cp.stage}:waiting`,'等待制作模型名额…',Date.now());await storage.setAlarm(Date.now()+5000);return false;}
     let uncertain=false,output:any;
     let timer:ReturnType<typeof setInterval>|undefined;
     try{
       const active=activeModelProfile(lease.config,'game');if(!active)throw new Error('制作模型未配置。');
       // Freeze a single selected profile, including key/config, for all stages.
-      if(cp.stage==='build')cp.config={...active.profile,activeProfile:active.id,profiles:{[active.id]:active.profile},routes:{create:active.id,review:active.id}};
-      cp.phase='started';cp.stageStartedAt=Date.now();await putCheckpoint(storage,cp);
-      const stageDeadline=Math.min(deadlineAt??Infinity,cp.stageStartedAt+HARNESS_MAX_REQUEST_MS);
-      await storage.setAlarm(Math.min(deadlineAt??Infinity,cp.stageStartedAt+14*60000));
-      await progress(DB,id,`${cp.stage}:${awaitingAllocation?'waiting':'model'}`,awaitingAllocation?'等待隔离执行名额…':labels[cp.stage],cp.stageStartedAt);
-      timer=setInterval(()=>{void DB.prepare("UPDATE forge_tasks SET updated_at=? WHERE id=? AND status='running'").bind(stamp(),id).run().catch(()=>{});},30000);
+      if(!recovering){
+        if(cp.stage==='build')cp.config={...active.profile,activeProfile:active.id,profiles:{[active.id]:active.profile},routes:{create:active.id,review:active.id}};
+        cp.phase='started';cp.stageStartedAt=Date.now();await putCheckpoint(storage,cp);
+        await storage.setAlarm(Math.min(deadlineAt??Infinity,cp.stageStartedAt+14*60000));
+        await progress(DB,id,`${cp.stage}:${awaitingAllocation?'waiting':'model'}`,awaitingAllocation?'等待隔离执行名额…':labels[cp.stage],cp.stageStartedAt);
+        timer=setInterval(()=>{void DB.prepare("UPDATE forge_tasks SET updated_at=? WHERE id=? AND status='running'").bind(stamp(),id).run().catch(()=>{});},30000);
+      }
+      const stageStartedAt=cp.stageStartedAt!;
+      const stageDeadline=Math.min(deadlineAt??Infinity,stageStartedAt+HARNESS_MAX_REQUEST_MS);
       const s=cp.snapshot;
       const input={topic:s.topic,brief:s.topic.brief_md,styleSvg:s.topic.preview_svg||'',assetHtml:s.topic.assets_html||'',html:cp.previous?.html,capture:cp.previousCapture,selfCheck:cp.previous?.selfCheck,requirements:cp.previous?.requirements,decisions:cp.previous?.decisions,coreChanges:cp.previous?.coreChanges,harnessEvidence:cp.harnessEvidence};
-      const harnessExecution=harness?harnessExecutionFor(row,'forge',cp.stage,await digest(row.input_snapshot||'null'),deadlineAt??cp.stageStartedAt+harness.limits.maxDurationMs):undefined;
+      const harnessExecution=harness?harnessExecutionFor(row,'forge',cp.stage,await digest(row.input_snapshot||'null'),deadlineAt??stageStartedAt+harness.limits.maxDurationMs):undefined;
+      if(harnessExecution&&recovering)harnessExecution.recoverSealed=true;
       if(harnessExecution)harnessExecution.onEvidence=async evidence=>{
         const sealed=await verifyHarnessEvidence(evidence);
         if(cp!.harnessEvidence?.some((record,index)=>sealed[index]?.evidenceHash!==record.evidenceHash)){
@@ -308,7 +323,7 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
         cp!.harnessEvidence=sealed;
       };
       if(harnessExecution&&cp.previous?.html)harnessExecution.previousHtml=cp.previous.html;
-      if(harnessExecution&&awaitingAllocation)harnessExecution.onAllocated=async clock=>{
+      if(harnessExecution&&awaitingAllocation&&!recovering)harnessExecution.onAllocated=async clock=>{
         cp!.harnessDeadlineAt=clock.taskDeadlineAt;cp!.stageStartedAt=clock.startedAt;
         await putCheckpoint(storage,cp!);
         await storage.setAlarm(Math.min(clock.taskDeadlineAt,clock.stageDeadlineAt+2*60000));
@@ -334,11 +349,12 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
         if(errors.length)throw problem(`制作阶段结构或版本证据不完整：${errors.join('、')}`);
       }
     }catch(e){
+      if(recovering&&!(e instanceof EmbeddedHarnessSealError||e instanceof ModelOutputError)&&!((e as any)?.status>=400&&(e as any)?.status<500))throw e;
       if(e instanceof HarnessCapacityWait&&cp.stage==='build'&&cp.harnessDeadlineAt===undefined){
         cp.phase='ready';cp.stageStartedAt=undefined;await putCheckpoint(storage,cp);
         await progress(DB,id,'build:waiting',e.message,Date.now());await storage.setAlarm(Date.now()+5000);return false;
       }
-      cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await storage.deleteAll();return false;
+      cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await clearHarnessRunnerStorage(env,storage,id);return false;
     }
     finally{clearInterval(timer);if(!uncertain)await lease.lease.release().catch(()=>{});}
     cp.output=output;cp.phase='output';
@@ -353,11 +369,14 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     await progress(DB,id,`${cp.stage}:capture`,`${labels[cp.stage]}已保存，正在采集三种手机比例…`,Date.now());
     let capture:any,error:any;
     for(let attempt=0;attempt<2&&!expired();attempt++)try{
-      capture=await (env.captureReview||captureFor({...env,creationCaptureStrict:true}))(cp.output.html,async(message:string)=>progress(DB,id,`${cp!.stage}:capture`,message),deadlineAt);
+      const onWait=async(message:string)=>progress(DB,id,`${cp!.stage}:capture`,message);
+      capture=await (harness?.engine==='ccb-embedded'
+        ?captureEmbeddedBaseline(env,storage,cp.output.html,onWait,deadlineAt!)
+        :(env.captureReview||captureFor({...env,creationCaptureStrict:true}))(cp.output.html,onWait,deadlineAt));
       break;
     }catch(e){error=e;}
-    if(!capture||expired()){await failForgeTask(env,row,expired()?deadlineFailure:`采集未完成，已保存阶段版本：${error instanceof Error?error.message:'环境不可用'}`);await storage.deleteAll();return false;}
-    try{cp.capture=await lockCreationCapture(capture,cp.stage,cp.output.html,await supplementalHash(cp));}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
+    if(!capture||expired()){await failForgeTask(env,row,expired()?deadlineFailure:`采集未完成，已保存阶段版本：${error instanceof Error?error.message:'环境不可用'}`);await clearHarnessRunnerStorage(env,storage,id);return false;}
+    try{cp.capture=await lockCreationCapture(capture,cp.stage,cp.output.html,await supplementalHash(cp));}catch(e){await failForgeTask(env,row,(e as Error).message);await clearHarnessRunnerStorage(env,storage,id);return false;}
     cp.phase='captured';await putCheckpoint(storage,cp);return true;
   }
   if(cp.phase==='captured'){
@@ -367,7 +386,7 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
       cp.stage==='polish'&&requestsRepair?'repair':
       cp.stage==='repair'&&requestsRepair&&(harness?.limits.maxRepairs??0)>1?'repair2':null;
     if(next){
-      if(expired()){await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;}
+      if(expired()){await failForgeTask(env,row,deadlineFailure);await clearHarnessRunnerStorage(env,storage,id);return false;}
       cp={...cp,stage:next,phase:'ready',previous:cp.output,previousCapture:cp.capture,output:undefined,capture:undefined,versionId:undefined};
       // Each paid stage has its own bounded alarm invocation, rather than
       // accumulating two twelve-minute calls in one event lifetime.
@@ -377,7 +396,7 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
   }
   if(cp.phase==='publish'){
     if(harness)await finishHarnessTask(env,id,'completed');
-    await publish(DB,row,cp);await storage.deleteAll();return false;
+    await publish(DB,row,cp);await clearHarnessRunnerStorage(env,storage,id);return false;
   }
   throw new Error('未知制作检查点。');
 }

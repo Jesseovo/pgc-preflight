@@ -7,8 +7,9 @@ import { deviceOwnerAllowed, failDeviceReview, readReviewInput, stamp } from './
 import { updateReviewProgress } from './review-jobs';
 import { captureFor } from './cloud-review-capture';
 import {recordReviewTiming,markReviewExecution,recordReviewConfiguration,hashReviewConfiguration,type ReviewTimingPhase} from './review-timing';
-import {harnessExecutionFor,finishHarnessTask} from './harness-execution';
-import {harnessHash,canonicalHarness} from './harness-policy';
+import {harnessExecutionFor,finishHarnessTask,clearHarnessRunnerStorage,hasEmbeddedPhaseSeal,EmbeddedHarnessSealError,embeddedCleanupOnlyKey} from './harness-execution';
+import {harnessHash,canonicalHarness,parseHarnessPolicy} from './harness-policy';
+import {captureEmbeddedBaseline} from './harness-embedded-capture';
 
 type Phase = 'prepared' | 'review-started' | 'draft-ready' | 'verify-started' | 'final-ready';
 type Checkpoint = { deadline: number; config: any; request: any; images: any[]; probe: any; title: string; topic_id: number | null; draft?: any; result?: any; materialRef?:string };
@@ -79,7 +80,7 @@ async function recordConfiguration(DB:any,id:string,data:Checkpoint,rulesSnapsho
     await recordReviewConfiguration(DB,id,{model:profile.model,effort,configHash,origin:'server'});
   }catch{/* Configuration telemetry never replays a completed paid stage. */}
 }
-const clear = async (storage: any) => { await storage.deleteAlarm(); await storage.deleteAll(); };
+const clear = async (storage: any,env:any,id:string) => { await clearHarnessRunnerStorage(env,storage,id); await storage.deleteAlarm(); };
 
 // Only administrator/legacy platform cloud work reaches this runner. Member
 // Agent tasks and device captures keep their own protocol and never use a key.
@@ -93,15 +94,20 @@ export async function cloudReviewAlarm(state: any, env: any, id: string) {
     // exact checkpoint and re-enter it later. Started phases still fail closed
     // on recovery; this is not a new provider request. Bound abandoned storage.
     const since=await state.storage.get('cloudRecoverySince')||Date.now();
-    if(Date.now()-since>=86400000){await clear(state.storage);return;}
+    if(Date.now()-since>=86400000){await clear(state.storage,env,id);return;}
     await state.storage.put('cloudRecoverySince',since);
     await state.storage.setAlarm(Date.now()+30000);
   }
 }
 export async function advanceCloudReview(state: any, env: any, id: string) {
+  env={...env,harnessStorage:state.storage};
   const DB = env.DB, storage = state.storage;
   const row = await DB.prepare('SELECT * FROM review_jobs WHERE id=?').bind(id).first();
-  if (!row || row.executor !== 'cloud' || row.model_executor !== 'platform' || !['queued', 'running'].includes(row.status)) { await clear(storage); return; }
+  if (!row || row.executor !== 'cloud' || row.model_executor !== 'platform' || !['queued', 'running'].includes(row.status)) { await clear(storage,env,id); return; }
+  if(await storage.get(embeddedCleanupOnlyKey)){
+    await failDeviceReview(DB,id,'后台审核检查点已超过私有材料保留期，未重放模型请求。');
+    await clear(storage,env,id);return;
+  }
   const phase: Phase | undefined = await storage.get('cloudPhase');
   if(!phase){
     const persisted=await DB.prepare('SELECT id FROM reviews WHERE job_id=?').bind(id).first();
@@ -111,7 +117,7 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
         ...['review_inputs','review_evidence','review_material'].map(t=>DB.prepare(`DELETE FROM ${t} WHERE job_id=? AND EXISTS(SELECT 1 FROM review_jobs WHERE id=? AND status='done')`).bind(id,id)),
       ]);
       await markReviewExecution(DB,id,'done').catch(()=>{});
-      await clear(storage);return;
+      await clear(storage,env,id);return;
     }
   }
   // Once the final model output is durable, database recovery is safe: retry
@@ -128,15 +134,21 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
       ...['review_inputs', 'review_evidence', 'review_material'].map(t => DB.prepare(`DELETE FROM ${t} WHERE job_id=? AND EXISTS(SELECT 1 FROM review_jobs WHERE id=? AND status='done')`).bind(id,id)),
     ]));
     await markReviewExecution(DB,id,'done').catch(()=>{});
-    await clear(storage);
+    await clear(storage,env,id);
     return;
   }
+  const interruptedPhase=phase==='review-started'?'review':phase==='verify-started'?'review_verify':null;
+  const recovering=interruptedPhase!==null&&parseHarnessPolicy(row.harness_policy)?.engine==='ccb-embedded'&&
+    await hasEmbeddedPhaseSeal(storage,id,interruptedPhase);
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let savingSealed=false;
   try {
-    if (phase === 'review-started' || phase === 'verify-started' || !phase && (row.model_execution_started_at || row.model_started_at)) throw new Error('云端执行意外中断，模型请求状态未知；未重复调用或发布评分，请手动重试。');
+    if ((interruptedPhase&&!recovering) || (!phase&&(row.model_execution_started_at||row.model_started_at))) throw new Error('云端执行意外中断，模型请求状态未知；未重复调用或发布评分，请手动重试。');
     await deviceOwnerAllowed(DB, row);
-    await storage.setAlarm(Date.now() + 14 * 60000);
-    heartbeat = setInterval(() => { void DB.prepare("UPDATE review_jobs SET updated_at=? WHERE id=? AND status='running'").bind(stamp(), id).run().catch(() => {}); }, 30000);
+    if(!recovering){
+      await storage.setAlarm(Date.now() + 14 * 60000);
+      heartbeat = setInterval(() => { void DB.prepare("UPDATE review_jobs SET updated_at=? WHERE id=? AND status='running'").bind(stamp(), id).run().catch(() => {}); }, 30000);
+    }
     if (!phase) {
       if (row.status === 'queued') {
         const claimed = await DB.prepare("UPDATE review_jobs SET status='running',stage='capture',updated_at=? WHERE id=? AND status='queued' AND model_executor='platform' AND executor='cloud' AND input_ready=1").bind(stamp(),id).run();
@@ -149,7 +161,9 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
       if (!selected?.profile.enabled || !selected.profile.encryptedKey) throw new Error('审核模型尚未配置或已停用。');
       const config = { ...selected.profile, activeProfile:selected.id, profiles:{[selected.id]:selected.profile}, routes:{review:selected.id} };
       const runtime = { ...env, ownerId:row.owner_id, modelStore:{get:async()=>config} };
-      const evidence = await timed<any>(DB,id,'capture',()=> (env.captureReview || captureFor({...env,reviewJobId:id}))(input.html, (message:string)=>updateReviewProgress(env,id,message)));
+      const evidence = await timed<any>(DB,id,'capture',()=>parseHarnessPolicy(row.harness_policy)?.engine==='ccb-embedded'
+        ?captureEmbeddedBaseline({...env,reviewJobId:id},storage,input.html,(message:string)=>updateReviewProgress(env,id,message),deadline)
+        :(env.captureReview || captureFor({...env,reviewJobId:id}))(input.html, (message:string)=>updateReviewProgress(env,id,message)));
       const reportSchemaVersion:1|2=row.report_schema_version===2?2:1;
       const {images,...preparedRequest} = await prepareReview(runtime,{...input,...evidence,rulesSnapshot:row.rules_snapshot?parseReviewRulesSnapshot(row.rules_snapshot):null,reportSchemaVersion});
       const request={...preparedRequest,reportSchemaVersion};
@@ -161,37 +175,48 @@ export async function advanceCloudReview(state: any, env: any, id: string) {
     }
     const data = await load(storage);
     await recordConfiguration(DB,id,data,row.rules_snapshot);
-    if (Date.now() >= data.deadline) throw new Error('审核处理时限已到，未发布评分，请重试。');
-    const harnessExecution=harnessExecutionFor(row,'review',phase==='prepared'?'review':'review_verify',await harnessHash(canonicalHarness({request:data.request,images:data.images})),data.deadline);
+    if (!recovering&&Date.now()>=data.deadline) throw new Error('审核处理时限已到，未发布评分，请重试。');
+    const initial=phase==='prepared'||phase==='review-started';
+    const harnessExecution=harnessExecutionFor(row,'review',initial?'review':'review_verify',await harnessHash(canonicalHarness({request:data.request,images:data.images})),data.deadline);
+    if(harnessExecution&&recovering)harnessExecution.recoverSealed=true;
     const runtime = { ...env,harnessExecution, ownerId:row.owner_id, modelStore:{get:async()=>data.config} };
     const request = { ...data.request, deadline:data.deadline, idempotencyKey:`pgc-review-${id}`,
       // A slow initial progress write must not replace the verification message.
-      onWait:async(message:string)=>{await DB.prepare("UPDATE review_jobs SET error=?,updated_at=? WHERE id=? AND status='running' AND stage=?").bind(message,stamp(),id,phase==='prepared'?'review':'verify').run();},
+      onWait:async(message:string)=>{await DB.prepare("UPDATE review_jobs SET error=?,updated_at=? WHERE id=? AND status='running' AND stage=?").bind(message,stamp(),id,initial?'review':'verify').run();},
       onStart:async()=>{
         await deviceOwnerAllowed(DB,row);
         const updated=await DB.prepare("UPDATE review_jobs SET model_started_at=COALESCE(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(stamp(),stamp(),id).run();
         if(!updated.meta.changes)throw new Error('审核任务已停止。');
       },
     };
-    if (phase === 'prepared') {
-      const claimed = await DB.prepare("UPDATE review_jobs SET model_execution_started_at=?,stage='review',updated_at=? WHERE id=? AND status='running' AND model_execution_started_at IS NULL").bind(stamp(),stamp(),id).run();
-      if(!claimed.meta.changes)throw new Error('模型请求状态未知，未重复执行，请手动重试。');
-      await storage.put('cloudPhase','review-started');
-      data.draft=await timed(DB,id,'initial',()=>generateReviewStage(runtime,{},request,'review'));
+    if(initial){
+      if(!recovering){
+        const claimed=await DB.prepare("UPDATE review_jobs SET model_execution_started_at=?,stage='review',updated_at=? WHERE id=? AND status='running' AND model_execution_started_at IS NULL").bind(stamp(),stamp(),id).run();
+        if(!claimed.meta.changes)throw new Error('模型请求状态未知，未重复执行，请手动重试。');
+        await storage.put('cloudPhase','review-started');
+      }
+      const generate=()=>generateReviewStage(runtime,{},request,'review');
+      data.draft=await (recovering?generate():timed(DB,id,'initial',generate));
+      savingSealed=harnessExecution?.policy.engine==='ccb-embedded';
       await save(storage,'draft-ready',data);
       return true;
-    } else if (phase === 'draft-ready') {
-      const advanced=await DB.prepare("UPDATE review_jobs SET stage='verify',updated_at=? WHERE id=? AND status='running' AND model_executor='platform'").bind(stamp(),id).run();
-      if(!advanced.meta.changes)throw new Error('审核任务已停止。');
-      await storage.put('cloudPhase','verify-started');
-      data.result=await timed(DB,id,'verification',()=>generateReviewStage(runtime,{},request,'review_verify',data.draft));
+    }else if(phase==='draft-ready'||phase==='verify-started'){
+      if(!recovering){
+        const advanced=await DB.prepare("UPDATE review_jobs SET stage='verify',updated_at=? WHERE id=? AND status='running' AND model_executor='platform'").bind(stamp(),id).run();
+        if(!advanced.meta.changes)throw new Error('审核任务已停止。');
+        await storage.put('cloudPhase','verify-started');
+      }
+      const generate=()=>generateReviewStage(runtime,{},request,'review_verify',data.draft);
+      data.result=await (recovering?generate():timed(DB,id,'verification',generate));
+      savingSealed=harnessExecution?.policy.engine==='ccb-embedded';
       await save(storage,'final-ready',data);
       return true;
-    } else throw new Error('审核阶段不正确，未发布评分。');
-  } catch (error) {
+    }else throw new Error('审核阶段不正确，未发布评分。');
+  }catch(error){
+    if(savingSealed||(recovering&&!(error instanceof EmbeddedHarnessSealError)))throw error;
     await failDeviceReview(DB,id,(error as Error).message||'审核未完成，请重试。');
     if(row.harness_policy)await finishHarnessTask(env,id,'failed').catch(()=>{});
     await markReviewExecution(DB,id,'error').catch(()=>{});
-    await clear(storage);
+    await clear(storage,env,id);
   } finally { clearInterval(heartbeat); }
 }

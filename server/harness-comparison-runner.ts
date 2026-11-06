@@ -253,7 +253,7 @@ export async function openComparisonTaskControl(options: {
         'Baseline task must retain its archived runner without Harness policy');
     } else {
       const policy = parseHarnessPolicy(row.harness_policy);
-      requireThat(policy && policy.family === (creation ? 'forge' : 'review') && policy.purpose === (creation ? 'game' : 'review') &&
+      requireThat(policy?.engine==='ccb' && policy.family === (creation ? 'forge' : 'review') && policy.purpose === (creation ? 'game' : 'review') &&
         policy.image === grant.image && policy.releaseHash === grant.planSha256 && policy.modelContractHash === identity.modelContractHash &&
         same(policy, identity.harnessPolicy) && await hashValue(policy) === seal.policySha256,
       'Comparison task research policy mismatch');

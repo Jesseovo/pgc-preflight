@@ -32,7 +32,7 @@ describe('tracked Harness capture', () => {
     const sessionId = 'newly-acquired-session';
     const browser = { close: vi.fn(async () => {}) };
     const binding = { closeSession: vi.fn(async (_id: string) => ({ status: 'closed' })), getSession: vi.fn(async (_id: string): Promise<unknown> => null) };
-    const lifecycle = { acquiring: vi.fn(async () => {}), acquired: vi.fn(async (_id: string) => {}), closed: vi.fn(async (_id: string) => {}) };
+    const lifecycle = { acquiring: vi.fn(async () => {}), rejected: vi.fn(async () => {}), acquired: vi.fn(async (_id: string) => {}), closed: vi.fn(async (_id: string) => {}) };
     vi.mocked(acquireBrowser).mockImplementation(async (_db, _limits, launch) => launch());
     vi.mocked(connectAcquiredBrowser).mockImplementation(async (acquire, connect) => connect((await acquire()).sessionId));
     vi.mocked(puppeteer.acquire).mockResolvedValue({ sessionId } as Awaited<ReturnType<typeof puppeteer.acquire>>);
@@ -70,13 +70,13 @@ describe('tracked Harness capture', () => {
   it('closes the exact ID after connection fails or the acquisition callback reports cancellation', async () => {
     const first = setup();
     vi.mocked(puppeteer.connect).mockRejectedValueOnce(new Error('socket refused'));
-    await expect(first.capture()).rejects.toThrow('socket refused');
+    await expect(first.capture()).rejects.toThrow('已分配截图浏览器未完成连接。');
     expect(first.binding.closeSession).toHaveBeenCalledExactlyOnceWith(first.sessionId);
     expect(first.lifecycle.closed).toHaveBeenCalledExactlyOnceWith(first.sessionId);
 
     const second = setup();
     second.lifecycle.acquired.mockRejectedValueOnce(new Error('task already closed'));
-    await expect(second.capture()).rejects.toThrow('task already closed');
+    await expect(second.capture()).rejects.toThrow('已分配截图浏览器未完成连接。');
     expect(puppeteer.connect).toHaveBeenCalledOnce();
     expect(captureReview).not.toHaveBeenCalled();
     expect(second.binding.closeSession).toHaveBeenCalledExactlyOnceWith(second.sessionId);

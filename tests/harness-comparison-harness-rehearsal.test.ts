@@ -1,13 +1,20 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { runHarnessRehearsal } from '../scripts/harness-comparison-harness-rehearsal';
 
 const parents: string[] = [];
 let trappedFetch: ReturnType<typeof vi.fn>;
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
+const adapterCommit = 'd67553ff2e42d716ae08c5d1e670521a368749c9';
+const runtimeCommit = '630303565f44c061c7ed8ad7b992dcc4e9db8929';
+const pinnedBytes = (commit: string, path: string) => execFileSync('/usr/bin/git', ['show', commit + ':' + path], {
+  cwd: fileURLToPath(new URL('../', import.meta.url)), env: { PATH: '/usr/bin:/bin', GIT_NO_REPLACE_OBJECTS: '1' },
+});
 function target() {
   const parent = mkdtempSync(join(realpathSync(tmpdir()), 'comparison-b-rehearsal-'));
   parents.push(parent);
@@ -33,11 +40,12 @@ test('B uses actual creation and review runners with exact synthetic evidence ac
   const sourceBytes = readFileSync(join(output, 'source.json'));
   const source = JSON.parse(sourceBytes.toString());
   expect(result.sourceVerification).toMatchObject({ sourceReceiptSha256: sha(sourceBytes),
-    adapterSha256: sha(readFileSync(new URL('../scripts/harness-comparison-harness-rehearsal.ts', import.meta.url))),
-    sharedFixtureSha256: sha(readFileSync(new URL('../scripts/harness-comparison-rehearsal-fixture.ts', import.meta.url))),
+    adapterSha256: sha(pinnedBytes(adapterCommit, 'scripts/harness-comparison-harness-rehearsal.ts')),
+    sharedFixtureSha256: sha(pinnedBytes(adapterCommit, 'scripts/harness-comparison-rehearsal-fixture.ts')),
     runtimeTreeSha256: source.runtimeTreeSha256, runtimeTreeEndSha256: source.runtimeTreeSha256 });
+  expect(source.implementationCommit).toBe(runtimeCommit);
   for (const name of ['server/harness-host.ts', 'server/harness-gateway.ts', 'harness/envelope.mjs', 'harness/model-bridge.mjs']) {
-    expect(source.trackedRuntimeFiles[name]).toBe(sha(readFileSync(new URL('../' + name, import.meta.url))));
+    expect(source.trackedRuntimeFiles[name]).toBe(sha(pinnedBytes(runtimeCommit, name)));
   }
   expect(result.creation.status).toBe('done');
   expect(result.creation.stages.map(stage => stage.stage)).toEqual(['build', 'polish']);
@@ -74,7 +82,7 @@ test('B uses actual creation and review runners with exact synthetic evidence ac
   expect(statSync(output).mode & 0o777).toBe(0o700);
   for (const name of readdirSync(output)) expect(statSync(join(output, name)).mode & 0o777).toBe(0o600);
   expect(readFileSync(join(output, 'dispatch-3.json'), 'utf8')).not.toMatch(/Bearer |encryptedKey|messages|reasoning_content/);
-  await expect(runHarnessRehearsal({ out: output })).rejects.toThrow(/EEXIST/);
+  await expect(runHarnessRehearsal({ out: output })).rejects.toMatchObject({ code: 'EEXIST' });
 }, 20_000);
 
 test('interrupted DeepSeek stream latches unknown and no replay or unchecked report is published', async () => {
@@ -97,3 +105,9 @@ test('a failed report transaction retries sealed publication with no additional 
   expect(existsSync(join(output, 'initial-draft.json'))).toBe(true);
   expect(existsSync(join(output, 'final-report.json'))).toBe(true);
 }, 20_000);
+
+test('rejects a parent traversal before creating the rehearsal', async () => {
+  const output = target();
+  await expect(runHarnessRehearsal({ out: output + '/../run' })).rejects.toThrow(/fresh private rehearsal directory/);
+  expect(existsSync(output)).toBe(false);
+});

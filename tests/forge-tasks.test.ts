@@ -74,7 +74,7 @@ describe('后台创作的持久任务',()=>{
     const one=await tryModelSlot(s.env.DB,runtime,'other-one',Date.now()+14*60000),two=await tryModelSlot(s.env.DB,runtime,'other-two',Date.now()+14*60000);
     const row=await enqueueForgeTask(s.env,{type:'game',id:9,requestId:'unused'});
     const fetcher=vi.fn(async()=>response('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><canvas></canvas><script>let score=0;</script></body></html>'));vi.stubGlobal('fetch',fetcher);
-    const storage={get:async()=>row.id,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    const storage={get:async(key:string)=>key==='taskId'?row.id:undefined,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
     await new ForgeRunner({storage},s.env).alarm();
     expect(s.task(row.id)).toMatchObject({status:'queued',model_started_at:null,started_at:null});expect(fetcher).not.toHaveBeenCalled();
     expect(storage.deleteAll).not.toHaveBeenCalled();expect(storage.setAlarm.mock.calls.at(-1)![0]-Date.now()).toBeGreaterThan(4000);
@@ -140,7 +140,7 @@ describe('后台创作的持久任务',()=>{
     expect(publicForgeTask(s.task(row.id)).result).toBeNull();
     s.sqlite.prepare('UPDATE forge_tasks SET started_at=? WHERE id=?').run(new Date(Date.now()-15*60_000).toISOString(),row.id);
     expect((await readForgeTask(s.env,row.id))?.status).toBe('running');
-    const storage={get:async()=>row.id,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    const storage={get:async(key:string)=>key==='taskId'?row.id:undefined,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
     await new ForgeRunner({storage},s.env).alarm();
     expect(s.task(row.id).status).toBe('done');
     expect(s.sqlite.prepare("SELECT count(*) n FROM artifact_versions WHERE task_id=?").get(row.id)).toMatchObject({n:1});
@@ -162,7 +162,7 @@ describe('后台创作的持久任务',()=>{
     const s=await setup();
     const row=await enqueueForgeTask(s.env,{type:'game',id:9,requestId:'unused'});
     s.sqlite.prepare("UPDATE forge_tasks SET status='running',started_at=?,model_started_at=? WHERE id=?").run(new Date().toISOString(),new Date().toISOString(),row.id);
-    const storage={get:async()=>row.id,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    const storage={get:async(key:string)=>key==='taskId'?row.id:undefined,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
     const fetcher=vi.fn();vi.stubGlobal('fetch',fetcher);
     await new ForgeRunner({storage},s.env).alarm();
     expect(fetcher).not.toHaveBeenCalled();expect(s.task(row.id).status).toBe('error');expect(s.row().product_status).toBe('error');
