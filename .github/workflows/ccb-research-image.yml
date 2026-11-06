@@ -16,6 +16,8 @@ on:
       - 'scripts/harness-native-probe*'
       - 'scripts/harness-egress-probe*'
       - 'scripts/harness-browser-close-probe*'
+      - 'scripts/harness-comparison*'
+      - 'scripts/prepare-harness-comparison*'
       - 'scripts/run-harness-native-probe.mjs'
       - '.github/workflows/ccb-research-image.yml'
 
@@ -37,6 +39,8 @@ jobs:
       - name: Check out research source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          # Offline comparison tests execute the exact archived baseline commit.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Node 24
