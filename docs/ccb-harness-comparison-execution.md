@@ -1,6 +1,6 @@
 # CCB 对照执行与恢复
 
-六题对照目前处于本地准备阶段。正式制作、审核和质量验收均待执行。
+六题正式对照已获独立额度授权并完成云端零模型联验。首题两臂制作的长流都在收到响应头后约 182 秒中断，尚无完整成品；后续任务停止放行。四次正式请求中，两次短工具调用完成，两次付费结果未知，不能自动重放。完整审核和质量验收尚未完成，不能据此切换默认流程或宣称效果改善。实际部署、账本、导出及撤场状态以本地私有 JSON 回执为准。
 
 ## 固定材料与暂停入队
 
@@ -30,12 +30,12 @@ Node 端 `harness-comparison-evidence.ts` 仅打包经过登记的 B 成品、�
 
 ## 私有部署接线
 
-下表记录本地入口需要的绑定。正式部署清单、初始化和读回回执仍需补齐并验证。A/B 的模型流保留请求取消，私有 Worker 包明确启用 `nodejs_compat` 和 `enable_request_signal`。候选沿用原生产兼容配置并单独验证请求取消能力。
+下表记录执行入口需要的绑定。首轮正式部署已完成初始化和独立读回，实际资源标识与回执仅存私有目录。A/B 的模型流保留请求取消，私有 Worker 包明确启用 `nodejs_compat` 和 `enable_request_signal`。候选沿用原生产兼容配置并单独验证请求取消能力。
 
 | 部署单元 | 入口和绑定 |
 | --- | --- |
 | A 归档执行器 | `A.js` 的命名入口 `ComparisonTaskControl`；`COMPARISON_TASKS` 指向本脚本的 SQLite `ComparisonTaskRunner`，`DB` 指向 A 研究库，`BROWSER` 供制作采集。绑定 authority 的 `ComparisonBaselineAuthority`；`COMPARISON_SERVICE_CONTEXT` 固定为 A，`COMPARISON_SERVICE_AUTH` 仅为比较服务签名 Secret。按候选 UUID 签名访问固定基线转发路径。 |
-| B CCB 执行器 | `B.js` 的命名入口 `ComparisonTaskControl`；`COMPARISON_TASKS` 指向 B 自己的 SQLite `ComparisonTaskRunner`，`DB` 指向 B 研究库，`BROWSER` 供制作采集。另将 `HARNESS_RUNNER` 绑定到容器类 `HarnessRunner`，使用计划冻结的镜像 digest，整个研究容器应用最多两实例。`HarnessOutbound` 拦截 HTTP/HTTPS，工具走本地 Host，模型走 `COMPARISON_CANDIDATE_BROKER` 私有 Fetcher。该 Fetcher 指向 relay 的 `ComparisonCandidateRelay`；`COMPARISON_AUTHORITY` 指向 `ComparisonAuthority`。 |
+| B CCB 执行器 | `B.js` 的命名入口 `ComparisonTaskControl`；`COMPARISON_TASKS` 指向 B 自己的 SQLite `ComparisonTaskRunner`，`DB` 指向 B 研究库，`BROWSER` 供制作采集。另将 `HARNESS_RUNNER` 绑定到容器类 `HarnessRunner`，使用计划冻结的镜像 digest。启动前由原子 D1 槽位限制最多两个活动任务，并独立监测实际实例；DO 托管策略不支持应用级 `max_instances`。`HarnessOutbound` 拦截 HTTP/HTTPS，工具走本地 Host，模型走 `COMPARISON_CANDIDATE_BROKER` 私有 Fetcher。该 Fetcher 指向 relay 的 `ComparisonCandidateRelay`；`COMPARISON_AUTHORITY` 指向 `ComparisonAuthority`。 |
 | A/B 部署证明 | 两臂分别设置 `COMPARISON_DATABASE_ID`、`COMPARISON_DEPLOYED_RUNTIME` 和 `COMPARISON_WORKER_VERSION`（Cloudflare `version_metadata` 绑定）。Authority 返回的 Worker UUID、bundle SHA-256 与运行时源摘要必须与独立部署读回一致。B 另固定 `COMPARISON_CANDIDATE_VERSION`。 |
 | 私有 authority | `authority.js` 导出 `ComparisonBaselineAuthority` 和 `ComparisonAuthority`。绑定 A/B 研究库、全局研究账本和独立 nonce 库，或明确将 nonce 与研究账本共用。只读冻结材料，核验任务、授权和 B 成品证明。 |
 | B 私有 relay | `relay.js` 的命名 Fetcher `ComparisonCandidateRelay`，绑定 B 的 `COMPARISON_SERVICE_CONTEXT` 和签名 Secret `COMPARISON_SERVICE_AUTH_KEY`。按固定 URL、版本覆盖和签名访问候选，验证响应执行版本并传递流式取消。 |
@@ -52,13 +52,23 @@ B 的 `HarnessRunner` 对 `/start` 和 `/tools` 串行处理。工具执行前�
 3. 在任何制作前暂停入队全部 12 个制作任务并回读快照、所属、排程意图及零模型启动标记。计划在此之前就固定 24 个任务 ID，初始授权只预留审核槽位，审核的源码与证据摘要保持未绑定。每题 B 制作完成后，独立基础采集对同一成品做封存，验证四张原始视口图和探测记录。再按两臂各自预定审核任务 ID，写入同一封存包至 `evidence/<taskId>/<packSha256>`，用原入队流程分别锁定 A/B 审核，逐项读回校验。统一账本按 case 原子绑定同一源码及证据摘要。没有对应 B 成品或证据不完整的审核槽位保留未执行状态。
 4. 独立读回候选、A/B 的实际版本 UUID、绑定和 bundle 字节，核对每臂签名上下文及候选响应证明。核验生产原版 100%、候选 0%，候选普通请求为 403，私有入口拒绝无签名、错误臂和错误版本。在已有明确正式授权且处于授权窗口时开启 grant，保持全部任务暂停。分别测试签名 profile 读取、私有 authority 读取及未放行的转发被拒。联验前后都独立确认放行行、Harness 租约、模型启动标记及派发账本记录为零。读回有偏差立即禁用 grant。联验通过后才按持久放行凭据逐项释放。未知模型结果保留在原任务中。
 
-仍待完成的正式启动门槛包括以下三项。
+首轮正式启动门槛的实测情况如下。
 
-- **版本初始化实测。** 候选 UUID 只能在上传后从 Cloudflare 读回。若把 UUID 回填进同一 Worker 的版本绑定，会生成新版本，破坏自身实际 UUID 等值校验。完整计划也可能超过 5 KB 单变量上限。两阶段初始化代码以固定小型 bootstrap 和上传后独立封存的部署行解决这两个问题，仍需在实际绑定上确认缺行、摘要不符或 UUID 不符时均拒绝服务。 [Cloudflare Workers 限制](https://developers.cloudflare.com/workers/platform/limits/)
-- **正式接线联验。** 禁用授权会拒绝 profile 与 authority 读取。通过明确授权开启 grant 后，接线检查仍需保持全部任务暂停，核对零放行、零派发和零模型启动。
-- **操作编排。** 包内没有经过验证的部署、全量暂停入队、B 成品独立采集、逐题双臂审核放行、结果导出和清理操作流程。审核槽位必须保持晚绑定，不能为占齐 24 个授权槽位提前填入合成摘要。还需验证两容器上限、共享生产节流、A/B 实际流式取消、未知请求停止及终态恢复。
+- **版本初始化。** 实际候选及五个研究 Worker 已按两阶段 bootstrap 独立读回并锁定模块、绑定和版本。不能把上传后 UUID 回填进同一 Worker 重新生成版本。完整配置封存在独立部署行，避免超出单变量大小限制。 [Cloudflare Workers 限制](https://developers.cloudflare.com/workers/platform/limits/)
+- **接线联验。** 11 项零模型联验通过，包括准确签名 profile、禁用授权、错误版本／臂、nonce 重放、错误放行摘要和 A/B 未放行转发的拒绝。前后均核对零放行、零派发和零模型启动。私有 authority 的正向调用在首次合法放行中完成，先于任务绑定和调度。
+- **操作编排。** 已实测独立部署、全量暂停入队、首题双臂放行、未知付费结果停止和失败记录导出。完整成品采集及逐题审核因首题中断尚未实测，不能用本地演练代替。审核槽位继续晚绑定，缺少 B 成品时保持未入队。撤场必须按实际回执独立验证，不能只检查脚本退出码。
 
-正式对照的待批准预算提案为最多 **246 次真实模型请求、3,840,000 个输出 Token**，包含供应商计入输出的思考 Token。这笔预算尚未授权。总账本预留以模型请求上限为准，结果未知保留完整预留，耗尽后停止新请求。正式对照须单独授权，先前九次合成兼容测试额度已耗尽。模型请求额度之外的容器、浏览器与 Workers 用量需按实际服务记录。
+用户已单独批准正式对照最多 **246 次真实模型请求、3,840,000 个输出 Token**，包含供应商计入输出的思考 Token。先前九次合成兼容测试额度独立且已耗尽。总账本按请求上限预留，未知结果保留完整预留，不能把预留当作实际用量。首题中断后保留四次请求及全部 24 个槽位；未执行的任务不得按成功计入。模型请求额度之外的容器、浏览器与 Workers 用量按实际服务记录。
+
+## 长流中断诊断
+
+研究适配层新增独立 `comparison_dispatch_stream_diagnostics`，记录传输层返回的 HTTP 状态、响应头和最后收包／完整帧时间、字节与帧计数，以及传输打开失败、HTTP 拒绝、上游 EOF、原生错误事件、帧或用量不合格、本地期限、请求取消和下游取消等类别。传输层也可能返回本地权限拒绝或限流状态，因此 HTTP 状态和传输打开失败都无法证明请求已发往供应商。原生错误类型和代码只保留明确允许的枚举；不保存正文、思考、请求头或密钥。诊断写入失败不改变流字节、结算、未知状态或重试政策。
+
+该记录是后续请求的观测能力，不能补造首题缺失的流事件。两臂中断时长相近只表明共用链路值得排查；目前不能断言具体供应商或 Cloudflare 层存在 180 秒上限。先用独立、无供应商请求的长流夹具检查静默、心跳和缺失终止帧，保留真实墙钟时长及环境。合成链路通过也不能代替实际渠道或成品质量验证。
+
+`syntheticKeepalive` 仅允许 `rehearsal` 授权显式启用：在首个完整原生帧之后、下游正在等待读取时，每 10 秒插入固定 SSE 注释；一个源读取和一个定时器，不延长绝对期限。原生诊断不计本地保活，终止帧仍等待结算。正式授权拒绝此选项。旧 A 读取器会把任意数据块视为活动，后续若采用正式保活，必须先在传输接收端隔离本地标记，避免将其冒充模型进度或供应商活动。
+
+独立云端合成实验中，无心跳的两个响应约 60 秒被下游取消；原生心跳及显式开启的合成保活均维持到 195 秒完整结束。合成保活下，源在 183 秒缺少终止帧直接结束时仍正确记为未知，实际输出用量保持空值。原生字节摘要与计数独立于本地保活。实验未经过真实供应商、生产候选转发或 CCB 容器，因此不解释正式请求约 182 秒的中断，也不构成已修复证明。临时实验 Worker、DO 和本地签名凭据均须独立验证清理。
 
 ## 恢复与撤场
 

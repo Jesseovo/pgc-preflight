@@ -457,13 +457,13 @@ export async function openComparisonCandidateRegistry(options: CandidateOptions)
   async function createBroker(slot: ComparisonAdmittedSlot) {
     const locked = await profile(slot.operation);
     const approval = { profileId: locked.profileId, profileHash: locked.profileHash, providerUrl: locked.providerUrl, publicProfileSnapshot: locked.snapshot };
-    const base = { grant, slot, approval, loadConfig, settingsKey, capacityDB: capacity.connection, fetcher };
+    const base = { grant, slot, approval, loadConfig, settingsKey, capacityDB: capacity.connection, fetcher, waitUntil };
     if (slot.arm === 'A') return { arm: 'A' as const, broker: await createComparisonBaselineBroker({ ...base, authorize: async scope => {
       const task = await active(scope.taskId, 'A', scope.stage);
       if (task.slot.operation === 'review') await sealedEvidence(task);
       return true;
     } }) };
-    return { arm: 'B' as const, broker: await createComparisonHarnessBroker({ ...base, harnessDB: databases.B.connection, waitUntil,
+    return { arm: 'B' as const, broker: await createComparisonHarnessBroker({ ...base, harnessDB: databases.B.connection,
       authorizeRun: async run => {
         try {
           if (run.taskId !== slot.taskId || !await authorizeHarnessTask({ DB: databases.B.connection }, run)) return false;

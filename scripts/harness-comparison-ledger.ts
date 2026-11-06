@@ -75,6 +75,26 @@ export type ComparisonTransport<T> = {
 export type ComparisonStreamFrame =
   | { kind: 'data'; bytes: Uint8Array }
   | { kind: 'terminal'; bytes: Uint8Array; outcome: SettlementOutcome };
+const nativeEndReasons = ['clean-terminal', 'transport-open-error', 'transport-http-rejected', 'unexpected-http-response',
+  'upstream-eof-before-terminal', 'upstream-body-read-error', 'native-sse-error', 'truncated-sse-frame',
+  'invalid-sse-frame', 'invalid-terminal-usage'] as const;
+export type ComparisonNativeStreamEnd = typeof nativeEndReasons[number];
+type StreamEnd = 'terminal' | 'http-rejection' | 'transport-error' | 'deadline' | 'inbound-abort' | 'downstream-cancel';
+export type ComparisonStreamObservation =
+  | { kind: 'head'; status: number }
+  | { kind: 'bytes'; size: number }
+  | { kind: 'frame' }
+  | { kind: 'end'; reason: ComparisonNativeStreamEnd; errorType?: unknown; errorCode?: unknown };
+type StreamDiagnostic = {
+  httpStatus: number | null; headAt: number | null; lastByteAt: number | null; lastFrameAt: number | null;
+  byteCount: number; frameCount: number; nativeEnd: ComparisonNativeStreamEnd | null;
+  providerErrorType: string | null; providerErrorCode: string | null; streamEnd: StreamEnd; observedAt: number;
+};
+const providerErrors = new Set(['api_error', 'authentication_error', 'bad_request', 'billing_error', 'content_filter',
+  'context_length_exceeded', 'engine_overloaded', 'insufficient_balance', 'internal_server_error', 'invalid_request',
+  'invalid_request_error', 'model_not_found', 'not_found_error', 'overloaded_error', 'permission_error', 'rate_limit_error',
+  'rate_limit_exceeded', 'request_too_large', 'server_error', 'server_overloaded', 'service_unavailable', 'timeout_error', 'upstream_timeout']);
+const providerError = (value: unknown) => typeof value === 'string' && providerErrors.has(value) ? value : value == null ? null : 'other';
 export type ComparisonStreamingTransport = {
   kind: 'approved-provider' | 'synthetic';
   modelContractHash: string;
@@ -82,7 +102,7 @@ export type ComparisonStreamingTransport = {
   // protocol terminator may appear in a data frame. The sole terminal frame
   // carries original terminator bytes and validated end-of-stream accounting.
   // EOF or rejection without such an outcome is not evidence of completion.
-  open(input: TransportInput & { signal: AbortSignal }): Promise<
+  open(input: TransportInput & { signal: AbortSignal; observe?(event: ComparisonStreamObservation): void }): Promise<
     | { kind: 'stream'; head: Response; frames: ReadableStream<ComparisonStreamFrame> }
     | { kind: 'rejected'; response: Response; outcome: FailedOutcome }
   >;
@@ -120,7 +140,8 @@ export type ComparisonDispatchReceipt = Usage & {
 };
 export type ComparisonStreamingDispatch =
   | { receipt: ComparisonDispatchReceipt; dispatched: false }
-  | { receipt: ComparisonDispatchReceipt; dispatched: true; response: Response | null; completion: Promise<ComparisonDispatchReceipt> };
+  | { receipt: ComparisonDispatchReceipt; dispatched: true; response: Response | null;
+      completion: Promise<ComparisonDispatchReceipt>; diagnostics: Promise<void> };
 
 export const COMPARISON_LEDGER_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS comparison_dispatch_grant (
@@ -142,6 +163,13 @@ export const COMPARISON_LEDGER_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS comparison_dispatch_transitions (
     slot_id TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL,
     PRIMARY KEY(slot_id,request_id,state)
+  )`,
+  `CREATE TABLE IF NOT EXISTS comparison_dispatch_stream_diagnostics (
+    slot_id TEXT NOT NULL, request_id TEXT NOT NULL, http_status INTEGER, head_at INTEGER,
+    last_byte_at INTEGER, last_frame_at INTEGER, byte_count INTEGER NOT NULL, frame_count INTEGER NOT NULL,
+    native_end TEXT, provider_error_type TEXT, provider_error_code TEXT, stream_end TEXT NOT NULL, observed_at INTEGER NOT NULL,
+    PRIMARY KEY(slot_id,request_id),
+    FOREIGN KEY(slot_id,request_id) REFERENCES comparison_dispatch_attempts(slot_id,request_id)
   )`,
   `CREATE TRIGGER IF NOT EXISTS comparison_dispatch_on_reserve AFTER INSERT ON comparison_dispatch_attempts
     BEGIN
@@ -259,48 +287,121 @@ async function bodyDigest(body: Uint8Array<ArrayBuffer>) {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', body)), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
+export const COMPARISON_SYNTHETIC_KEEPALIVE_FRAME = ': pgc-comparison-keepalive\n\n';
+const syntheticKeepaliveMs = 10_000;
+const syntheticKeepaliveBytes = new TextEncoder().encode(COMPARISON_SYNTHETIC_KEEPALIVE_FRAME);
+
+/** One outstanding source read and at most one demanded keepalive timer. */
+function keepaliveFrameReader(reader: ReadableStreamDefaultReader<ComparisonStreamFrame>) {
+  type ReadResult = { value: ReadableStreamReadResult<ComparisonStreamFrame> } | { failed: true };
+  let pending = false, stopped = false;
+  let ready: ReadResult | undefined;
+  let wake: (() => void) | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  function deliver(result: ReadResult) {
+    if (stopped) return;
+    ready = result;
+    wake?.();
+  }
+  return {
+    async next(canKeepalive: boolean) {
+      if (!pending && !stopped) {
+        pending = true;
+        void reader.read().then(value => deliver({ value }), () => deliver({ failed: true }));
+      }
+      if (!ready && !stopped) await new Promise<void>(resolve => {
+        wake = resolve;
+        if (canKeepalive) timer = setTimeout(resolve, syntheticKeepaliveMs);
+      });
+      clearTimeout(timer);
+      wake = undefined;
+      if (stopped) return null;
+      const result = ready;
+      if (!result) return null;
+      ready = undefined;
+      pending = false;
+      if ('failed' in result) throw new Error('Comparison source read failed');
+      return result.value;
+    },
+    stop() {
+      stopped = true;
+      ready = undefined;
+      clearTimeout(timer);
+      wake?.();
+    },
+  };
+}
+
 /** Only the trusted protocol adapter reads the supplier stream. The ledger owns the last frame. */
 async function streamResponse(input: TransportInput, open: ComparisonStreamingTransport['open'], initial: ComparisonDispatchReceipt,
   settle: (outcome?: SettlementOutcome) => Promise<{ receipt: ComparisonDispatchReceipt; settled: boolean }>,
-  now: () => number, signal?: AbortSignal): Promise<ComparisonStreamingDispatch> {
+  saveDiagnostic: (value: StreamDiagnostic) => Promise<unknown>, now: () => number, signal?: AbortSignal,
+  syntheticKeepalive = false): Promise<ComparisonStreamingDispatch> {
   const upstream = new AbortController();
   let reader: ReadableStreamDefaultReader<ComparisonStreamFrame> | undefined;
+  let keepalive: ReturnType<typeof keepaliveFrameReader> | undefined;
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   let closed = false;
   let finishPromise: ReturnType<typeof settle> | undefined;
   let finishReceipt!: (receipt: ComparisonDispatchReceipt) => void, failReceipt!: (error: unknown) => void;
   const completion = new Promise<ComparisonDispatchReceipt>((resolve, reject) => { finishReceipt = resolve; failReceipt = reject; });
   void completion.catch(() => {});
+  let doneDiagnostic!: () => void;
+  const diagnostics = new Promise<void>(resolve => { doneDiagnostic = resolve; });
+  const observed: Omit<StreamDiagnostic, 'streamEnd' | 'observedAt'> = {
+    httpStatus: null, headAt: null, lastByteAt: null, lastFrameAt: null, byteCount: 0, frameCount: 0,
+    nativeEnd: null, providerErrorType: null, providerErrorCode: null,
+  };
+  function observe(event: ComparisonStreamObservation) {
+    if (finishPromise) return;
+    if (event.kind === 'head' && observed.headAt === null && Number.isSafeInteger(event.status) && event.status >= 100 && event.status <= 599) {
+      observed.httpStatus = event.status; observed.headAt = now();
+    } else if (event.kind === 'bytes' && Number.isSafeInteger(event.size) && event.size > 0) {
+      observed.lastByteAt = now(); observed.byteCount += event.size;
+    } else if (event.kind === 'frame') {
+      observed.lastFrameAt = now(); observed.frameCount++;
+    } else if (event.kind === 'end' && observed.nativeEnd === null && nativeEndReasons.includes(event.reason)) {
+      observed.nativeEnd = event.reason;
+      if (event.reason === 'native-sse-error') {
+        observed.providerErrorType = providerError(event.errorType); observed.providerErrorCode = providerError(event.errorCode);
+      }
+    }
+  }
   let stopped!: () => void;
   const stoppedBeforeHead = new Promise<null>(resolve => { stopped = () => resolve(null); });
   const terminate = () => {
     if (!closed && controller) { closed = true; controller.error(new Error('Comparison stream ended without a verified terminal frame')); }
   };
-  function finish(outcome?: SettlementOutcome) {
+  function finish(streamEnd: StreamEnd, outcome?: SettlementOutcome) {
     if (!finishPromise) {
       finishPromise = settle(outcome);
+      const diagnostic = { ...observed, streamEnd, observedAt: now() };
+      void Promise.resolve().then(() => saveDiagnostic(diagnostic)).catch(() => {}).then(doneDiagnostic);
       void finishPromise.then(value => finishReceipt(value.receipt), () => failReceipt(new Error('Comparison stream settlement could not be verified'))).finally(() => {
         clearTimeout(timer);
-        signal?.removeEventListener('abort', abort);
+        signal?.removeEventListener('abort', abortInbound);
       });
     }
     return finishPromise;
   }
-  function abort() {
+  function abort(reason: StreamEnd = 'transport-error') {
     if (!upstream.signal.aborted) {
       upstream.abort(); stopped(); terminate();
+      keepalive?.stop();
       void reader?.cancel().catch(() => {});
     }
-    void finish().catch(() => {});
+    void finish(reason).catch(() => {});
   }
-  const timer = setTimeout(abort, Math.max(0, Math.min(2_147_483_647, input.deadlineAt - now())));
-  signal?.addEventListener('abort', abort, { once: true });
-  if (signal?.aborted || now() >= input.deadlineAt) abort();
+  const abortInbound = () => abort('inbound-abort');
+  const timer = setTimeout(() => abort('deadline'), Math.max(0, Math.min(2_147_483_647, input.deadlineAt - now())));
+  signal?.addEventListener('abort', abortInbound, { once: true });
+  if (signal?.aborted) abortInbound();
+  else if (now() >= input.deadlineAt) abort('deadline');
   let invoked = false;
   const opened = Promise.resolve().then(() => {
     if (upstream.signal.aborted) return null;
     invoked = true;
-    return open({ ...input, signal: upstream.signal });
+    return open({ ...input, signal: upstream.signal, observe });
   }).then(reply => {
     if (!upstream.signal.aborted || !reply) return reply;
     if (reply.kind === 'stream') void reply.frames.cancel().catch(() => {});
@@ -309,11 +410,11 @@ async function streamResponse(input: TransportInput, open: ComparisonStreamingTr
   }).catch(() => { abort(); return null; });
   const reply = await Promise.race([opened, stoppedBeforeHead]);
   if (!invoked) return { receipt: await completion, dispatched: false };
-  const result = { receipt: initial, dispatched: true as const, completion };
+  const result = { receipt: initial, dispatched: true as const, completion, diagnostics };
   if (!reply || upstream.signal.aborted) return { ...result, response: null };
   if (reply.kind === 'rejected') {
     if (reply.response instanceof Response && !reply.response.ok && reply.outcome?.state === 'failed') {
-      const settled = await finish(reply.outcome).catch(() => null);
+      const settled = await finish('http-rejection', reply.outcome).catch(() => null);
       if (settled?.settled && settled.receipt.state === 'failed' && !upstream.signal.aborted) return { ...result, response: reply.response };
     }
     void reply.response?.body?.cancel().catch(() => {});
@@ -328,19 +429,25 @@ async function streamResponse(input: TransportInput, open: ComparisonStreamingTr
     return { ...result, response: null };
   }
   try { reader = reply.frames.getReader(); } catch { abort(); return { ...result, response: null }; }
+  if (syntheticKeepalive) keepalive = keepaliveFrameReader(reader);
+  let nativeFrameDelivered = false;
   const body = new ReadableStream<Uint8Array>({
     start(value) { controller = value; },
     async pull(value) {
       try {
-        const next = await reader!.read();
+        // Keep the native stream start (including an optional UTF-8 BOM)
+        // untouched. A comment is safe only between complete adapter frames.
+        const next = keepalive ? await keepalive.next(nativeFrameDelivered) : await reader!.read();
         if (closed || upstream.signal.aborted) return;
-        if (now() >= input.deadlineAt || next.done) { abort(); return; }
+        if (now() >= input.deadlineAt) { abort('deadline'); return; }
+        if (next === null) { value.enqueue(syntheticKeepaliveBytes.slice()); return; }
+        if (next.done) { abort(); return; }
         const frame = next.value;
         if (!(frame?.bytes instanceof Uint8Array) || frame.bytes.length === 0 || frame.bytes.length > 8 * 1024 * 1024) { abort(); return; }
         const bytes = new Uint8Array(frame.bytes);
-        if (frame.kind === 'data') { value.enqueue(bytes); return; }
+        if (frame.kind === 'data') { nativeFrameDelivered = true; value.enqueue(bytes); return; }
         if (frame.kind !== 'terminal') { abort(); return; }
-        const settled = await finish(frame.outcome);
+        const settled = await finish('terminal', frame.outcome);
         if (closed) return;
         if (!settled.settled || settled.receipt.state !== 'completed' || now() >= input.deadlineAt) { abort(); return; }
         closed = true;
@@ -349,7 +456,7 @@ async function streamResponse(input: TransportInput, open: ComparisonStreamingTr
         void reader?.cancel().catch(() => {});
       } catch { abort(); }
     },
-    cancel() { closed = true; abort(); },
+    cancel() { closed = true; abort('downstream-cancel'); },
   }, { highWaterMark: 0 });
   return { ...result, response: new Response(body, { status: reply.head.status, statusText: reply.head.statusText, headers: reply.head.headers }) };
 }
@@ -362,9 +469,10 @@ export async function openComparisonLedger<T>(options: {
   authorities: ReadonlyMap<string, object>;
   transports?: ReadonlyMap<string, ComparisonTransport<T>>;
   streamingTransports?: ReadonlyMap<string, ComparisonStreamingTransport>;
+  syntheticKeepalive?: boolean;
   now?: () => number;
 }) {
-  const { database, now = Date.now } = options;
+  const { database, now = Date.now, syntheticKeepalive = false } = options;
   need(database.scope === 'isolated-comparison' && matches(id, database.id), 'An isolated comparison ledger database is required');
   const supplied = options.grant;
   need(exactKeys(supplied, ['schemaVersion', 'purpose', 'scope', 'runId', 'ledgerDatabaseId', 'planSha256', 'manifestSha256', 'admittedSlotsSha256',
@@ -377,6 +485,8 @@ export async function openComparisonLedger<T>(options: {
     positive(supplied.notBefore) && positive(supplied.deadlineAt) && supplied.notBefore < supplied.deadlineAt,
   'An explicit isolated comparison grant with request and output caps is required');
   const grant = { ...supplied };
+  need(typeof syntheticKeepalive === 'boolean' && (!syntheticKeepalive || grant.scope === 'rehearsal'),
+    'Comparison keepalives are limited to isolated rehearsal transport');
   const snapshot = structuredClone(sortedSlots(options.slots));
   need(await comparisonAdmittedSlotsSha256(snapshot) === grant.admittedSlotsSha256, 'Admitted slot snapshot conflicts with the comparison grant');
   const authorities = new Set<object>();
@@ -595,7 +705,13 @@ export async function openComparisonLedger<T>(options: {
         const result = await settleOutcome(slot, input.requestId, outputCap);
         return { dispatched: false, receipt: result.receipt };
       }
-      return streamResponse(input, transport.open!, initial, outcome => settleOutcome(slot, input.requestId, outputCap, outcome), now, signal);
+      return streamResponse(input, transport.open!, initial, outcome => settleOutcome(slot, input.requestId, outputCap, outcome),
+        diagnostic => db.prepare(`INSERT OR IGNORE INTO comparison_dispatch_stream_diagnostics
+          (slot_id,request_id,http_status,head_at,last_byte_at,last_frame_at,byte_count,frame_count,native_end,
+           provider_error_type,provider_error_code,stream_end,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          RETURNING request_id`).bind(slot.identity.slotId, input.requestId, diagnostic.httpStatus, diagnostic.headAt, diagnostic.lastByteAt,
+          diagnostic.lastFrameAt, diagnostic.byteCount, diagnostic.frameCount, diagnostic.nativeEnd, diagnostic.providerErrorType,
+          diagnostic.providerErrorCode, diagnostic.streamEnd, diagnostic.observedAt).first(), now, signal, syntheticKeepalive);
     }
     return { read, dispatch, dispatchStream };
   }

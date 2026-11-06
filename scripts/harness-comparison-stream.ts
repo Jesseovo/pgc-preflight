@@ -1,8 +1,9 @@
-import type { ComparisonStreamFrame, ComparisonStreamingTransport } from './harness-comparison-ledger';
+import type { ComparisonNativeStreamEnd, ComparisonStreamFrame, ComparisonStreamObservation, ComparisonStreamingTransport } from './harness-comparison-ledger';
 
 type Protocol = 'anthropic' | 'openai';
 type OpenInput = Parameters<ComparisonStreamingTransport['open']>[0];
 type Outcome = Extract<ComparisonStreamFrame, { kind: 'terminal' }>['outcome'];
+type Observer = ((event: ComparisonStreamObservation) => void) | undefined;
 
 const maxFrameBytes = 2 * 1024 * 1024;
 const maxResponseBytes = 12 * 1024 * 1024;
@@ -13,8 +14,21 @@ const finishReasons: Record<Protocol, readonly string[]> = {
 const truncated = new Set(['max_tokens', 'length']);
 const rejected = new Set(['refusal', 'pause_turn', 'content_filter']);
 
-function invalid(): never {
-  throw new Error('Comparison supplier stream could not be verified');
+class StreamDiagnosticError extends Error {
+  constructor(readonly reason: ComparisonNativeStreamEnd, readonly errorType?: unknown, readonly errorCode?: unknown) {
+    super('Comparison supplier stream could not be verified');
+  }
+}
+function invalid(reason: ComparisonNativeStreamEnd = 'invalid-sse-frame'): never {
+  throw new StreamDiagnosticError(reason);
+}
+function nativeError(value: unknown): never {
+  const body = record(value) ? value : {};
+  const error = record(body.error) ? body.error : body;
+  throw new StreamDiagnosticError('native-sse-error', error.type, error.code);
+}
+function observeEvent(observe: Observer, event: ComparisonStreamObservation) {
+  try { observe?.(event); } catch { /* Diagnostics never affect native bytes or settlement. */ }
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -76,7 +90,12 @@ class NativeUsage {
   }
 
   accept({ event, data }: ReturnType<typeof frameFields>) {
-    if (event === 'error' || this.terminal && (data !== undefined || event !== undefined)) return invalid();
+    if (event === 'error') {
+      let error: unknown;
+      try { if (data !== undefined) error = JSON.parse(data); } catch { /* Keep the known event class. */ }
+      return nativeError(error);
+    }
+    if (this.terminal && (data !== undefined || event !== undefined)) return invalid();
     if (data === undefined) return;
     if (this.protocol === 'openai') {
       if (event !== undefined && event !== 'message') return invalid();
@@ -84,7 +103,8 @@ class NativeUsage {
     }
 
     const value: unknown = JSON.parse(data);
-    if (!record(value) || value.type === 'error' || value.error != null) return invalid();
+    if (!record(value)) return invalid();
+    if (value.type === 'error' || value.error != null) return nativeError(value);
     if (this.protocol === 'anthropic') {
       if (typeof value.type !== 'string' || event !== undefined && event !== value.type) return invalid();
       if (value.type === 'message_start') {
@@ -112,8 +132,9 @@ class NativeUsage {
   }
 
   outcome(): Outcome {
-    if (!this.terminal || !this.finishReason || !this.finalOutput || this.output === null ||
-        this.reasoning !== null && this.reasoning > this.output) return invalid();
+    if (!this.terminal) return invalid('upstream-eof-before-terminal');
+    if (!this.finishReason || !this.finalOutput || this.output === null ||
+        this.reasoning !== null && this.reasoning > this.output) return invalid('invalid-terminal-usage');
     // Native output totals already include reasoning tokens.
     const usage = { inputTokens: this.input, outputTokens: this.output };
     if (truncated.has(this.finishReason)) return { state: 'failed', failureCode: 'truncated', ...usage };
@@ -131,7 +152,7 @@ class ByteFrames {
   private buffer = new Uint8Array(1024);
   private size = 0;
 
-  constructor(private readonly reader: ReadableStreamDefaultReader<Uint8Array>) {}
+  constructor(private readonly reader: ReadableStreamDefaultReader<Uint8Array>, private readonly observe: Observer) {}
 
   private append(byte: number) {
     if (this.size === maxFrameBytes) return invalid();
@@ -148,10 +169,11 @@ class ByteFrames {
     let cr = false;
     while (true) {
       if (this.offset === this.chunk.length && !this.done) {
-        const part = await this.reader.read();
+        const part = await this.reader.read().catch(() => invalid('upstream-body-read-error'));
         this.done = part.done;
         if (!part.done) {
           if (!(part.value instanceof Uint8Array)) return invalid();
+          if (part.value.byteLength) observeEvent(this.observe, { kind: 'bytes', size: part.value.byteLength });
           this.total += part.value.length;
           if (this.total > maxResponseBytes) return invalid();
           this.chunk = part.value;
@@ -165,7 +187,7 @@ class ByteFrames {
         lineBytes = 0;
       }
       if (byte === undefined) {
-        if (this.size !== 0) return invalid();
+        if (this.size !== 0) return invalid('truncated-sse-frame');
         return null;
       }
       this.offset++;
@@ -184,9 +206,9 @@ class ByteFrames {
   }
 }
 
-function responseFrames(body: ReadableStream<Uint8Array>, protocol: Protocol) {
+function responseFrames(body: ReadableStream<Uint8Array>, protocol: Protocol, observe: Observer) {
   const reader = body.getReader();
-  const frames = new ByteFrames(reader);
+  const frames = new ByteFrames(reader, observe);
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const usage = new NativeUsage(protocol);
   let first = true;
@@ -207,11 +229,13 @@ function responseFrames(body: ReadableStream<Uint8Array>, protocol: Protocol) {
           if (released) return;
           if (bytes === null) {
             const outcome = usage.outcome();
+            observeEvent(observe, { kind: 'end', reason: 'clean-terminal' });
             release(false);
             controller.enqueue({ kind: 'terminal', bytes: held.subarray(0, heldBytes), outcome });
             controller.close();
             return;
           }
+          observeEvent(observe, { kind: 'frame' });
           const text = decoder.decode(bytes);
           usage.accept(frameFields(first ? text.replace(/^\uFEFF/, '') : text));
           first = false;
@@ -231,8 +255,11 @@ function responseFrames(body: ReadableStream<Uint8Array>, protocol: Protocol) {
           held.set(bytes, heldBytes);
           heldBytes = end;
         }
-      } catch {
+      } catch (error) {
         if (!released) {
+          observeEvent(observe, error instanceof StreamDiagnosticError ?
+            { kind: 'end', reason: error.reason, errorType: error.errorType, errorCode: error.errorCode } :
+            { kind: 'end', reason: 'invalid-sse-frame' });
           release(true);
           controller.error(new Error('Comparison supplier stream could not be verified'));
         }
@@ -258,13 +285,22 @@ export function createComparisonSseTransport(options: {
     async open(input) {
       if (input.signal.aborted) return invalid();
       let response: Response;
-      try { response = await fetchResponse(input); } catch { return invalid(); }
+      try { response = await fetchResponse(input); }
+      catch {
+        observeEvent(input.observe, { kind: 'end', reason: 'transport-open-error' });
+        return invalid();
+      }
+      observeEvent(input.observe, { kind: 'head', status: response.status });
       if (input.signal.aborted || response.redirected || !response.ok || !response.body ||
           !/^text\/event-stream(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')) {
         void response.body?.cancel().catch(() => {});
-        if (input.signal.aborted || response.redirected) return invalid();
+        if (input.signal.aborted || response.redirected) {
+          observeEvent(input.observe, { kind: 'end', reason: 'unexpected-http-response' });
+          return invalid();
+        }
         const status = response.status;
         const redirect = status >= 300 && status < 400;
+        observeEvent(input.observe, { kind: 'end', reason: !response.ok ? 'transport-http-rejected' : 'unexpected-http-response' });
         // The existing gateway treats HTTP 408/409 and 5xx as potentially paid.
         if (!redirect && !(status >= 400 && status < 500 && status !== 408 && status !== 409)) return invalid();
         return {
@@ -278,7 +314,7 @@ export function createComparisonSseTransport(options: {
         head: new Response(null, { status: response.status, headers: {
           'content-type': 'text/event-stream', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff',
         } }),
-        frames: responseFrames(response.body, protocol),
+        frames: responseFrames(response.body, protocol, input.observe),
       };
     },
   };

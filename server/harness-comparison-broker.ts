@@ -22,6 +22,7 @@ type Approval = Readonly<{ profileId: string; profileHash: string; providerUrl: 
 type BrokerOptions = {
   grant: ComparisonGrant; slot: ComparisonAdmittedSlot; approval: Approval;
   loadConfig(): Promise<ModelConfig | null>; settingsKey: string; capacityDB: ModelThrottleDatabase; fetcher: NativeFetch;
+  waitUntil?(promise: Promise<unknown>): void;
 };
 
 const sentinel = 'pgc-comparison-local-placeholder';
@@ -32,6 +33,9 @@ const publicKeys = ['name', 'model', 'baseUrl', 'protocol', 'enabled', 'vision',
 const deltaKeys = new Set(['content', 'reasoning_content', 'text', 'thinking', 'partial_json', 'arguments', 'signature']);
 const internalError = () => new Error('Comparison provider request unavailable');
 function requireSafe(condition: unknown): asserts condition { if (!condition) throw internalError(); }
+function holdDiagnostics(options: BrokerOptions, diagnostics: Promise<void>) {
+  try { options.waitUntil?.(diagnostics); } catch { /* Observation cannot affect forwarding. */ }
+}
 
 function allowedStage(scope: Scope, key: string) {
   const creation = scope.operation === 'creation';
@@ -217,6 +221,7 @@ export async function createComparisonBaselineBroker(options: BrokerOptions & { 
           throw internalError();
         }
         void outcome.completion.then(receipt => clean(context.vendorStarted && receipt.state === 'unknown'), () => clean(context.vendorStarted));
+        holdDiagnostics(options, outcome.diagnostics);
         // A baseline transport can retry selected HTTP statuses; this bridge
         // returns only successful native SSE and surfaces all other results as a fixed error.
         if (!outcome.response?.ok) throw internalError();
@@ -241,7 +246,6 @@ export type ComparisonHarnessOutboundScope = HarnessOutboundScope & Readonly<{
 export async function createComparisonHarnessBroker(options: BrokerOptions & {
   harnessDB: HarnessDatabase;
   authorizeRun(run: HarnessRun): Promise<boolean>;
-  waitUntil?(promise: Promise<unknown>): void;
 }) {
   const { slot, grant, approval, protocol, providerUrl, currentProfile } = await lockedProvider(options, 'B');
   const { capacityDB, harnessDB, settingsKey, loadConfig, authorizeRun, fetcher } = options;
@@ -330,6 +334,7 @@ export async function createComparisonHarnessBroker(options: BrokerOptions & {
             const outcome = await bound.dispatchStream({ requestId, stage, body: encoder.encode(wire.body) }, init.signal);
             requireSafe(outcome.dispatched);
             options.waitUntil?.(outcome.completion);
+            holdDiagnostics(options, outcome.diagnostics);
             // open() captures the secret guard before returning any response.
             requireSafe(outcome.response);
             return outcome.response;
