@@ -23,6 +23,17 @@ npx tsx scripts/harness-evaluation.ts report --out "$RUN" --save evaluation.json
 
 `--comparison-index` 核对原归档索引中的六题、18 份材料和试玩清单字节摘要，再把索引摘要纳入新清单。2026-11-06 本地复核一致，归档的 `settingsFrozen` 仍为 false。去掉 `--settings` 可预演清单并查看空结果。正式对照要在另一个新目录冻结实际设置。脚本只组织材料和导入记录，不调用模型、浏览器、上游或生产。
 
+冻结设置后，可离线生成协调计划。
+
+```sh
+PLAN=artifacts/ccb-harness-comparison-plan
+npx tsx scripts/harness-comparison-coordinator.ts plan --registry "$RUN" --comparison-index "$INDEX" --out "$PLAN" --scope formal
+```
+
+计划重新核对登记、归档索引、18 份原始材料和设置快照，写入私有 `plan.json`。正式范围要求 B 固定实现 `630303565f44c061c7ed8ad7b992dcc4e9db8929` 和镜像摘要 `0e95a0406e8dc94b0a4eea1f2cb62ff2a31ff48261d8fca87923d99ebfcec957`。已有计划字节一致时可重读，冲突时拒绝覆盖。合成排练使用独立私有登记和输出目录，指定 `--scope rehearsal`，其编号与正式范围分开。
+
+计划包含 12 个制作槽位和 12 个审核槽位。每题的两路审核均指向该题 B 成品槽位，并要求后续核验已锁定的审核输入与原始 B HTML 一致。计划器只声明依赖，不读取执行结果、不入队、不调用模型。模型和规则的来源、供应商兼容性及执行授权在计划中均标为未核验，质量仍由独立评估判定。协调员只向正式登记导入正式执行记录。
+
 前置的生产使用权与供应商兼容性初始均为 false。若取得真实证据，使用 `import prerequisite` 分别确认。授权记录须明确涵盖生产使用，兼容性记录须来自冻结镜像、所选供应商和实际创作与审核配置。2026-11-06 的 Opus 合成协议回执只覆盖当时的镜像和已测创作契约。正式审核模型验证、原生隔离及生产使用授权独立核验，发布前由部署检查器按实际回执核对。两项前置状态与质量判定分开。
 
 ## 正式对照交接

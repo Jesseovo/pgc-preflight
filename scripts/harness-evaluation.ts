@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, readdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parseArgs } from 'node:util';
+import { isDeepStrictEqual, parseArgs } from 'node:util';
 import { reviewReportErrors } from '../server/review-report';
 import { HARNESS_CCB_COMMIT as engine, isHarnessImage } from '../server/harness-protocol';
 
@@ -95,6 +95,10 @@ function unique<T extends { id: string }>(rows: T[], label: string) {
 function sha(bytes: Buffer | string) { return createHash('sha256').update(bytes).digest('hex'); }
 function jsonBytes(value: unknown) { return JSON.stringify(value, null, 2) + '\n'; }
 async function json(path: string): Promise<unknown> { return JSON.parse(await readFile(path, 'utf8')); }
+async function regularFileBytes(path: string) {
+  need(await realpath(path) === path && (await lstat(path)).isFile(), 'Frozen registry paths must be regular files without symbolic links');
+  return readFile(path);
+}
 async function store(path: string, value: unknown) {
   const temporary = `${path}.${randomUUID()}.tmp`;
   await writeFile(temporary, jsonBytes(value), { mode: 0o600, flag: 'wx' });
@@ -151,9 +155,22 @@ function fixedPaths(directory: string) {
     materials: join(directory, 'materials'),
   };
 }
+function frozenWorkflows(lock: Settings | null) {
+  return {
+    creation: {
+      A: { implementationCommit: baseline, path: 'published-platform-v2', thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000 },
+      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000,
+        taskMaxOutputTokens: 256_000, taskMaxMs: 2_400_000, maxTurns: 24, maxRepairs: 2 },
+    },
+    review: {
+      A: { implementationCommit: baseline, path: 'original-admin', mode: 'basic' },
+      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, path: 'new-admin', mode: 'basic' },
+    },
+  };
+}
 async function materialRegistration(checklistBytes: Buffer, indexPath?: string) {
   if (!indexPath) return null;
-  const bytes = await readFile(indexPath);
+  const bytes = await regularFileBytes(resolve(indexPath));
   const index = JSON.parse(bytes.toString('utf8')) as RecordData;
   need(index?.schemaVersion === 1 && index.checklistSha256 === sha(checklistBytes), 'Archived checklist differs from the evaluation fixtures');
   const archived = unique(list(index.cases, 'archived cases').map(raw => {
@@ -201,15 +218,7 @@ export async function prepare(directory: string, settingsPath?: string, indexPat
   const manifest: Frozen = {
     schemaVersion: 1, frozenAt: new Date().toISOString(), settings: lock, cases: frozenCases,
     ...(archive ? { materialIndexSha256: archive.sha256 } : {}),
-    creation: {
-      A: { implementationCommit: baseline, path: 'published-platform-v2', thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000 },
-      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000,
-        taskMaxOutputTokens: 256_000, taskMaxMs: 2_400_000, maxTurns: 24, maxRepairs: 2 },
-    },
-    review: {
-      A: { implementationCommit: baseline, path: 'original-admin', mode: 'basic' },
-      B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, path: 'new-admin', mode: 'basic' },
-    },
+    ...frozenWorkflows(lock),
     acceptance: {
       selectReviewHtml: 'B output for each of the six registered cases; no substitution',
       completedCreationRequiredB: 6, allBCoreRequirementsVerified: true, metrics,
@@ -229,21 +238,60 @@ export async function prepare(directory: string, settingsPath?: string, indexPat
 }
 
 async function openRegistry(directory: string) {
+  directory = resolve(directory);
   const paths = fixedPaths(directory);
-  const manifestBytes = await readFile(paths.manifest);
-  const mappingBytes = await readFile(paths.mapping);
+  const manifestBytes = await regularFileBytes(paths.manifest);
+  const mappingBytes = await regularFileBytes(paths.mapping);
   const manifestSha256 = sha(manifestBytes);
-  const seal = await json(paths.seal) as { manifestSha256: string; mappingSha256: string };
+  const seal = JSON.parse((await regularFileBytes(paths.seal)).toString('utf8')) as { manifestSha256: string; mappingSha256: string };
   need(seal.manifestSha256 === manifestSha256 && seal.mappingSha256 === sha(mappingBytes), 'Frozen registration or blind mapping has changed');
   const manifest = JSON.parse(manifestBytes.toString('utf8')) as Frozen;
   const mapping = JSON.parse(mappingBytes.toString('utf8')) as Mapping[];
-  if (manifest.settings) await settings(directory, manifest.settings);
+  need(manifest.schemaVersion === 1 && Array.isArray(manifest.cases) &&
+    JSON.stringify(manifest.cases.map(item => item?.id)) === JSON.stringify(cases), 'Frozen registry must contain the six registered cases in order');
+  const validatedSettings = manifest.settings ? await settings(directory, manifest.settings) : null;
   for (const item of manifest.cases) {
     for (const name of materialNames) {
-      need(sha(await readFile(join(paths.materials, item.id, name))) === item.materials[name], 'Frozen material hash mismatch');
+      need(sha(await regularFileBytes(join(paths.materials, item.id, name))) === item.materials?.[name], 'Frozen material hash mismatch');
     }
   }
-  return { directory, paths, manifest, manifestSha256, mapping };
+  return { directory, paths, manifest, manifestSha256, mapping, validatedSettings };
+}
+
+/** Read the sealed inputs required by the planner, without exposing the blind mapping or results. */
+export async function readFrozenComparison(directory: string, indexPath: string) {
+  const registry = await openRegistry(directory);
+  const { manifest, manifestSha256, validatedSettings } = registry;
+  need(validatedSettings, 'Freeze model and rules snapshots before planning');
+  const workflows = frozenWorkflows(validatedSettings);
+  need(isDeepStrictEqual(manifest.creation, workflows.creation) && isDeepStrictEqual(manifest.review, workflows.review),
+    'Frozen creation or review workflow differs from the registered implementation, mode or budget');
+  const checklistBytes = await readFile(join(fixtureRoot, 'checklists.json'));
+  const archived = await materialRegistration(checklistBytes, resolve(indexPath));
+  need(archived && manifest.materialIndexSha256 === archived.sha256, 'Comparison index differs from the frozen registration');
+  const checklists = JSON.parse(checklistBytes.toString('utf8')) as FrozenCase[];
+  const registeredCases = await Promise.all(manifest.cases.map(async (item, index) => {
+    const materials = Object.fromEntries(materialNames.map(name => [name, item.materials[name]]));
+    need(Object.keys(item.materials).length === materialNames.length && item.materialSha256 === sha(jsonBytes(materials)) &&
+      materialNames.every(name => archived.cases.get(item.id)?.get(name) === materials[name]), 'Frozen materials differ from the comparison index');
+    need(JSON.stringify(item.checklist) === JSON.stringify(checklists[index].checklist), 'Frozen checklist differs from the comparison index');
+    const refs = await Promise.all(materialNames.map(async name => {
+      need(sha(await readFile(join(fixtureRoot, item.id, name))) === materials[name], 'Frozen material differs from the fixed comparison fixture');
+      return { path: `materials/${item.id}/${name}`, sha256: materials[name] };
+    }));
+    return { id: item.id, materialSha256: item.materialSha256, materials: refs };
+  }));
+  for (const model of [validatedSettings.creationModel, validatedSettings.reviewModel]) {
+    const bytes = await fileBytes(registry.directory, model.config.path);
+    need(sha(bytes) === model.config.sha256, 'File hash mismatch for model configuration snapshot');
+    let config: unknown;
+    try { config = JSON.parse(bytes.toString('utf8')); } catch { continue; }
+    if (config && typeof config === 'object' && Object.hasOwn(config, 'model')) {
+      need((config as RecordData).model === model.name, 'Model configuration snapshot disagrees with the registered model name');
+    }
+  }
+  return { manifestSha256, materialIndexSha256: archived.sha256, cases: registeredCases,
+    settings: validatedSettings, workflows, baseline, engine };
 }
 type Registry = Awaited<ReturnType<typeof openRegistry>>;
 function oneCase(registry: Registry, caseId: unknown) {

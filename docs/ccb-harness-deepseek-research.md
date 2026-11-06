@@ -6,7 +6,11 @@
 
 两次请求验证一次工具往返和结构化结果。独立初评与同模型复核需要两个分离的会话和锁定审核证据，留待另一项验证。此夹具只检查两张合成图的颜色和工具回执，审核准确度和真实审核流程验收另行记录。
 
-本地用固定 CCB 构建和 Node 24.16 运行 `scripts/capture-harness-deepseek-fixture.ts <artifacts 中的 cli-node.js> --check-only`。脚本只连本机回环网关，使用脚本 SSE，重新核对两轮原生请求哈希。合成回执记录两轮和 20 个脚本输出 Token，保存在私有 `artifacts/ccb-harness-deepseek-fixture/ccb-deepseek-review-tool-v1/`。Vitest 另用本地容器替身、带签名的 broker 和独立 SQLite 账本验证两轮、拒绝第三次请求及清理。真实模型调用为零，真实供应商对图片、工具与 JSON mode 组合的响应仍待验证。 [DeepSeek 图片输入](https://api-docs.deepseek.com/guides/vision/) · [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)
+本地用固定 CCB 构建和 Node 24.16 运行 `scripts/capture-harness-deepseek-fixture.ts <artifacts 中的 cli-node.js> --check-only`。脚本只连本机回环网关，使用脚本 SSE，重新核对两轮原生请求哈希。合成回执记录两轮和 20 个脚本输出 Token，保存在私有 `artifacts/ccb-harness-deepseek-fixture/ccb-deepseek-review-tool-v1/`。Vitest 另用本地容器替身、带签名的 broker 和独立 SQLite 账本验证两轮、拒绝第三次请求及清理。这些本地检查没有真实模型调用。 [DeepSeek 图片输入](https://api-docs.deepseek.com/guides/vision/) · [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)
+
+2026-11-06 的真实隔离测试仅发出一次请求，上游返回 HTTP 401，账本为 `provider_rejected`。没有第二轮、自动重试或可用模型结果，供应商 Token 用量保持 null；内部已结算输出计数为 0 不能证明供应商计费为零。代码核查显示请求使用锁定审核配置的服务端解密值构造 Bearer 认证，目的地与原审核路径一致；未发现漏传认证、错组选取或内部租约替代 Key 的实现问题。401 只能确认上游拒绝认证，不能据此确定凭据失效的具体原因。该通道兼容性仍未通过，需先核对当前审核凭据，再按剩余额度准备完整复测。
+
+该次研究的容器、Worker、DO 命名空间及 D1 已清理，独立只读核验确认原版接收全部常规流量，登录及静态资源符合基线。研究候选只保留在非活动上传历史中。原始失败记录、独立读回和后续诊断分别保存在私有 `artifacts/ccb-harness-20261106-hardening/run-deepseek/`，不覆盖失败状态。
 
 ## 后续真实渠道验证的部署边界
 
