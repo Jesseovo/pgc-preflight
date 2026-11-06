@@ -64,7 +64,8 @@ function stream(text: string, size = 19) {
   }), { headers: { 'Content-Type': 'text/event-stream' } });
 }
 
-async function setup(protocol: ModelProtocol = 'anthropic', options: Partial<HarnessGatewayOptions> = {}, vision = protocol === 'anthropic', baseUrl?: string) {
+async function setup(protocol: ModelProtocol = 'anthropic', options: Partial<HarnessGatewayOptions> = {}, vision = protocol === 'anthropic',
+  baseUrl?: string, limits?: Parameters<typeof createHarnessRun>[1]['limits']) {
   const sqlite = new DatabaseSync(':memory:');
   opened.push(sqlite);
   for (const file of readdirSync('migrations').sort().filter(name => name.endsWith('.sql') && name < '0034')) {
@@ -96,7 +97,7 @@ async function setup(protocol: ModelProtocol = 'anthropic', options: Partial<Har
   config = { ...config, profiles: { default: { ...config } } };
   const model = (await lockHarnessModel(config, anthropicProvider ? 'game' : 'review'))!;
   const create = (taskId: string, ownerId = 'member-a', deadlineAt?: number) =>
-    createHarnessRun(DB, { taskId, ownerId, generation: 'generation', actor: 'star', sourceHash: 'a'.repeat(64), snapshot: { versions: ['v1'] }, model, deadlineAt });
+    createHarnessRun(DB, { taskId, ownerId, generation: 'generation', actor: 'star', sourceHash: 'a'.repeat(64), snapshot: { versions: ['v1'] }, model, deadlineAt, limits });
   const { run, lease } = (await create('task'))!;
   const path = anthropicProvider ? '/v1/messages' : '/v1/chat/completions';
   const defaultBody = anthropicProvider ? anthropic : openAI;
@@ -248,6 +249,100 @@ describe('private harness model gateway', () => {
     expect((await s.send('replacement')).status).toBe(401);
     expect(await endHarnessRun(s.DB, s.run, 'done')).toBe(false);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { label: '24k reservation keeps its original wire limit', declaredCap: 24_000, outputCap: 24_000, priorOutput: 0, wireLimit: 12 * 1024 * 1024 },
+    { label: '64k declaration clamped to 24k by earlier usage', declaredCap: 64_000, outputCap: 24_000, priorOutput: 40_000, wireLimit: 12 * 1024 * 1024 },
+    { label: '64k reservation still has a cumulative wire limit', declaredCap: 64_000, outputCap: 64_000, priorOutput: 0, wireLimit: 64 * 1024 * 1024 },
+  ])('latches unknown when a $label is exceeded', async ({ declaredCap, outputCap, priorOutput, wireLimit }) => {
+    const encode = (value: string) => new TextEncoder().encode(value);
+    const frame = encode(event('ping', { metadata: 'x'.repeat(63 * 1024) }));
+    const opening = encode(messageStart);
+    const count = Math.floor((wireLimit - opening.length) / frame.length) + 1;
+    let reads = 0;
+    const canceled = vi.fn();
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (reads === 0) controller.enqueue(opening);
+        else if (reads <= count) controller.enqueue(frame);
+        else controller.close();
+        reads++;
+      },
+      cancel: canceled,
+    }, { highWaterMark: 0 }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    const s = await setup('anthropic', { fetcher }, true, undefined, priorOutput ? { maxTotalOutputTokens: 64_000, maxModelTurns: 2 } : undefined);
+    if (priorOutput) {
+      const earlier = messageStart + messageDelta('end_turn', { output_tokens: priorOutput }) + messageStop;
+      fetcher.mockImplementationOnce(async () => stream(earlier));
+      expect(await (await s.send('previous-paid-stage')).text()).toBe(earlier);
+    }
+    const response = await s.send('too-many-wire-bytes', { ...anthropic, max_tokens: declaredCap });
+    expect(JSON.parse(String(fetcher.mock.calls.at(-1)?.[1]?.body))).toMatchObject({ max_tokens: outputCap });
+    const reader = response.body!.getReader();
+    let forwarded = 0;
+    await expect((async () => {
+      for (;;) {
+        const result = await reader.read();
+        if (result.done) break;
+        forwarded += result.value.byteLength;
+      }
+    })()).rejects.toThrow('stream_limit');
+    expect(forwarded).toBe(opening.length + (count - 1) * frame.length);
+    expect(reads).toBe(count + 1);
+    expect(canceled).toHaveBeenCalledTimes(1);
+    expect(await s.summary()).toMatchObject({ status: 'unknown', failureCode: 'stream_limit', outputTokens: priorOutput, reservedTokens: outputCap });
+    expect(fetcher).toHaveBeenCalledTimes(priorOutput ? 2 : 1);
+  });
+
+  it('retains the per-event limit with an extended cumulative wire budget', async () => {
+    const oversizeFrame = ':' + 'x'.repeat(2 * 1024 * 1024) + '\n\n';
+    const fetcher = vi.fn<typeof fetch>(async () => stream(messageStart + oversizeFrame, 32 * 1024));
+    const s = await setup('anthropic', { fetcher });
+    const response = await s.send('large-single-frame');
+    await expect(response.text()).rejects.toThrow('stream_limit');
+    expect(await s.summary()).toMatchObject({ status: 'unknown', failureCode: 'stream_limit', reservedTokens: 64_000 });
+  });
+
+  it.each([
+    { label: 'blank frames before the terminator', prefix: messageStart, frame: '\n' },
+    { label: 'comment frames after the terminator', prefix: anthStream, frame: ': keepalive\n\n' },
+  ])('bounds a single read flooded with $label', async ({ prefix, frame }) => {
+    const encode = new TextEncoder();
+    let read = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (read === 0) controller.enqueue(encode.encode(prefix));
+        else if (read === 1) controller.enqueue(encode.encode(frame.repeat(65_537)));
+        else controller.close();
+        read++;
+      },
+    }, { highWaterMark: 0 }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    const s = await setup('anthropic', { fetcher });
+    const response = await s.send('frame-flood');
+    await expect(response.text()).rejects.toThrow('stream_limit');
+    expect(await s.summary()).toMatchObject({ status: 'unknown', failureCode: 'stream_limit', outputTokens: 0, reservedTokens: 64_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds the held terminal tail without releasing it before settlement', async () => {
+    const encode = (value: string) => new TextEncoder().encode(value);
+    const comment = encode(':' + 'x'.repeat(1024 * 1024) + '\n\n');
+    let reads = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (reads === 0) controller.enqueue(encode(anthStream));
+        else if (reads <= 12) controller.enqueue(comment);
+        else controller.close();
+        reads++;
+      },
+    }, { highWaterMark: 0 }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    const s = await setup('anthropic', { fetcher });
+    const reader = (await s.send('terminal-tail')).body!.getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).not.toContain('message_stop');
+    await expect(reader.read()).rejects.toThrow('stream_limit');
+    expect(await s.summary()).toMatchObject({ status: 'unknown', reservedTokens: 64_000 });
   });
 
   it('records known truncation and consumed output without forwarding a successful terminal frame', async () => {

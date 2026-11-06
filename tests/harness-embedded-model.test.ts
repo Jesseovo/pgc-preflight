@@ -54,8 +54,8 @@ function stream(text: string, size = 17) {
   }), { headers: { 'Content-Type': 'text/event-stream' } });
 }
 
-async function setup(fetcher: typeof fetch, { protocol = 'anthropic', vision = true, total = 65_000 }:
-  { protocol?: ModelProtocol; vision?: boolean; total?: number } = {}) {
+async function setup(fetcher: typeof fetch, { protocol = 'anthropic', vision = true, total = 65_000, requestCap }:
+  { protocol?: ModelProtocol; vision?: boolean; total?: number; requestCap?: number } = {}) {
   const sqlite = new DatabaseSync(':memory:');
   databases.push(sqlite);
   for (const file of readdirSync('migrations').sort().filter(name => name.endsWith('.sql') && name < '0034')) {
@@ -76,7 +76,7 @@ async function setup(fetcher: typeof fetch, { protocol = 'anthropic', vision = t
   const profile = { model: openAI ? deepSeek : opus, baseUrl: openAI ? 'https://api.deepseek.com' : 'https://model.synthetic.invalid',
     protocol, encryptedKey: await encryptKey(providerKey, secret), enabled: true, updatedAt: 'initial', vision };
   const config: ModelConfig = { ...profile, activeProfile: 'default', profiles: { default: profile } };
-  const model = (await lockHarnessModel(config, openAI ? 'review' : 'game'))!;
+  const model = (await lockHarnessModel(config, openAI ? 'review' : 'game', requestCap))!;
   const deadlineAt = Date.now() + 70_000;
   const { run, lease } = (await createHarnessRun(DB, { taskId: 'task-native', generation: 'generation', ownerId: 'owner', actor: 'star',
     sourceHash: 'a'.repeat(64), snapshot: { marker: 'synthetic' }, model, deadlineAt,
@@ -219,6 +219,48 @@ describe('embedded model native gateway', () => {
     expect(s.requests()).toEqual([expect.objectContaining({ state: 'unknown', error_code: code, input_tokens: null, output_tokens: null, attempts: 1 })]);
     expect(await s.summary()).toMatchObject({ status: 'unknown', reservedTokens: 64_000 });
     await expect(s.call('stage-0-two')).rejects.toBeInstanceOf(EmbeddedHarnessModelError);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles a 64k DeepSeek stream whose many small native envelopes exceed the old 12 MiB wire limit', async () => {
+    const delta = openAIChoice({ reasoning_content: 'r' }).replace('"choices"', '"object":"chat.completion.chunk","metadata":"' + 'x'.repeat(180) + '","choices"');
+    const repeatsPerRead = 128;
+    const reads = 352;
+    const repeated = new TextEncoder().encode(delta.repeat(repeatsPerRead));
+    expect(repeated.length * reads).toBeGreaterThan(12 * 1024 * 1024);
+    let index = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (index++ < reads) controller.enqueue(repeated);
+        else {
+          controller.enqueue(new TextEncoder().encode(openAIChoice({ content: '完整 HTML' }, 'stop') + openAIUsage(52_000, 50_000)));
+          controller.close();
+        }
+      },
+    }, { highWaterMark: 0 }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    const s = await setup(fetcher, { protocol: 'openai', requestCap: 64_000 });
+    const answer = await s.call('long-response');
+    expect(answer.content).toEqual([{ type: 'thinking', thinking: 'r'.repeat(repeatsPerRead * reads) },
+      { type: 'text', text: '完整 HTML' }]);
+    expect(answer.diagnostics.byteCount).toBeGreaterThan(12 * 1024 * 1024);
+    expect(answer.diagnostics.nativeEventCount).toBe(repeatsPerRead * reads + 3);
+    expect(s.requests()).toEqual([expect.objectContaining({ state: 'completed', output_tokens: 52_000, reasoning_tokens: 50_000, attempts: 1 })]);
+    expect(await s.summary()).toMatchObject({ status: 'active', reservedTokens: 0, outputTokens: 52_000 });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects retained native reasoning above 12 MiB even within the expanded wire allowance', async () => {
+    const repeated = new TextEncoder().encode(openAIChoice({ reasoning_content: 'r'.repeat(1024 * 1024 - 128) }));
+    let index = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (index++ < 13) controller.enqueue(repeated);
+        else controller.close();
+      },
+    }, { highWaterMark: 0 }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    const s = await setup(fetcher, { protocol: 'openai', requestCap: 64_000 });
+    await expect(s.call('reasoning-limit')).rejects.toMatchObject({ code: 'stream_limit', diagnostics: { nativeEventCount: 13 } });
+    expect(await s.summary()).toMatchObject({ status: 'unknown', reservedTokens: 64_000 });
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 

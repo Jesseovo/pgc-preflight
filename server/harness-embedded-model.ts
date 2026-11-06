@@ -1,5 +1,5 @@
 import type { EmbeddedAssistantBlock, EmbeddedModelRequest } from './embedded-ccb/types';
-import { handleHarnessModelRequest, type HarnessGatewayOptions, type HarnessNativeObserver, type HarnessNativeUsage, type HarnessUpstreamErrorResponse } from './harness-gateway';
+import { handleHarnessModelRequest, HARNESS_MAX_RETAINED_RESPONSE_BYTES, HarnessNativeResponseLimitError, type HarnessGatewayOptions, type HarnessNativeObserver, type HarnessNativeUsage, type HarnessUpstreamErrorResponse } from './harness-gateway';
 import { harnessSha256, type HarnessRequestIdentity, type HarnessRun } from './harness-ledger';
 import { HARNESS_MODEL_HEADERS, type HarnessFinishReason, type HarnessModelPolicy } from './harness-protocol';
 import { retryAfterMs } from './model-throttle';
@@ -8,6 +8,14 @@ type JsonObject = Record<string, unknown>;
 const object = (value: unknown): value is JsonObject => value !== null && typeof value === 'object' && !Array.isArray(value);
 const maxBlocks = 256;
 const maxEvents = 128_000;
+const encoder = new TextEncoder();
+class RetainedResponseBudget {
+  private bytes = 0;
+  retain(...parts: (string | undefined)[]) {
+    for (const part of parts) if (part) this.bytes += encoder.encode(part).byteLength;
+    if (this.bytes > HARNESS_MAX_RETAINED_RESPONSE_BYTES) throw new HarnessNativeResponseLimitError();
+  }
+}
 const invalid = (): never => { throw new Error('stream_invalid'); };
 function requireNative(value: unknown): asserts value { if (!value) invalid(); }
 
@@ -114,6 +122,7 @@ function anthropicBlock(value: unknown): AnthropicBlock {
 }
 
 class AnthropicAssembly implements NativeAssembly {
+  private readonly budget = new RetainedResponseBudget();
   private readonly content: AnthropicBlock[] = [];
   private readonly toolIds = new Set<string>();
   private readonly streamedInputs = new Map<ToolBlock, string>();
@@ -134,6 +143,7 @@ class AnthropicAssembly implements NativeAssembly {
         Array.isArray(message.content) && message.content.length === 0);
       requireNative(message.model === undefined || message.model === this.model);
       requireNative(message.id === undefined || typeof message.id === 'string' && message.id.length > 0);
+      this.budget.retain(message.id);
       this.id = message.id;
       this.started = true;
       return;
@@ -155,7 +165,12 @@ class AnthropicAssembly implements NativeAssembly {
     requireNative(!this.hasReason && value.index === this.content.length && this.content.length < maxBlocks);
     if (value.type === 'content_block_start') {
       requireNative(!this.active);
-      this.active = { block: anthropicBlock(value.content_block), parts: [] };
+      const block = anthropicBlock(value.content_block);
+      if (block.type === 'text') this.budget.retain(block.text);
+      if (block.type === 'thinking') this.budget.retain(block.thinking, block.signature);
+      if (block.type === 'redacted_thinking') this.budget.retain(block.data);
+      if (block.type === 'tool_use') this.budget.retain(block.id, block.name, JSON.stringify(block.input));
+      this.active = { block, parts: [] };
       return;
     }
     requireNative(this.active);
@@ -186,16 +201,20 @@ class AnthropicAssembly implements NativeAssembly {
     if (block.type === 'thinking') {
       if (delta.type === 'signature_delta') {
         requireNative(typeof delta.signature === 'string' && delta.signature.length > 0 && !block.signature);
+        this.budget.retain(delta.signature);
         block.signature = delta.signature;
         return;
       }
       requireNative(delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && !block.signature);
+      this.budget.retain(delta.thinking);
       parts.push(delta.thinking);
     } else if (block.type === 'text') {
       requireNative(delta.type === 'text_delta' && typeof delta.text === 'string');
+      this.budget.retain(delta.text);
       parts.push(delta.text);
     } else if (block.type === 'tool_use') {
       requireNative(delta.type === 'input_json_delta' && typeof delta.partial_json === 'string');
+      this.budget.retain(delta.partial_json);
       if (delta.partial_json) parts.push(delta.partial_json);
     } else invalid();
   }
@@ -211,6 +230,7 @@ class AnthropicAssembly implements NativeAssembly {
 type OpenAITool = { id: string; name: string; arguments: string[]; isFunction: boolean };
 
 class OpenAIAssembly implements NativeAssembly {
+  private readonly budget = new RetainedResponseBudget();
   private id?: string;
   private readonly text: string[] = [];
   private readonly reasoning: string[] = [];
@@ -230,6 +250,7 @@ class OpenAIAssembly implements NativeAssembly {
     requireNative(value.model === undefined || value.model === this.model);
     if (value.id !== undefined) {
       requireNative(typeof value.id === 'string' && value.id.length > 0 && (this.id === undefined || this.id === value.id));
+      if (this.id === undefined) this.budget.retain(value.id);
       this.id = value.id;
     }
     requireNative(Array.isArray(value.choices) && value.choices.length <= 1);
@@ -241,10 +262,12 @@ class OpenAIAssembly implements NativeAssembly {
     requireNative(delta.function_call == null && delta.refusal == null);
     if (delta.content != null) {
       requireNative(typeof delta.content === 'string');
+      this.budget.retain(delta.content);
       this.text.push(delta.content);
     }
     if (delta.reasoning_content != null) {
       requireNative(typeof delta.reasoning_content === 'string');
+      this.budget.retain(delta.reasoning_content);
       this.reasoning.push(delta.reasoning_content);
     }
     if (delta.tool_calls != null) {
@@ -263,6 +286,7 @@ class OpenAIAssembly implements NativeAssembly {
     requireNative(value.id == null || typeof value.id === 'string');
     requireNative(fn?.name == null || typeof fn.name === 'string');
     requireNative(fn?.arguments == null || typeof fn.arguments === 'string');
+    this.budget.retain(value.id ?? undefined, fn?.name ?? undefined, fn?.arguments ?? undefined);
     const tool = this.tools[value.index] ?? { id: '', name: '', arguments: [], isFunction: false };
     tool.id += value.id ?? '';
     tool.name += fn?.name ?? '';
@@ -406,7 +430,7 @@ function nativeObserver(model: HarnessModelPolicy, diagnostics: EmbeddedHarnessM
       diagnostics.nativeEventCount++;
       requireNative(model.protocol !== 'openai' || name === undefined || name === 'message');
       if (value === '[DONE]' || value.type === 'message_stop') diagnostics.nativeTerminalAt = at;
-      requireNative(diagnostics.nativeEventCount <= maxEvents);
+      if (diagnostics.nativeEventCount > maxEvents) throw new HarnessNativeResponseLimitError();
       assembly.event(value);
     },
     complete(usage) { result = { message: assembly.complete(usage.finishReason), usage }; },

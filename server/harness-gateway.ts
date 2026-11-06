@@ -5,15 +5,27 @@ import {
   type HarnessDatabase, type HarnessRequestIdentity, type HarnessReviewPhase, type HarnessRun,
 } from './harness-ledger';
 import {
-  HARNESS_MAX_REQUEST_MS, HARNESS_MODEL_HEADERS, type HarnessFailureCode, type HarnessFinishReason, type HarnessModelPolicy,
+  HARNESS_MAX_REQUEST_MS, HARNESS_MAX_REQUEST_TOKENS, HARNESS_MODEL_HEADERS, type HarnessFailureCode, type HarnessFinishReason, type HarnessModelPolicy,
 } from './harness-protocol';
 import { tryModelSlot } from './model-capacity';
 import { createModelThrottle, pauseModel, retryAfterMs, type ModelThrottleDatabase } from './model-throttle';
 import { decryptKey, type ModelConfig, type ModelRuntime } from './settings';
 
 const maxRequestBytes = 24 * 1024 * 1024;
-const maxResponseBytes = 12 * 1024 * 1024;
+const maxBufferedWireBytes = 12 * 1024 * 1024;
+const maxResponseBytes = 64 * 1024 * 1024;
+const baselineOutputCap = 24_000;
+export const HARNESS_MAX_RETAINED_RESPONSE_BYTES = 12 * 1024 * 1024;
+export class HarnessNativeResponseLimitError extends Error {}
+
+// SSE repeats envelope metadata on every delta. Scale only the cumulative
+// wire allowance for larger reservations, never the retained content.
+function responseByteBudget(outputCap: number) {
+  return Math.min(maxResponseBytes, maxBufferedWireBytes + Math.ceil(Math.max(0, outputCap - baselineOutputCap) *
+    (maxResponseBytes - maxBufferedWireBytes) / (HARNESS_MAX_REQUEST_TOKENS - baselineOutputCap)));
+}
 const maxEventCharacters = 2 * 1024 * 1024;
+const maxFramesPerRead = 65_536;
 const maxMessages = 256;
 const maxTools = 96;
 const encoder = new TextEncoder();
@@ -252,6 +264,12 @@ class StreamUsage {
     this.reasoningTokens = reasoning ?? this.reasoningTokens;
   }
 
+  private addCharacters(count: number) {
+    // Preserve the visible character ceiling in the request ledger schema.
+    if (this.characters + count > HARNESS_MAX_RETAINED_RESPONSE_BYTES) throw new StreamError('stream_limit');
+    this.characters += count;
+  }
+
   private reason(value: unknown, allowed: readonly HarnessFinishReason[]) {
     if (value == null) return;
     if (!allowed.includes(value as HarnessFinishReason) || this.finishReason && this.finishReason !== value) throw new StreamError('stream_invalid');
@@ -279,7 +297,7 @@ class StreamUsage {
         this.usage(value.message.usage);
       } else if (value.type === 'content_block_delta' && object(value.delta) && value.delta.type === 'text_delta' &&
           typeof value.delta.text === 'string') {
-        this.characters += value.delta.text.length;
+        this.addCharacters(value.delta.text.length);
       } else if (value.type === 'message_delta') {
         if (!this.started || !object(value.delta)) throw new StreamError('stream_invalid');
         this.reason(value.delta.stop_reason, anthropicReasons);
@@ -294,7 +312,7 @@ class StreamUsage {
       if (choice !== undefined) {
         if (!object(choice) || (choice.index !== undefined && choice.index !== 0)) throw new StreamError('stream_invalid');
         this.reason(choice.finish_reason, openAIReasons);
-        if (object(choice.delta) && typeof choice.delta.content === 'string') this.characters += choice.delta.content.length;
+        if (object(choice.delta) && typeof choice.delta.content === 'string') this.addCharacters(choice.delta.content.length);
       }
       this.usage(value.usage, Boolean(this.finishReason));
     }
@@ -321,12 +339,15 @@ class StreamFrames {
   private event?: string;
   private bytes = 0;
 
-  constructor(private readonly usage: StreamUsage,
+  constructor(private readonly usage: StreamUsage, private readonly byteBudget: number,
     private readonly observe?: (value: Record<string, unknown> | '[DONE]', name?: string) => void) {}
 
   add(bytes?: Uint8Array): { ordinary: string; terminal: string } {
-    this.bytes += bytes?.length ?? 0;
-    if (this.bytes > maxResponseBytes) throw new StreamError('stream_limit');
+    const chunkBytes = bytes?.byteLength ?? 0;
+    this.bytes += chunkBytes;
+    if (chunkBytes + this.remaining.length + this.frame.length > maxBufferedWireBytes || this.bytes > this.byteBudget) {
+      throw new StreamError('stream_limit');
+    }
     const previouslyScanned = this.remaining.length - Number(this.remaining.endsWith('\r'));
     try {
       this.remaining += bytes ? this.decoder.decode(bytes, { stream: true }) : this.decoder.decode();
@@ -335,7 +356,7 @@ class StreamFrames {
     }
     const ordinary: string[] = [];
     const terminal: string[] = [];
-    let offset = 0;
+    let offset = 0, frameCount = 0;
     const lineEnd = /\r\n|[\n\r]/g;
     lineEnd.lastIndex = previouslyScanned;
     for (let match = lineEnd.exec(this.remaining); match; match = lineEnd.exec(this.remaining)) {
@@ -347,6 +368,8 @@ class StreamFrames {
       if (this.frame.length > maxEventCharacters) throw new StreamError('stream_limit');
       offset = end;
       if (!line) {
+        // Empty and comment-only frames also occupy entries in the output arrays.
+        if (++frameCount > maxFramesPerRead) throw new StreamError('stream_limit');
         if (this.event === 'error' || this.data.length) {
           const value = this.usage.accept(this.event, this.data.join('\n'));
           this.observe?.(value, this.event);
@@ -449,7 +472,9 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
   const observer = options.nativeObserver;
   const observe = (operation: (target: HarnessNativeObserver) => void) => {
     if (!observer) return;
-    try { operation(observer); } catch { throw new StreamError('stream_invalid'); }
+    try { operation(observer); } catch (error) {
+      throw new StreamError(error instanceof HarnessNativeResponseLimitError ? 'stream_limit' : 'stream_invalid');
+    }
   };
   let protocol: HarnessModelPolicy['protocol'] | null = null;
   let id: HarnessRequestIdentity | undefined;
@@ -568,8 +593,9 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
 
     const reader = upstream.body.getReader();
     const usage = new StreamUsage(protocol, reservation.outputCap);
-    const frames = new StreamFrames(usage, observer ? (value, name) => observe(target => target.event(value, now(), name)) : undefined);
+    const frames = new StreamFrames(usage, responseByteBudget(reservation.outputCap), observer ? (value, name) => observe(target => target.event(value, now(), name)) : undefined);
     const finalFrames: string[] = [];
+    let finalFrameCharacters = 0;
     let finished = false;
     let finalize: Promise<void> | undefined;
     let done!: () => void;
@@ -610,7 +636,11 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
             if (finished) return;
             if (!part.done) observe(target => target.bytes(part.value.byteLength, now()));
             const parsed = frames.add(part.done ? undefined : part.value);
-            if (parsed.terminal) finalFrames.push(parsed.terminal);
+            if (parsed.terminal) {
+              finalFrameCharacters += parsed.terminal.length;
+              if (finalFrameCharacters > maxBufferedWireBytes) throw new StreamError('stream_limit');
+              finalFrames.push(parsed.terminal);
+            }
             if (part.done) {
               const outcome = usage.outcome();
               if (outcome.state === 'completed') observe(target => target.complete(outcome));
