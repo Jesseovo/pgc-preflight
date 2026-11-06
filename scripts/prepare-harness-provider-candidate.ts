@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url';
 // accepts no credentials. Apply only after separate approval and revalidation.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
-if (args.length !== 4 || args[0] !== '--baseline' || args[2] !== '--out') throw new Error('Expected --baseline PRIVATE_BASELINE_DIR --out PRIVATE_PACKAGE_DIR');
+const deepSeek = args.length === 5 && args[4] === '--deepseek-review';
+if (args.length !== (deepSeek ? 5 : 4) || args[0] !== '--baseline' || args[2] !== '--out') {
+  throw new Error('Expected --baseline PRIVATE_BASELINE_DIR --out PRIVATE_PACKAGE_DIR [--deepseek-review]');
+}
 const baselineDir = resolve(args[1]);
 const out = resolve(args[3]);
 if (![baselineDir, out].every(path => path.startsWith(root + '/artifacts/')) || baselineDir === out) throw new Error('Only separate private artifact directories are allowed');
@@ -24,7 +27,7 @@ await mkdir(out, { recursive: true, mode: 0o700 });
 const bytes = await readFile(resolve(baselineDir, 'modules/worker.js'));
 if (sha256(bytes) !== original.modules[0].sha256 || bytes.length !== original.modules[0].bytes) throw new Error('Original module hash mismatch');
 const compiled = await build({
-  entryPoints: [resolve(root, 'scripts/harness-provider-candidate-entry.ts')], bundle: true, write: false,
+  entryPoints: [resolve(root, deepSeek ? 'scripts/harness-provider-deepseek-candidate-entry.ts' : 'scripts/harness-provider-candidate-entry.ts')], bundle: true, write: false,
   format: 'esm', target: 'es2022', platform: 'neutral', conditions: ['workerd'], legalComments: 'inline',
 });
 if (compiled.outputFiles.length !== 1) throw new Error('Unexpected candidate bundle');
@@ -39,7 +42,7 @@ for (const module of modules) await writeFile(resolve(out, module.name), module.
 const receipt = {
   schemaVersion: 1, recordedAt: new Date().toISOString(), worker: baseline.worker,
   baseVersion: original.id, baseDeployment: baseline.deployment.id, mainModule: 'research-entry.js',
-  productionChanged: false, deployed: false, providerCalls: 0,
+  productionChanged: false, deployed: false, providerCalls: 0, ...(deepSeek && { fixture: 'ccb-deepseek-review-tool-v1' }),
   modules: modules.map(module => ({ name: module.name, source: module.source, bytes: module.content.length, sha256: sha256(module.content), contentType: 'application/javascript+module' })),
   requiredOriginalBindings: original.bindings.map((binding: { name: string; type: string }) => ({ name: binding.name, type: binding.type })),
   addedBindings: ['HARNESS_RESEARCH_DB', 'PGC_RESEARCH_AUTH', 'PGC_RESEARCH_VERSION', 'PGC_RESEARCH_MANIFEST'],

@@ -1,6 +1,7 @@
 import { harnessSha256, type HarnessDatabase, type HarnessRequestIdentity } from './harness-ledger';
 import { canonicalHarness } from './harness-policy';
 import type { HarnessFailureCode, HarnessRunIdentity } from './harness-protocol';
+import { DEEPSEEK_RESEARCH_FIXTURE_ID } from './harness-provider-deepseek-fixture';
 
 const maxBytes = 1024 * 1024;
 const maxBlocks = 32;
@@ -18,9 +19,12 @@ export async function recordProviderResearchAssistantDigest(db: HarnessDatabase,
   const result = await db.prepare(`INSERT INTO provider_research_assistant_digests(task_id,generation,request_id,assistant_sha256)
     SELECT r.task_id,r.generation,r.request_id,? FROM harness_requests r
     JOIN harness_runs run ON run.task_id=r.task_id AND run.generation=r.generation
-    WHERE r.task_id=? AND r.generation=? AND r.request_id=? AND r.state='completed' AND r.finish_reason='tool_use' AND run.status='active'
+    WHERE r.task_id=? AND r.generation=? AND r.request_id=? AND r.state='completed' AND run.status='active'
+      AND (r.finish_reason='tool_use' AND run.protocol='anthropic'
+        OR r.finish_reason='tool_calls' AND run.protocol='openai' AND run.model='deepseek-flash' AND run.purpose='review'
+          AND json_extract(run.snapshot,'$.fixtureId')=?)
     ON CONFLICT DO NOTHING RETURNING request_id`)
-    .bind(receipt.assistantSha256, receipt.taskId, receipt.generation, receipt.requestId).first<{ request_id: string }>();
+    .bind(receipt.assistantSha256, receipt.taskId, receipt.generation, receipt.requestId, DEEPSEEK_RESEARCH_FIXTURE_ID).first<{ request_id: string }>();
   if (!result) throw bad();
 }
 
@@ -170,11 +174,12 @@ interface ObservationOptions {
   waitUntil?: (promise: Promise<unknown>) => void;
 }
 
+type AssistantFrames = { readonly ending: boolean; push(chunk: Uint8Array): void; finish(): readonly unknown[] | null };
+
 export function observeProviderResearchAssistant(response: Response, identity: HarnessRequestIdentity, signal: AbortSignal,
-  options: ObservationOptions): Response {
+  options: ObservationOptions, assistant: AssistantFrames = assistantBlocks()): Response {
   if (!response.ok || !response.body || !response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) return response;
   const reader = response.body.getReader();
-  const assistant = assistantBlocks();
   const tail: Uint8Array[] = [];
   let delivered = false;
   let closing: Promise<void> | undefined;

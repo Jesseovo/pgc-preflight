@@ -30,9 +30,10 @@ function fixture() {
     exec: vi.fn(async () => ({ exitCode: Promise.resolve(0), output: async () => ({ exitCode: 0, stdout: new TextEncoder().encode(JSON.stringify(observations(enabled))) }) })),
   };
   const env = { RESEARCH_IMAGE: image, HARNESS_RESEARCH_TOKEN: token, EGRESS_PROBE: {} as any };
-  const runner = new EgressProbeRunner({ storage, container, exports: { EgressProbeOutbound: () => ({}) } }, env);
+  const outbound = vi.fn((options: unknown) => { expect(options).toEqual({ props: {} }); return {}; });
+  const runner = new EgressProbeRunner({ storage, container, exports: { EgressProbeOutbound: outbound } }, env);
   const call = (phase: string) => runner.fetch(new Request(`http://pgc-egress-probe.internal/${phase}`, { method: 'POST' }));
-  return { storage, data, container, runner, env, call };
+  return { storage, data, container, runner, env, call, outbound };
 }
 
 describe('paired native non-HTTP research probe', () => {
@@ -82,6 +83,7 @@ describe('paired native non-HTTP research probe', () => {
       expect((await f.call(phase)).status).toBe(409);
     }
     expect(f.container.start.mock.calls.map(([opts]) => opts.enableInternet)).toEqual([true, false, true]);
+    expect(f.outbound).toHaveBeenCalledTimes(3);
     expect(f.container.destroy).toHaveBeenCalledTimes(3);
     const status = await (await f.runner.fetch(new Request('http://pgc-egress-probe.internal/status'))).json() as any;
     expect(status.active).toBeNull(); expect(status.releaseReady).toBe(false);
@@ -98,6 +100,17 @@ describe('paired native non-HTTP research probe', () => {
     expect((await f.call('blocked')).status).toBe(409);
     expect((f.data.get('receipts') as any[])[0].state).toBe('failed');
   });
+  it('retains only controlled failure steps and output counts, never exception or process content', async () => {
+    const f = fixture(); f.container.interceptOutboundHttps.mockRejectedValue(new Error('secret control token'));
+    const response = await f.call('positive-before'), text = await response.text();
+    expect(response.status).toBe(502); expect(text).not.toContain('secret control token');
+    expect(JSON.parse(text)).toMatchObject({ failedStep: 'https-policy', containerDestroyed: true, state: 'failed' });
+    const g = fixture(); g.container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(1),
+      output: async () => ({ exitCode: 1, stdout: new TextEncoder().encode('private output') }) });
+    const failed = await (await g.call('positive-before')).json();
+    expect(failed).toMatchObject({ failedStep: 'output', processExitCode: 1, stdoutBytes: 14 });
+    expect(JSON.stringify(failed)).not.toContain('private output');
+  });
   it('serializes alarm cleanup with the next phase and preserves polling', async () => {
     const f = fixture();
     let finish!: () => void;
@@ -112,6 +125,19 @@ describe('paired native non-HTTP research probe', () => {
     expect(status.active).toBe('positive-before'); expect(f.container.start).toHaveBeenCalledTimes(1);
     finish(); expect((await before).status).toBe(200); await alarm;
     expect((await blocked).status).toBe(200); expect(f.container.destroy).toHaveBeenCalledTimes(2);
+  });
+  it('bounds a stalled output RPC even after the native process has exited', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture();
+      f.container.exec.mockResolvedValueOnce({ exitCode: Promise.resolve(0), output: () => new Promise(() => {}) });
+      const pending = f.call('positive-before');
+      await vi.advanceTimersByTimeAsync(8001);
+      expect((await pending).status).toBe(502);
+      expect((f.data.get('receipts') as any[])[0]).toMatchObject({ failedStep: 'output', state: 'failed', containerDestroyed: true });
+      expect(f.container.destroy).toHaveBeenCalledOnce();
+      expect(f.data.has('active')).toBe(false);
+    } finally { vi.useRealTimers(); }
   });
   it('does not label an over-deadline execution completed even when sockets returned observations', async () => {
     const f = fixture(), now = Date.now();

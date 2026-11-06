@@ -10,11 +10,13 @@ export const egressPhases = ['positive-before', 'blocked', 'positive-after'] as 
 type Phase = typeof egressPhases[number];
 const checks = ['tcp4', 'udp4', 'tcp6', 'udp6'] as const;
 type Check = typeof checks[number];
+type Step = 'start' | 'outbound-binding' | 'inactivity-timeout' | 'http-policy' | 'https-policy' | 'health' | 'image-check' | 'exec' | 'output' | 'parse';
 export type Observation = { reached: boolean; connected: boolean; result: 'response' | 'timeout' | 'network-error' | 'invalid-response' };
 type Receipt = {
   phase: Phase; image: string; startedAt: number; endedAt?: number;
   state: 'running' | 'completed' | 'failed'; enableInternet: boolean;
   observations?: Record<Check, Observation>; containerDestroyed: boolean;
+  failedStep?: Step; processExitCode?: number; stdoutBytes?: number;
   error?: 'execution-failed' | 'watchdog-expired' | 'cleanup-unconfirmed'; releaseReady: false;
 };
 const internal = 'http://pgc-egress-probe.internal';
@@ -159,6 +161,7 @@ export class EgressProbeRunner {
     const stillActive = async () => {
       if (Date.now() >= receipt.startedAt + maxMs || await storage.get('active') !== phase) throw Error('expired');
     };
+    let step: Step = 'start';
     try {
       const container = this.ctx.container;
       if (container.running) throw Error();
@@ -166,10 +169,13 @@ export class EgressProbeRunner {
       await container.start({ image: receipt.image, instance: 'standard-1', enableInternet: receipt.enableInternet,
         env: { PGC_HARNESS_CONTROL_TOKEN: control, PGC_HARNESS_GATEWAY_URL: 'http://pgc-harness.internal' } });
       await stillActive();
-      await container.setInactivityTimeout(maxMs);
       // Same HTTP policy on both controls and blocked phase; only native internet changes.
-      const denied = this.ctx.exports.EgressProbeOutbound();
-      await container.interceptAllOutboundHttp(denied); await container.interceptOutboundHttps('*', denied);
+      step = 'outbound-binding';
+      const denied = this.ctx.exports.EgressProbeOutbound({ props: {} });
+      step = 'http-policy'; await container.interceptAllOutboundHttp(denied);
+      step = 'https-policy'; await container.interceptOutboundHttps('*', denied);
+      step = 'inactivity-timeout'; await container.setInactivityTimeout(maxMs);
+      step = 'health';
       const readyBy = Date.now() + 18_000; let ready = false;
       while (Date.now() < readyBy) {
         try {
@@ -180,18 +186,33 @@ export class EgressProbeRunner {
         } catch { /* readiness reads only */ }
         await new Promise(resolve => setTimeout(resolve, 250));
       }
-      if (!ready || (await container.inspect())?.image !== receipt.image) throw Error();
+      if (!ready) throw Error();
+      step = 'image-check';
+      if ((await container.inspect())?.image !== receipt.image) throw Error();
       await stillActive();
-      const abort = new AbortController(); const timeout = setTimeout(() => abort.abort(), 8000);
+      const abort = new AbortController();
+      let exited = false, timeout: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          if (!exited) { try { abort.abort(); } catch { /* Native exec may have just exited. */ } }
+          reject(Error('probe_output_deadline'));
+        }, 8000);
+      });
       try {
-        const process = await container.exec(['node', '--input-type=module', '-e', egressScript], { signal: abort.signal, stderr: 'ignore' });
-        // Native exec cannot be aborted after its exit; output may be read later.
-        void process.exitCode.then(() => clearTimeout(timeout), () => clearTimeout(timeout));
-        const output = await process.output();
+        step = 'exec';
+        const process = await Promise.race([container.exec(['node', '--input-type=module', '-e', egressScript], {
+          signal: abort.signal, stderr: 'ignore',
+        }), deadline]);
+        // Do not abort an exited process, but keep the output RPC independently bounded.
+        void process.exitCode.then(() => { exited = true; }, () => { exited = true; });
+        step = 'output';
+        const output = await Promise.race([process.output(), deadline]);
+        receipt.processExitCode = output.exitCode; receipt.stdoutBytes = output.stdout.byteLength;
         if (output.exitCode !== 0 || output.stdout.byteLength > 4096) throw Error();
+        step = 'parse';
         receipt.observations = parseEgressObservations(JSON.parse(new TextDecoder().decode(output.stdout)));
       } finally { clearTimeout(timeout); }
-    } catch { receipt.error = 'execution-failed'; }
+    } catch { receipt.error = 'execution-failed'; receipt.failedStep = step; }
     await this.cleanup(receipt);
     return json(receipt, receipt.state === 'completed' ? 200 : 502);
   }

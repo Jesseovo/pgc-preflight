@@ -13,6 +13,11 @@ import {
 } from './harness-provider-fixture';
 import { PROVIDER_RESEARCH_MODEL, PROVIDER_RESEARCH_PLAN, signHarnessProviderResearch } from './harness-provider-research';
 import { readProviderResearchPriorAssistantDigest } from './harness-provider-research-observer';
+import {
+  DEEPSEEK_RESEARCH_CONTRACT, DEEPSEEK_RESEARCH_FIXTURE_ID, DEEPSEEK_RESEARCH_MODEL, DEEPSEEK_RESEARCH_OUTPUT_CAP,
+  DEEPSEEK_RESEARCH_PHASE, DEEPSEEK_RESEARCH_TOOLS, DEEPSEEK_RESEARCH_TOTAL_CAP, DEEPSEEK_RESEARCH_TURN_CAP,
+  DEEPSEEK_RESEARCH_WIRE, deepSeekResearchFixtureEnvelope, deepSeekResearchResultMatches,
+} from './harness-provider-deepseek-fixture';
 
 type FetchBinding = { fetch(request: Request): Promise<Response> };
 type ObjectBinding = { idFromName(name: string): unknown; get(id: unknown): FetchBinding };
@@ -59,7 +64,6 @@ const broker = 'https://pgc.ovoxin.top';
 const brokerWorker = 'pgc-preflight';
 const hexPattern = /^[a-f0-9]{64}$/;
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-const requestPattern = /^build-0-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const encoder = new TextEncoder();
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
@@ -75,14 +79,49 @@ const secret = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), valu
 const fromHex = (value: string) => Uint8Array.from(value.match(/../g) ?? [], item => Number.parseInt(item, 16));
 const identity = ({ taskId, generation }: NativeConfig) => ({ taskId, generation });
 const slotName = ({ taskId, generation }: NativeConfig) => `${taskId}:${generation}`;
-const limits = { maxTotalOutputTokens: OPUS_RESEARCH_TOTAL_CAP, maxModelTurns: OPUS_RESEARCH_TURN_CAP, maxRepairs: 0 };
+type NativeFixture = {
+  id: string; sourceHash: string; modelContractHash?: string; phase: string; family: 'forge' | 'review';
+  protocol: 'anthropic' | 'openai'; purpose: 'game' | 'review'; model: string; effort: 'high' | 'low';
+  outputCap: number; limits: NonNullable<Plan['limits']>; tools: readonly string[];
+  path: '/v1/messages' | '/v1/chat/completions'; finishReasons: readonly [string, string];
+  envelope(identity: { runId: string; taskId: string; generation: string }, deadlineAt: number): Promise<object>;
+  resultMatches(value: Record<string, unknown>): Promise<boolean>;
+};
 
-function terminalRuntimeStatus(status: Record<string, unknown>): NativeRuntimeStatus | undefined {
+const opusFixture: NativeFixture = {
+  id: OPUS_RESEARCH_FIXTURE_ID, sourceHash: OPUS_RESEARCH_WIRE.sourceHash, phase: OPUS_RESEARCH_PHASE,
+  family: 'forge', protocol: 'anthropic', purpose: 'game', model: OPUS_RESEARCH_MODEL, effort: 'high',
+  outputCap: OPUS_RESEARCH_OUTPUT_CAP, tools: OPUS_RESEARCH_TOOLS, path: '/v1/messages', finishReasons: ['tool_use', 'end_turn'],
+  limits: { maxTotalOutputTokens: OPUS_RESEARCH_TOTAL_CAP, maxModelTurns: OPUS_RESEARCH_TURN_CAP, maxRepairs: 0 },
+  envelope: opusResearchFixtureEnvelope,
+  resultMatches: async value => same(value.files, [
+    { path: 'game.html', encoding: 'utf8', content: OPUS_RESEARCH_HTML, sha256: await harnessHash(OPUS_RESEARCH_HTML) },
+    { path: 'record.json', encoding: 'utf8', content: OPUS_RESEARCH_RECORD, sha256: OPUS_RESEARCH_WIRE.recordSha256 },
+  ]),
+};
+
+export const deepSeekNativeFixture: NativeFixture = {
+  id: DEEPSEEK_RESEARCH_FIXTURE_ID, sourceHash: DEEPSEEK_RESEARCH_WIRE.sourceHash, modelContractHash: DEEPSEEK_RESEARCH_CONTRACT,
+  phase: DEEPSEEK_RESEARCH_PHASE, family: 'review', protocol: 'openai', purpose: 'review', model: DEEPSEEK_RESEARCH_MODEL, effort: 'low',
+  outputCap: DEEPSEEK_RESEARCH_OUTPUT_CAP, tools: DEEPSEEK_RESEARCH_TOOLS, path: '/v1/chat/completions', finishReasons: ['tool_calls', 'stop'],
+  limits: { maxTotalOutputTokens: DEEPSEEK_RESEARCH_TOTAL_CAP, maxModelTurns: DEEPSEEK_RESEARCH_TURN_CAP, maxRepairs: 0 },
+  envelope: deepSeekResearchFixtureEnvelope,
+  resultMatches: async value => typeof value.text === 'string' && deepSeekResearchResultMatches(value.text) && same(value.files, [
+    { path: 'result.txt', encoding: 'utf8', content: value.text, sha256: await harnessHash(value.text) },
+  ]),
+};
+
+function fixtureRequestId(id: string | null, fixture: NativeFixture) {
+  const prefix = `${fixture.phase}-0-`;
+  return id !== null && id.startsWith(prefix) && uuidPattern.test(id.slice(prefix.length));
+}
+
+function terminalRuntimeStatus(status: Record<string, unknown>, fixture: NativeFixture): NativeRuntimeStatus | undefined {
   if (status.state !== 'failed' && status.state !== 'cancelled' && status.state !== 'succeeded') return undefined;
   return {
     state: status.state, failure: runtimeFailures.find(code => code === status.failure) ?? null,
-    ...(boundedCount(status.modelTurns, OPUS_RESEARCH_TURN_CAP) && { modelTurns: status.modelTurns }),
-    ...(boundedCount(status.outputTokens, OPUS_RESEARCH_TOTAL_CAP) && { outputTokens: status.outputTokens }),
+    ...(boundedCount(status.modelTurns, fixture.limits.maxModelTurns) && { modelTurns: status.modelTurns }),
+    ...(boundedCount(status.outputTokens, fixture.limits.maxTotalOutputTokens) && { outputTokens: status.outputTokens }),
   };
 }
 class NativeFailure extends Error {
@@ -256,38 +295,39 @@ async function signedBrokerRequest(env: ProviderNativeEnv, config: NativeConfig,
   return response;
 }
 
-function exactPlan(value: unknown, config: NativeConfig): Plan {
+function exactPlan(value: unknown, config: NativeConfig, fixture: NativeFixture): Plan {
   if (!exactKeys(value, ['taskId', 'generation', 'ownerId', 'actor', 'family', 'sourceHash', 'snapshot', 'model',
     'limits', 'maxRequestOutputTokens', 'phase', 'deadlineAt'])) throw fail('broker_plan_rejected');
   const plan = value as unknown as Plan;
   const snapshot = {
-    kind: 'provider-research-v1', fixtureId: OPUS_RESEARCH_FIXTURE_ID, sourceHash: OPUS_RESEARCH_WIRE.sourceHash,
-    modelContractHash: config.modelContractHash, purpose: 'game', phase: OPUS_RESEARCH_PHASE,
-    notBefore: config.notBefore, expiresAt: config.expiresAt, maxRequestOutputTokens: OPUS_RESEARCH_OUTPUT_CAP,
-    limits, toolNames: [...OPUS_RESEARCH_TOOLS],
+    kind: 'provider-research-v1', fixtureId: fixture.id, sourceHash: fixture.sourceHash,
+    modelContractHash: config.modelContractHash, purpose: fixture.purpose, phase: fixture.phase,
+    notBefore: config.notBefore, expiresAt: config.expiresAt, maxRequestOutputTokens: fixture.outputCap,
+    limits: fixture.limits, toolNames: [...fixture.tools],
   };
   const model = plan.model;
   if (plan.taskId !== config.taskId || plan.generation !== config.generation || plan.ownerId !== 'admin' || plan.actor !== 'admin' ||
-      plan.family !== 'forge' || plan.sourceHash !== OPUS_RESEARCH_WIRE.sourceHash || plan.phase !== OPUS_RESEARCH_PHASE ||
-      plan.deadlineAt !== config.expiresAt || plan.maxRequestOutputTokens !== OPUS_RESEARCH_OUTPUT_CAP ||
-      !same(plan.limits, limits) || JSON.stringify(plan.snapshot) !== JSON.stringify(snapshot) ||
+      plan.family !== fixture.family || plan.sourceHash !== fixture.sourceHash || plan.phase !== fixture.phase ||
+      plan.deadlineAt !== config.expiresAt || plan.maxRequestOutputTokens !== fixture.outputCap ||
+      !same(plan.limits, fixture.limits) || JSON.stringify(plan.snapshot) !== JSON.stringify(snapshot) ||
       !exactKeys(model, ['profileId', 'profileHash', 'model', 'protocol', 'purpose', 'effort', 'vision', 'maxOutputTokens']) ||
       !harnessIdentifier(model.profileId) || !hexPattern.test(model.profileHash) ||
-      model.model !== OPUS_RESEARCH_MODEL || model.protocol !== 'anthropic' || model.purpose !== 'game' ||
-      model.effort !== 'high' || model.vision !== true || model.maxOutputTokens !== OPUS_RESEARCH_OUTPUT_CAP) {
+      model.model !== fixture.model || model.protocol !== fixture.protocol || model.purpose !== fixture.purpose ||
+      model.effort !== fixture.effort || model.vision !== true || model.maxOutputTokens !== fixture.outputCap) {
     throw fail('broker_plan_rejected');
   }
   return plan;
 }
 
-export async function handleProviderNativeOutbound(request: Request, env: ProviderNativeEnv, scope: HarnessOutboundScope) {
+export async function handleProviderNativeOutbound(request: Request, env: ProviderNativeEnv, scope: HarnessOutboundScope, fixture = opusFixture) {
   const config = configured(env);
   const forwarded = scopeHarnessOutbound(request, scope);
-  if (!config || !forwarded || new URL(forwarded.url).pathname !== '/v1/messages' ||
+  if (!config || fixture.modelContractHash && config.modelContractHash !== fixture.modelContractHash ||
+      !forwarded || new URL(forwarded.url).pathname !== fixture.path ||
       scope.taskId !== config.taskId || scope.generation !== config.generation || !hexPattern.test(scope.lease) ||
       Date.now() < config.notBefore || Date.now() >= config.expiresAt) return deny();
   const requestId = forwarded.headers.get(HARNESS_MODEL_HEADERS.requestId);
-  if (!requestPattern.test(requestId ?? '') || forwarded.headers.has('cookie')) return deny();
+  if (!fixtureRequestId(requestId, fixture) || forwarded.headers.has('cookie')) return deny();
   try {
     const body = await readBytes(forwarded.body, 1024 * 1024);
     if (forwarded.signal.aborted || Date.now() >= config.expiresAt) return deny();
@@ -312,7 +352,7 @@ export async function handleProviderNativeOutbound(request: Request, env: Provid
 
 export class ProviderNativeRunnerHost {
   private work?: Promise<void>;
-  constructor(private ctx: any, private env: ProviderNativeEnv) {}
+  constructor(private ctx: any, private env: ProviderNativeEnv, private fixture = opusFixture) {}
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -326,7 +366,8 @@ export class ProviderNativeRunnerHost {
       return new Response(response.body, { status: response.status, headers });
     };
     const config = configured(this.env);
-    if (!config) return identify(deny(), 'configuration');
+    const fixture = this.fixture;
+    if (!config || fixture.modelContractHash && config.modelContractHash !== fixture.modelContractHash) return identify(deny(), 'configuration');
     if (url.origin !== internal) return identify(deny(), 'origin');
     if (url.search || url.hash) return identify(deny(), 'route');
     const storage = this.ctx.storage;
@@ -340,8 +381,8 @@ export class ProviderNativeRunnerHost {
     if (url.pathname !== '/run' || request.method !== 'POST' || Date.now() < config.notBefore || Date.now() >= config.expiresAt ||
         this.ctx.container?.images?.ccb !== config.image) return identify(deny(), 'route');
     const receipt: NativeReceipt = {
-      state: 'armed', fixtureId: OPUS_RESEARCH_FIXTURE_ID, image: config.image, candidateVersion: config.candidateVersion,
-      sourceHash: OPUS_RESEARCH_WIRE.sourceHash, modelContractHash: config.modelContractHash, releaseReady: false,
+      state: 'armed', fixtureId: fixture.id, image: config.image, candidateVersion: config.candidateVersion,
+      sourceHash: fixture.sourceHash, modelContractHash: config.modelContractHash, releaseReady: false,
     };
     const claimed = await storage.transaction(async (tx: any) => {
       if (await tx.get('research-latch')) return false;
@@ -353,25 +394,26 @@ export class ProviderNativeRunnerHost {
   }
 
   private async modelTransition(request: Request, config: NativeConfig, completing: boolean) {
+    const fixture = this.fixture;
     const requestId = request.headers.get(HARNESS_MODEL_HEADERS.requestId);
     const lease = request.headers.get('authorization')?.match(/^Bearer ([a-f0-9]{64})$/)?.[1];
-    if (!requestId || !requestPattern.test(requestId) || !lease || request.signal.aborted || Date.now() >= config.expiresAt) return false;
+    if (!requestId || !fixtureRequestId(requestId, fixture) || !lease || request.signal.aborted || Date.now() >= config.expiresAt) return false;
     const run = await authorizeHarnessLease(this.env.PROVIDER_RESEARCH_DB, identity(config), lease, {
       authorizeRun: async candidate => candidate.actor === 'admin' && candidate.ownerId === 'admin' &&
-        candidate.family === 'forge' && candidate.sourceHash === OPUS_RESEARCH_WIRE.sourceHash &&
-        candidate.model.model === OPUS_RESEARCH_MODEL && candidate.model.purpose === 'game',
+        candidate.family === fixture.family && candidate.sourceHash === fixture.sourceHash &&
+        candidate.model.model === fixture.model && candidate.model.purpose === fixture.purpose && candidate.model.protocol === fixture.protocol,
     });
-    if (!run || !completing && run.modelTurns >= OPUS_RESEARCH_TURN_CAP) return false;
+    if (!run || !completing && run.modelTurns >= fixture.limits.maxModelTurns) return false;
     const prior = run.modelTurns === 1 ? await readProviderResearchPriorAssistantDigest(this.env.PROVIDER_RESEARCH_DB, run) : null;
     if (completing) {
       const terminal = await this.env.PROVIDER_RESEARCH_DB.prepare(`SELECT state,finish_reason FROM harness_requests
         WHERE task_id=? AND generation=? AND request_id=?`).bind(config.taskId, config.generation, requestId)
         .first<{ state: string; finish_reason: string }>();
-      if (terminal?.state !== 'completed' || terminal.finish_reason !== (run.modelTurns === 1 ? 'tool_use' : 'end_turn')) return false;
+      if (terminal?.state !== 'completed' || terminal.finish_reason !== fixture.finishReasons[run.modelTurns - 1]) return false;
     }
     return this.ctx.storage.transaction(async (tx: any) => {
       const latch = await tx.get('research-latch') as Latch | undefined;
-      if (!latch || latch.receipt.state !== 'running' || !same(latch.config, config) ||
+      if (!latch || latch.receipt.state !== 'running' || latch.receipt.fixtureId !== fixture.id || !same(latch.config, config) ||
           request.signal.aborted || latch.requestIds.length !== run.modelTurns ||
           (run.modelTurns === 1 && prior?.requestId !== latch.requestIds[0])) return false;
       if (completing) {
@@ -395,7 +437,8 @@ export class ProviderNativeRunnerHost {
     const latch = await storage.get('research-latch') as Latch | undefined;
     if (!latch || ['passed', 'failed', 'unknown'].includes(latch.receipt.state)) return;
     const config = configured(this.env);
-    if (!config || !same(config, latch.config)) {
+    if (!config || !same(config, latch.config) || latch.receipt.fixtureId !== this.fixture.id ||
+        this.fixture.modelContractHash && config.modelContractHash !== this.fixture.modelContractHash) {
       // The original D1 binding cannot be verified after configuration drift.
       // Destroy locally without writing to a possibly different database.
       latch.receipt.failure ??= 'research_configuration_changed';
@@ -427,7 +470,7 @@ export class ProviderNativeRunnerHost {
     const planResponse = await signedBrokerRequest(this.env, config, PROVIDER_RESEARCH_PLAN, 'plan', '', new Uint8Array(),
       AbortSignal.timeout(Math.min(5000, Math.max(1, config.expiresAt - Date.now()))));
     if (!planResponse.ok) throw fail('broker_plan_unavailable');
-    const plan = exactPlan(await readJson(planResponse), config);
+    const plan = exactPlan(await readJson(planResponse), config, this.fixture);
     if (Date.now() >= config.expiresAt || this.ctx.container.running || this.ctx.container.images.ccb !== config.image) throw fail('research_container_unavailable');
     const allocated = await createHarnessRun(this.env.PROVIDER_RESEARCH_DB, plan);
     if (!allocated) throw fail('research_lease_unavailable');
@@ -442,7 +485,7 @@ export class ProviderNativeRunnerHost {
     await container.setInactivityTimeout(Math.max(1000, config.expiresAt - Date.now() + 10_000));
     await this.waitForRuntime(config, session);
     if ((await container.inspect())?.image !== config.image) throw fail('research_image_mismatch');
-    const envelope = await opusResearchFixtureEnvelope({ ...identity(config), runId: session.runId }, config.expiresAt);
+    const envelope = await this.fixture.envelope({ ...identity(config), runId: session.runId }, config.expiresAt);
     // Never resend this POST if the runtime accepted it but its reply was lost.
     const start = await this.runtime(config, session, '/v1/start', {
       envelope, envelopeSha256: await harnessHash(canonicalHarness(envelope)), lease: allocated.lease,
@@ -480,42 +523,42 @@ export class ProviderNativeRunnerHost {
   }
 
   private async waitForCompletion(config: NativeConfig, session: RuntimeSession, observation: Pick<NativeReceipt, 'runtime'>) {
+    const fixture = this.fixture;
     while (Date.now() < config.expiresAt) {
       const response = await this.runtime(config, session, '/v1/status');
       if (!response.ok) throw fail('research_runtime_status_unknown');
       const status = await readJson(response, 4096);
       if (!isObject(status) || status.runId !== session.runId) throw fail('research_runtime_status_unknown');
       if (status.state === 'running') { await wait(1000); continue; }
-      const terminal = terminalRuntimeStatus(status);
+      const terminal = terminalRuntimeStatus(status, fixture);
       if (terminal) observation.runtime = terminal;
-      if (status.state !== 'succeeded' || status.modelTurns !== OPUS_RESEARCH_TURN_CAP ||
+      if (status.state !== 'succeeded' || status.modelTurns !== fixture.limits.maxModelTurns ||
           typeof status.outputTokens !== 'number' || !Number.isSafeInteger(status.outputTokens) ||
-          status.outputTokens <= 0 || status.outputTokens > OPUS_RESEARCH_TOTAL_CAP) throw fail('research_runtime_incomplete');
+          status.outputTokens <= 0 || status.outputTokens > fixture.limits.maxTotalOutputTokens) throw fail('research_runtime_incomplete');
       const result = await this.runtime(config, session, '/v1/result');
       if (!result.ok) throw fail('research_fixture_result_missing');
       const value = await readJson(result);
       if (!isObject(value) || value.runId !== session.runId || value.state !== 'succeeded' ||
-          value.modelTurns !== OPUS_RESEARCH_TURN_CAP || value.outputTokens !== status.outputTokens || !same(value.files, [
-        { path: 'game.html', encoding: 'utf8', content: OPUS_RESEARCH_HTML, sha256: await harnessHash(OPUS_RESEARCH_HTML) },
-        { path: 'record.json', encoding: 'utf8', content: OPUS_RESEARCH_RECORD, sha256: OPUS_RESEARCH_WIRE.recordSha256 },
-      ])) throw fail('research_fixture_result_mismatch');
+          value.modelTurns !== fixture.limits.maxModelTurns || value.outputTokens !== status.outputTokens ||
+          !await fixture.resultMatches(value)) throw fail('research_fixture_result_mismatch');
       return status.outputTokens;
     }
     throw fail('research_deadline');
   }
 
   private async verifySettlement(config: NativeConfig, latch: Latch, outputTokens: number) {
+    const fixture = this.fixture;
     const db = this.env.PROVIDER_RESEARCH_DB;
     const [first, last] = latch.requestIds;
-    if (latch.requestIds.length !== OPUS_RESEARCH_TURN_CAP || latch.completedTurns !== OPUS_RESEARCH_TURN_CAP) throw fail('research_settlement_missing');
+    if (latch.requestIds.length !== fixture.limits.maxModelTurns || latch.completedTurns !== fixture.limits.maxModelTurns) throw fail('research_settlement_missing');
     const summary = await getHarnessRunSummary(db, identity(config));
     const prior = await readProviderResearchPriorAssistantDigest(db, identity(config));
     const counts = await db.prepare(`SELECT count(*) AS total,
-      sum(CASE WHEN request_id=? AND state='completed' AND attempts=1 AND finish_reason='tool_use' AND input_tokens IS NOT NULL THEN 1 ELSE 0 END) AS tool,
-      sum(CASE WHEN request_id=? AND state='completed' AND attempts=1 AND finish_reason='end_turn' AND input_tokens IS NOT NULL THEN 1 ELSE 0 END) AS final
+      sum(CASE WHEN request_id=? AND state='completed' AND attempts=1 AND finish_reason=? AND input_tokens IS NOT NULL THEN 1 ELSE 0 END) AS tool,
+      sum(CASE WHEN request_id=? AND state='completed' AND attempts=1 AND finish_reason=? AND input_tokens IS NOT NULL THEN 1 ELSE 0 END) AS final
       FROM harness_requests WHERE task_id=? AND generation=?`)
-      .bind(first, last, config.taskId, config.generation).first<{ total: number; tool: number; final: number }>();
-    if (summary?.status !== 'active' || summary.modelTurns !== OPUS_RESEARCH_TURN_CAP || summary.reservedTokens !== 0 ||
+      .bind(first, fixture.finishReasons[0], last, fixture.finishReasons[1], config.taskId, config.generation).first<{ total: number; tool: number; final: number }>();
+    if (summary?.status !== 'active' || summary.modelTurns !== fixture.limits.maxModelTurns || summary.reservedTokens !== 0 ||
         summary.outputTokens !== outputTokens || prior?.requestId !== first || counts?.total !== 2 || counts.tool !== 1 || counts.final !== 1) {
       throw fail('research_settlement_missing');
     }
@@ -528,7 +571,7 @@ export class ProviderNativeRunnerHost {
     const db = this.env.PROVIDER_RESEARCH_DB;
     const storage = this.ctx.storage;
     receipt.state = 'cleanup_pending';
-    if (boundedCount(latch.requestIds.length, OPUS_RESEARCH_TURN_CAP) && boundedCount(latch.completedTurns, latch.requestIds.length)) {
+    if (boundedCount(latch.requestIds.length, this.fixture.limits.maxModelTurns) && boundedCount(latch.completedTurns, latch.requestIds.length)) {
       receipt.transitions = { admitted: latch.requestIds.length, completed: latch.completedTurns };
     }
     latch.cleanupAttempts++;

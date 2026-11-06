@@ -5,6 +5,8 @@ import { HARNESS_MAX_REQUEST_MS, HARNESS_MAX_REQUEST_TOKENS, HARNESS_MODEL_HEADE
 import { observeProviderResearchAssistant, publishProviderResearchAssistantDigest, readProviderResearchPriorAssistantDigest,
   revokeProviderResearchAssistantDigest, type ProviderResearchAssistantReceipt } from './harness-provider-research-observer';
 import { MODEL_PURPOSES, type ModelPurpose } from './settings';
+import { DEEPSEEK_RESEARCH_FIXTURE_ID, isDeepSeekResearchManifest } from './harness-provider-deepseek-fixture';
+import { deepSeekResearchAssistantFrames } from './harness-provider-deepseek-observer';
 
 export { providerResearchAssistantDigest, recordProviderResearchAssistantDigest } from './harness-provider-research-observer';
 
@@ -42,7 +44,7 @@ export interface ProviderResearchOptions extends Pick<HarnessGatewayOptions, 'DB
   capacityDB: NonNullable<HarnessGatewayOptions['capacityDB']>;
   authKey: string;
   manifest: ProviderResearchManifest;
-  /** Mandatory for an Anthropic fixture with a tool continuation. Use the research ledger. */
+  /** Mandatory for a supported fixture with a tool continuation. Use the research ledger. */
   recordAssistantDigest?: (receipt: ProviderResearchAssistantReceipt) => Promise<void>;
 }
 
@@ -198,7 +200,10 @@ export async function handleHarnessProviderResearch(request: Request, options: P
     };
     const family = manifest.purpose === 'review' || manifest.purpose === 'review_verify' ? 'review' : 'forge';
     const toolContinuation = manifest.toolNames.length > 0 && manifest.maxModelTurns > 1;
-    const continuationSupported = (model: LockedHarnessModel) => !toolContinuation || model.protocol === 'anthropic' && !!options.recordAssistantDigest;
+    const deepSeek = isDeepSeekResearchManifest(manifest);
+    if (manifest.fixtureId === DEEPSEEK_RESEARCH_FIXTURE_ID && !deepSeek) return reject('research_unavailable', 503);
+    const continuationSupported = (model: LockedHarnessModel) => !toolContinuation ||
+      !!options.recordAssistantDigest && (deepSeek ? model.protocol === 'openai' : model.protocol === 'anthropic');
     const limits = { maxTotalOutputTokens: manifest.maxTotalOutputTokens, maxModelTurns: manifest.maxModelTurns, maxRepairs: 0 };
     const snapshot = { kind: 'provider-research-v1', fixtureId: manifest.fixtureId, sourceHash: manifest.sourceHash,
       modelContractHash: manifest.modelContractHash, purpose: manifest.purpose, phase: manifest.phase, notBefore: manifest.notBefore,
@@ -242,20 +247,20 @@ export async function handleHarnessProviderResearch(request: Request, options: P
     }), {
       DB, capacityDB, settingsKey, now, authorizeRun, fetcher: options.fetcher, waitUntil: options.waitUntil,
       deadlineAt: manifest.expiresAt, requestIdPrefix: `${manifest.phase}-0-`, expectedModelTurns: run.modelTurns,
-      allowTransportRetry: false,
+      allowTransportRetry: false, ...(deepSeek && { jsonOutput: true }),
       loadConfig: async () => {
         const selected = await selectModel();
         return selected && canonicalHarness(selected.model) === canonicalHarness(run.model) ? selected.config : null;
       },
     });
-    return toolContinuation && run.modelTurns === 0 ? observeProviderResearchAssistant(response, scope, request.signal, {
+    return deepSeek || toolContinuation && run.modelTurns === 0 ? observeProviderResearchAssistant(response, scope, request.signal, {
       record: options.recordAssistantDigest!, publish: receipt => publishProviderResearchAssistantDigest(DB, receipt),
       fail: async code => {
         await endHarnessRun(DB, run, 'failed', code, now());
         await revokeProviderResearchAssistantDigest(DB, scope);
       },
       waitUntil: options.waitUntil,
-    }) : response;
+    }, deepSeek ? deepSeekResearchAssistantFrames(run.modelTurns === 0) : undefined) : response;
   } catch {
     return reject('research_unavailable', 503);
   }
