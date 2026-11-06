@@ -4,7 +4,7 @@ import { canonicalHarness, harnessHash } from '../server/harness-policy';
 import type { HarnessRun } from '../server/harness-ledger';
 import {
   OPUS_RESEARCH_MODEL, OPUS_RESEARCH_OUTPUT_CAP, OPUS_RESEARCH_RECORD, OPUS_RESEARCH_TOOL,
-  OPUS_RESEARCH_TOTAL_CAP, OPUS_RESEARCH_TURN_CAP, OPUS_RESEARCH_WIRE,
+  OPUS_RESEARCH_TOTAL_CAP, OPUS_RESEARCH_TURN_CAP, OPUS_RESEARCH_WIRE, OPUS_RESEARCH_WIRE_V1,
   matchOpusResearchRequest, opusResearchFixtureManifest, opusResearchFixtureMaterial, opusResearchFixtureSourceHash,
 } from '../server/harness-provider-fixture';
 
@@ -84,7 +84,8 @@ describe('pinned Opus provider research fixture', () => {
     const manifest = opusResearchFixtureManifest({ ...run, modelContractHash: 'c'.repeat(64),
       notBefore: startedAt, expiresAt: run.deadlineAt });
     expect(manifest).toMatchObject({
-      purpose: 'game', phase: 'build', maxRequestOutputTokens: 64_000, maxTotalOutputTokens: 128_000, maxModelTurns: 2,
+      fixtureId: 'ccb-opus-provider-v2', purpose: 'game', phase: 'build', maxRequestOutputTokens: 64_000,
+      maxTotalOutputTokens: 128_000, maxModelTurns: 2,
     });
     const materials = await opusResearchFixtureMaterial();
     expect(await opusResearchFixtureSourceHash()).toBe(OPUS_RESEARCH_WIRE.sourceHash);
@@ -92,6 +93,17 @@ describe('pinned Opus provider research fixture', () => {
     expect(new Set(OPUS_RESEARCH_WIRE.imageSha256).size).toBe(16);
     expect(await matchFirst(await bodyFixture())).toBe(true);
     expect(await matchNext(await bodyFixture(true))).toBe(true);
+  });
+
+  it('keeps the historical tools pin distinct from the active fixture', async () => {
+    const body = await bodyFixture();
+    const historicalDescriptions = new Map([
+      ['mcp__pgc_workspace__list', 'List private task files and artifact paths.'],
+      ['mcp__pgc_workspace__read', 'Read UTF-8 text using zero-based character offsets. Read successive chunks using nextOffset. Images are included directly in the user message.'],
+    ]);
+    const tools = body.tools.map(tool => ({ ...tool, description: historicalDescriptions.get(tool.name) ?? tool.description }));
+    expect(await harnessHash(canonicalHarness(tools))).toBe(OPUS_RESEARCH_WIRE_V1.toolsSha256);
+    expect(await matchFirst({ ...body, tools })).toBe(false);
   });
 
   it('rejects changed initial system, tool schema, prompt, image order, date, or native model options', async () => {

@@ -9,6 +9,9 @@ export interface ForgeRunnerBinding { idFromName(name: string): unknown; get(id:
 export interface ForgeTask { harness_policy?:string|null;creative_version?:number;phase?:string|null;phase_started_at?:string|null;owner_id?:string;executor?:string;input_snapshot?:string;retry_of?:string|null;requested_by?:string|null; id: string; kind: string; scope: string; payload: string; status: string; detail: string; error: string; result: string | null; created_at: string; updated_at: string; started_at: string | null; model_started_at: string | null }
 const stamp = () => new Date().toISOString();
 export const FORGE_TASK_LIMIT_MS = 14 * 60000;
+export const FORGE_RESULT_RECOVERY_MS = 24 * 60 * 60_000;
+export const hasForgeHarnessResult = (row: ForgeTask) =>
+  row.executor==='platform'&&row.status==='running'&&!!row.harness_policy&&!!row.result;
 export const taskScope = (job: ForgeJob,owner='admin') => `${owner}:${job.type}:${job.type==='mechanism-check'?`${job.id}:${job.comparison?.candidate_index??(job as any).candidate_index}`:job.type==='expand'?job.ids[0]:job.type==='suggest'?job.dim:job.type==='tag'?'all':'id' in job?job.id:''}`;
 
 // Insert the task and its visible state in one transaction. A repeated click
@@ -39,7 +42,7 @@ export async function enqueueForgeTask(env: ForgeEnv, job: ForgeJob, taskId: str
 }
 
 export async function scheduleForgeTask(env: ForgeEnv, row: ForgeTask) {
-  if (row.executor==='agent' || (row.status !== 'queued' && !(row.creative_version===2&&row.kind==='game'&&row.status==='running')) || !env.FORGE_RUNNER) return;
+  if (row.executor==='agent' || (row.status !== 'queued' && !(row.creative_version===2&&row.kind==='game'&&row.status==='running') && !hasForgeHarnessResult(row)) || !env.FORGE_RUNNER) return;
   try {
     const binding = env.FORGE_RUNNER;
     const response = await binding.get(binding.idFromName(row.id)).fetch(new Request('https://internal/run',{method:'POST',body:row.id}));
@@ -69,7 +72,9 @@ export async function readForgeTask(env: ForgeEnv, id: string) {
   let row: ForgeTask | null = await env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
   if (!row) return null;
   if(row.executor==='agent')return row;
-  if ((row.status === 'running' && !(row.creative_version===2&&row.kind==='game') && Date.now() - Date.parse(row.started_at!) > FORGE_TASK_LIMIT_MS) ||
+  if ((row.status === 'running' && !(row.creative_version===2&&row.kind==='game') && (hasForgeHarnessResult(row)
+      ? Date.now()-Date.parse(row.updated_at)>FORGE_RESULT_RECOVERY_MS
+      : Date.now()-Date.parse(row.started_at!)>FORGE_TASK_LIMIT_MS)) ||
       (row.status === 'queued' && Date.now() - Date.parse(row.created_at) > 86400000)) {
     await failForgeTask(env,row,'后台执行已中断，未自动重复调用模型。请检查后手动重试。');
     row = await env.DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();

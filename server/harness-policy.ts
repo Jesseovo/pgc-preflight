@@ -26,6 +26,7 @@ export function parseHarnessPolicy(raw:unknown):HarnessPolicy|null{
   if(p?.version!==1||p.engine!=='ccb'||p.engineCommit!==CCB_ENGINE_COMMIT||!isHarnessImage(p.image)||!['forge','review'].includes(p.family)||!/^[a-f0-9]{64}$/.test(p.releaseHash)||!/^[a-f0-9]{64}$/.test(p.modelContractHash)||!p.limits)throw new Error('任务的 Harness 版本或预算记录无效。');
   for(const [key,cap] of Object.entries(HARNESS_GAME_LIMITS))if(!Number.isSafeInteger(p.limits[key])||p.limits[key]<0||p.limits[key]>cap)throw new Error('任务的 Harness 预算超出已批准范围。');
   if(!p.limits.maxOutputTokens||!p.limits.maxTotalOutputTokens||!p.limits.maxModelTurns||!p.limits.maxDurationMs)throw new Error('Harness 预算不能为空。');
+  if(p.family==='review'&&(p.limits.maxTotalOutputTokens<2*p.limits.maxOutputTokens||p.limits.maxModelTurns<2))throw new Error('Harness 审核必须分别保留初评与复核预算。');
   if(!MODEL_PURPOSES.includes(p.purpose)||p.family==='review'&&p.purpose!=='review'||p.family==='forge'&&['review','review_verify'].includes(p.purpose))throw new Error('Harness 模型分组无效。');
   return p;
 }

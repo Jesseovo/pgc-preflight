@@ -64,7 +64,7 @@ function stream(text: string, size = 19) {
   }), { headers: { 'Content-Type': 'text/event-stream' } });
 }
 
-async function setup(protocol: ModelProtocol = 'anthropic', options: Partial<HarnessGatewayOptions> = {}, vision = protocol === 'anthropic') {
+async function setup(protocol: ModelProtocol = 'anthropic', options: Partial<HarnessGatewayOptions> = {}, vision = protocol === 'anthropic', baseUrl?: string) {
   const sqlite = new DatabaseSync(':memory:');
   opened.push(sqlite);
   for (const file of readdirSync('migrations').sort().filter(name => name.endsWith('.sql') && name < '0034')) {
@@ -90,7 +90,7 @@ async function setup(protocol: ModelProtocol = 'anthropic', options: Partial<Har
   const anthropicProvider = protocol === 'anthropic';
   let config: ModelConfig = {
     activeProfile: 'default', model: anthropicProvider ? anthropic.model : openAI.model,
-    baseUrl: anthropicProvider ? 'https://models.synthetic.invalid' : 'https://api.deepseek.com',
+    baseUrl: baseUrl ?? (anthropicProvider ? 'https://models.synthetic.invalid' : 'https://api.deepseek.com'),
     protocol, encryptedKey: await encryptKey(key, secret), enabled: true, updatedAt: 'initial', vision,
   };
   config = { ...config, profiles: { default: { ...config } } };
@@ -154,6 +154,34 @@ describe('private harness model gateway', () => {
     expect(s.sqlite.prepare('SELECT input_tokens,output_tokens,reasoning_tokens FROM harness_requests').get())
       .toEqual({ input_tokens: 17, output_tokens: 850, reasoning_tokens: 800 });
   });
+
+  it('locks official DeepSeek JSON mode at the structured stage boundary before reserving a model turn', async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => stream(openAIStream));
+    const s = await setup('openai', { fetcher, jsonOutput: true, requestIdPrefix: 'review_verify-0-' });
+    expect((await s.send('review-0-unscoped')).status).toBe(401);
+    for (const response_format of [{ type: 'text' }, { type: 'json_schema' }, { type: 'json_object', extra: true }]) {
+      expect((await s.send('review_verify-0-invalid', { ...openAI, response_format })).status).toBe(400);
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(await s.summary()).toMatchObject({ modelTurns: 0, reservedTokens: 0 });
+    expect(await (await s.send('review_verify-0-valid')).text()).toBe(openAIStream);
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual({
+      ...openAI, response_format: { type: 'json_object' }, stream_options: { include_usage: true },
+      reasoning_effort: 'low', thinking: { type: 'enabled' },
+    });
+  });
+
+  it.each([[false, 'https://api.deepseek.com'], [true, 'https://models.synthetic.invalid']])(
+    'does not let the caller enable JSON mode outside the locked official DeepSeek JSON contract (%s, %s)',
+    async (jsonOutput, baseUrl) => {
+      const fetcher = vi.fn<typeof fetch>(async () => stream(openAIStream));
+      const s = await setup('openai', { fetcher, jsonOutput }, false, baseUrl);
+      expect((await s.send('bad-format', { ...openAI, response_format: { type: 'json_object' } })).status).toBe(400);
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(await (await s.send('plain-format')).text()).toBe(openAIStream);
+      expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).not.toHaveProperty('response_format');
+    },
+  );
 
   it('rejects other routes, models, effort, oversized controls and remote tools before forwarding', async () => {
     const fetcher = vi.fn<typeof fetch>(async () => stream(anthStream));

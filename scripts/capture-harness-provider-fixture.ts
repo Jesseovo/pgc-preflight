@@ -7,14 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { createHarness } from '../harness/runtime.mjs';
 import { canonical, sha256 } from '../harness/envelope.mjs';
 import {
-  OPUS_RESEARCH_FINAL, OPUS_RESEARCH_HTML, OPUS_RESEARCH_MODEL, OPUS_RESEARCH_RECORD, OPUS_RESEARCH_TOOL,
+  OPUS_RESEARCH_FINAL, OPUS_RESEARCH_FIXTURE_ID, OPUS_RESEARCH_HTML, OPUS_RESEARCH_MODEL, OPUS_RESEARCH_RECORD, OPUS_RESEARCH_TOOL,
   OPUS_RESEARCH_OUTPUT_CAP, OPUS_RESEARCH_TOTAL_CAP, OPUS_RESEARCH_TURN_CAP, OPUS_RESEARCH_WIRE,
   matchOpusResearchRequest, opusResearchFixtureEnvelope, opusResearchFixtureSourceHash,
 } from '../server/harness-provider-fixture';
 import type { HarnessRun } from '../server/harness-ledger';
 
 const artifacts = fileURLToPath(new URL('../artifacts/', import.meta.url));
-const output = resolve(artifacts, 'ccb-harness-20261105/provider-fixture');
+const output = resolve(artifacts, 'ccb-harness-20261105/provider-fixture', OPUS_RESEARCH_FIXTURE_ID);
 const entry = await realpath(resolve(process.argv[2] ?? ''));
 const child = relative(artifacts, entry);
 assert.ok(child && !child.startsWith('..') && entry.endsWith('/dist/cli-node.js'), 'Provide the privately built pinned CCB CLI under artifacts/');
@@ -132,12 +132,12 @@ try {
   await mkdir(output, { recursive: true, mode: 0o700 });
   assert.equal(await realpath(output), output, 'Synthetic fixture output must stay in the private directory');
   for (const [name, value] of Object.entries({ first: captured[0], continuation: captured[1], assistant })) {
-    await writeFile(resolve(output, `${name}.synthetic.json`), JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+    await writeFile(resolve(output, `${name}.synthetic.json`), JSON.stringify(value, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   }
   await writeFile(resolve(output, 'synthetic-receipt.json'), JSON.stringify({
-    fixture: 'ccb-opus-provider-v1', sourceHash, wire: OPUS_RESEARCH_WIRE, firstAssistantSha256: priorDigest,
+    fixture: OPUS_RESEARCH_FIXTURE_ID, sourceHash, wire: OPUS_RESEARCH_WIRE, firstAssistantSha256: priorDigest,
     synthetic: true, modelTurns: result.modelTurns, outputTokens: result.outputTokens,
-  }, null, 2) + '\n', { mode: 0o600 });
+  }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   console.log('Pinned CCB synthetic provider fixture completed two native turns with original images and one allowed workspace write.');
 } finally {
   runtime.close();

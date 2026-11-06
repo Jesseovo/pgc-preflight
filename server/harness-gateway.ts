@@ -2,7 +2,7 @@ import { modelCapabilities } from '../src/model-options';
 import {
   authorizeHarnessLease, finishHarnessRequest, forwardHarnessRequest, harnessIdentifier,
   harnessSha256, readLockedHarnessProfile, rearmHarnessRequest, reserveHarnessRequest,
-  type HarnessDatabase, type HarnessRequestIdentity, type HarnessRun,
+  type HarnessDatabase, type HarnessRequestIdentity, type HarnessReviewPhase, type HarnessRun,
 } from './harness-ledger';
 import {
   HARNESS_MAX_REQUEST_MS, HARNESS_MODEL_HEADERS, type HarnessFailureCode, type HarnessFinishReason, type HarnessModelPolicy,
@@ -48,6 +48,8 @@ export interface HarnessGatewayOptions {
   waitUntil?: (promise: Promise<unknown>) => void;
   deadlineAt?: number;
   requestIdPrefix?: string;
+  reviewPhase?: HarnessReviewPhase;
+  jsonOutput?: boolean;
   expectedModelTurns?: number;
   allowTransportRetry?: boolean;
 }
@@ -126,7 +128,7 @@ function openAIContent(value: unknown, vision: boolean): boolean {
   });
 }
 
-function parseModelRequest(raw: unknown, policy: HarnessModelPolicy, profile: ModelRuntime): { body: Record<string, unknown>; outputCap: number } {
+function parseModelRequest(raw: unknown, policy: HarnessModelPolicy, profile: ModelRuntime, jsonOutput?: boolean): { body: Record<string, unknown>; outputCap: number } {
   if (!object(raw) || raw.model !== policy.model || raw.stream !== true ||
       !Array.isArray(raw.messages) || !raw.messages.length || raw.messages.length > maxMessages) return invalid();
   const anthropic = policy.protocol === 'anthropic';
@@ -165,6 +167,12 @@ function parseModelRequest(raw: unknown, policy: HarnessModelPolicy, profile: Mo
   } else {
     if ((raw.n !== undefined && raw.n !== 1) || (raw.store !== undefined && raw.store !== false)) return invalid();
     if (raw.stream_options !== undefined && (!object(raw.stream_options) || !hasOnly(raw.stream_options, ['include_usage']))) return invalid();
+    // Production derives this contract from the host's locked stage. The
+    // research route instead verifies the exact fixture before forwarding.
+    if (jsonOutput !== undefined && raw.response_format !== undefined &&
+        (!jsonOutput || !object(raw.response_format) || raw.response_format.type !== 'json_object' ||
+          !hasOnly(raw.response_format, ['type']))) return invalid();
+    if (jsonOutput) body.response_format = { type: 'json_object' };
     body.stream_options = { include_usage: true };
     if (raw.max_completion_tokens === undefined) body.max_tokens = limit;
     if (capability.kind === 'deepseek') {
@@ -426,9 +434,10 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
     if (!apiKey) throw new GatewayError('profile_unavailable', 503);
     const runtime = { ...profile, apiKey };
     const url = providerUrl(runtime);
-    const body = parseModelRequest(await requestBody(request, signal), run.model, runtime);
+    const jsonOutput = options.jsonOutput === undefined ? undefined : options.jsonOutput && url.hostname === 'api.deepseek.com';
+    const body = parseModelRequest(await requestBody(request, signal), run.model, runtime, jsonOutput);
     const bodyHash = await harnessSha256(JSON.stringify(body.body));
-    const reservation = await reserveHarnessRequest(db, id, bodyHash, body.outputCap, now(), requestStartedAt, stageDeadline, options.expectedModelTurns);
+    const reservation = await reserveHarnessRequest(db, id, bodyHash, body.outputCap, now(), requestStartedAt, stageDeadline, options.expectedModelTurns, options.reviewPhase);
     if (reservation.status !== 'reserved') {
       const code = reservation.status === 'duplicate' ? 'request_duplicate' :
         reservation.status === 'conflict' ? 'request_conflict' : 'budget_or_state';
@@ -455,7 +464,7 @@ export async function handleHarnessModelRequest(request: Request, options: Harne
       if (!await readLockedHarnessProfile(await abortable(options.loadConfig(), signal), run.model)) throw new GatewayError('profile_unavailable', 503);
       signal.throwIfAborted();
       if (!await abortable(options.authorizeRun(run), signal)) throw new GatewayError('authorization_revoked', 403);
-      if (!await forwardHarnessRequest(db, id, now())) throw new GatewayError('budget_or_state', 409);
+      if (!await forwardHarnessRequest(db, id, now(), options.reviewPhase)) throw new GatewayError('budget_or_state', 409);
       signal.throwIfAborted();
       const requestAt = now();
       potentiallyPaid = true;

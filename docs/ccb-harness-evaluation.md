@@ -8,8 +8,9 @@
 
 ```sh
 RUN=artifacts/ccb-harness-evaluation
+INDEX=artifacts/ccb-harness-20261105/delivery/comparison-index.json
 mkdir -m 700 -p "$RUN/inputs"
-npx tsx scripts/harness-evaluation.ts prepare --out "$RUN" --settings "$RUN/inputs/settings.json"
+npx tsx scripts/harness-evaluation.ts prepare --out "$RUN" --comparison-index "$INDEX" --settings "$RUN/inputs/settings.json"
 npx tsx scripts/harness-evaluation.ts import creation --out "$RUN" --input "$RUN/inputs/creation-record.json"
 npx tsx scripts/harness-evaluation.ts packet creation tap-rhythm B --out "$RUN"
 npx tsx scripts/harness-evaluation.ts import creation-judgment --out "$RUN" --input "$RUN/inputs/creation-judgment.json"
@@ -20,9 +21,17 @@ npx tsx scripts/harness-evaluation.ts import review-judgment --out "$RUN" --inpu
 npx tsx scripts/harness-evaluation.ts report --out "$RUN" --save evaluation.json
 ```
 
-去掉 `--settings` 可预演清单并查看空结果。实际运行前应以另一个新目录冻结正式设置。脚本只组织材料和导入记录，不调用模型、浏览器、上游或生产。前置的生产使用权与供应商兼容性初始均为 false。若取得真实证据，使用 `import prerequisite` 分别确认。授权记录须明确涵盖生产使用，兼容性记录须来自所选供应商和配置的真实核验。两项状态与质量判定分开。
+`--comparison-index` 核对原归档索引中的六题、18 份材料和试玩清单字节摘要，再把索引摘要纳入新清单。2026-11-06 本地复核一致，归档的 `settingsFrozen` 仍为 false。去掉 `--settings` 可预演清单并查看空结果。正式对照要在另一个新目录冻结实际设置。脚本只组织材料和导入记录，不调用模型、浏览器、上游或生产。
 
-评估协调员保管 `manifest.json`、`registration.json`、`mapping.private.json`、全部执行记录和原始材料。制作执行者按私有清单获得两组各自的任务。独立观察员只接收一个 `blind/<随机编号>/` 目录及本协议的裁决方法，使用新的独立上下文，避免读取同一题目另一结果、私有映射、历史、Creator 自检、作者身份和模型记录。包内原始游戏标题属于可观察内容。协调员在导入时核对 HTML、正式截图、探测记录、报告和关键问题证据无实验身份或自检泄漏后才声明 `blindSafe`。若原始 HTML 自带这些信息，保留原文件和失败状态，不能修改字节后宣称原版本通过盲评。盲包复制已核验文件，原文件名被替换。文件哈希保护一致性，独立性、测试真实性和披露范围由流程保证。同一系统用户可越过目录约定，目录本身不构成安全沙箱。
+前置的生产使用权与供应商兼容性初始均为 false。若取得真实证据，使用 `import prerequisite` 分别确认。授权记录须明确涵盖生产使用，兼容性记录须来自冻结镜像、所选供应商和实际创作与审核配置。2026-11-06 的 Opus 合成协议回执只覆盖当时的镜像和已测创作契约。正式审核模型验证、原生隔离及生产使用授权独立核验，发布前由部署检查器按实际回执核对。两项前置状态与质量判定分开。
+
+## 正式对照交接
+
+1. 协调员先锁定同一份脱敏创作模型配置和同一份脱敏审核模型配置、真实规则与校准、执行提交和 B 镜像。逐题把同一份简报、样板与素材交给 A、B，各自以新任务和隔离会话开始。执行记录保留任务编号、会话或等效隔离凭据，以及每次模型请求的实际时间、用量和产物摘要。不得把任一组的草稿、修复、评语或其他题目的材料交给另一组。
+2. B 成品完成后，由协调员对其原始文件用 `npx tsx scripts/review-offline-session.ts baseline-only --input <B原始HTML> --out <本次运行的私有采集子目录>` 采集。保留 `baseline.json` 和原始四张 JPEG，把其中 `probe` 原样保存为审核输入所引用的 JSON，四图按 `screenshots` 顺序引用。核对 `inputHash` 对应 B 原字节，并与预登记的独立关键问题目录一起导入锁定。`review-input` 验证基础探测版本、原图文件类型、原始 HTML 及整个证据摘要，协调员核验实际采集来源和披露内容。
+3. 在隔离研究环境把这一份锁定的 HTML、基础探测记录和四图送入 A、B 审核执行路径。两路常规管理员上传都会各自拍摄。离线评估脚本导出的 `lockedReviewCapture(runDirectory, caseId)` 为两个独立 Runner 环境各生成 `captureReview` 回放依赖，验证实际传入 HTML，按原顺序和原始标签返回四图。两个环境收到各自的材料副本。开始正式运行前，以脚本模型验证两路实际初评及复核收到相同原证据，并记录摘要。正式运行仍须真实调用授权。每臂初评后只附加本臂的初稿进行同模型同证据复核，关键问题目录只交独立观察员。
+
+评估协调员保管 `manifest.json`、`registration.json`、`mapping.private.json`、全部执行记录和原始材料。制作执行者按私有清单获得两组各自的任务。同题的关键问题目录和四个盲包分别分配给独立观察员或独立 Agent 上下文。协调员为每个同题角色登记不同 `observerId`，不能给已看过同题材料的观察员换编号。导入拒绝同题重复编号。盲评观察员只接收一个 `blind/<随机编号>/` 目录及本协议的裁决方法，使用新的独立上下文，避免读取同一题目另一结果、私有映射、历史、Creator 自检、作者身份和模型记录。包内原始游戏标题属于可观察内容。协调员在导入时核对 HTML、正式截图、探测记录、报告和关键问题证据无实验身份或自检泄漏后才声明 `blindSafe`。若原始 HTML 自带这些信息，保留原文件和失败状态，不能修改字节后宣称原版本通过盲评。盲包复制已核验文件，原文件名被替换。文件哈希保护一致性，独立性、测试真实性和披露范围由流程保证。同一系统用户可越过目录约定，目录本身不构成安全沙箱。
 
 游戏用项目已有的隔离浏览器、可信触摸与禁外部网络策略试玩，关闭试玩后退出浏览器。观察员先实际读取截图，再在后续调用写观察。仅有动画变化不足以证明输入响应。盲评覆盖开始、有效与无效操作、成功、失败、重开以及三种预登记手机尺寸。验收需要操作和画面证据，可按实际需要补源码行段；任意缺陷不由文字关键字或字段位置自动裁决。审核关键问题目录由独立观察员在看到两组预测前锁定，针对同一 B 成品并记录复现证据。目录和裁决不得作为审核模型材料。
 

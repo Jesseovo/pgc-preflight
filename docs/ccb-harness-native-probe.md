@@ -54,6 +54,16 @@ node scripts/run-harness-native-probe.mjs \
 
 只保存必要的研究回执和镜像摘要。确认实例和 Alarm 已清理后撤销研究 Secret、关闭研究路由并删除临时 Worker。不要将本回执用于 `HARNESS_RELEASE`。
 
+## 非 HTTP 正反对照
+
+`scripts/harness-egress-probe-worker.ts` 是另一个独立研究入口。它没有生产 D1、模型网关或浏览器绑定，只接受研究 Secret 和固定镜像摘要。三次顺序运行分别为 `POST /positive-before`、`POST /blocked`、`POST /positive-after`；`GET /status` 返回检查记录。每次运行销毁容器并确认后才能进入下一项，同项不能重新提交。结果未知时只查询状态，持久 Alarm 处理清理。
+
+三项使用相同镜像和 HTTP 拒绝策略，只改变 `enableInternet` 为 true、false、true。固定探针使用 Node 原生 socket，测试 Cloudflare 公共 [DNS over TLS](https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-tls/) 的 TCP 853 和 [NTP](https://developers.cloudflare.com/time-services/ntp/usage/) 的 UDP 123，各含 IPv4 和 IPv6。请求只含固定的 `example.com` DNS 问题或 NTP 随机关联标识，不接收自定义目标、请求体、游戏、提示词或模型凭据。它绕开 CCB 的进程内 socket 限制，专门核验 Cloudflare 原生网络边界。
+
+仅在同一协议和地址族的前后正向控制都取得匹配响应、禁网项无法连接或响应、且三次容器清理均确认后，该项才标为 true。禁网项连通为 false；正向服务不可达、响应不合格、清理或执行状态不明都保留 null。局部 true 只代表这些固定端点的 TCP 建连或 UDP 请求响应在本次配置下被阻断；UDP 无回包不能排除单向数据包已送达，须独立受控接收端才能验证这一点。不能据此证明所有协议或任意恶意 JavaScript 的操作系统沙箱，也不能代替实际模型和质量对照。IPv6 无正向可达证据时不可算通过。回执始终 `releaseReady:false`。
+
+Cloudflare 文档说明 `enableInternet:false` 会拒绝非 HTTP 外联，HTTP/HTTPS 拦截器本身不覆盖其他端口；该声明与实际探针记录分别保存。[出站网络规则](https://developers.cloudflare.com/containers/configuration/outbound-traffic/#non-http-traffic)
+
 ## 独立的真实渠道研究 broker
 
 `server/harness-provider-research.ts` 是单独的服务端模块，默认 Worker 和上述合成流探针均不加载它。候选服务必须绑定独立研究 D1 及现有生产容量库，通过服务端读取现行配置，使用独立的 256 位 HMAC Secret。容器只收到该研究任务的租约。研究账本和遥测留在研究库，只有既有模型限流及槽位操作使用生产容量库。

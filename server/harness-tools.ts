@@ -2,11 +2,12 @@ import puppeteer from '@cloudflare/puppeteer';
 import type { Browser } from 'puppeteer-core';
 import { AdaptivePlay, PLAY_LIMITS, plannedPlayActionMs, playActionCaptureCount, validatePlayActions } from '../scripts/review-adaptive';
 import { acquireBrowser, connectAcquiredBrowser } from './browser-capacity';
-import { captureFor } from './cloud-review-capture';
+import { captureFor, closeCaptureBrowser, supportsBrowserSessionControl } from './cloud-review-capture';
 import { canonicalHarness, harnessHash } from './harness-policy';
 import { problem } from './review-device-state';
 
 const stateKey = 'harness-browser-state';
+const pendingCaptureKey = 'harness-browser-pending-capture';
 const completedKey = 'harness-browser-completed';
 const invocationKey = (id: string) => `harness-browser-call:${id}`;
 const maxInvocations = 32;
@@ -19,7 +20,8 @@ const toolNames = ['capture', 'play-start', 'play-act', 'play-finish', 'play-clo
 type ToolName = typeof toolNames[number];
 type JSONRecord = Record<string, unknown>;
 type Shot = Omit<AdaptivePlay['shots'][number], 'actionRefs'> & { actionRefs?: (string | number)[] };
-type Session = { id: string; inputHash: string; browserId?: string; shotIds?: [string, string][]; actionIds?: string[] };
+type Session = { id: string; inputHash: string; browserId?: string; acquisitionStarted?: boolean; cancelled?: true; shotIds?: [string, string][]; actionIds?: string[] };
+type PendingCapture = { invocationId: string; browserId?: string; cancelled?: true };
 export type HarnessBrowserEvidence = JSONRecord & {
   evidenceId: string;
   evidenceHash: string;
@@ -48,7 +50,7 @@ type ToolStorage = Store & { transaction<T>(operation: (tx: Store) => Promise<T>
 type ToolEnv = { DB: unknown; BROWSER: Parameters<typeof puppeteer.acquire>[0] };
 type ToolDependencies = {
   capture: ReturnType<typeof captureFor>;
-  launch: (deadlineAt: number, acquired: (browserId: string) => Promise<void>) => Promise<Browser>;
+  launch: (deadlineAt: number, acquired: (browserId: string) => Promise<void>, acquiring: () => Promise<void>) => Promise<Browser>;
   closeOwn: (browserId: string) => Promise<void>;
   play: (browser: Browser, html: string, inputHash: string, activeMs: number) => Pick<AdaptivePlay, 'start' | 'act' | 'summary' | 'close' | 'shots' | 'playMs' | 'closed'>;
 };
@@ -63,35 +65,32 @@ const identifier = (value: unknown): value is string => typeof value === 'string
 function toolDependencies(env: ToolEnv): ToolDependencies {
   return {
     capture: captureFor({ ...env, creationCaptureStrict: true }),
-    async launch(deadlineAt, acquired) {
+    async launch(deadlineAt, acquired, acquiring) {
       const remaining = () => deadlineAt - Date.now();
+      if (!supportsBrowserSessionControl(env.BROWSER)) throw new Error('试玩服务缺少按会话确认关闭的能力。');
       if (remaining() <= 0) throw new Error('Browser deadline reached');
       return await acquireBrowser(env.DB, () => puppeteer.limits(env.BROWSER), () =>
         connectAcquiredBrowser(async () => {
           if (remaining() <= 0) throw new Error('Browser deadline reached');
+          await acquiring();
           const result = await puppeteer.acquire(env.BROWSER, {
             recording: false, guardrails: { allowedDomains: [] },
-            keep_alive: Math.max(1_000, Math.min(60_000, remaining())),
-          });
+            keep_alive: Math.max(10_000, Math.min(60_000, remaining())),
+          }).catch(() => { throw new Error('试玩浏览器申请结果未确认。'); });
+          if (typeof result?.sessionId !== 'string' || !result.sessionId) throw new Error('试玩浏览器缺少会话编号。');
           try {
             await acquired(result.sessionId);
           } catch (error) {
-            void puppeteer.connect(env.BROWSER, result.sessionId).then(browser => browser.close()).catch(() => {});
+            await closeCaptureBrowser(env.BROWSER, result.sessionId).catch(() => {});
             throw error;
           }
           return result;
-        }, id => puppeteer.connect(env.BROWSER, id)), undefined, Math.min(240_000, remaining())) as unknown as Browser;
+        }, id => {
+          if (remaining() <= 0) throw new Error('Browser deadline reached');
+          return puppeteer.connect(env.BROWSER, id);
+        }), undefined, Math.min(240_000, remaining())) as unknown as Browser;
     },
-    async closeOwn(browserId) {
-      try {
-        const browser = await puppeteer.connect(env.BROWSER, browserId);
-        await browser.close();
-      } catch (error) {
-        // Only an explicit missing/closed response for this same ID confirms
-        // it is already gone. A generic connection failure remains ambiguous.
-        if (!/session (?:not found|already closed)|\b404\b/i.test(String(error))) throw error;
-      }
-    },
+    closeOwn: browserId => closeCaptureBrowser(env.BROWSER, browserId),
     play: (browser, html, inputHash, activeMs) => new AdaptivePlay(browser, html, {
       creationInputHash: inputHash, creationActiveBudgetMs: activeMs, denyExternal: true,
     }),
@@ -265,6 +264,7 @@ export class HarnessTools {
       const capturing = name === 'capture';
       const reservingTime = opening || acting || capturing;
       const remaining = PLAY_LIMITS.playMs - saved.activeMs;
+      if (await this.storage.get<PendingCapture | null>(pendingCaptureKey)) throw problem('原截图浏览器关闭尚未确认。', 503);
       if (opening || capturing) {
         if (saved.session) throw problem('已有锁定的试玩会话，请先结束或关闭该会话。', 409);
       } else {
@@ -287,13 +287,13 @@ export class HarnessTools {
         rounds: saved.rounds + Number(acting),
         actions: saved.actions + actions.length,
         activeMs: reservingTime ? PLAY_LIMITS.playMs : saved.activeMs,
-        ...(opening && { session: { id: crypto.randomUUID(), inputHash } }),
+        ...(opening && { session: { id: crypto.randomUUID(), inputHash, acquisitionStarted: false } }),
       };
       // A loss after this checkpoint consumes the reservation. Only a verified
       // completion can release unused active time, and actions are never replayed.
       await this.storage.transaction(async tx => {
         const latest = await tx.get<ToolState>(stateKey) ?? freshState();
-        if (this.closing || latest.attempts !== saved.attempts || await tx.get(key)) throw problem('工具调用已中止。', 409);
+        if (this.closing || latest.attempts !== saved.attempts || await tx.get(key) || await tx.get(pendingCaptureKey)) throw problem('工具调用已中止。', 409);
         await tx.put(stateKey, state);
         await tx.put<Invocation>(key, { hash, status: 'started' });
       });
@@ -334,8 +334,31 @@ export class HarnessTools {
     deadlineAt: number, closed: () => boolean): Promise<HarnessBrowserEvidence> {
     const { name, args, inputHash } = input;
     if (name === 'capture') {
-      const result = await this.deps.capture(args.html as string, undefined, deadlineAt, { activeBudgetMs: remaining });
-      if (result.shots.length !== shotCount || !('captureRuntimeMs' in result)) throw new Error('Incomplete three-ratio capture');
+      let closureConfirmed = false;
+      const result = await this.deps.capture(args.html as string, undefined, deadlineAt, { activeBudgetMs: remaining }, {
+        acquiring: async () => this.storage.transaction(async tx => {
+          const pending = await tx.get(pendingCaptureKey);
+          if (pending || closed()) throw problem('工具调用已中止。', 409);
+          await tx.put<PendingCapture>(pendingCaptureKey, { invocationId: input.id });
+          if (closed()) throw problem('工具调用已中止。', 409);
+        }),
+        acquired: async browserId => {
+          const cancelled = await this.storage.transaction(async tx => {
+            const pending = await tx.get<PendingCapture>(pendingCaptureKey);
+            if (pending?.invocationId !== input.id || pending.browserId) throw new Error('截图浏览器申请记录不匹配。');
+            await tx.put<PendingCapture>(pendingCaptureKey, { ...pending, browserId });
+            return pending.cancelled;
+          });
+          // Persist even if the deadline or close won the race. The capture
+          // finally block and the next host cleanup can address this exact ID.
+          if (cancelled || closed()) throw problem('工具调用已中止。', 409);
+        },
+        closed: async browserId => {
+          await this.clearCapture(input.id, browserId);
+          closureConfirmed = true;
+        },
+      });
+      if (!closureConfirmed || result.shots.length !== shotCount || !('captureRuntimeMs' in result)) throw new Error('Incomplete three-ratio capture');
       return seal(input, {
         contextOrigin: 'creator-self-check', sourceBlind: false, captureRuntimeMs: result.captureRuntimeMs, probe: result.probe,
       }, result.shots as unknown as Shot[]);
@@ -343,12 +366,28 @@ export class HarnessTools {
     const session = state.session!;
     if (name === 'play-start') {
       const browser = await this.deps.launch(deadlineAt, async browserId => {
-        if (closed()) throw problem('工具调用已中止。', 409);
+        const cancelled = await this.storage.transaction(async tx => {
+          const latest = await tx.get<ToolState>(stateKey);
+          const pending = latest?.session;
+          if (!latest || pending?.id !== session.id || pending.acquisitionStarted !== true || pending.browserId) throw new Error('试玩浏览器申请记录不匹配。');
+          await tx.put(stateKey, { ...latest, session: { ...pending, browserId } });
+          return pending.cancelled;
+        });
         session.browserId = browserId;
-        await this.storage.put(stateKey, state);
+        if (cancelled || closed()) throw problem('工具调用已中止。', 409);
+      }, async () => {
+        await this.storage.transaction(async tx => {
+          const latest = await tx.get<ToolState>(stateKey);
+          const pending = latest?.session;
+          if (!latest || pending?.id !== session.id || pending.cancelled || pending.acquisitionStarted !== false || closed()) throw problem('工具调用已中止。', 409);
+          await tx.put(stateKey, { ...latest, session: { ...pending, acquisitionStarted: true } });
+          if (closed()) throw problem('工具调用已中止。', 409);
+        });
+        session.acquisitionStarted = true;
       });
       if (closed()) {
-        await browser.close().catch(() => {});
+        await browser.disconnect().catch(() => {});
+        if (session.browserId) await this.deps.closeOwn(session.browserId).catch(() => {});
         throw problem('工具调用已中止。', 409);
       }
       const play = this.deps.play(browser, args.html as string, inputHash, remaining);
@@ -358,9 +397,7 @@ export class HarnessTools {
       return seal(input, { sessionId: session.id, contextOrigin: 'creator-self-check', sourceBlind: false, viewport: { width: 360, height: 780 }, playMs: play.playMs }, play.shots, session);
     }
     if (name === 'play-close') {
-      const closed = this.live ? await this.closeLive() : session.browserId
-        ? await this.deps.closeOwn(session.browserId).then(() => true, () => false) : true;
-      if (!closed) throw problem('隔离浏览器关闭尚未确认。', 503);
+      await this.retireSession();
       return seal(input, { sessionId: session.id, closed: true });
     }
     const play = this.live!.play;
@@ -382,6 +419,10 @@ export class HarnessTools {
     if (text.length > maxEvidenceCharacters) throw new Error('Browser evidence exceeds storage limit');
     await this.storage.transaction(async tx => {
       if (this.closing) throw problem('工具调用已中止。', 409);
+      if (state.session) {
+        const latest = (await tx.get<ToolState>(stateKey))?.session;
+        if (latest?.id !== state.session.id || latest.cancelled) throw problem('工具调用已中止。', 409);
+      }
       const completed = await tx.get<string[]>(completedKey) ?? [];
       if (completed.length >= maxInvocations || completed.includes(id)) throw new Error('Invalid completed browser evidence index');
       let parts = 0;
@@ -416,20 +457,46 @@ export class HarnessTools {
     const live = this.live;
     this.live = undefined;
     if (!live) return false;
-    const browserClosed = live.browser.close().then(() => true, () => false);
+    const browserClosed = live.session.browserId ? this.deps.closeOwn(live.session.browserId).then(() => true, () => false) : Promise.resolve(false);
     await live.play.close().catch(() => {});
+    await live.browser.disconnect().catch(() => {});
     return browserClosed;
   }
 
+  private async clearCapture(invocationId: string, browserId: string) {
+    await this.storage.transaction(async tx => {
+      const pending = await tx.get<PendingCapture>(pendingCaptureKey);
+      if (!pending) return;
+      if (pending.invocationId !== invocationId || pending.browserId !== browserId) throw new Error('截图浏览器关闭记录不匹配。');
+      await tx.put(pendingCaptureKey, null);
+    });
+  }
+
+  private async retireCapture() {
+    const pending = await this.storage.transaction(async tx => {
+      const capture = await tx.get<PendingCapture>(pendingCaptureKey);
+      if (capture && !capture.cancelled) await tx.put<PendingCapture>(pendingCaptureKey, { ...capture, cancelled: true });
+      return capture;
+    });
+    if (!pending) return;
+    if (!pending.browserId) throw problem('截图浏览器申请结果尚未确认。', 503);
+    const browserId = pending.browserId;
+    const closed = await within(this.deps.closeOwn(browserId), Date.now() + 5000, () => {}).then(() => true, () => false);
+    if (!closed) throw problem('截图浏览器关闭尚未确认。', 503);
+    await this.clearCapture(pending.invocationId, browserId);
+  }
+
   private async retireSession() {
-    const session = (await this.storage.get<ToolState>(stateKey))?.session;
-    let closed = false;
-    if (this.live) closed = await within(this.closeLive(), Date.now() + 5000, () => {}).catch(() => false);
-    if (!closed && session?.browserId) {
-      const browserId = session.browserId;
-      closed = await within(this.deps.closeOwn(browserId), Date.now() + 5000, () => {}).then(() => true, () => false);
-      if (!closed) throw problem('隔离浏览器关闭尚未确认。', 503);
-    }
+    const session = await this.storage.transaction(async tx => {
+      const state = await tx.get<ToolState>(stateKey);
+      if (!state?.session) return;
+      if (!state.session.cancelled) await tx.put(stateKey, { ...state, session: { ...state.session, cancelled: true } });
+      return state.session;
+    });
+    if (session && !session.browserId && session.acquisitionStarted !== false) throw problem('试玩浏览器申请结果尚未确认。', 503);
+    if (session && this.live && this.live.session.id !== session.id) throw problem('试玩浏览器关闭记录不匹配。', 503);
+    const close = this.live ? this.closeLive() : session?.browserId ? this.deps.closeOwn(session.browserId).then(() => true, () => false) : null;
+    if (close && !await within(close, Date.now() + 5000, () => {}).catch(() => false)) throw problem('隔离浏览器关闭尚未确认。', 503);
     if (!session) return;
     await this.storage.transaction(async tx => {
       const state = await tx.get<ToolState>(stateKey);
@@ -443,7 +510,7 @@ export class HarnessTools {
   close() {
     this.closing = true;
     this.generation++;
-    return this.closePromise ??= this.retireSession().catch(error => {
+    return this.closePromise ??= this.retireCapture().then(() => this.retireSession()).catch(error => {
       this.closePromise = undefined;
       throw error;
     });

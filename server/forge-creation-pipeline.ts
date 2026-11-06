@@ -275,9 +275,8 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
   const awaitingAllocation=harness&&cp.stage==='build'&&deadlineAt===undefined;
   const expired=()=>deadlineAt!==undefined&&Date.now()>=deadlineAt;
   const deadlineFailure='制作任务已到达总时限；已完成的阶段版本保留，未自动重发模型请求。';
-  if(expired()){
+  if(expired()&&cp.phase!=='captured'&&cp.phase!=='publish'){
     if(cp.phase==='output')await persistStage(DB,row,cp);
-    if(cp.phase==='captured')await persistEvidence(DB,row,cp);
     await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;
   }
   if(cp.phase==='started'||cp.phase==='failed'){
@@ -322,9 +321,10 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
       const budget=harness?.limits.maxOutputTokens??legacyBudget;
       const remainingRepairs=cp.stage==='polish'?(harness?.limits.maxRepairs??1):cp.stage==='repair'?Math.max(0,(harness?.limits.maxRepairs??1)-1):0;
       const promptStage=cp.stage==='repair2'?'repair':cp.stage;
-      const system=gameStageSystem(promptStage,'framed',remainingRepairs)+(harness?
+      const format=harness?'workspace':'framed';
+      const system=gameStageSystem(promptStage,format,remainingRepairs)+(harness?
         '\nHarness 补测记录只对应记录中的 inputHash。仅引用实际返回的证据编号。若请求自动修复，未解决问题必须引用刚采集的上一阶段成品或本次实际交付 HTML 的证据，不能只依据旧版或中间版。': '');
-      const result=await complete(runtime,s.cfg,{system,user:gameStageUser(promptStage,input,'framed'),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous,remainingRepairs>0,cp!.harnessEvidence),maxTokens:budget,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
+      const result=await complete(runtime,s.cfg,{system,user:gameStageUser(promptStage,input,format),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous,remainingRepairs>0,cp!.harnessEvidence),maxTokens:budget,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
       if(harness&&cp.harnessDeadlineAt===undefined)throw new Error('Harness 启动时间未保存，未重复发起模型请求。');
       const html=await prepareArtifact('game',result.html,s);
       output={...result,html};
@@ -367,6 +367,7 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
       cp.stage==='polish'&&requestsRepair?'repair':
       cp.stage==='repair'&&requestsRepair&&(harness?.limits.maxRepairs??0)>1?'repair2':null;
     if(next){
+      if(expired()){await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;}
       cp={...cp,stage:next,phase:'ready',previous:cp.output,previousCapture:cp.capture,output:undefined,capture:undefined,versionId:undefined};
       // Each paid stage has its own bounded alarm invocation, rather than
       // accumulating two twelve-minute calls in one event lifetime.
@@ -375,10 +376,7 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     cp.phase='publish';await putCheckpoint(storage,cp);return true;
   }
   if(cp.phase==='publish'){
-    if(harness){
-      await finishHarnessTask(env,id,'completed');
-      if(expired()){await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;}
-    }
+    if(harness)await finishHarnessTask(env,id,'completed');
     await publish(DB,row,cp);await storage.deleteAll();return false;
   }
   throw new Error('未知制作检查点。');

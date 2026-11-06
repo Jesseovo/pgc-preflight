@@ -175,16 +175,19 @@ export async function authorizeHarnessLease(db: HarnessDatabase, id: HarnessRunI
 }
 
 export async function endHarnessRun(db: HarnessDatabase, id: HarnessRunIdentity, outcome: 'done' | 'failed',
-  failureCode: HarnessFailureCode = 'runtime_failed', now = Date.now()): Promise<boolean> {
+  failureCode: HarnessFailureCode = 'runtime_failed', now = Date.now(), sealedAt = now): Promise<boolean> {
+  if (!Number.isSafeInteger(sealedAt) || sealedAt > now) return false;
   const row = await db.prepare(`UPDATE harness_runs SET
     status=CASE WHEN ?='failed' AND EXISTS (SELECT 1 FROM harness_requests
       WHERE task_id=? AND generation=? AND state='forwarded') THEN 'unknown' ELSE ? END,
     failure_code=?,ended_at=?
     WHERE task_id=? AND generation=? AND status='active' AND (
-      ?='failed' OR (deadline_at>? AND model_turns>0 AND reserved_tokens=0)
+      ?='failed' OR (deadline_at>? AND started_at<=? AND model_turns>0 AND reserved_tokens=0 AND NOT EXISTS (
+        SELECT 1 FROM harness_requests WHERE task_id=? AND generation=? AND state='completed' AND finished_at>?
+      ))
     ) RETURNING task_id`)
     .bind(outcome,id.taskId,id.generation,outcome,outcome === 'failed' ? failureCode : null,
-      now,id.taskId,id.generation,outcome,now).first<{ task_id: string }>();
+      now,id.taskId,id.generation,outcome,sealedAt,sealedAt,id.taskId,id.generation,sealedAt).first<{ task_id: string }>();
   if (outcome === 'failed') {
     await db.prepare(`UPDATE harness_requests SET state=CASE WHEN state='forwarded' THEN 'unknown' ELSE 'failed' END,
       error_code=?,finished_at=? WHERE task_id=? AND generation=? AND state IN ('reserved','forwarded')`)
@@ -215,27 +218,43 @@ export async function recordHarnessEvent(db: HarnessDatabase, id: HarnessRunIden
 }
 
 type RequestState = 'reserved' | 'forwarded' | 'completed' | 'failed' | 'unknown';
+export type HarnessReviewPhase = 'review' | 'review_verify';
 export interface HarnessRequestIdentity extends HarnessRunIdentity { requestId: string }
 interface RequestRow { body_hash: string; state: RequestState; deadline_at: number }
 
+function reviewRequestPrefix(phase?: HarnessReviewPhase) {
+  return phase ? `${phase}-0-` : null;
+}
+
 export async function reserveHarnessRequest(db: HarnessDatabase, id: HarnessRequestIdentity, bodyHash: string,
-  outputCap: number, now = Date.now(), requestStartedAt = now, allowedUntil = Infinity, expectedModelTurns: number | null = null): Promise<
+  outputCap: number, now = Date.now(), requestStartedAt = now, allowedUntil = Infinity, expectedModelTurns: number | null = null,
+  reviewPhase?: HarnessReviewPhase): Promise<
   { status: 'reserved'; deadlineAt: number; outputCap: number } |
   { status: 'duplicate'; previous: RequestState } |
   { status: 'conflict' | 'blocked' }
 > {
+  const prefix = reviewRequestPrefix(reviewPhase);
+  if (prefix && !id.requestId.startsWith(prefix)) return { status: 'blocked' };
   // A crash after forwarding must latch the old request before accepting new IDs.
   await db.prepare(`UPDATE harness_requests SET state=CASE WHEN state='forwarded' THEN 'unknown' ELSE 'failed' END,
     error_code='deadline',finished_at=? WHERE task_id=? AND generation=? AND deadline_at<=? AND state IN ('reserved','forwarded')`)
     .bind(now,id.taskId,id.generation,now).run();
   const requestDeadline = Math.min(requestStartedAt + HARNESS_MAX_REQUEST_MS, allowedUntil);
-  const row = await db.prepare(`INSERT INTO harness_requests(task_id,generation,request_id,body_hash,output_cap,created_at,deadline_at)
-    SELECT task_id,generation,?,?,min(?,total_output_cap-output_tokens-reserved_tokens),?,min(deadline_at,?)
-    FROM harness_runs WHERE task_id=? AND generation=? AND status='active' AND deadline_at>? AND model_turns<max_model_turns
+  const row = await db.prepare(`WITH phase_usage AS (
+    SELECT coalesce(sum(CASE WHEN state IN ('reserved','forwarded') THEN output_cap ELSE output_tokens END),0) AS tokens,
+      coalesce(sum(max(attempts,1)),0) AS turns
+    FROM harness_requests WHERE task_id=? AND generation=? AND substr(request_id,1,length(?))=?
+  )
+    INSERT INTO harness_requests(task_id,generation,request_id,body_hash,output_cap,created_at,deadline_at)
+    SELECT task_id,generation,?,?,min(?,total_output_cap-output_tokens-reserved_tokens,
+      per_request_cap-CASE WHEN ? IS NULL THEN 0 ELSE phase_usage.tokens END),?,min(deadline_at,?)
+    FROM harness_runs CROSS JOIN phase_usage
+    WHERE task_id=? AND generation=? AND status='active' AND deadline_at>? AND model_turns<max_model_turns
+    AND (? IS NULL OR (family='review' AND phase_usage.tokens<per_request_cap AND phase_usage.turns<max_model_turns/2))
     AND (? IS NULL OR model_turns=?)
     AND ?>0 AND ?<=per_request_cap AND output_tokens+reserved_tokens<total_output_cap AND ?>?
     ON CONFLICT DO NOTHING RETURNING deadline_at,output_cap`)
-    .bind(id.requestId,bodyHash,outputCap,requestStartedAt,requestDeadline,id.taskId,id.generation,now,expectedModelTurns,expectedModelTurns,
+    .bind(id.taskId,id.generation,prefix,prefix,id.requestId,bodyHash,outputCap,prefix,requestStartedAt,requestDeadline,id.taskId,id.generation,now,prefix,expectedModelTurns,expectedModelTurns,
       outputCap,outputCap,requestDeadline,now).first<{ deadline_at: number; output_cap: number }>();
   if (row) return { status: 'reserved', deadlineAt: row.deadline_at, outputCap: row.output_cap };
   const previous = await db.prepare('SELECT body_hash,state,deadline_at FROM harness_requests WHERE task_id=? AND generation=? AND request_id=?')
@@ -244,12 +263,17 @@ export async function reserveHarnessRequest(db: HarnessDatabase, id: HarnessRequ
   return previous.body_hash === bodyHash ? { status: 'duplicate', previous: previous.state } : { status: 'conflict' };
 }
 
-export async function forwardHarnessRequest(db: HarnessDatabase, id: HarnessRequestIdentity, now = Date.now()): Promise<boolean> {
+export async function forwardHarnessRequest(db: HarnessDatabase, id: HarnessRequestIdentity, now = Date.now(), reviewPhase?: HarnessReviewPhase): Promise<boolean> {
+  const prefix = reviewRequestPrefix(reviewPhase);
+  if (prefix && !id.requestId.startsWith(prefix)) return false;
   const row = await db.prepare(`UPDATE harness_requests SET state='forwarded',forwarded_at=?,attempts=attempts+1
     WHERE task_id=? AND generation=? AND request_id=? AND state='reserved' AND deadline_at>? AND attempts<2
     AND EXISTS (SELECT 1 FROM harness_runs WHERE task_id=? AND generation=? AND status='active'
-      AND (harness_requests.attempts=0 OR model_turns<max_model_turns))
-    RETURNING request_id`).bind(now,id.taskId,id.generation,id.requestId,now,id.taskId,id.generation).first<{ request_id: string }>();
+      AND (harness_requests.attempts=0 OR (model_turns<max_model_turns AND (? IS NULL OR (
+        SELECT sum(max(q.attempts,1)) FROM harness_requests q WHERE q.task_id=harness_runs.task_id
+          AND q.generation=harness_runs.generation AND substr(q.request_id,1,length(?))=?
+      )<max_model_turns/2))))
+    RETURNING request_id`).bind(now,id.taskId,id.generation,id.requestId,now,id.taskId,id.generation,prefix,prefix,prefix).first<{ request_id: string }>();
   return row !== null;
 }
 

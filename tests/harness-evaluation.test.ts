@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { importRecord, packet, prepare, report } from '../scripts/harness-evaluation';
+import { importRecord, lockedReviewCapture, packet, prepare, report } from '../scripts/harness-evaluation';
 
 const baseline = '8afbf81c85c785f5d2d071dda9ecedba510b42ab';
 const revision = 'b'.repeat(40);
@@ -21,7 +22,7 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
 
-async function setup(configured = true) {
+async function setup(configured = true, archived = false, mutateArchive?: (index: { checklistSha256: string; cases: { id: string; materials: Ref[] }[] }) => void) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'pgc-harness-eval-')));
   directories.push(directory);
   await mkdir(join(directory, 'inputs'));
@@ -39,11 +40,26 @@ async function setup(configured = true) {
     reviewModel: { name: 'deepseek-test', config: reviewConfig },
     rulesVersion: 'synthetic-v2', rules, calibration, harnessCommit: revision, harnessImage,
   }));
-  const manifestSha256 = await prepare(directory, configured ? join(directory, settings.path) : undefined);
+  let indexPath: string | undefined;
+  if (archived) {
+    const fixtures = fileURLToPath(new URL('../fixtures/harness-evaluation', import.meta.url));
+    const checklist = await readFile(join(fixtures, 'checklists.json'));
+    const cases = await Promise.all((JSON.parse(checklist.toString('utf8')) as Case[]).map(async ({ id }) => ({ id,
+      materials: await Promise.all(['assets.html', 'brief.md', 'sample.svg'].map(async name => ({
+        path: `archive/${id}/${name}`, sha256: digest(await readFile(join(fixtures, id, name))),
+      }))),
+    })));
+    const index = { schemaVersion: 1, checklistSha256: digest(checklist), cases: cases.reverse() };
+    mutateArchive?.(index);
+    indexPath = join(directory, (await artifact('comparison-index.json', encoded(index))).path);
+  }
+  const manifestSha256 = await prepare(directory, configured ? join(directory, settings.path) : undefined, indexPath);
   const manifest = JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8')) as { cases: Case[]; frozenAt: string };
   const usageEvidence = await artifact('usage.json', '{"input":500,"output":600}');
   const coverageEvidence = [await artifact('observation.txt', 'Synthetic test evidence')];
-  const probe = await artifact('probe.json', '{"captureMethod":"browser-viewport-v2"}');
+  const probe = await artifact('probe.json', encoded({ captureMethod: 'browser-viewport-v1', observations: [1, 2, 3, 4].map(i => ({
+    id: `baseline-${i}`, label: `original screenshot ${i}`, capturedAt: manifest.frozenAt, actionRefs: [],
+  })) }));
   const shots = await Promise.all([1, 2, 3, 4].map(i =>
     artifact(`image-${i}.png`, Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from([i])]))));
   const reportArtifact = await artifact('report.json', encoded({
@@ -53,7 +69,7 @@ async function setup(configured = true) {
   }));
   const after = (instant: string, amount: number) => new Date(Date.parse(instant) + amount).toISOString();
   const clock = { startedAt: manifest.frozenAt, finishedAt: manifest.frozenAt };
-  const observer = { independent: true, observerType: 'human', observerId: 'fixture-adjudicator' };
+  const observer = { independent: true, observerType: 'human', observerId: 'fixture-catalog-adjudicator' };
   const stage = (phase: string, window: Time) => ({
     phase, status: 'completed', ...window, failure: null, inputTokens: 500, outputTokens: 600, usageEvidence,
   });
@@ -68,11 +84,11 @@ async function setup(configured = true) {
     });
     return html;
   }
-  async function lockedReviewInput(item: Case, html: Ref) {
-    const evidenceSha256 = digest(encoded({ html: html.sha256, probe: probe.sha256, shots: shots.map(shot => shot.sha256) }));
+  async function lockedReviewInput(item: Case, html: Ref, overrideProbe = probe, overrideShots = shots) {
+    const evidenceSha256 = digest(encoded({ html: html.sha256, probe: overrideProbe.sha256, shots: overrideShots.map(shot => shot.sha256) }));
     const catalog = [{ id: 'critical-1', observation: 'Synthetic observed issue', evidence: coverageEvidence }];
     await importRecord(directory, 'review-input', {
-      manifestSha256, caseId: item.id, htmlSha256: html.sha256, evidenceSha256, probe, shots,
+      manifestSha256, caseId: item.id, htmlSha256: html.sha256, evidenceSha256, probe: overrideProbe, shots: overrideShots,
       blindSafe: true, ...observer, catalogExhaustive: true, catalog, catalogEvidence: coverageEvidence, disputes: [],
     });
     const locked = JSON.parse(await readFile(join(directory, 'records', `review-input.${item.id}.json`), 'utf8')) as { lockedAt: string };
@@ -95,17 +111,28 @@ async function setup(configured = true) {
   async function judge(item: Case, arm: Arm, kind: 'creation' | 'review', overrides: object = {}) {
     const disclosed = await packet(directory, kind, item.id, arm);
     return importRecord(directory, kind === 'creation' ? 'creation-judgment' : 'review-judgment', {
-      manifestSha256, ...disclosed, ...observer, blind: true, coverageComplete: true, coverageEvidence, disputes: [],
+      manifestSha256, ...disclosed, ...observer, observerId: `fixture-${kind}-${arm}`, blind: true, coverageComplete: true, coverageEvidence, disputes: [],
       ...(kind === 'creation'
         ? { checks: item.checklist.map(({ id }) => finding(id)), criticalDefects: [], unapprovedCoreChanges: [] }
         : { mandatoryRemediations: [], criticalHits: [finding('critical-1')] }),
       ...overrides,
     });
   }
-  return { directory, manifest, manifestSha256, artifact, creation, lockedReviewInput, review, judge, finding, clock };
+  return { directory, manifest, manifestSha256, indexPath, artifact, creation, lockedReviewInput, review, judge, finding, clock };
 }
 
 describe('offline harness evaluation', () => {
+  it('verifies and seals the archived materials without treating a rehearsal as a formal freeze', async () => {
+    const run = await setup(false, true);
+    expect((await report(run.directory)).registration).toEqual({
+      settingsFrozen: false, materialIndexSha256: digest(await readFile(run.indexPath!)),
+    });
+    await expect(setup(false, true, index => { index.cases[0].materials[0].sha256 = '1'.repeat(64); }))
+      .rejects.toThrow('Archived material differs');
+    await expect(setup(false, true, index => { index.checklistSha256 = '1'.repeat(64); }))
+      .rejects.toThrow('Archived checklist differs');
+  });
+
   it('freezes six full material sets and preserves all missing denominators', async () => {
     const run = await setup(false);
     const output = await report(run.directory);
@@ -152,6 +179,9 @@ describe('offline harness evaluation', () => {
     const a = await run.creation(second, 'A', {}, '<title>A version</title>');
     const b = await run.creation(second, 'B', {}, '<title>B version</title>');
     await expect(run.lockedReviewInput(second, a)).rejects.toThrow('exact blind-safe completed B HTML');
+    const enhanced = await run.artifact('enhanced-probe.json', '{"captureMethod":"browser-viewport-v2"}');
+    await expect(run.lockedReviewInput(second, b, enhanced)).rejects.toThrow('original basic Chromium capture');
+    await expect(run.lockedReviewInput(second, b, undefined, [a, a, a, a])).rejects.toThrow('original PNG or JPEG');
     const lock = await run.lockedReviewInput(second, b);
     await expect(run.review(second, 'B', b, lock, { htmlSha256: a.sha256 })).rejects.toThrow('same locked HTML');
     await expect(run.review(second, 'B', b, lock, { evidenceSha256: 'e'.repeat(64) })).rejects.toThrow('same locked HTML');
@@ -169,6 +199,42 @@ describe('offline harness evaluation', () => {
     expect(summary.cases[0].runs[0].creation.failure).toBe('provider-refused');
     expect(summary.arms[1].criticalHits).toMatchObject({ denominator: 1, missing: 1 });
     expect(summary.quality).toBe('not-ready');
+  });
+
+  it('rejects reuse of a same-case observer between the critical catalog and blind packets', async () => {
+    const run = await setup();
+    const item = run.manifest.cases[0];
+    const html = await run.creation(item, 'B');
+    const locked = await run.lockedReviewInput(item, html);
+    await run.review(item, 'B', html, locked);
+    await run.judge(item, 'B', 'creation', { observerId: 'separate-observer' });
+    await expect(run.judge(item, 'B', 'review', { observerId: 'SEPARATE-observer' })).rejects.toThrow('different independent observer');
+    await run.review(item, 'A', html, locked);
+    await expect(run.judge(item, 'A', 'review', { observerId: 'fixture-catalog-adjudicator' })).rejects.toThrow('different independent observer');
+    expect((await report(run.directory)).arms.map(arm => arm.adjudicatedReviews)).toEqual([0, 0]);
+  });
+
+  it('replays the exact B HTML, basic probe and original images into independent Runner contexts', async () => {
+    const run = await setup();
+    const item = run.manifest.cases[0];
+    const original = '<title>Synthetic paired evidence</title>';
+    const html = await run.creation(item, 'B', {}, original);
+    await expect(lockedReviewCapture(run.directory, item.id)).rejects.toThrow('Lock the review input before replay');
+    await run.lockedReviewInput(item, html);
+    const captureA = await lockedReviewCapture(run.directory, item.id);
+    const captureB = await lockedReviewCapture(run.directory, item.id);
+    const [a, b] = await Promise.all([captureA(original), captureB(original)]);
+    expect(a).toEqual(b);
+    expect(a.probe).toEqual(JSON.parse(await readFile(join(run.directory, 'inputs/probe.json'), 'utf8')));
+    for (const [index, shot] of a.shots.entries()) {
+      expect(shot.label).toBe(`original screenshot ${index + 1}`);
+      expect(Buffer.from(shot.data.split(',')[1], 'base64')).toEqual(await readFile(join(run.directory, `inputs/image-${index + 1}.png`)));
+    }
+    a.shots[0].label = 'mutation isolated to arm A';
+    expect(await captureA(original)).toEqual(b);
+    await expect(captureB(original + '\n')).rejects.toThrow('Runner HTML differs');
+    await writeFile(join(run.directory, 'inputs/image-1.png'), 'changed');
+    await expect(lockedReviewCapture(run.directory, item.id)).rejects.toThrow('File hash mismatch');
   });
 
   it.each(['ceiling', 'improved', 'disputed', 'critical-miss', 'unsupported'] as const)(

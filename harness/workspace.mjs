@@ -3,10 +3,11 @@ import { cleanGameHtml } from './game-html.mjs';
 
 const string = { type: 'string' };
 const integer = { type: 'integer', minimum: 0 };
+const readChunkUtf16 = 20_000;
 const remoteTools = new Set(['capture', 'play-start', 'play-act', 'play-finish', 'play-close']);
 const tools = [
-  { name: 'list', description: 'List private task files and artifact paths.', properties: {}, required: [] },
-  { name: 'read', description: 'Read UTF-8 text using zero-based character offsets. Read successive chunks using nextOffset. Images are included directly in the user message.', properties: { path: string, offset: integer }, required: ['path'] },
+  { name: 'list', description: 'List private task files, their lengths and hashes, the text read chunk size, and writable artifact paths.', properties: {}, required: [] },
+  { name: 'read', description: 'Read UTF-8 text using zero-based UTF-16 offsets. Read successive chunks using nextOffset or parallel chunks at multiples of the listed read chunk size. The returned range has an exclusive end. Images are included directly in the user message.', properties: { path: string, offset: integer }, required: ['path'] },
   { name: 'write', description: 'Write a complete UTF-8 artifact to an allowed output path.', properties: { path: string, content: string }, required: ['path', 'content'] },
   { name: 'patch', description: 'Replace one exact, unique UTF-8 string in an existing output artifact. Include enough context to identify exactly one occurrence.', properties: { path: string, oldText: string, newText: string }, required: ['path', 'oldText', 'newText'] },
   { name: 'capture', description: 'Apply the platform HTML preparation to game.html, then capture and probe the exact prepared file in an isolated mobile browser. Inspect the returned original viewport images and probe evidence.', properties: {}, required: [] },
@@ -24,6 +25,19 @@ function selectedTools(run) {
 
 export function permittedTools(run) {
   return new Set(selectedTools(run).map(({ name }) => `mcp__pgc_workspace__${name}`));
+}
+
+function fileDetails({ path, encoding, content, sha256 }) {
+  const bytes = Buffer.byteLength(content, encoding);
+  return { path, encoding, sha256, ...(encoding === 'utf8' ? { utf8Bytes: bytes, utf16Length: content.length } : { bytes }) };
+}
+
+function textBoundary(content, offset) {
+  const previous = content.charCodeAt(offset - 1);
+  const next = content.charCodeAt(offset);
+  // Both adjacent ranges use the same boundary if a nominal offset splits
+  // a surrogate pair. Parallel reads therefore neither overlap nor skip text.
+  return previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? offset + 1 : offset;
 }
 
 export async function workspaceResponse(context, request, gateway) {
@@ -71,8 +85,7 @@ export async function workspaceResponse(context, request, gateway) {
   }
   if (name === 'list') {
     return output({
-      files: [...context.files.values()].map(({ path, encoding, sha256 }) => ({ path, encoding, sha256 })),
-      writable: context.outputs,
+      files: [...context.files.values()].map(fileDetails), writable: context.outputs, readChunkUtf16,
     });
   }
   const entry = context.files.get(args.path);
@@ -80,10 +93,10 @@ export async function workspaceResponse(context, request, gateway) {
     if (entry?.encoding !== 'utf8') return output({ error: 'Readable text file not found' }, true);
     const offset = args.offset ?? 0;
     if (offset > entry.content.length) return output({ error: 'Invalid offset' }, true);
-    let end = Math.min(offset + 20_000, entry.content.length);
-    const code = entry.content.charCodeAt(end - 1);
-    if (end < entry.content.length && code >= 0xd800 && code <= 0xdbff) end++;
-    return output({ content: entry.content.slice(offset, end), nextOffset: end < entry.content.length ? end : null, sha256: entry.sha256 });
+    const start = textBoundary(entry.content, offset);
+    const end = textBoundary(entry.content, Math.min(offset + readChunkUtf16, entry.content.length));
+    return output({ ...fileDetails(entry), range: { start, end }, content: entry.content.slice(start, end),
+      nextOffset: end < entry.content.length ? end : null });
   }
   if (!context.outputs.includes(args.path)) return output({ error: 'Path is outside the writable artifacts' }, true);
   let content = args.content;

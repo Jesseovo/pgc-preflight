@@ -1,7 +1,7 @@
 /** Offline registration and accounting. Judgments are supplied by independent observers. */
 import { createHash, randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, readdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { reviewReportErrors } from '../server/review-report';
@@ -28,6 +28,7 @@ type Settings = {
 type FrozenCase = { id: string; checklist: Checklist[]; materials: Record<string, string>; materialSha256: string };
 type Frozen = {
   schemaVersion: 1; frozenAt: string; cases: FrozenCase[]; settings: Settings | null;
+  materialIndexSha256?: string;
   creation: { A: object; B: object }; review: { A: object; B: object };
   acceptance: object; prerequisitesAtFreeze: { rightsConfirmed: false; providerCompatibilityVerified: false };
 };
@@ -45,16 +46,16 @@ type Creation = {
   stages: Stage[]; html: Ref | null; blindSafe: boolean; attachments: Ref[]; controllerUsage: ControllerUsage | null;
 };
 type Critical = { id: string; observation: string; evidence: Ref[] };
-type ReviewInput = { lockedAt: string; html: Ref; probe: Ref; shots: Ref[]; evidenceSha256: string; catalog: Critical[]; catalogEvidence: Ref[]; disputes: string[] };
+type ReviewInput = { lockedAt: string; html: Ref; probe: Ref; shots: Ref[]; evidenceSha256: string; catalog: Critical[]; catalogEvidence: Ref[]; disputes: string[]; observerId: string };
 type Review = {
   image?: string; status: RunStatus; startedAt: string | null; finishedAt: string | null; failure: string | null;
   initial: (Stage & { image?: string }) | null; verify: (Stage & { image?: string }) | null; initialReport: Ref | null; finalReport: Ref | null; blindSafe: boolean; attachments: Ref[];
 };
 type Finding = { id: string; observation: string; evidence: Ref[]; state: JudgmentState };
 type CreationJudgment = {
-  checks: Finding[]; criticalDefects: Finding[]; unapprovedCoreChanges: Finding[]; disputes: string[];
+  checks: Finding[]; criticalDefects: Finding[]; unapprovedCoreChanges: Finding[]; disputes: string[]; observerId: string;
 };
-type ReviewJudgment = { mandatoryRemediations: Finding[]; criticalHits: Finding[]; disputes: string[] };
+type ReviewJudgment = { mandatoryRemediations: Finding[]; criticalHits: Finding[]; disputes: string[]; observerId: string };
 
 function need(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -87,7 +88,7 @@ function code(value: unknown, label: string) {
   need(/^[a-z0-9][a-z0-9._-]{0,95}$/i.test(id), `Invalid identifier for ${label}`);
   return id;
 }
-function unique(rows: { id: string }[], label: string) {
+function unique<T extends { id: string }>(rows: T[], label: string) {
   need(new Set(rows.map(row => row.id)).size === rows.length, `Duplicate ${label}`);
   return rows;
 }
@@ -150,21 +151,48 @@ function fixedPaths(directory: string) {
     materials: join(directory, 'materials'),
   };
 }
-export async function prepare(directory: string, settingsPath?: string) {
+async function materialRegistration(checklistBytes: Buffer, indexPath?: string) {
+  if (!indexPath) return null;
+  const bytes = await readFile(indexPath);
+  const index = JSON.parse(bytes.toString('utf8')) as RecordData;
+  need(index?.schemaVersion === 1 && index.checklistSha256 === sha(checklistBytes), 'Archived checklist differs from the evaluation fixtures');
+  const archived = unique(list(index.cases, 'archived cases').map(raw => {
+    const row = object(raw, ['id', 'materials', 'creation', 'review', 'adjudication'], 'archived case');
+    const materials = unique(list(row.materials, 'archived materials').map(value => {
+      const ref = object(value, ['path', 'sha256'], 'archived material');
+      return { id: basename(str(ref.path, 'archived material path')), sha256: hash(ref.sha256, 'archived material') };
+    }), 'archived material name');
+    need(materials.length === materialNames.length && materialNames.every(name => materials.some(ref => ref.id === name)), 'Archived case requires the exact three registered materials');
+    return { id: code(row.id, 'archived case ID'), materials };
+  }), 'archived case');
+  need(archived.length === cases.length && cases.every(id => archived.some(row => row.id === id)), 'Archive must cover the same six registered cases');
+  return { sha256: sha(bytes), cases: new Map(archived.map(row => [row.id, new Map(row.materials.map(ref => [ref.id, ref.sha256]))])) };
+}
+export async function prepare(directory: string, settingsPath?: string, indexPath?: string) {
   const paths = fixedPaths(directory);
   const lock = settingsPath ? await settings(directory, await json(settingsPath)) : null;
+  const checklistBytes = await readFile(join(fixtureRoot, 'checklists.json'));
+  const archive = await materialRegistration(checklistBytes, indexPath);
+  const registered = JSON.parse(checklistBytes.toString('utf8')) as FrozenCase[];
+  need(JSON.stringify(registered.map(item => item.id)) === JSON.stringify(cases), 'Synthetic case registry changed');
+  const materialBytes = new Map<string, Buffer>();
+  for (const { id } of registered) {
+    for (const name of materialNames) {
+      const bytes = await readFile(join(fixtureRoot, id, name));
+      need(!archive || archive.cases.get(id)?.get(name) === sha(bytes), `Archived material differs for ${id}/${name}`);
+      materialBytes.set(`${id}/${name}`, bytes);
+    }
+  }
   await mkdir(paths.records, { mode: 0o700 });
   await mkdir(paths.blind, { mode: 0o700 });
   await mkdir(paths.materials, { mode: 0o700 });
-  const registered = await json(join(fixtureRoot, 'checklists.json')) as FrozenCase[];
-  need(JSON.stringify(registered.map(item => item.id)) === JSON.stringify(cases), 'Synthetic case registry changed');
   const frozenCases: FrozenCase[] = [];
   for (const { id, checklist } of registered) {
     const dir = join(paths.materials, id);
     await mkdir(dir, { mode: 0o700 });
     const materials: Record<string, string> = {};
     for (const name of materialNames) {
-      const bytes = await readFile(join(fixtureRoot, id, name));
+      const bytes = materialBytes.get(`${id}/${name}`)!;
       await writeFile(join(dir, name), bytes, { mode: 0o600, flag: 'wx' });
       materials[name] = sha(bytes);
     }
@@ -172,6 +200,7 @@ export async function prepare(directory: string, settingsPath?: string) {
   }
   const manifest: Frozen = {
     schemaVersion: 1, frozenAt: new Date().toISOString(), settings: lock, cases: frozenCases,
+    ...(archive ? { materialIndexSha256: archive.sha256 } : {}),
     creation: {
       A: { implementationCommit: baseline, path: 'published-platform-v2', thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000 },
       B: { implementationCommit: lock?.harnessCommit ?? null, engineCommit: engine, image: lock?.harnessImage ?? null, thinking: 'adaptive', effort: 'high', requestMaxOutputTokens: 64_000,
@@ -317,7 +346,7 @@ function disputes(value: unknown) { return list(value, 'unresolved disputes').ma
 function independent(data: RecordData) {
   need(data.independent === true, 'Independent human or Agent adjudication must be attested');
   need(data.observerType === 'human' || data.observerType === 'independent-agent', 'Unknown adjudicator type');
-  code(data.observerId, 'opaque adjudicator ID');
+  return code(data.observerId, 'opaque adjudicator ID').toLowerCase();
 }
 function recordPath(registry: Registry, kind: Kind, key: string) {
   return join(registry.paths.records, `${kind}.${key}.json`);
@@ -341,11 +370,13 @@ async function reviewInput(registry: Registry, raw: unknown) {
     'Paired review requires the exact blind-safe completed B HTML; no substitute');
   const html = await reference(registry.directory, selected.html, 'selected review HTML');
   const probe = await reference(registry.directory, data.probe, 'locked basic probe');
+  await readBasicProbe(registry.directory, probe);
   const shots = await Promise.all(list(data.shots, 'locked viewport screenshots').map(value => reference(registry.directory, value, 'locked viewport screenshot')));
   need(shots.length === 4 && data.blindSafe === true, 'Paired basic review requires four blind-safe original viewport screenshots');
+  for (const shot of shots) imageExtension(await fileBytes(registry.directory, shot.path));
   const evidenceSha256 = sha(jsonBytes({ html: html.sha256, probe: probe.sha256, shots: shots.map(shot => shot.sha256) }));
   need(data.evidenceSha256 === evidenceSha256, 'Review evidence bundle SHA-256 mismatch');
-  independent(data);
+  const observerId = independent(data);
   need(data.catalogExhaustive === true, 'Lock the independent critical-issue catalog before reviewing predictions');
   const catalogEvidence = await refs(registry.directory, data.catalogEvidence, 'critical catalog coverage evidence', 1);
   const catalog = unique(await Promise.all(list(data.catalog, 'critical catalog').map(async rawCritical => {
@@ -355,7 +386,7 @@ async function reviewInput(registry: Registry, raw: unknown) {
   })), 'critical issue');
   const lockedAt = new Date().toISOString();
   need(Date.parse(selected.finishedAt!) <= Date.parse(lockedAt), 'Review input cannot be locked before the selected creation finishes');
-  return { ...data, caseId: id, lockedAt, html, probe, shots, evidenceSha256, catalog, catalogEvidence, disputes: disputes(data.disputes) };
+  return { ...data, caseId: id, observerId, lockedAt, html, probe, shots, evidenceSha256, catalog, catalogEvidence, disputes: disputes(data.disputes) };
 }
 
 async function review(registry: Registry, raw: unknown) {
@@ -417,6 +448,46 @@ function imageExtension(bytes: Buffer) {
   if (bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return 'png';
   if (bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'))) return 'jpg';
   throw new Error('Viewport evidence must be original PNG or JPEG bytes');
+}
+type BasicObservation = { id: string; label: string; capturedAt: string; actionRefs: string[] };
+async function readBasicProbe(directory: string, ref: Ref) {
+  const bytes = await fileBytes(directory, ref.path);
+  need(sha(bytes) === ref.sha256, 'File hash mismatch for the basic Chromium probe');
+  const probe = JSON.parse(bytes.toString('utf8')) as
+    { captureMethod?: string; observations?: BasicObservation[] } | null;
+  need(probe?.captureMethod === 'browser-viewport-v1', 'Use the original basic Chromium capture probe');
+  need(Array.isArray(probe.observations) && probe.observations.length === 4 && probe.observations.every((shot, index) =>
+    shot?.id === `baseline-${index + 1}` && typeof shot.label === 'string' && shot.label.trim() &&
+    typeof shot.capturedAt === 'string' && Number.isFinite(Date.parse(shot.capturedAt)) &&
+    Array.isArray(shot.actionRefs) && shot.actionRefs.every(ref => typeof ref === 'string')),
+  'Basic Chromium probe must identify all four original viewport screenshots in order');
+  return { ...probe, observations: probe.observations };
+}
+/** Local research Runner injection. Material integrity is checked before either arm sees it. */
+export async function lockedReviewCapture(directory: string, caseId: string) {
+  const registry = await openRegistry(directory);
+  const item = oneCase(registry, caseId);
+  const input = await load<ReviewInput>(registry, 'review-input', item.id);
+  need(input, 'Lock the review input before replay');
+  const selected = await load<Creation>(registry, 'creation', runKey(item.id, 'B'));
+  need(selected?.status === 'completed' && selected.blindSafe && selected.html?.sha256 === input.html.sha256,
+    'Paired review requires the exact blind-safe completed B HTML; no substitute');
+  await reference(directory, input.html, 'locked review HTML');
+  const probe = await readBasicProbe(directory, input.probe);
+  need(input.shots.length === 4 && input.evidenceSha256 === sha(jsonBytes({
+    html: input.html.sha256, probe: input.probe.sha256, shots: input.shots.map(shot => shot.sha256),
+  })), 'Review evidence bundle SHA-256 mismatch');
+  const shots = await Promise.all(input.shots.map(async (shot, index) => {
+    const bytes = await fileBytes(directory, shot.path);
+    need(sha(bytes) === shot.sha256, 'File hash mismatch for replayed viewport screenshot');
+    const type = imageExtension(bytes) === 'jpg' ? 'jpeg' : 'png';
+    const { id, label, capturedAt, actionRefs } = probe.observations[index];
+    return { id, label, capturedAt, actionRefs, source: 'isolated-chromium', data: `data:image/${type};base64,${bytes.toString('base64')}` };
+  }));
+  return async (html: string) => {
+    need(sha(html) === input.html.sha256, 'Runner HTML differs from the locked review input');
+    return structuredClone({ probe, shots });
+  };
 }
 type BlindPacket = { packetId: string; files: Record<string, string> };
 export async function packet(directory: string, kind: RunKind, caseId: string, arm: Arm) {
@@ -488,12 +559,12 @@ async function judgment(registry: Registry, raw: unknown, kind: RunKind) {
   const fields = kind === 'creation' ? ['checks', 'criticalDefects', 'unapprovedCoreChanges'] : ['mandatoryRemediations', 'criticalHits'];
   const data = object(raw, [...judgmentKeys, ...fields], 'independent judgment');
   provenance(registry, data);
-  independent(data);
+  const observerId = independent(data);
   need(data.blind === true && data.coverageComplete === true, 'Independent blinded judgment and complete coverage must be attested');
   const row = mappingFor(registry, data.packetId, kind);
   const manifest = await validatePacket(registry, row.id, data.packetSha256);
   const coverageEvidence = await refs(registry.directory, data.coverageEvidence, 'judgment coverage evidence', 1);
-  const common = { ...data, coverageEvidence, disputes: disputes(data.disputes) };
+  const common = { ...data, observerId, coverageEvidence, disputes: disputes(data.disputes) };
   const key = runKey(row.caseId, row.arm);
   if (kind === 'creation') {
     const run = await load<Creation>(registry, kind, key);
@@ -501,7 +572,7 @@ async function judgment(registry: Registry, raw: unknown, kind: RunKind) {
     const checks = await findings(registry.directory, data.checks, 'preregistered requirement');
     const registered = oneCase(registry, row.caseId).checklist.map(check => check.id);
     need(checks.length === registered.length && checks.every(check => registered.includes(check.id)), 'Include one judgment for every preregistered requirement');
-    return { key: row.id, value: { ...common, checks,
+    return { key: row.id, caseId: row.caseId, observerId, value: { ...common, checks,
       criticalDefects: await findings(registry.directory, data.criticalDefects, 'critical defect'),
       unapprovedCoreChanges: await findings(registry.directory, data.unapprovedCoreChanges, 'unapproved core change') } };
   }
@@ -512,7 +583,7 @@ async function judgment(registry: Registry, raw: unknown, kind: RunKind) {
   const criticalHits = await findings(registry.directory, data.criticalHits, 'critical hit');
   need(criticalHits.length === input.catalog.length && criticalHits.every(hit => input.catalog.some(issue => issue.id === hit.id)),
     'Include a hit or miss for every independently confirmed critical issue');
-  return { key: row.id, value: { ...common, criticalHits,
+  return { key: row.id, caseId: row.caseId, observerId, value: { ...common, criticalHits,
     mandatoryRemediations: await findings(registry.directory, data.mandatoryRemediations, 'mandatory remediation') } };
 }
 async function prerequisite(registry: Registry, raw: unknown) {
@@ -528,18 +599,34 @@ async function prerequisite(registry: Registry, raw: unknown) {
 export async function importRecord(directory: string, kind: Kind, value: unknown) {
   const registry = await openRegistry(directory);
   let record: { key: string; value: unknown };
+  let observer: { caseId: string; observerId: string } | undefined;
   if (kind === 'creation' || kind === 'review') {
     const run = await (kind === 'creation' ? creation(registry, value) : review(registry, value));
     record = { key: runKey(run.caseId, run.arm), value: run };
   } else if (kind === 'review-input') {
     const input = await reviewInput(registry, value);
     record = { key: input.caseId, value: input };
+    observer = input;
   } else if (kind === 'prerequisite') {
     record = await prerequisite(registry, value);
   } else {
-    record = await judgment(registry, value, kind === 'creation-judgment' ? 'creation' : 'review');
+    const judged = await judgment(registry, value, kind === 'creation-judgment' ? 'creation' : 'review');
+    record = judged;
+    observer = judged;
   }
-  await store(recordPath(registry, kind, record.key), record.value);
+  const slot = recordPath(registry, kind, record.key);
+  if (observer) {
+    const claim = join(registry.paths.records, `observer.${observer.caseId}.${observer.observerId}.json`);
+    try { await store(claim, { kind, slot: record.key }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('Use a different independent observer for each packet and the critical catalog of this case');
+      throw error;
+    }
+    try { await store(slot, record.value); }
+    catch (error) { await unlink(claim); throw error; }
+  } else {
+    await store(slot, record.value);
+  }
   return record.key;
 }
 const emptyRun = { status: 'missing', startedAt: null, finishedAt: null, failure: 'record-not-imported' } as const;
@@ -595,6 +682,9 @@ export async function report(directory: string) {
       return { arm, creation: created, creationElapsedMs: elapsedMs(created), withinHarnessBudget: arm === 'B' ? budget(created) : null,
         review: reviewed, reviewElapsedMs: elapsedMs(reviewed), creationJudgment, reviewJudgment };
     }));
+    const observers = [input?.observerId, ...runs.flatMap(run => [run.creationJudgment?.observerId, run.reviewJudgment?.observerId])]
+      .filter((id): id is string => typeof id === 'string').map(id => id.toLowerCase());
+    need(new Set(observers).size === observers.length, 'Saved same-case evidence reuses an independent observer');
     rows.push({ caseId: item.id, reviewInput: input, runs });
   }
   const rights = await load(registry, 'prerequisite', 'rightsConfirmed');
@@ -656,6 +746,7 @@ export async function report(directory: string) {
   const prereqs = { rightsConfirmed: Boolean(rights), providerCompatibilityVerified: Boolean(provider) };
   const quality = !compared || !check.knownHarnessBudget ? 'not-ready' : Object.values(check).every(Boolean) ? 'passed' : 'failed';
   return { manifestSha256: registry.manifestSha256, cases: rows, arms: byArm,
+    registration: { settingsFrozen: Boolean(registry.manifest.settings), materialIndexSha256: registry.manifest.materialIndexSha256 ?? null },
     registered: { creationRuns: 12, reviewPairs: 6, reviewRuns: 12 }, prerequisites: prereqs,
     prerequisiteEvidence: { rights, provider }, controlCeiling, improvedQualityMetrics: improved, checks: check, quality,
     releaseReady: quality === 'passed' && Object.values(prereqs).every(Boolean), modelCalls: 0,
@@ -664,7 +755,7 @@ export async function report(directory: string) {
 
 async function main() {
   const { positionals, values } = parseArgs({
-    allowPositionals: true, options: { out: { type: 'string' }, settings: { type: 'string' }, input: { type: 'string' }, save: { type: 'string' } },
+    allowPositionals: true, options: { out: { type: 'string' }, settings: { type: 'string' }, 'comparison-index': { type: 'string' }, input: { type: 'string' }, save: { type: 'string' } },
   });
   const [command, argument, caseId, arm] = positionals;
   const parent = join(root, 'artifacts');
@@ -676,7 +767,7 @@ async function main() {
   need(await realpath(directory) === directory, 'Private run directory must not be a symbolic link');
   if (command === 'prepare') {
     await mkdir(join(directory, 'inputs'), { mode: 0o700, recursive: true });
-    process.stdout.write(jsonBytes({ manifestSha256: await prepare(directory, values.settings), modelCalls: 0 }));
+    process.stdout.write(jsonBytes({ manifestSha256: await prepare(directory, values.settings, values['comparison-index']), modelCalls: 0 }));
   } else if (command === 'import' && recordKinds.includes(argument as Kind) && values.input) {
     await importRecord(directory, argument as Kind, await json(values.input));
     process.stdout.write(jsonBytes({ imported: argument, modelCalls: 0 }));
@@ -687,7 +778,7 @@ async function main() {
     const name = code(values.save ?? 'evaluation.json', 'report file name');
     need(name.endsWith('.json'), 'Report filename must end in .json');
     await store(join(directory, name), result);
-    process.stdout.write(jsonBytes({ output: join(directory, name), quality: result.quality, releaseReady: result.releaseReady, modelCalls: 0 }));
+    process.stdout.write(jsonBytes({ output: join(directory, name), ...result.registration, quality: result.quality, releaseReady: result.releaseReady, modelCalls: 0 }));
   } else {
     throw new Error('Use prepare, import, packet or report. See docs/ccb-harness-evaluation.md.');
   }

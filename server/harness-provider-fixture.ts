@@ -1,7 +1,7 @@
 import { canonicalHarness, harnessHash } from './harness-policy';
 import type { ProviderResearchManifest } from './harness-provider-research';
 
-export const OPUS_RESEARCH_FIXTURE_ID = 'ccb-opus-provider-v1';
+export const OPUS_RESEARCH_FIXTURE_ID = 'ccb-opus-provider-v2';
 export const OPUS_RESEARCH_PURPOSE = 'game';
 export const OPUS_RESEARCH_PHASE = 'build';
 export const OPUS_RESEARCH_MODEL = 'claude-opus-5-5';
@@ -79,10 +79,10 @@ export const OPUS_RESEARCH_TOOLS = Object.freeze([
   "mcp__pgc_workspace__write"
 ] as const);
 
-// Captured with pinned CCB 963e001 on Node 24.16 against the local scripted
-// fixture. CCB moves the prompt cache marker from the original user text to
-// the tool result on the continuation, so their user message pins differ.
-export const OPUS_RESEARCH_WIRE = Object.freeze({
+// Historical fixture pins. The v1 provider receipt belongs to this contract.
+// CCB moves the cache marker from the original user text to the tool result
+// on continuation, so the two user message pins differ.
+export const OPUS_RESEARCH_WIRE_V1 = Object.freeze({
   sourceHash: '0a829fc3511ab49d5260b67fa83af9292a4d54d198bae1c6365ec1c0cb789258',
   systemSha256: 'fcd85cf61753fcd6bab4202e3cf1b706d2f4d7a0af36321e8095d92d25284685',
   toolsSha256: 'a5a1a5ef2ecab24c1c5cf8a1bd006efae81b0f7631acabca44f94a18ba46ac78',
@@ -107,6 +107,13 @@ export const OPUS_RESEARCH_WIRE = Object.freeze({
     "430c4a11827d224f42606ed8672beea2793f385db93046a3fdf27b71873ca409",
     "860b34e8ed68cf917160b8aadc8c3083688d30a8de968443fcb4654a1aadbbed"
   ] as const),
+});
+
+// Captured with pinned CCB 963e001 and Node 24.16 against the local scripted
+// gateway. The revised workspace descriptions changed the native tools array.
+export const OPUS_RESEARCH_WIRE = Object.freeze({
+  ...OPUS_RESEARCH_WIRE_V1,
+  toolsSha256: '16fb2396e986895668ee5a4d06ec83e74b0f14b05f98833d28509047eda09289',
 });
 
 const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);

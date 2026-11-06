@@ -57,8 +57,9 @@ export function validateStart(input, now) {
   if (!object(env, [
     'runId', 'taskId', 'generation', 'phase', 'purpose', 'protocol', 'model', 'effort',
     'deadlineAt', 'maxOutputTokens', 'maxTotalOutputTokens', 'maxModelTurns', 'maxRepairs', 'repair',
-    'prompt', 'systemPrompt', 'files',
-  ], ['imagePaths', 'outputPath', 'vision'])) return null;
+    'prompt', 'files',
+  ], ['systemPrompt', 'inlineTaskMaterials', 'imagePaths', 'outputPath', 'vision'])) return null;
+  const inlineTaskMaterials = env.inlineTaskMaterials === true;
   if (![env.runId, env.taskId, env.phase, env.purpose].every(value => string(value, identifier)) ||
       !string(env.model, modelName) ||
       !(integer(env.generation, 1, Number.MAX_SAFE_INTEGER) || string(env.generation, /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/)) ||
@@ -71,7 +72,9 @@ export function validateStart(input, now) {
       !integer(env.maxModelTurns, 1, LIMITS.maxModelTurns) ||
       !integer(env.maxRepairs, 0, LIMITS.maxRepairs) ||
       !integer(env.repair, 0, env.maxRepairs) ||
-      !prompt(env.prompt) || !prompt(env.systemPrompt) ||
+      !prompt(env.prompt) ||
+      (inlineTaskMaterials ? env.purpose === 'game' || env.systemPrompt !== undefined
+        : env.inlineTaskMaterials !== undefined || !prompt(env.systemPrompt)) ||
       !Array.isArray(env.files) || env.files.length > 24) return null;
 
   const game = env.purpose === 'game';
@@ -106,7 +109,22 @@ export function validateStart(input, now) {
     }
   }
   if (sha256(canonical(env)) !== input.envelopeSha256) return null;
-  const { files: _files, imagePaths: _imagePaths, ...run } = env;
+  const { files: _files, imagePaths: _imagePaths, inlineTaskMaterials: _inlineTaskMaterials, ...run } = env;
+  if (inlineTaskMaterials) {
+    // The validated file limit also bounds the inline input. Preserve the
+    // original system role and send the complete user materials without
+    // spending model turns re-reading them from the workspace.
+    const material = files.get('input/materials.json');
+    if (material?.encoding !== 'utf8') return null;
+    try {
+      const { system, ...taskMaterials } = JSON.parse(material.content);
+      if (typeof system !== 'string' || !system.trim() || !Object.hasOwn(taskMaterials, 'user')) return null;
+      run.systemPrompt = system;
+      run.prompt += `\n\nLocked task materials (full text; images supplied separately):\n${JSON.stringify(taskMaterials)}`;
+    } catch {
+      return null;
+    }
+  }
   // A later game phase may patch a copy of the hash-locked prior HTML in place.
   const previous = files.get('input/game.html');
   if (game && previous?.encoding === 'utf8') files.set('game.html', fileEntry('game.html', previous.content));

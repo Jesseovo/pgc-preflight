@@ -40,7 +40,7 @@ class MemoryStorage {
   async deleteAlarm() { this.alarmAt = null; }
 }
 
-type Envelope = { runId: string; taskId: string; generation: string; phase: string; imagePaths?: string[]; files: { path: string; content: string; sha256: string }[] };
+type Envelope = { runId: string; taskId: string; generation: string; phase: string; prompt: string; imagePaths?: string[]; files: { path: string; content: string; sha256: string }[] };
 type StartBody = { envelope: Envelope; envelopeSha256: string; lease: string };
 type Meta = { taskId: string; generation: string; createdAt: number; phase: string; state: string };
 const file = async (path: string, content: string) => ({ path, content, encoding: 'utf8', sha256: await harnessHash(content) });
@@ -291,6 +291,72 @@ describe('harness evidence and result binding', () => {
 });
 
 describe('harness phase recovery, ledger and cleanup', () => {
+  it('recovers the host seal when the final result GET fails on both sides of expiry', async () => {
+    const { db, host, container, review, reviewPolicy, payload, send, readPhase, paidRequest } = await setup();
+    review('admin-job','admin');
+    const text='synthetic sealed report';
+    vi.useFakeTimers();
+    try{
+      const deadline=Date.now()+1_000;
+      const shared={taskId:'admin-job',ownerId:'admin',family:'review',policy:reviewPolicy,maxTokens:24_000,deadlineAt:deadline};
+      const materials={system:'Synthetic system',user:'Synthetic input'};
+      const initial=await payload('review',{...shared,purpose:'review',materials});
+      const verify=await payload('review_verify',{...shared,purpose:'review_verify',materials});
+      for(const [input,output] of [[initial,'synthetic draft'],[verify,text]] as const){
+        expect((await send('/start',input)).ok).toBe(true);
+        await paidRequest(input.phase);
+        container.setOutput([await file('result.txt',output)]);
+        expect((await readPhase('/result',input)).ok).toBe(true);
+      }
+      let cancelCount=0;
+      const fetch=vi.fn(async(request:Request)=>{
+        const path=new URL(request.url).pathname;
+        if(path==='/result')return Response.json({error:'temporary fixture outage'},{status:503});
+        const result=await host.fetch(request);
+        if(path==='/cancel'&&++cancelCount===1){
+          expect(result.ok).toBe(true);
+          throw new Error('synthetic lost deadline response');
+        }
+        return result;
+      });
+      const execution=harnessExecutionFor({id:'admin-job',owner_id:'admin',harness_policy:reviewPolicy},
+        'review','review_verify',sourceHash,verify.taskDeadlineAt)!;
+      let signalRetry!:()=>void;
+      const retrying=new Promise<void>(resolve=>{signalRetry=resolve;});
+      const result=harnessCompletion({harnessExecution:execution,modelStore:{get:async()=>config},
+        HARNESS_RUNNER:{idFromName:name=>name,get:()=>({fetch})}},
+      {...materials,deadline,purpose:'review_verify',onWait:async()=>signalRetry()});
+      await retrying;
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(()=>expect(cancelCount).toBe(2));
+      expect(await result).toBe(text);
+      expect(fetch.mock.calls.map(([request])=>new URL(request.url).pathname))
+        .toEqual(['/start','/status','/result','/status','/result','/cancel','/cancel']);
+      expect(container.posts()).toHaveLength(2);
+      expect((await send('/finish',{outcome:'completed'})).ok).toBe(true);
+      const settled=await db.prepare("SELECT status,model_turns,released_at FROM harness_runs WHERE task_id='admin-job'").first();
+      expect(settled).toMatchObject({status:'done',model_turns:2,released_at:expect.any(Number)});
+    }finally{vi.useRealTimers();}
+  });
+
+  it.each(['deadline','explicit'])('keeps the %s stop separate from delivery recovery',async reason=>{
+    const {db,container,forge,payload,send,readPhase,paidRequest}=await setup();
+    forge('game');
+    const input=await payload();
+    expect((await send('/start',input)).ok).toBe(true);
+    const request=await paidRequest('build',reason==='explicit');
+    if(reason==='explicit'){
+      container.setOutput([await file('game.html',html),await file('record.json','{}')]);
+      expect((await readPhase('/result',input)).ok).toBe(true);
+    }else{
+      vi.spyOn(Date,'now').mockReturnValue(input.deadlineAt+1);
+    }
+    expect(await (await send(`/cancel?phase=build&material=${input.materialHash}`,{reason})).json()).toEqual({ok:true});
+    expect((await readPhase('/result',input)).ok).toBe(false);
+    expect(await getHarnessRun(db,request)).toMatchObject({status:reason==='explicit'?'failed':'unknown',modelTurns:1});
+    expect(container.posts()).toHaveLength(1);
+  });
+
   it('serializes concurrent alarm and result reads, pins material and never replays completed phases', async () => {
     const { db, storage, container, host, forge, payload, send, readPhase, paidRequest, harnessOutbound } = await setup();
     forge('game');
@@ -312,7 +378,8 @@ describe('harness phase recovery, ledger and cleanup', () => {
       env: { PGC_HARNESS_CONTROL_TOKEN: expect.any(String), PGC_HARNESS_GATEWAY_URL: 'http://pgc-harness.internal' },
     }));
     expect(JSON.stringify(container.state.start.mock.calls)).not.toContain(profile.encryptedKey);
-    expect(harnessOutbound).toHaveBeenCalledWith({ props: expect.objectContaining({ requestIdPrefix: 'build-0-', lease: container.body?.lease }) });
+    expect(harnessOutbound).toHaveBeenCalledWith({ props: expect.objectContaining({ requestIdPrefix: 'build-0-', lease: container.body?.lease, jsonOutput: false }) });
+    expect(container.body!.envelope.prompt).toContain('Check the returned ranges cover the file through its end.');
     expect((await send('/start', await payload('build', { materials: { system: 'Changed material' } }))).status).toBe(409);
     const id = await paidRequest('build');
     expect((await send('/finish', { outcome: 'completed' })).status).toBe(409);
@@ -437,11 +504,17 @@ describe('harness phase recovery, ledger and cleanup', () => {
     expect(container.posts()).toHaveLength(1);
   });
 
-  it('preserves the original admin image bytes in both review phases and finalizes after verify', async () => {
-    const { db, container, review, reviewPolicy, payload, send, readPhase, paidRequest } = await setup();
+  it('preserves long UTF-8 review text and original image bytes in both phases and finalizes after verify', async () => {
+    const { db, container, harnessOutbound, review, reviewPolicy, payload, send, readPhase, paidRequest } = await setup();
     review('admin-job', 'admin');
     const shared = { taskId: 'admin-job', ownerId: 'admin', family: 'review', policy: reviewPolicy, maxTokens: 24_000 };
-    const initial = await payload('review', { ...shared, purpose: 'review' });
+    const system = '审核原规则。'.repeat(30_000);
+    const source = '<!--' + '合'.repeat(239_993) + '-->';
+    const initial = await payload('review', {
+      ...shared, purpose: 'review', materials: { system, schema: { type: 'object' }, user: [
+        { type: 'text', text: source }, { type: 'image', data: `data:image/png;base64,${image}` },
+      ] },
+    });
     const verify = await payload('review_verify', {
       ...shared, purpose: 'review_verify',
       materials: { ...initial.materials, user: [...initial.materials.user, 'Synthetic initial report for verification'] },
@@ -449,6 +522,19 @@ describe('harness phase recovery, ledger and cleanup', () => {
     expect(verify.materialHash).not.toBe(initial.materialHash);
     expect((await send('/start', verify)).status).toBe(409);
     expect((await send('/start', initial)).ok).toBe(true);
+    const envelope = container.body!.envelope;
+    expect(Buffer.byteLength(envelope.prompt)).toBeLessThan(1024);
+    expect(envelope).not.toHaveProperty('systemPrompt');
+    const initialRun = validateStart(container.body!, Date.now())!;
+    const prefix = '\n\nLocked task materials (full text; images supplied separately):\n';
+    const manifest = initialRun.run.prompt.split(prefix)[1];
+    const { system: materialSystem, ...materialUser } = JSON.parse(envelope.files.find(item => item.path === 'input/materials.json')!.content);
+    expect(materialSystem).toBe(system);
+    expect(JSON.parse(manifest)).toEqual(materialUser);
+    expect(JSON.parse(manifest).user[0].text).toBe(source);
+    expect(initialRun.run.systemPrompt).toBe(system);
+    expect(initialRun.images[0].source.data).toBe(image);
+    expect(harnessOutbound).toHaveBeenLastCalledWith({ props: expect.objectContaining({ requestIdPrefix: 'review-0-', jsonOutput: true }) });
     const original = container.body!.envelope.files.find(item => item.path === 'input/image-1.png');
     const id = await paidRequest('review');
     container.setOutput([await file('result.txt', 'synthetic initial report')]);
@@ -456,11 +542,44 @@ describe('harness phase recovery, ledger and cleanup', () => {
     expect((await send('/finish', { outcome: 'completed' })).status).toBe(409);
     expect((await send('/start', verify)).ok).toBe(true);
     expect(container.body!.envelope.files.find(item => item.path === 'input/image-1.png')).toEqual(original);
+    const verifyRun = validateStart(container.body!, Date.now())!;
+    expect(JSON.parse(verifyRun.run.prompt.split(prefix)[1]).user).toEqual([
+      ...JSON.parse(manifest).user, 'Synthetic initial report for verification',
+    ]);
+    expect(verifyRun.run.systemPrompt).toBe(system);
+    expect(verifyRun.images).toEqual(initialRun.images);
+    expect(harnessOutbound).toHaveBeenLastCalledWith({ props: expect.objectContaining({ requestIdPrefix: 'review_verify-0-', jsonOutput: true }) });
     await paidRequest('review_verify');
     container.setOutput([await file('result.txt', 'synthetic verified report')]);
     expect(await (await readPhase('/result', verify)).json()).toMatchObject({ text: 'synthetic verified report' });
     expect((await send('/finish', { outcome: 'completed' })).ok).toBe(true);
     expect(await getHarnessRun(db, id)).toMatchObject({ status: 'done', modelTurns: 2, releasedAt: expect.any(Number) });
+  });
+
+  it('finishes a sealed verification after the deadline while rejecting another paid phase', async () => {
+    const { db, container, host, review, reviewPolicy, payload, send, readPhase, paidRequest } = await setup();
+    review('admin-job', 'admin');
+    const shared = { taskId: 'admin-job', ownerId: 'admin', family: 'review', policy: reviewPolicy, maxTokens: 24_000 };
+    for (const phase of ['review', 'review_verify']) {
+      const input = await payload(phase, { ...shared, purpose: phase });
+      expect((await send('/start', input)).ok).toBe(true);
+      await paidRequest(phase);
+      container.setOutput([await file('result.txt', phase)]);
+      expect(await (await readPhase('/result', input)).json()).toMatchObject({ text: phase, sealedAt: expect.any(Number) });
+    }
+    const run = (await db.prepare("SELECT generation,deadline_at FROM harness_runs WHERE task_id='admin-job'").first<{ generation: string; deadline_at: number }>())!;
+    vi.spyOn(Date, 'now').mockReturnValue(run.deadline_at + 1);
+    await host.alarm();
+    expect((await send('/start', await payload('review_verify', shared))).ok).toBe(false);
+    vi.spyOn(db,'prepare').mockImplementationOnce(()=>{throw new Error('temporary fixture DB failure');});
+    expect((await send('/finish', { outcome: 'completed' })).status).toBe(503);
+    expect(await getHarnessRun(db, { taskId: 'admin-job', generation: run.generation })).toMatchObject({status:'active'});
+    await host.alarm();
+    expect((await send('/finish', { outcome: 'completed' })).ok).toBe(true);
+    expect(await getHarnessRun(db, { taskId: 'admin-job', generation: run.generation })).toMatchObject({
+      status: 'done', modelTurns: 2, releasedAt: expect.any(Number),
+    });
+    expect(container.posts()).toHaveLength(2);
   });
 
   it('revokes tool access and marks a forwarded model request unknown without starting another phase', async () => {

@@ -345,7 +345,9 @@ it('retains stage artifacts but waits for a durable harness finish before publis
   expect(s.row().status).toBe('running');
   expect(s.sqlite.prepare('SELECT stage FROM forge_creation_stages ORDER BY stage').all()).toEqual([{ stage: 'build' }, { stage: 'polish' }]);
   expect(s.sqlite.prepare('SELECT product_html FROM topics WHERE id=1').get()).toEqual({ product_html: null });
-  await creationPipelineAlarm(s.state, env, s.id);
+  const checkpoint=JSON.parse(await s.storage.get('creation:0'));
+  const clock=vi.spyOn(Date,'now').mockReturnValue(checkpoint.harnessDeadlineAt+1);
+  try{await creationPipelineAlarm(s.state,env,s.id);}finally{clock.mockRestore();}
   expect(s.row().status).toBe('done');
   expect(complete).toHaveBeenCalledTimes(2);
   expect(finish).toHaveBeenCalledTimes(2);

@@ -125,6 +125,39 @@ describe('harness run ledger', () => {
     expect(await getHarnessRunSummary(db, run)).toMatchObject({ modelTurns: 2, outputTokens: 1 });
   });
 
+  it('reserves independent review and verification token and request budgets', async () => {
+    const { db } = await setup();
+    const model = (await lockHarnessModel(config, 'review', 24_000))!;
+    const { run } = (await createHarnessRun(db, { taskId: 'review-task', generation: 'g-1', ownerId: 'admin',
+      actor: 'admin', model, sourceHash: source, snapshot: {}, now: timestamp,
+      limits: { maxTotalOutputTokens: 48_000, maxModelTurns: 8 } }))!;
+    const review = (requestId: string) => ({ ...run, requestId: `review-0-${requestId}` });
+    const reserve = (id: ReturnType<typeof review>, phase: 'review' | 'review_verify') =>
+      reserveHarnessRequest(db, id, bodyHash, 24_000, timestamp, timestamp, run.deadlineAt, null, phase);
+    async function complete(id: ReturnType<typeof review>, outputTokens: number) {
+      expect(await forwardHarnessRequest(db, id, timestamp, 'review')).toBe(true);
+      expect(await finishHarnessRequest(db, id, { state: 'completed', outputTokens }, timestamp + 1)).toBe(true);
+    }
+    const first = review('one'), second = review('two'), third = review('three');
+    expect(await Promise.all([reserve(first, 'review'), reserve(second, 'review')])).toEqual([
+      { status: 'reserved', outputCap: 24_000, deadlineAt: timestamp + HARNESS_MAX_REQUEST_MS },
+      { status: 'blocked' },
+    ]);
+    await complete(first, 23_000);
+    expect(await reserve(second, 'review')).toMatchObject({ status: 'reserved', outputCap: 1_000 });
+    await complete(second, 1);
+    expect(await reserve(third, 'review')).toMatchObject({ status: 'reserved', outputCap: 999 });
+    expect(await forwardHarnessRequest(db, third, timestamp, 'review')).toBe(true);
+    expect(await rearmHarnessRequest(db, third)).toBe(true);
+    expect(await forwardHarnessRequest(db, third, timestamp + 1, 'review')).toBe(true);
+    expect(await finishHarnessRequest(db, third, { state: 'completed', outputTokens: 998 }, timestamp + 2)).toBe(true);
+    expect(await getHarnessRunSummary(db, run)).toMatchObject({ modelTurns: 4, outputTokens: 23_999 });
+    expect(await reserve(review('four'), 'review')).toEqual({ status: 'blocked' });
+    expect(await reserve(review('four'), 'review_verify')).toEqual({ status: 'blocked' });
+    expect(await reserve({ ...run, requestId: 'review_verify-0-one' }, 'review_verify'))
+      .toMatchObject({ status: 'reserved', outputCap: 24_000 });
+  });
+
   it('latches an interrupted paid call as unknown and never converts its task to success', async () => {
     const { db, create } = await setup();
     const { run } = (await create('task'))!;
@@ -133,6 +166,7 @@ describe('harness run ledger', () => {
     await forwardHarnessRequest(db, request, timestamp);
     expect(await reserveHarnessRequest(db, { ...run, requestId: 'build-2' }, bodyHash, 64_000, timestamp + HARNESS_MAX_REQUEST_MS)).toEqual({ status: 'blocked' });
     expect(await endHarnessRun(db, run, 'done', undefined, timestamp + HARNESS_MAX_REQUEST_MS)).toBe(false);
+    expect(await endHarnessRun(db, run, 'done', undefined, timestamp + HARNESS_MAX_REQUEST_MS, timestamp + 1)).toBe(false);
     expect(await finishHarnessRequest(db, request, { state: 'completed', outputTokens: 10 }, timestamp + HARNESS_MAX_REQUEST_MS)).toBe(false);
     expect(await getHarnessRun(db, run)).toMatchObject({ status: 'unknown', failureCode: 'deadline', outputTokens: 0, reservedTokens: 64_000 });
   });

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { assertContainerIsolation, createHarness } from '../harness/runtime.mjs';
 import { canonical, fileEntry, sha256 } from '../harness/envelope.mjs';
 import { inspectStream } from '../harness/model-bridge.mjs';
+import { workspaceResponse } from '../harness/workspace.mjs';
 import { validateCreationOutput } from '../server/forge-creation-pipeline';
 import { parseProductionOutput } from '../server/forge-production-output';
 import { harnessResultText } from '../server/harness-host';
@@ -134,6 +135,31 @@ const syntheticSSE = (protocol: string, reason: string, tokens: number) => proto
 
 type Gateway = (request: IncomingMessage, response: ServerResponse, body: any) => void;
 
+it('enumerates and reconstructs a UTF-8 file with parallel UTF-16 workspace reads', async () => {
+  const source = '源'.repeat(19_999) + '🎮' + '画'.repeat(19_998) + '🕹️' + '终';
+  const entry = fileEntry('input/materials.json', source);
+  const context = { run: { purpose: 'game' }, files: new Map([[entry.path, entry]]), outputs: ['game.html', 'record.json'] };
+  const call = async (name: string, args: object) => {
+    const response = await workspaceResponse(context, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }, 'http://unused.invalid');
+    if (!response || !('result' in response)) throw new Error('Workspace fixture did not return a tool result');
+    return JSON.parse(response.result.content[0].text);
+  };
+  const details = { path: entry.path, sha256: entry.sha256, encoding: 'utf8', utf16Length: source.length, utf8Bytes: Buffer.byteLength(source) };
+  const { files, readChunkUtf16 } = await call('list', {});
+  expect(files).toEqual([details]);
+  expect(readChunkUtf16).toBe(20_000);
+  const chunks = await Promise.all([0, readChunkUtf16, readChunkUtf16 * 2].map(offset => call('read', { path: entry.path, offset })));
+  expect(chunks.map(chunk => chunk.range)).toEqual([
+    { start: 0, end: 20_001 }, { start: 20_001, end: 40_001 }, { start: 40_001, end: source.length },
+  ]);
+  expect(chunks.map(chunk => chunk.nextOffset)).toEqual([20_001, 40_001, null]);
+  expect(chunks.map(chunk => chunk.content).join('')).toBe(source);
+  for (const chunk of chunks) expect(chunk).toMatchObject(details);
+  const sequential = await call('read', { path: entry.path, offset: chunks[0].nextOffset });
+  expect(sequential.range.start).toBe(chunks[0].range.end);
+  expect((await call('read', { path: entry.path, offset: source.length + 1 })).error).toBe('Invalid offset');
+});
+
 describe('Linux container startup verification', () => {
   const capabilityFields = ['CapEff', 'CapPrm', 'CapInh', 'CapAmb', 'CapBnd'];
   const status = [
@@ -240,6 +266,35 @@ describe('CCB Node runtime boundary', () => {
     });
     expect(observed[0].body).not.toHaveProperty('enable_thinking');
     expect((await call('/v1/result', undefined, 'another-run')).status).toBe(404);
+  });
+
+  it.each(['review', 'brief'])('sends the full UTF-8 %s user material and native image on the first model turn', async purpose => {
+    const observed: any[] = [];
+    await serve((_request, response, body) => {
+      observed.push(body);
+      response.setHeader('content-type', 'text/event-stream');
+      response.end(syntheticSSE('openai', 'stop', 22));
+    });
+    const source = '画'.repeat(240_000);
+    const user = [source, { imagePath: 'input/image-1.png' }];
+    const userMaterials = { user, ...(purpose === 'review' && { schema: { type: 'object' } }) };
+    const material = JSON.stringify({ system: 'Locked stage system', ...userMaterials });
+    const image = {
+      path: 'input/image-1.png', encoding: 'base64', content: screenshot,
+      sha256: sha256(Buffer.from(screenshot, 'base64')),
+    };
+    const { systemPrompt: _systemPrompt, ...envelope } = run({
+      inlineTaskMaterials: true, purpose, phase: purpose, maxModelTurns: purpose === 'brief' ? 6 : 8, vision: true, imagePaths: [image.path],
+      files: [fileEntry('input/materials.json', material), image],
+    });
+    const oversized = fileEntry('input/materials.json', JSON.stringify({ system: 'Rules', user: '画'.repeat(700_000) }));
+    expect((await start({ ...envelope, files: [oversized, image] })).status).toBe(400);
+    expect((await start(envelope)).status).toBe(202);
+    expect(await done()).toMatchObject({ state: 'succeeded', modelTurns: 1 });
+    expect(observed).toHaveLength(1);
+    const content = observed[0].messages[0].content;
+    expect(content[0]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: screenshot } });
+    expect(JSON.parse(content[1].text.split('\n\nLocked task materials (full text; images supplied separately):\n')[1])).toEqual(userMaterials);
   });
 
   it('captures the platform-prepared HTML and accepts repair references only for its saved bytes', async () => {

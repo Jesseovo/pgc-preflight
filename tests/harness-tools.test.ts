@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Browser } from 'puppeteer-core';
 import { describe, expect, it, vi } from 'vitest';
 import { HarnessTools } from '../server/harness-tools';
+import type { CaptureBrowserLifecycle } from '../server/cloud-review-capture';
 import { canonicalHarness, harnessHash } from '../server/harness-policy';
 import { AdaptivePlay, playActionCaptureCount, validatePlayActions } from '../scripts/review-adaptive';
 
@@ -27,23 +28,35 @@ const shot = (index: number, actionRefs: (string | number)[] = []) => ({
   id: `shot-${index}`, label: 'Original viewport', data: screenshot, actionRefs,
 });
 const deadline = () => Date.now() + 10_000;
+const pendingCaptureKey = 'harness-browser-pending-capture';
 const call = (name: string, id: string, args: Record<string, unknown>) => ({ name, id, arguments: args });
 const version = async (input: string) => ({ html: input, inputHash: await harnessHash(input) });
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
 
 function fixture(storage = new TestStorage()) {
-  const closeBrowser = vi.fn(async () => {});
-  const closeOwn = vi.fn(async () => {});
-  const launch = vi.fn(async (_deadline: number, acquired: (id: string) => Promise<void>) => {
+  const disconnect = vi.fn(async () => {});
+  const closeOwn = vi.fn(async (_browserId: string) => {});
+  const launch = vi.fn(async (_deadline: number, acquired: (id: string) => Promise<void>, acquiring: () => Promise<void>) => {
+    await acquiring();
     await acquired('exact-acquired-browser');
-    return { close: closeBrowser } as unknown as Browser;
+    return { disconnect } as unknown as Browser;
   });
-  const capture = vi.fn(async (_html: string, _onWait?: unknown, _deadline?: number, _creation?: { activeBudgetMs: number }) => ({
-    shots: Array.from({ length: 4 }, (_, i) => shot(i + 1, i === 0 ? [] : ['touch'])),
-    probe: {
-      loaded: {}, actions: [{ id: 'touch', type: 'tap' }],
-      observations: Array.from({ length: 4 }, (_, i) => ({ id: `shot-${i + 1}`, actionRefs: i === 0 ? [] : ['touch'] })),
-    }, captureRuntimeMs: 26_000,
-  }));
+  const capture = vi.fn(async (_html: string, _onWait?: unknown, _deadline?: number, _creation?: { activeBudgetMs: number }, lifecycle?: CaptureBrowserLifecycle) => {
+    await lifecycle!.acquiring();
+    await lifecycle!.acquired('exact-capture-browser');
+    await lifecycle!.closed('exact-capture-browser');
+    return {
+      shots: Array.from({ length: 4 }, (_, i) => shot(i + 1, i === 0 ? [] : ['touch'])),
+      probe: {
+        loaded: {}, actions: [{ id: 'touch', type: 'tap' }],
+        observations: Array.from({ length: 4 }, (_, i) => ({ id: `shot-${i + 1}`, actionRefs: i === 0 ? [] : ['touch'] })),
+      }, captureRuntimeMs: 26_000,
+    };
+  });
   const act = vi.fn();
   const play = vi.fn((_browser: Browser, _html: string, inputHash: string, _remaining: number) => ({
     closed: false,
@@ -69,7 +82,7 @@ function fixture(storage = new TestStorage()) {
   }));
   const deps = { closeOwn, launch, capture, play };
   const env = {} as ConstructorParameters<typeof HarnessTools>[0];
-  return { tools: new HarnessTools(env, storage, deps as unknown as ConstructorParameters<typeof HarnessTools>[2]), capture, launch, closeBrowser, closeOwn, act, play, storage };
+  return { tools: new HarnessTools(env, storage, deps as unknown as ConstructorParameters<typeof HarnessTools>[2]), capture, launch, disconnect, closeOwn, act, play, storage };
 }
 
 describe('Harness isolated browser tools', () => {
@@ -105,13 +118,13 @@ describe('Harness isolated browser tools', () => {
     expect(await fixture(first.storage).tools.readResults()).toEqual([original, second, third]);
     await expect(resumed.tools.execute(call('play-start', 'start-after-budget', material), deadline())).rejects.toMatchObject({ status: 409 });
     expect(resumed.capture).toHaveBeenCalledTimes(2);
-    expect(resumed.capture.mock.calls[0]).toMatchObject([another, undefined, expect.any(Number), { activeBudgetMs: 154_000 }]);
-    expect(resumed.capture.mock.calls[1]).toMatchObject([html, undefined, expect.any(Number), { activeBudgetMs: 128_000 }]);
+    expect(resumed.capture.mock.calls[0].slice(0, 4)).toMatchObject([another, undefined, expect.any(Number), { activeBudgetMs: 154_000 }]);
+    expect(resumed.capture.mock.calls[1].slice(0, 4)).toMatchObject([html, undefined, expect.any(Number), { activeBudgetMs: 128_000 }]);
     expect(await first.storage.get('harness-browser-state')).toMatchObject({ shots: 12, activeMs: 78_000 });
   });
 
   it('preserves continuous-drag originals, tracks real active time, and closes the exact session', async () => {
-    const { tools, act, closeBrowser, play } = fixture();
+    const { tools, act, closeOwn, disconnect, play } = fixture();
     const material = await version(html);
     const started = await tools.execute(call('play-start', 'start', material), deadline());
     expect(started).toMatchObject({ sourceBlind: false, playMs: 1100, shots: [{ data: screenshot }] });
@@ -142,11 +155,13 @@ describe('Harness isolated browser tools', () => {
     expect(finished.actions).toEqual([]);
     expect(finished.summary).toMatchObject({ actions: [...result.actions, ...next.actions] });
     expect(await tools.readResults()).toEqual([started, result, next, finished]);
-    expect(closeBrowser).toHaveBeenCalledOnce();
+    expect(closeOwn).toHaveBeenCalledExactlyOnceWith('exact-acquired-browser');
+    expect(disconnect).toHaveBeenCalledOnce();
     await tools.execute(call('play-start', 'second-version', await version(another)), deadline());
     expect(play.mock.calls[1][3]).toBe(180_000 - 1500);
     await tools.close();
-    expect(closeBrowser).toHaveBeenCalledTimes(2);
+    expect(closeOwn).toHaveBeenCalledTimes(2);
+    expect(disconnect).toHaveBeenCalledTimes(2);
   });
 
   it('refuses to resume a lost context and only attempts closing the acquired browser ID', async () => {
@@ -169,10 +184,99 @@ describe('Harness isolated browser tools', () => {
     await first.tools.close();
     const next = fixture(first.storage);
     await next.tools.execute(call('play-start', 'start-phase-2', await version(another)), deadline());
-    expect(first.closeBrowser).toHaveBeenCalledOnce();
+    expect(first.closeOwn).toHaveBeenCalledExactlyOnceWith('exact-acquired-browser');
     expect(next.play.mock.calls[0][3]).toBe(180_000 - 1100);
     expect(await first.storage.get('harness-browser-state')).toMatchObject({ shots: 2, activeMs: 2200 });
     await next.tools.close();
+  });
+
+  it('retains an unknown or legacy allocation without an ID and refuses to report it closed', async () => {
+    const first = fixture();
+    first.launch.mockImplementationOnce(async (_deadline, _acquired, acquiring) => {
+      await acquiring();
+      throw new Error('lost acquisition response');
+    });
+    const material = await version(html);
+    await expect(first.tools.execute(call('play-start', 'unknown-play', material), deadline())).rejects.toMatchObject({ status: 502 });
+    const state = (await first.storage.get<{ session: { id: string; acquisitionStarted?: boolean } }>('harness-browser-state'))!;
+    expect(state.session).toMatchObject({ acquisitionStarted: true });
+    const resumed = fixture(first.storage);
+    const closing = call('play-close', 'close-unknown', { sessionId: state.session.id, inputHash: material.inputHash });
+    await expect(resumed.tools.execute(closing, deadline())).rejects.toMatchObject({ status: 503 });
+    await expect(resumed.tools.close()).rejects.toMatchObject({ status: 503 });
+    expect(resumed.closeOwn).not.toHaveBeenCalled();
+
+    delete state.session.acquisitionStarted;
+    await first.storage.put('harness-browser-state', state);
+    await expect(fixture(first.storage).tools.close()).rejects.toMatchObject({ status: 503 });
+  });
+
+  it('retires only a queued, unrequested play session and prevents a later launch', async () => {
+    const first = fixture();
+    const queued = gate();
+    const gateOpen = gate();
+    first.launch.mockImplementationOnce(async (_deadline, _acquired, acquiring) => {
+      queued.resolve();
+      await gateOpen.promise;
+      await acquiring();
+      throw new Error('unexpected request after retirement');
+    });
+    const execution = first.tools.execute(call('play-start', 'queued-play', await version(html)), deadline());
+    const outcome = expect(execution).rejects.toMatchObject({ status: 409 });
+    await queued.promise;
+    const resumed = fixture(first.storage);
+    await expect(resumed.tools.close()).resolves.toBeUndefined();
+    gateOpen.resolve();
+    await outcome;
+    expect(resumed.closeOwn).not.toHaveBeenCalled();
+    expect(await first.storage.get<{ session?: unknown }>('harness-browser-state')).not.toHaveProperty('session');
+  });
+
+  it('persists a late play allocation before cancellation and recovers the exact ID after restart', async () => {
+    const first = fixture();
+    const started = gate();
+    const allocated = gate();
+    first.launch.mockImplementationOnce(async (_deadline, acquired, acquiring) => {
+      await acquiring();
+      started.resolve();
+      await allocated.promise;
+      await acquired('late-play-browser');
+      throw new Error('unexpected connection after cancellation');
+    });
+    const execution = first.tools.execute(call('play-start', 'late-play', await version(html)), deadline());
+    const outcome = expect(execution).rejects.toMatchObject({ status: 409 });
+    await started.promise;
+    const resumed = fixture(first.storage);
+    await expect(resumed.tools.close()).rejects.toMatchObject({ status: 503 });
+    expect(resumed.closeOwn).not.toHaveBeenCalled();
+    allocated.resolve();
+    await outcome;
+    expect(await first.storage.get('harness-browser-state')).toMatchObject({ session: { browserId: 'late-play-browser', acquisitionStarted: true, cancelled: true } });
+    await expect(resumed.tools.close()).resolves.toBeUndefined();
+    expect(resumed.closeOwn).toHaveBeenCalledExactlyOnceWith('late-play-browser');
+  });
+
+  it('does not treat local disconnect as remote closure and retries a known connection failure by ID', async () => {
+    const first = fixture();
+    const material = await version(html);
+    const opening = await first.tools.execute(call('play-start', 'open', material), deadline());
+    first.closeOwn.mockRejectedValueOnce(new Error('remote close unknown'));
+    await expect(first.tools.execute(call('play-close', 'close-unconfirmed', { sessionId: opening.sessionId, inputHash: material.inputHash }), deadline())).rejects.toMatchObject({ status: 503 });
+    expect(first.disconnect).toHaveBeenCalledOnce();
+    expect(await first.storage.get('harness-browser-state')).toMatchObject({ session: { browserId: 'exact-acquired-browser' } });
+    const resumed = fixture(first.storage);
+    await resumed.tools.close();
+    expect(resumed.closeOwn).toHaveBeenCalledExactlyOnceWith('exact-acquired-browser');
+
+    const connection = fixture();
+    connection.launch.mockImplementationOnce(async (_deadline, acquired, acquiring) => {
+      await acquiring();
+      await acquired('play-with-failed-connect');
+      throw new Error('connection failed');
+    });
+    await expect(connection.tools.execute(call('play-start', 'failed-connect', material), deadline())).rejects.toMatchObject({ status: 502 });
+    await connection.tools.close();
+    expect(connection.closeOwn).toHaveBeenCalledExactlyOnceWith('play-with-failed-connect');
   });
 
   it('fails closed on corrupted completed evidence without another browser call', async () => {
@@ -206,6 +310,96 @@ describe('Harness isolated browser tools', () => {
     await expect(tools.execute(operation, deadline())).rejects.toMatchObject({ status: 409 });
     expect(capture).toHaveBeenCalledOnce();
     expect(await tools.readResults()).toEqual([]);
+  });
+
+  it('keeps an acquired capture across connection failure, restart and an unconfirmed close', async () => {
+    const first = fixture();
+    first.capture.mockImplementationOnce(async (_html, _wait, _deadline, _creation, lifecycle) => {
+      await lifecycle!.acquiring();
+      await lifecycle!.acquired('capture-after-connect-failure');
+      throw new Error('connection failed');
+    });
+    const material = await version(html);
+    await expect(first.tools.execute(call('capture', 'interrupted', material), deadline())).rejects.toMatchObject({ status: 502 });
+    expect(await first.storage.get(pendingCaptureKey)).toEqual({ invocationId: 'interrupted', browserId: 'capture-after-connect-failure' });
+    const resumed = fixture(first.storage);
+    await expect(resumed.tools.execute(call('capture', 'different', material), deadline())).rejects.toMatchObject({ status: 503 });
+    resumed.closeOwn.mockRejectedValueOnce(new Error('unknown close result'));
+    await expect(resumed.tools.close()).rejects.toMatchObject({ status: 503 });
+    expect(await first.storage.get(pendingCaptureKey)).toMatchObject({ browserId: 'capture-after-connect-failure', cancelled: true });
+    await expect(resumed.tools.close()).resolves.toBeUndefined();
+    expect(resumed.closeOwn.mock.calls).toEqual([['capture-after-connect-failure'], ['capture-after-connect-failure']]);
+    expect(await first.storage.get(pendingCaptureKey)).toBeNull();
+    expect(await resumed.tools.readResults()).toEqual([]);
+  });
+
+  it('blocks cleanup before a late acquire returns and records the exact ID before aborting', async () => {
+    const first = fixture();
+    const waiting = gate();
+    const allocated = gate();
+    first.capture.mockImplementationOnce(async (_html, _wait, _deadline, _creation, lifecycle) => {
+      await lifecycle!.acquiring();
+      waiting.resolve();
+      await allocated.promise;
+      await lifecycle!.acquired('capture-allocated-after-close');
+      throw new Error('unexpected capture after cancellation');
+    });
+    const material = await version(html);
+    const running = first.tools.execute(call('capture', 'acquiring', material), deadline());
+    const outcome = expect(running).rejects.toMatchObject({ status: 409 });
+    await waiting.promise;
+    const resumed = fixture(first.storage);
+    await expect(resumed.tools.close()).rejects.toMatchObject({ status: 503 });
+    expect(resumed.closeOwn).not.toHaveBeenCalled();
+    expect(await first.storage.get(pendingCaptureKey)).toEqual({ invocationId: 'acquiring', cancelled: true });
+    allocated.resolve();
+    await outcome;
+    expect(await first.storage.get(pendingCaptureKey)).toMatchObject({ browserId: 'capture-allocated-after-close' });
+    await expect(resumed.tools.close()).resolves.toBeUndefined();
+    expect(resumed.closeOwn).toHaveBeenCalledExactlyOnceWith('capture-allocated-after-close');
+  });
+
+  it('stops a queued capture from acquiring a browser after cleanup succeeded', async () => {
+    const first = fixture();
+    const queued = gate();
+    const gateOpen = gate();
+    first.capture.mockImplementationOnce(async (_html, _wait, _deadline, _creation, lifecycle) => {
+      queued.resolve();
+      await gateOpen.promise;
+      await lifecycle!.acquiring();
+      throw new Error('unexpected allocation after cleanup');
+    });
+    const running = first.tools.execute(call('capture', 'queued', await version(html)), deadline());
+    const outcome = expect(running).rejects.toMatchObject({ status: 409 });
+    await queued.promise;
+    await expect(first.tools.close()).resolves.toBeUndefined();
+    gateOpen.resolve();
+    await outcome;
+    expect(first.closeOwn).not.toHaveBeenCalled();
+    expect(await first.storage.get(pendingCaptureKey)).toBeUndefined();
+  });
+
+  it('keeps an unknown allocation after its deadline and closes a known late allocation without releasing evidence', async () => {
+    const first = fixture();
+    const late = gate();
+    const returned = gate();
+    first.capture.mockImplementationOnce(async (_html, _wait, _deadline, _creation, lifecycle) => {
+      await lifecycle!.acquiring();
+      await late.promise;
+      try { await lifecycle!.acquired('capture-returned-after-deadline'); }
+      finally { returned.resolve(); }
+      throw new Error('unexpected capture after deadline');
+    });
+    const material = await version(html);
+    await expect(first.tools.execute(call('capture', 'expired', material), Date.now() + 80)).rejects.toMatchObject({ status: 504 });
+    const resumed = fixture(first.storage);
+    await expect(resumed.tools.close()).rejects.toMatchObject({ status: 503 });
+    expect(resumed.closeOwn).not.toHaveBeenCalled();
+    late.resolve();
+    await returned.promise;
+    await expect(resumed.tools.close()).resolves.toBeUndefined();
+    expect(resumed.closeOwn).toHaveBeenCalledExactlyOnceWith('capture-returned-after-deadline');
+    expect(await resumed.tools.readResults()).toEqual([]);
   });
 
   it('labels creator observations as source-aware without allowing a blind first-look record', async () => {

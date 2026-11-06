@@ -14,6 +14,8 @@ on:
       - 'server/harness-*.ts'
       - 'tests/harness-*.test.ts'
       - 'scripts/harness-native-probe*'
+      - 'scripts/harness-egress-probe*'
+      - 'scripts/harness-browser-close-probe*'
       - 'scripts/run-harness-native-probe.mjs'
       - '.github/workflows/ccb-research-image.yml'
 

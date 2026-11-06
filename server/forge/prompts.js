@@ -295,7 +295,7 @@ const gameEvidenceBoundary = (repairBudget, continuation = false) => `【证据�
 
 /**
  * @param {"build"|"polish"|"repair"} stage
- * @param {"json"|"framed"} format
+ * @param {"json"|"framed"|"workspace"} format
  * @param {number} remainingRepairs
  */
 export function gameStageSystem(stage, format = "json", remainingRepairs = stage === "polish" ? 1 : 0) {
@@ -342,14 +342,19 @@ const gameRecordBoundary = "不能写进 HTML 注释、脚本、DOM 或可访问
 
 /**
  * @param {"build"|"polish"|"repair"} stage
- * @param {"json"|"framed"} format
+ * @param {"json"|"framed"|"workspace"} format
  * @param {boolean} mayRequestRepair
  */
 function gameStageFormat(stage, format, mayRequestRepair = stage === "polish") {
   const schema = stage === "build" ? GAME_BUILD_SCHEMA : mayRequestRepair ? GAME_POLISH_SCHEMA : GAME_REPAIR_SCHEMA;
-  if (format === "framed") {
+  if (format === "framed" || format === "workspace") {
     const recordFields = Object.fromEntries(Object.entries(schema.properties).filter(([name]) => name !== "html"));
     const required = schema.required.filter(name => name !== "html");
+    const recordSchema = JSON.stringify(closed(recordFields, required));
+    if (format === "workspace") return `【工作区交付格式】
+使用私有工作区工具保存两个文件。game.html 保存从 <!doctype html> 到 </html> 的完整 HTML 原文，保留原始引号、换行和脚本。record.json 只保存符合下方 Schema 的单个 JSON 对象。两个文件都不含区块标记或 Markdown 代码围栏。${gameRecordBoundary}
+【记录 JSON Schema】
+${recordSchema}`;
     return `【交付格式】
 按下方结构输出两个连续区块。四个标记各占独立一行，各出现一次。首行必须是 HTML 开始标记，末行必须是记录结束标记。区块外不写解释、Markdown 代码围栏或其他文字。用实际产物替换模板中省略的部分。
 
@@ -364,7 +369,7 @@ function gameStageFormat(stage, format, mayRequestRepair = stage === "polish") {
 
 HTML 区块从 <!doctype html> 到 </html>，直接输出 HTML 原文，保留原始引号、换行和脚本。记录区块只包含下面的 JSON 字段。${gameRecordBoundary}
 【记录 JSON Schema】
-${JSON.stringify(closed(recordFields, required))}`;
+${recordSchema}`;
   }
   const keys = schema.required;
   return `【交付格式】
@@ -377,17 +382,18 @@ ${JSON.stringify(htmlEscapeExample)}
 const gameJsonReminder = '请按系统给定的顶层字段返回单个 JSON 对象。完整 HTML 只放在正确转义的 "html" 字符串中。';
 
 const gameFramedReminder = "请按系统给定的 PGC_HTML 和 PGC_RECORD 区块交付完整 HTML 原文及独立 JSON 记录。保留四行标记，区块外不加内容。";
+const gameWorkspaceReminder = "请使用私有工作区工具，将完整 HTML 原文保存为 game.html，独立 JSON 记录保存为 record.json。";
 
 /**
  * @param {"build"|"polish"|"repair"} stage
  * @param {{topic:any, brief:string, styleSvg?:string, styleImage?:string, assetHtml?:string,
  *   html?:string, capture?:{shots:{id:string,label:string,data:string,actionRefs?:string[]}[],probe:unknown,hash?:string,stage?:string},
  *   requirements?:unknown,decisions?:unknown,coreChanges?:unknown,selfCheck?:unknown,harnessEvidence?:Array<{evidenceId:string,inputHash:string,shots:Array<{id:string,data:string}>}>}} input
- * @param {"json"|"framed"} format
+ * @param {"json"|"framed"|"workspace"} format
  * @returns {Array<{type:"text",text:string}|{type:"image",data:string}>}
  */
 export function gameStageUser(stage, input, format = "json") {
-  const gameOutputReminder = format === "framed" ? gameFramedReminder : gameJsonReminder;
+  const gameOutputReminder = format === "workspace" ? gameWorkspaceReminder : format === "framed" ? gameFramedReminder : gameJsonReminder;
   const { topic, brief, styleSvg, styleImage, assetHtml, html, capture, requirements, decisions, coreChanges, selfCheck, harnessEvidence } = input;
   const asset = extractGameAssetScript(assetHtml);
   if (assetHtml && !asset) throw new Error("锁定的美术资产缺少可复用的 GAME_ASSETS 脚本。");
