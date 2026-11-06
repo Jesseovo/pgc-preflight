@@ -1,7 +1,10 @@
+import { readFileSync } from 'node:fs';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { cloudReviewAlarm } from '../server/cloud-review-runner';
 import { creationPipelineAlarm } from '../server/forge-creation-pipeline';
 import { HarnessHost } from '../server/harness-host';
+import { createHarnessRun } from '../server/harness-ledger';
 import { HARNESS_MODEL_HEADERS } from '../server/harness-protocol';
 
 vi.mock('cloudflare:workers', () => ({
@@ -71,18 +74,19 @@ function setup() {
     readFrozenInput: vi.fn(async () => 'frozen input'),
     readEvidencePack: vi.fn(async () => 'sealed evidence'),
   };
-  const forward = vi.fn<NonNullable<Env['COMPARISON_CANDIDATE_BROKER']>['forwardHarness']>()
-    .mockImplementation(async () => new Response('original stream bytes', { headers: { 'x-pgc-comparison-broker-version': version } }));
-  const readVerifiedProfile = vi.fn<NonNullable<Env['COMPARISON_CANDIDATE_BROKER']>['readVerifiedProfile']>()
-    .mockResolvedValue(null);
+  const forward = vi.fn<NonNullable<Env['COMPARISON_CANDIDATE_BROKER']>['fetch']>()
+    .mockImplementation(async () => new Response('original stream bytes', { headers: { 'x-pgc-comparison-broker-version': version, 'content-type': 'text/event-stream' } }));
+  const readVerifiedProfile = vi.fn<NonNullable<Env['COMPARISON_CANDIDATE_BROKER']>['fetch']>()
+    .mockImplementation(async () => new Response(null, { status: 404, headers: { 'x-pgc-comparison-broker-version': version } }));
   const harnessFetch = vi.fn<(request: Request) => Promise<Response>>().mockResolvedValue(new Response(null, { status: 202 }));
   const harnessGet = vi.fn(() => ({ fetch: harnessFetch }));
-  const namespaceGet = vi.fn((_id: { toString(): string }) => ({ release: object.release }));
+  const namespaceGet = vi.fn((_id: { toString(): string }) => ({ release: object.release, readReviewArchive: object.readReviewArchive }));
   const env: Env = {
     DB: { prepare() { throw new Error('Fixture did not wire a real task database'); } },
     COMPARISON_TASKS: { idFromName: vi.fn(objectId), get: namespaceGet },
     COMPARISON_DATABASE_ID: 'research-b',
-    COMPARISON_AUTHORITY: authority, COMPARISON_CANDIDATE_BROKER: { forwardHarness: forward, readVerifiedProfile },
+    COMPARISON_AUTHORITY: authority, COMPARISON_CANDIDATE_BROKER: { fetch: request =>
+      new URL(request.url).pathname === '/profile' ? readVerifiedProfile(request) : forward(request) },
     COMPARISON_CANDIDATE_VERSION: version,
     COMPARISON_WORKER_VERSION: { id: other },
     COMPARISON_DEPLOYED_RUNTIME: { implementationCommit: 'a'.repeat(40), runtimeTreeSha256: 'b'.repeat(64),
@@ -166,6 +170,50 @@ test('runner storage transaction and cleanup preserve the permanent object bindi
   expect(await s.store.storage.get('comparison:metadata')).toBe('persistent');
 });
 
+test('B checkpoints seal both reports transactionally and retain only the archive after cleanup', async () => {
+  const s = setup();
+  await s.object.release(seal);
+  await s.object.alarm();
+  const state = s.bindTask.mock.calls[0][2] as unknown as {
+    storage: ReturnType<typeof import('../server/harness-comparison-archive').comparisonRunnerState>['storage'];
+  };
+  const materialRef = '12345678-1234-4000-8000-123456789abc';
+  const draft = { reviewer_comment: 'synthetic first report' };
+  const result = { reviewer_comment: 'synthetic final report' };
+  async function checkpoint(phase: 'draft-ready' | 'final-ready', saved: Record<string, unknown>) {
+    await state.storage.transaction(async tx => {
+      await tx.put('cloudState:0', JSON.stringify({ version: 2, materialRef, ...saved }));
+      await tx.put('cloudStateParts', 1);
+      await tx.put('cloudCheckpointVersion', 2);
+      await tx.put('cloudPhase', phase);
+    });
+  }
+  await state.storage.put('cloudImmutable:0', 'synthetic private config and screenshots');
+  await expect(checkpoint('final-ready', { result })).rejects.toThrow(/archive is incomplete/);
+  expect(await state.storage.get('cloudPhase')).toBeUndefined();
+  await checkpoint('draft-ready', { draft });
+  const initial = await s.object.readReviewArchive(taskId);
+  expect(initial).toMatchObject([{ taskId, materialRef, stage: 'review', report: draft, sealedAt: now }]);
+  await checkpoint('draft-ready', { draft });
+  expect(await s.object.readReviewArchive(taskId)).toEqual(initial);
+  await expect(checkpoint('draft-ready', { draft: result })).rejects.toThrow(/archive is incomplete/);
+  expect(JSON.parse(String(await state.storage.get('cloudState:0'))).draft).toEqual(draft);
+  await state.storage.put('cloudState:0', JSON.stringify({ version: 2, materialRef, draft: result }));
+  await expect(s.object.alarm()).rejects.toThrow(/archive is incomplete/);
+  expect(s.coreAlarm).toHaveBeenCalledTimes(1);
+  await checkpoint('draft-ready', { draft });
+  await checkpoint('final-ready', { result });
+  const completed = await s.object.readReviewArchive(taskId);
+  expect(completed).toMatchObject([...initial, { taskId, materialRef, stage: 'review_verify', report: result, sealedAt: now }]);
+  await state.storage.deleteAll();
+  expect(await s.store.storage.list({ prefix: 'runner:', limit: 100 })).toEqual(new Map());
+  const reopened = createComparisonTaskObject(s.context, { ...s.env, COMPARISON_AUTHORITY: undefined }, s.deps);
+  expect(await reopened.readReviewArchive(taskId)).toEqual(completed);
+  expect(() => reopened.readReviewArchive(other)).toThrow(/does not belong/);
+  await s.store.storage.put('comparison:review-archive:review:0', '{}');
+  await expect(reopened.readReviewArchive(taskId)).rejects.toThrow(/archive is incomplete/);
+});
+
 test('missing runtime or mismatched candidate profile cannot schedule a task', async () => {
   const s = setup();
   const missing = createComparisonTaskObject(s.context, { ...s.env, COMPARISON_CANDIDATE_BROKER: undefined }, s.deps);
@@ -183,12 +231,14 @@ test('missing runtime or mismatched candidate profile cannot schedule a task', a
     const bind = s.openControl.mock.calls.at(-1)?.[0].bindVerifiedBroker!;
     const scope = { taskId } as Parameters<typeof bind>[0];
     expect(await bind({ ...scope, taskId: other })).toBeNull();
-    expect(await bind(scope)).toBeNull();
+    await expect(bind(scope)).rejects.toThrow('Comparison relay unavailable');
     throw new Error('No verified candidate profile');
   });
-  s.readVerifiedProfile.mockResolvedValueOnce({ candidateVersion: other } as NonNullable<Awaited<ReturnType<typeof s.readVerifiedProfile>>>);
+  s.readVerifiedProfile.mockResolvedValueOnce(Response.json({ candidateVersion: other }, { headers: { 'x-pgc-comparison-broker-version': version } }));
   await expect(s.object.release(seal)).rejects.toThrow(/No verified candidate profile/);
-  expect(s.readVerifiedProfile).toHaveBeenCalledExactlyOnceWith({ taskId }, version);
+  expect(s.readVerifiedProfile).toHaveBeenCalledOnce();
+  const profileRequest = s.readVerifiedProfile.mock.calls[0][0];
+  expect(JSON.parse(profileRequest.headers.get('x-pgc-comparison-relay-scope')!)).toEqual({ scope: { taskId }, version });
   expect(s.store.setAlarm).not.toHaveBeenCalled();
 });
 
@@ -196,9 +246,10 @@ test('model outbound preserves exact scope and only returns the pinned broker ve
   const s = setup();
   const response = await comparisonHarnessOutbound(modelRequest(), props, s.env, () => now);
   expect(await response.text()).toBe('original stream bytes');
-  const [forwarded, scope, expected] = s.forward.mock.calls[0];
-  expect(expected).toBe(version);
-  expect(scope).toEqual({ ...props, stage: 'review_verify' });
+  const [forwarded] = s.forward.mock.calls[0];
+  expect(forwarded.url).toBe('https://comparison-relay.internal/forward');
+  expect(JSON.parse(forwarded.headers.get('x-pgc-comparison-relay-scope')!))
+    .toEqual({ version, scope: { ...props, stage: 'review_verify' }, protocol: 'openai' });
   expect(await forwarded.text()).toBe('{"model":"deepseek-flash"}');
   expect(forwarded.headers.get('authorization')).toBe(`Bearer ${lease}`);
   expect(forwarded.headers.get(HARNESS_MODEL_HEADERS.task)).toBe(taskId);
@@ -226,15 +277,90 @@ test('model outbound preserves exact scope and only returns the pinned broker ve
 
 test('only creation tools reach the same local Harness DO and never the candidate model service', async () => {
   const s = setup();
-  const request = () => modelRequest('/v1/tools');
+  const request = () => modelRequest('/v1/tools', { 'x-pgc-comparison-tool-phase': 'untrusted', 'x-pgc-comparison-tool-deadline': '0' });
   expect((await comparisonHarnessOutbound(request(), props, s.env, () => now)).status).toBe(403);
-  const creation = { ...props, requestIdPrefix: 'build-0-', jsonOutput: false };
-  expect((await comparisonHarnessOutbound(request(), creation, s.env, () => now)).status).toBe(202);
-  expect(s.harnessGet).toHaveBeenCalledExactlyOnceWith(taskId);
-  const tool = s.harnessFetch.mock.calls[0][0];
-  expect(tool.url).toBe('http://harness/tools');
-  expect(tool.headers.get('authorization')).toBe(`Bearer ${lease}`);
-  expect(s.forward).not.toHaveBeenCalled();
+  const sqlite = new DatabaseSync(':memory:');
+  try {
+    sqlite.exec(`CREATE TABLE forge_tasks(id TEXT,owner_id TEXT,status TEXT,executor TEXT,kind TEXT,creative_version INTEGER,phase TEXT);
+      CREATE TABLE review_jobs(id TEXT); CREATE TABLE members(id TEXT,enabled INTEGER,star INTEGER);
+      INSERT INTO members VALUES('owner',1,1);`);
+    sqlite.exec(readFileSync('migrations/0033_harness.sql', 'utf8'));
+    sqlite.prepare("INSERT INTO forge_tasks VALUES (?, 'owner','running','platform','game',2,'build:waiting','{}')").run(taskId);
+    function prepare(sql: string, args: SQLInputValue[] = []): ReturnType<Env['DB']['prepare']> {
+      return { bind: (...values) => prepare(sql, values), first: async <T>() => (sqlite.prepare(sql).get(...args) ?? null) as T | null,
+        all: async <T>() => ({ results: sqlite.prepare(sql).all(...args) as T[] }), run: async () => sqlite.prepare(sql).run(...args) };
+    }
+    s.env.DB = { prepare };
+    const allocated = await createHarnessRun(s.env.DB, { taskId, generation: props.generation, ownerId: 'owner', actor: 'star',
+      sourceHash: 'c'.repeat(64), snapshot: {}, now, deadlineAt: now + 120_000,
+      model: { profileId: 'test', profileHash: 'd'.repeat(64), purpose: 'game', protocol: 'anthropic', model: 'claude-opus-5-5',
+        effort: 'high', vision: true, maxOutputTokens: 64_000 } });
+    const creation = { ...props, lease: allocated!.lease, requestIdPrefix: 'build-0-', jsonOutput: false };
+    const dispatch = (scope = creation) => comparisonHarnessOutbound(request(), scope, s.env, () => now);
+    expect((await dispatch()).status).toBe(202);
+    expect(s.harnessGet).toHaveBeenCalledExactlyOnceWith(taskId);
+    const tool = s.harnessFetch.mock.calls[0][0];
+    expect(tool.url).toBe('http://harness/tools');
+    expect(tool.headers.get('authorization')).toBe(`Bearer ${allocated!.lease}`);
+    expect(tool.headers.get('x-pgc-comparison-tool-phase')).toBe('build');
+    expect(tool.headers.get('x-pgc-comparison-tool-deadline')).toBe(String(creation.stageDeadlineAt));
+    expect((await dispatch({ ...creation, lease })).status).toBe(403);
+    expect((await dispatch({ ...creation, generation: 'stale-generation' })).status).toBe(403);
+    expect((await dispatch({ ...creation, stageDeadlineAt: now + 120_001 })).status).toBe(403);
+    sqlite.exec("UPDATE forge_tasks SET phase='build:capture'");
+    expect((await dispatch()).status).toBe(403);
+    sqlite.exec("UPDATE forge_tasks SET phase='polish:model'");
+    expect((await dispatch()).status).toBe(403);
+    const polish = { ...creation, requestIdPrefix: 'polish-0-' };
+    expect((await dispatch(polish)).status).toBe(202);
+    vi.mocked(s.authority.readTaskRuntime).mockResolvedValueOnce(null);
+    expect((await dispatch(polish)).status).toBe(503);
+    sqlite.exec('UPDATE members SET star=0');
+    expect((await dispatch(polish)).status).toBe(403);
+    expect(s.harnessFetch).toHaveBeenCalledTimes(2);
+    expect(s.forward).not.toHaveBeenCalled();
+  } finally { sqlite.close(); }
+});
+
+test('a queued tool rechecks both the Host stage and live authority after an earlier Host request', async () => {
+  const s = setup(), deadlineAt = Date.now() + 60_000;
+  const meta = { taskId, generation: props.generation, state: 'running', stageDeadlineAt: deadlineAt };
+  await s.store.storage.put('meta', { ...meta, phase: 'build' });
+  const runner = new HarnessRunner(s.context, s.env);
+  const queue = () => {
+    let advance!: () => void;
+    const pending = new Promise<void>(resolve => { advance = resolve; });
+    return { pending, advance };
+  };
+  const transition = queue(), checkpoint = queue();
+  const originalFetch = vi.spyOn(HarnessHost.prototype, 'fetch').mockImplementation(async request => {
+    const path = new URL(request.url).pathname;
+    if (path === '/start') {
+      await transition.pending;
+      await s.store.storage.put('meta', { ...meta, phase: 'polish' });
+    }
+    if (path === '/status') await checkpoint.pending;
+    return new Response(null, { status: 202 });
+  });
+  const tool = (phase: string) => new Request('http://harness/tools', { method: 'POST', headers: {
+    [HARNESS_MODEL_HEADERS.task]: taskId, [HARNESS_MODEL_HEADERS.generation]: props.generation,
+    'x-pgc-comparison-tool-phase': phase, 'x-pgc-comparison-tool-deadline': String(deadlineAt),
+  } });
+  try {
+    const start = runner.fetch(new Request('http://harness/start', { method: 'POST' }));
+    const stale = runner.fetch(tool('build'));
+    transition.advance();
+    expect((await start).status).toBe(202);
+    expect((await stale).status).toBe(403);
+    expect((await runner.fetch(tool('polish'))).status).toBe(202);
+    const status = runner.fetch(new Request('http://harness/status'));
+    const revoked = runner.fetch(tool('polish'));
+    vi.mocked(s.authority.readTaskRuntime).mockResolvedValueOnce(null);
+    checkpoint.advance();
+    expect((await status).status).toBe(202);
+    expect((await revoked).status).toBe(503);
+    expect(originalFetch.mock.calls.map(([request]) => new URL(request.url).pathname)).toEqual(['/start', '/tools', '/status']);
+  } finally { originalFetch.mockRestore(); }
 });
 
 

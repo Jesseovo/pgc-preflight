@@ -3,13 +3,16 @@ import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
 import { captureFor } from '../server/cloud-review-capture';
 import { cloudReviewAlarm } from '../server/cloud-review-runner';
 import { creationPipelineAlarm } from '../server/forge-creation-pipeline';
+import { comparisonBoundTaskKey, comparisonRunnerState, readComparisonReviewArchive, verifyComparisonReviewCheckpoint } from '../server/harness-comparison-archive';
 import type { ComparisonHarnessOutboundScope } from '../server/harness-comparison-broker';
 import type { ComparisonEvidenceIdentity } from '../server/harness-comparison-evidence';
 import { openComparisonTaskControl, type ComparisonReleaseSeal } from '../server/harness-comparison-runner';
 import { HarnessHost } from '../server/harness-host';
+import { authorizeHarnessLease } from '../server/harness-ledger';
 import { scopeHarnessOutbound, type HarnessOutboundScope } from '../server/harness-outbound-scope';
 import type { HarnessBinding } from '../server/harness-policy';
 import { HARNESS_MODEL_HEADERS } from '../server/harness-protocol';
+import { createComparisonCandidateRelayClient, type ComparisonRelayFetcher } from './harness-comparison-relay-worker';
 
 declare module 'cloudflare:workers' {
   export class DurableObject<Env = unknown> {
@@ -18,8 +21,6 @@ declare module 'cloudflare:workers' {
 }
 
 type Options = Parameters<typeof openComparisonTaskControl>[0];
-type BrokerScope = Parameters<NonNullable<Options['bindVerifiedBroker']>>[0];
-type BrokerProfile = Pick<NonNullable<Awaited<ReturnType<NonNullable<Options['bindVerifiedBroker']>>>>, 'scopeSha256' | 'profileId' | 'profile'>;
 type FrozenRuntime = Pick<Options, 'grant' | 'planBytes'> & { workerVersion: string; bundleSha256: string };
 type DeployedRuntime = Options['runtime'] & { bundleSha256: string };
 type Release = Awaited<ReturnType<Awaited<ReturnType<typeof openComparisonTaskControl>>['release']>>;
@@ -32,34 +33,21 @@ export type ComparisonAuthorityService = {
   readFrozenInput(taskId: string, sha256: string): Promise<string>;
   readEvidencePack(taskId: string, identity: ComparisonEvidenceIdentity): Promise<string>;
 };
-// This service is a private relay, not a direct RPC target on the 0% Worker
-// version. Its implementation must sign a fixed HTTP version-override request,
-// verify the actual executing candidate, and only then stamp the returned version.
-export type ComparisonCandidateService = {
-  readVerifiedProfile(scope: BrokerScope, expectedVersion: string): Promise<(BrokerProfile & { candidateVersion: string }) | null>;
-  forwardHarness(request: Request, scope: ComparisonHarnessOutboundScope, expectedVersion: string): Promise<Response>;
-};
+// Candidate access uses a stable Fetcher binding to the named private relay.
 
 type ObjectId = { toString(): string };
-type TaskNamespace = { idFromName(taskId: string): ObjectId; get(id: ObjectId): { release(seal: ComparisonReleaseSeal): Promise<Release> } };
-type StorageAccess = {
-  get<T>(key: string): Promise<T | undefined>;
-  put(key: string, value: unknown): Promise<void>;
-  delete(key: string): Promise<boolean>;
-  delete(keys: string[]): Promise<number>;
-  list<T>(options: { prefix: string; limit: number }): Promise<Map<string, T>>;
-  getAlarm(): Promise<number | null>;
-  setAlarm(at: number | Date): Promise<void>;
-  deleteAlarm(): Promise<void>;
-};
-type ObjectStorage = StorageAccess & { transaction<T>(operation: (tx: StorageAccess) => Promise<T>): Promise<T> };
+type TaskNamespace = { idFromName(taskId: string): ObjectId; get(id: ObjectId): {
+  release(seal: ComparisonReleaseSeal): Promise<Release>;
+  readReviewArchive(taskId: string): ReturnType<typeof readComparisonReviewArchive>;
+} };
+type ObjectStorage = Parameters<typeof comparisonRunnerState>[0];
 type TaskContext = { id: ObjectId; storage: ObjectStorage };
 export type ComparisonTaskWorkerEnv = {
   DB: Options['database']['connection'];
   COMPARISON_DATABASE_ID?: string;
   COMPARISON_TASKS?: TaskNamespace;
   COMPARISON_AUTHORITY?: ComparisonAuthorityService;
-  COMPARISON_CANDIDATE_BROKER?: ComparisonCandidateService;
+  COMPARISON_CANDIDATE_BROKER?: ComparisonRelayFetcher;
   COMPARISON_CANDIDATE_VERSION?: string;
   COMPARISON_DEPLOYED_RUNTIME?: DeployedRuntime;
   COMPARISON_WORKER_VERSION?: { id: string };
@@ -76,12 +64,12 @@ const versionPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const digestPattern = /^[0-9a-f]{64}$/;
 const generationPattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const databasePattern = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const storedTaskKey = 'comparison:bound-task';
-const runnerPrefix = 'runner:';
 const stageForPrefix = new Map<string, ComparisonHarnessOutboundScope['stage']>([
   ['build-0-', 'build'], ['polish-0-', 'polish'], ['repair-1-', 'repair'], ['repair2-2-', 'repair2'],
   ['review-0-', 'review'], ['review_verify-0-', 'review_verify'],
 ]);
+const toolPhaseHeader = 'x-pgc-comparison-tool-phase';
+const toolDeadlineHeader = 'x-pgc-comparison-tool-deadline';
 
 function requireThat(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -110,9 +98,9 @@ function privateAuthority(env: WorkerEnv) {
 function verifiedCandidate(env: WorkerEnv) {
   const candidate = env.COMPARISON_CANDIDATE_BROKER;
   const version = env.COMPARISON_CANDIDATE_VERSION;
-  requireThat(candidate && typeof candidate.readVerifiedProfile === 'function' && typeof candidate.forwardHarness === 'function' &&
-    typeof version === 'string' && versionPattern.test(version), 'Private comparison candidate broker is unavailable');
-  return { candidate, version };
+  requireThat(candidate && typeof candidate.fetch === 'function' && typeof version === 'string' && versionPattern.test(version),
+    'Private comparison candidate broker is unavailable');
+  return { candidate: createComparisonCandidateRelayClient(candidate), version };
 }
 
 function deployedRuntime(env: WorkerEnv, approved: FrozenRuntime) {
@@ -133,34 +121,10 @@ export async function routeComparisonRelease(env: WorkerEnv, input: ComparisonRe
   return env.COMPARISON_TASKS.get(env.COMPARISON_TASKS.idFromName(seal.taskId)).release(seal);
 }
 
-function scopedStorage(storage: StorageAccess) {
-  return {
-    get<T>(key: string) { return storage.get<T>(runnerPrefix + key); },
-    put(key: string, value: unknown) { return storage.put(runnerPrefix + key, value); },
-    delete(key: string) { return storage.delete(runnerPrefix + key); },
-    async deleteAll() {
-      while (true) {
-        const items = await storage.list({ prefix: runnerPrefix, limit: 128 });
-        if (items.size === 0) return;
-        await storage.delete([...items.keys()]);
-      }
-    },
-    getAlarm() { return storage.getAlarm(); },
-    setAlarm(at: number | Date) { return storage.setAlarm(at); },
-    deleteAlarm() { return storage.deleteAlarm(); },
-  };
-}
-
-function originalRunnerState(storage: ObjectStorage) {
-  return { storage: { ...scopedStorage(storage), transaction<T>(operation: (tx: ReturnType<typeof scopedStorage>) => Promise<T>) {
-    return storage.transaction(tx => operation(scopedStorage(tx)));
-  } } };
-}
-
 /** Unit-testable DO implementation; callback injection is never a deployment binding. */
 export function createComparisonTaskObject(ctx: TaskContext, env: WorkerEnv, dependencies: Dependencies = defaults) {
   const capability = Object.freeze({});
-  const runnerState = originalRunnerState(ctx.storage);
+  const runnerState = comparisonRunnerState(ctx.storage, dependencies.now);
   let pending: Promise<unknown> = Promise.resolve();
 
   function serial<T>(work: () => Promise<T>) {
@@ -215,20 +179,25 @@ export function createComparisonTaskObject(ctx: TaskContext, env: WorkerEnv, dep
         requireThat(await privateAuthority(env).authorizeRelease(seal) === true, 'Private comparison authority refused release');
         const control = await controller(seal.taskId);
         await ctx.storage.transaction(async tx => {
-          const existing = await tx.get<string>(storedTaskKey);
+          const existing = await tx.get<string>(comparisonBoundTaskKey);
           requireThat(existing === undefined || existing === seal.taskId, 'Comparison Durable Object is already bound to another task');
-          if (existing === undefined) await tx.put(storedTaskKey, seal.taskId);
+          if (existing === undefined) await tx.put(comparisonBoundTaskKey, seal.taskId);
         });
         const result = await control.release(capability, seal);
         if (await ctx.storage.getAlarm() === null) await ctx.storage.setAlarm(dependencies.now() + 100);
         return result;
       });
     },
+    readReviewArchive(taskId: string) {
+      fixedObject(taskId);
+      return readComparisonReviewArchive(ctx.storage, taskId);
+    },
     alarm() {
       return serial(async () => {
-        const taskId = await ctx.storage.get<string>(storedTaskKey);
+        const taskId = await ctx.storage.get<string>(comparisonBoundTaskKey);
         if (taskId === undefined) return;
         const control = await controller(taskId);
+        await verifyComparisonReviewCheckpoint(ctx.storage, taskId);
         // Expired grants fail closed here. Do not clear sealed checkpoints:
         // a distinct recovery operation must independently prove seal time.
         await control.bindTask(capability, taskId, runnerState).alarm();
@@ -249,22 +218,40 @@ export async function comparisonHarnessOutbound(request: Request, props: Outboun
   const path = new URL(scoped.url).pathname;
   const review = stage === 'review' || stage === 'review_verify';
   if (props.jsonOutput !== review) return denied();
-  if (path === '/v1/tools') {
-    if (review) return denied();
-    const binding = env.HARNESS_RUNNER;
-    if (!binding) return unavailable();
-    return binding.get(binding.idFromName(props.taskId)).fetch(new Request('http://harness/tools', scoped));
+  const tools = path === '/v1/tools';
+  if (tools ? review : !review && path !== '/v1/messages') return denied();
+  if (!tools) {
+    const requestId = scoped.headers.get(HARNESS_MODEL_HEADERS.requestId);
+    if (!requestId || !generationPattern.test(requestId) || !requestId.startsWith(props.requestIdPrefix)) return denied();
   }
-  if (!review && path !== '/v1/messages') return denied();
-  const requestId = scoped.headers.get(HARNESS_MODEL_HEADERS.requestId);
-  if (!requestId || !generationPattern.test(requestId) || !requestId.startsWith(props.requestIdPrefix)) return denied();
   try {
-    const { candidate, version } = verifiedCandidate(env);
     const { taskId, generation, lease, stageDeadlineAt, requestIdPrefix, jsonOutput } = props;
     const approved = await privateAuthority(env).readTaskRuntime(taskId);
     if (!approved) return unavailable();
     deployedRuntime(env, approved);
     if (stageDeadlineAt <= now() || scoped.signal.aborted) return denied();
+    if (tools) {
+      const binding = env.HARNESS_RUNNER;
+      if (!binding) return unavailable();
+      const modelPhase = stage + ':model';
+      const run = await authorizeHarnessLease(env.DB, { taskId, generation }, lease, {
+        now: now(),
+        async authorizeRun(run) {
+          if (run.family !== 'forge' || run.actor !== 'star' || run.model.purpose !== 'game' || !run.model.vision ||
+              stageDeadlineAt > run.deadlineAt) return false;
+          return Boolean(await env.DB.prepare(`SELECT 1 FROM forge_tasks t JOIN members m ON m.id=t.owner_id
+            WHERE t.id=? AND t.owner_id=? AND t.status='running' AND t.executor='platform' AND t.kind='game'
+              AND t.creative_version=2 AND t.harness_policy IS NOT NULL AND t.phase IN (?,?) AND m.enabled=1 AND m.star=1`)
+            .bind(taskId, run.ownerId, modelPhase, stage === 'build' ? 'build:waiting' : modelPhase).first());
+        },
+      });
+      if (!run || stageDeadlineAt <= now() || scoped.signal.aborted) return denied();
+      const headers = new Headers(scoped.headers);
+      headers.set(toolPhaseHeader, stage);
+      headers.set(toolDeadlineHeader, String(stageDeadlineAt));
+      return await binding.get(binding.idFromName(taskId)).fetch(new Request('http://harness/tools', new Request(scoped, { headers })));
+    }
+    const { candidate, version } = verifiedCandidate(env);
     const response = await candidate.forwardHarness(scoped, { taskId, generation, lease, stageDeadlineAt, requestIdPrefix, jsonOutput, stage }, version);
     if (response.headers.get('x-pgc-comparison-broker-version') !== version || (response.status >= 300 && response.status < 400)) {
       void response.body?.cancel().catch(() => {});
@@ -281,6 +268,11 @@ export async function comparisonHarnessOutbound(request: Request, props: Outboun
 export class ComparisonTaskControl extends WorkerEntrypoint<WorkerEnv> {
   fetch() { return denied(); }
   release(seal: ComparisonReleaseSeal) { return routeComparisonRelease(this.env, seal); }
+  readReviewArchive(taskId: string) {
+    const tasks = this.env.COMPARISON_TASKS;
+    requireThat(typeof taskId === 'string' && taskIdPattern.test(taskId) && tasks, 'Private comparison task namespace is unavailable');
+    return tasks.get(tasks.idFromName(taskId)).readReviewArchive(taskId);
+  }
 }
 
 export class ComparisonTaskRunner extends DurableObject<WorkerEnv> {
@@ -291,10 +283,44 @@ export class ComparisonTaskRunner extends DurableObject<WorkerEnv> {
   }
   fetch() { return denied(); }
   release(seal: ComparisonReleaseSeal) { return this.#task.release(seal); }
+  readReviewArchive(taskId: string) { return this.#task.readReviewArchive(taskId); }
   alarm() { return this.#task.alarm(); }
 }
 
-export class HarnessRunner extends HarnessHost {}
+export class HarnessRunner extends HarnessHost {
+  #serial: Promise<unknown> = Promise.resolve();
+  constructor(private readonly context: Pick<TaskContext, 'storage'>, private readonly bindings: WorkerEnv) {
+    super(context, bindings);
+  }
+
+  fetch(request: Request) {
+    // Hold the same research lock for /start and /tools. A new stage cannot
+    // replace the Host checkpoint between this check and the tool execution.
+    const operation = this.#serial.then(async () => {
+      if (new URL(request.url).pathname === '/tools') {
+        try {
+          const taskId = request.headers.get(HARNESS_MODEL_HEADERS.task);
+          const generation = request.headers.get(HARNESS_MODEL_HEADERS.generation);
+          const phase = request.headers.get(toolPhaseHeader);
+          const deadlineAt = Number(request.headers.get(toolDeadlineHeader));
+          if (!taskId || !taskIdPattern.test(taskId) || !generation || !generationPattern.test(generation) ||
+              !phase || !Number.isSafeInteger(deadlineAt) || deadlineAt <= Date.now() || request.signal.aborted) return denied();
+          const runtime = await privateAuthority(this.bindings).readTaskRuntime(taskId);
+          if (!runtime) return unavailable();
+          deployedRuntime(this.bindings, runtime);
+          const meta = await this.context.storage.get<{
+            taskId: string; generation: string; phase: string; stageDeadlineAt: number; state: string;
+          }>('meta');
+          if (!meta || meta.taskId !== taskId || meta.generation !== generation || meta.phase !== phase ||
+              meta.stageDeadlineAt !== deadlineAt || meta.state !== 'running' || deadlineAt <= Date.now() || request.signal.aborted) return denied();
+        } catch { return unavailable(); }
+      }
+      return super.fetch(request);
+    });
+    this.#serial = operation.catch(() => {});
+    return operation;
+  }
+}
 
 export class HarnessOutbound extends WorkerEntrypoint<WorkerEnv, OutboundProps> {
   fetch(request: Request) { return comparisonHarnessOutbound(request, this.ctx.props, this.env); }

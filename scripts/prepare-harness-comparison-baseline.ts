@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { baselineWorkerTemplate } from './harness-comparison-baseline-worker-template';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const commit = '8afbf81c85c785f5d2d071dda9ecedba510b42ab';
@@ -14,6 +15,9 @@ const tree = '491936d02f57b9125be86e36e73e76048009d82f';
 const modelPath = 'server/model.ts';
 const completionPath = 'server/forge-llm.ts';
 const entryPath = 'server/comparison-baseline-entry.ts';
+const workerPath = 'server/comparison-baseline-worker.ts';
+const sharedLayer = ['harness-comparison-runner.ts', 'harness-comparison-evidence.ts', 'harness-comparison-service.ts',
+  'harness-policy.ts', 'harness-protocol.ts', 'harness-comparison-archive.ts'].map(file => 'server/' + file);
 const baselineFileHashes = {
   [modelPath]: '959accf6574e5635e9b8dee08de20713676e05867775a3fef8db0a93f7b18993',
   [completionPath]: 'cf3f977e31858bc8bf088a78b75d91fe4fc4f951e1acfce46172da111e3d64d7',
@@ -56,31 +60,33 @@ import { enqueueForgeTask } from './forge-tasks';
 import { creationPipelineAlarm } from './forge-creation-pipeline';
 import { enqueueReview } from './review-jobs';
 import { cloudReviewAlarm } from './cloud-review-runner';
-import { encryptKey, type StoredModelProfile } from './settings';
+import { decryptKey, encryptKey, type StoredModelProfile } from './settings';
 import { COMPARISON_PROVIDER_SENTINEL, type ComparisonModelFetch } from './model';
 
 export { enqueueForgeTask, creationPipelineAlarm, enqueueReview, cloudReviewAlarm };
 
 type Scope = { taskId: string; ownerId: string; operation: 'creation' | 'review' };
 type Stage = 'build' | 'polish' | 'repair' | 'review' | 'review_verify';
-type PublicProfile = Pick<StoredModelProfile, 'baseUrl' | 'model' | 'protocol' | 'enabled' | 'updatedAt' | 'vision' | 'effort' | 'maxOutputTokens'>;
+type PublicProfile = Pick<StoredModelProfile, 'name' | 'baseUrl' | 'model' | 'protocol' | 'enabled' | 'updatedAt' | 'vision' | 'effort' | 'maxOutputTokens'>;
 type TrustedFetch = (identity: Readonly<Scope & { arm: 'A'; stage: Stage }>, url: string, init: RequestInit) => Promise<Response>;
 
+const placeholderSettingsKey = (taskId: string) => 'pgc-comparison-placeholder-config-v1:' + taskId;
+export async function verifyBaselineCheckpointProfile(taskId: string, profile: StoredModelProfile) {
+  return await decryptKey(profile.encryptedKey, placeholderSettingsKey(taskId)).catch(() => null) === COMPARISON_PROVIDER_SENTINEL;
+}
 export async function createBaselineTaskAdapter(scope: Scope, profile: PublicProfile, trustedFetch: TrustedFetch) {
   const { taskId, ownerId, operation } = scope;
   if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(taskId) || !ownerId ||
       (operation !== 'creation' && operation !== 'review') || (operation === 'review' && ownerId !== 'admin') || typeof trustedFetch !== 'function') {
     throw new Error('Invalid private baseline task binding');
   }
-  const { baseUrl, model, protocol, enabled, updatedAt, vision, effort, maxOutputTokens } = profile;
-  if (Object.keys(profile).some(key => !['baseUrl', 'model', 'protocol', 'enabled', 'updatedAt', 'vision', 'effort', 'maxOutputTokens'].includes(key))) {
+  if (Object.keys(profile).some(key => !['name', 'baseUrl', 'model', 'protocol', 'enabled', 'updatedAt', 'vision', 'effort', 'maxOutputTokens'].includes(key))) {
     throw new Error('A comparison profile accepts only public model settings');
   }
   // Archived runner checkpoints retain the encrypted placeholder profile across alarms.
   // This derived value is stable for a task and deliberately is not a credential.
-  const settingsKey = 'pgc-comparison-placeholder-config-v1:' + taskId;
-  const selected = { baseUrl, model, protocol, enabled, updatedAt, vision, effort, maxOutputTokens,
-    encryptedKey: await encryptKey(COMPARISON_PROVIDER_SENTINEL, settingsKey) };
+  const settingsKey = placeholderSettingsKey(taskId);
+  const selected = { ...profile, encryptedKey: await encryptKey(COMPARISON_PROVIDER_SENTINEL, settingsKey) };
   const route = operation === 'creation' ? 'create' : 'review';
   const config = { ...selected, activeProfile: 'comparison', profiles: { comparison: selected }, routes: { [route]: 'comparison' } };
 
@@ -160,15 +166,24 @@ export function prepareComparisonBaseline({ out }: { out: string }) {
       writeFileSync(destination, updated);
       return { path, originalSha256, generatedSha256: sha(updated), patch: difference(originalPath, destination, path) };
     });
-    const adapterEntry = join(source, entryPath);
-    writeFileSync(adapterEntry, entry, { flag: 'wx', mode: 0o600 });
-    const patch = changes.map(change => change.patch).join('') + difference('/dev/null', adapterEntry, entryPath, true);
+    const additions = [
+      { path: entryPath, bytes: Buffer.from(entry) },
+      { path: workerPath, bytes: Buffer.from(baselineWorkerTemplate) },
+      ...sharedLayer.map(path => ({ path, bytes: readFileSync(join(root, path)) })),
+    ].map(({ path, bytes }) => {
+      const destination = join(source, path);
+      writeFileSync(destination, bytes, { flag: 'wx', mode: 0o600 });
+      return { path, sha256: sha(bytes), patch: difference('/dev/null', destination, path, true) };
+    });
+    const patch = [...changes, ...additions].map(change => change.patch).join('');
     writeFileSync(join(output, 'adapter.patch'), patch, { flag: 'wx', mode: 0o600 });
     const manifest = {
       schemaVersion: 1, scope: 'unpublished-comparison-baseline-adapter', executionAuthorized: false, deploymentPerformed: false, providerRequests: 0,
       implementationCommit: commit, tree, archiveSha256: sha(archive), adapterPatchSha256: sha(patch),
       preparerSha256: sha(readFileSync(fileURLToPath(import.meta.url))),
       entry: { path: entryPath, sha256: sha(entry) },
+      workerEntry: { path: workerPath, sha256: sha(baselineWorkerTemplate) },
+      comparisonLayer: additions.filter(value => sharedLayer.includes(value.path)).map(({ path, sha256 }) => ({ path, sha256 })),
       changes: changes.map(({ patch: ignored, ...change }) => change),
     };
     const notes = [
@@ -176,14 +191,15 @@ export function prepareComparisonBaseline({ out }: { out: string }) {
       '',
       'baseline.tar is the unmodified pinned Git archive. The source directory is a generated private copy.',
       'adapter.patch changes only the fetch boundary, passes the task transport through completion, and adds the private runner entry.',
-      'Use createBaselineTaskAdapter with a trusted task binding, public profile and private broker callback. No adapter route is public.',
+      'The private Worker entry exports the fixed task Durable Object and an authority-gated control service. All HTTP entrypoints deny requests.',
+      'It accepts an independently pinned Worker version, isolated database and signed candidate service scope. It needs separately provisioned private bindings before execution.',
       'The broker independently validates the allowed destination, provider model and ledger identity. It replaces the non-secret placeholder with its server-held credential and returns the original streaming response.',
       'This package is preparation only. It does not establish provider compatibility, formal evaluation readiness or authorization.',
       '',
     ].join('\n');
     writeFileSync(join(output, 'README.md'), notes, { flag: 'wx', mode: 0o600 });
     writeFileSync(join(output, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-    return { output, source, entry: adapterEntry, manifest };
+    return { output, source, entry: join(source, entryPath), workerEntry: join(source, workerPath), manifest };
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

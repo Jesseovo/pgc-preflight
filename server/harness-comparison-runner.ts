@@ -1,4 +1,4 @@
-/** Private B comparison release/alarm barrier. No route, scheduler, or provider transport. */
+/** Private comparison release/alarm barrier. No route, scheduler, or provider transport. */
 import { prepareReview } from './forge-api';
 import { openComparisonEvidencePack, type ComparisonEvidenceIdentity } from './harness-comparison-evidence';
 import { canonicalHarness, CCB_ENGINE_COMMIT, harnessHash, modelContractHash, parseHarnessPolicy, type HarnessBinding } from './harness-policy';
@@ -24,7 +24,16 @@ type PrivateRunnerEnvironment = {
   captureReview(html: string, progress?: (message: string) => Promise<void>, deadlineAt?: number): unknown;
 };
 type Alarm = (state: TaskState, env: PrivateRunnerEnvironment, taskId: string) => Promise<unknown>;
-type RuntimePin = { implementationCommit: string; runtimeTreeSha256: string; image: string };
+type RuntimePin = { implementationCommit: string; runtimeTreeSha256: string; image: string | null };
+type PublicProfile = Omit<StoredModelProfile, 'encryptedKey'>;
+type BaselineTaskScope = { taskId: string; ownerId: string; operation: Operation };
+type BaselineAdapter = {
+  verifyBArtifact(input: { taskId: string; caseId: string; planSha256: string; manifestSha256: string;
+    sourceSha256: string; evidenceSha256: string; packSha256: string }): Promise<boolean>;
+  verifyCheckpointProfile(taskId: string, profile: StoredModelProfile): Promise<boolean>;
+  run(input: { scope: BaselineTaskScope; profile: PublicProfile; state: TaskState; allowForward: boolean;
+    env: Pick<PrivateRunnerEnvironment, 'DB' | 'captureReview'> }): Promise<unknown>;
+};
 export type ComparisonRunnerGrant = RuntimePin & {
   schemaVersion: 1;
   purpose: 'isolated-comparison';
@@ -76,7 +85,7 @@ type Slot = {
 };
 type Plan = {
   schemaVersion: 1; scope: 'formal'; executionAllowed: false; manifestSha256: string;
-  source: { B: { implementationCommit: string; engineCommit: string; image: string } };
+  source: { A?: { implementationCommit: string }; B: { implementationCommit: string; engineCommit: string; image: string } };
   slots: Slot[];
   cases: { id: string; materialSha256: string; materials: { path: string; sha256: string }[] }[];
 };
@@ -151,7 +160,8 @@ export async function openComparisonTaskControl(options: {
   loadEvidencePack?: (identity: ComparisonEvidenceIdentity) => Promise<string>;
   bindVerifiedBroker?: (scope: Readonly<BrokerScope>) => Promise<BrokerBinding | null>;
   failedHarnessRunner?: HarnessBinding;
-  alarms: { creation: Alarm; review: Alarm };
+  alarms?: { creation: Alarm; review: Alarm };
+  baseline?: BaselineAdapter;
   captureCreation?: PrivateRunnerEnvironment['captureReview'];
   now?: () => number;
 }) {
@@ -159,26 +169,29 @@ export async function openComparisonTaskControl(options: {
   requireThat(authority && typeof authority === 'object', 'Comparison control authority is required');
   const grant = { ...options.grant };
   const runtime = { ...options.runtime };
-  const alarms = { ...options.alarms };
+  const baseline = options.baseline;
+  const arm = baseline ? 'A' : 'B';
+  const alarms = options.alarms;
+  requireThat(baseline ? !alarms && !bindVerifiedBroker && !failedHarnessRunner : alarms, 'Comparison execution adapter conflicts with its arm');
   requireThat(exact(grant, ['schemaVersion', 'purpose', 'scope', 'authorizationSha256', 'dispatchGrantSha256', 'planSha256', 'manifestSha256',
     'runnerDatabaseId', 'maxRequests', 'maxOutputTokens', 'notBefore', 'deadlineAt', 'implementationCommit', 'runtimeTreeSha256', 'image']) &&
     grant.schemaVersion === 1 && grant.scope === 'formal' && grant.purpose === 'isolated-comparison' &&
     [grant.authorizationSha256, grant.dispatchGrantSha256, grant.planSha256, grant.manifestSha256, grant.runtimeTreeSha256].every(isHash) &&
-    commit.test(grant.implementationCommit) && isHarnessImage(grant.image) && positive(grant.maxRequests) && positive(grant.maxOutputTokens) &&
+    commit.test(grant.implementationCommit) && (baseline ? grant.image === null : isHarnessImage(grant.image)) && positive(grant.maxRequests) && positive(grant.maxOutputTokens) &&
     positive(grant.notBefore) && positive(grant.deadlineAt) && grant.notBefore < grant.deadlineAt,
   'An explicit formal comparison grant with aggregate caps is required');
   requireThat(database.scope === 'isolated-comparison' && id.test(database.id) && database.id === grant.runnerDatabaseId,
-    'An independently bound isolated B database is required');
+    'An independently bound isolated comparison database is required');
   requireThat(runtime.implementationCommit === grant.implementationCommit && runtime.runtimeTreeSha256 === grant.runtimeTreeSha256 &&
     runtime.image === grant.image, 'Comparison runtime attestation does not match the grant');
   requireThat(typeof options.planBytes === 'string' && options.planBytes.length <= 512 * 1024 &&
     await harnessHash(options.planBytes) === grant.planSha256, 'Frozen comparison plan digest mismatch');
   const plan = parseJson<Plan>(options.planBytes, 'plan');
   requireThat(plan.schemaVersion === 1 && plan.scope === 'formal' && plan.executionAllowed === false &&
-    plan.manifestSha256 === grant.manifestSha256 && plan.source?.B?.implementationCommit === grant.implementationCommit &&
-    plan.source.B.image === grant.image && plan.source.B.engineCommit === CCB_ENGINE_COMMIT &&
+    plan.manifestSha256 === grant.manifestSha256 && plan.source?.[arm]?.implementationCommit === grant.implementationCommit &&
+    (baseline || plan.source.B.image === grant.image && plan.source.B.engineCommit === CCB_ENGINE_COMMIT) &&
     Array.isArray(plan.slots) && plan.slots.length === 24 && new Set(plan.slots.map(slot => slot.taskId)).size === 24 &&
-    Array.isArray(plan.cases) && plan.cases.length === 6, 'Frozen plan does not describe the approved B comparison');
+    Array.isArray(plan.cases) && plan.cases.length === 6, 'Frozen plan does not describe the approved comparison arm');
   const db = database.connection;
   const grantSha256 = await hashValue(grant);
   const owner = `comparison-${grant.planSha256.slice(0, 24)}`;
@@ -197,13 +210,13 @@ export async function openComparisonTaskControl(options: {
   async function isolated() {
     const binding = await db.prepare('SELECT plan_sha,arm,implementation FROM comparison_arm WHERE id=1')
       .first<{ plan_sha: string; arm: string; implementation: string }>();
-    requireThat(binding?.arm === 'B' && binding.plan_sha === grant.planSha256 && binding.implementation === grant.implementationCommit &&
-      !await db.prepare('SELECT 1 FROM settings LIMIT 1').first(), 'Comparison database marker conflicts with the isolated B plan');
+    requireThat(binding?.arm === arm && binding.plan_sha === grant.planSha256 && binding.implementation === grant.implementationCommit &&
+      !await db.prepare('SELECT 1 FROM settings LIMIT 1').first(), 'Comparison database marker conflicts with the isolated plan');
   }
-  function approvedSlot(taskId: string) {
+  function approvedSlot(taskId: string, expectedArm: 'A' | 'B' = arm) {
     const slot = plan.slots.find(value => value.taskId === taskId);
-    requireThat(taskIdentifier.test(taskId) && slot?.arm === 'B' && (slot.operation === 'creation' || slot.operation === 'review') &&
-      isHash(slot.modelConfigSha256) && typeof slot.caseId === 'string', 'Task is not a frozen B comparison slot');
+    requireThat(taskIdentifier.test(taskId) && slot?.arm === expectedArm && (slot.operation === 'creation' || slot.operation === 'review') &&
+      isHash(slot.modelConfigSha256) && typeof slot.caseId === 'string', `Task is not a frozen ${expectedArm} comparison slot`);
     return slot;
   }
   async function readRelease(taskId: string) {
@@ -235,11 +248,16 @@ export async function openComparisonTaskControl(options: {
       (creation ? row.kind === 'game' && row.creative_version === 2 : row.model_executor === 'platform' &&
         row.review_mode === 'basic' && row.report_schema_version === 2 && row.title === slot.caseId &&
         row.filename === `${slot.caseId}.html` && row.topic_id === null), 'Comparison task owner, executor or identity mismatch');
-    const policy = parseHarnessPolicy(row.harness_policy);
-    requireThat(policy && policy.family === (creation ? 'forge' : 'review') && policy.purpose === (creation ? 'game' : 'review') &&
-      policy.image === grant.image && policy.releaseHash === grant.planSha256 && policy.modelContractHash === identity.modelContractHash &&
-      same(policy, identity.harnessPolicy) && await hashValue(policy) === seal.policySha256,
-    'Comparison task research policy mismatch');
+    if (baseline) {
+      requireThat(row.harness_policy === undefined && identity.harnessPolicy === null && await hashValue(null) === seal.policySha256,
+        'Baseline task must retain its archived runner without Harness policy');
+    } else {
+      const policy = parseHarnessPolicy(row.harness_policy);
+      requireThat(policy && policy.family === (creation ? 'forge' : 'review') && policy.purpose === (creation ? 'game' : 'review') &&
+        policy.image === grant.image && policy.releaseHash === grant.planSha256 && policy.modelContractHash === identity.modelContractHash &&
+        same(policy, identity.harnessPolicy) && await hashValue(policy) === seal.policySha256,
+      'Comparison task research policy mismatch');
+    }
     if (allowTerminal && (row.status === 'done' || row.status === 'error')) return { row, slot, identity };
     requireThat(row.status === 'queued' || (allowTerminal && row.status === 'running'), 'Comparison task cannot be released or resumed');
 
@@ -268,25 +286,34 @@ export async function openComparisonTaskControl(options: {
     requireThat(row.input_ready === 1 && row.input_hash === identity.sourceHash && typeof row.rules_snapshot === 'string' &&
       isHash(identity.evidenceHash) && isHash(identity.packHash) && isHash(slot.rulesSha256) && isHash(slot.calibrationSha256) && loadEvidencePack,
     'Comparison review input or sealed evidence is unavailable');
-    const dependency = approvedSlot(slot.requires?.creationTaskId ?? '');
+    const dependency = approvedSlot(slot.requires?.creationTaskId ?? '', 'B');
     requireThat(dependency.operation === 'creation' && dependency.caseId === slot.caseId, 'Review does not depend on the exact B creation slot');
-    const creationRelease = await readRelease(dependency.taskId);
-    requireThat(creationRelease?.grant_sha === grantSha256 && creationRelease.slot_sha === await hashValue(dependency) &&
-      creationRelease.release_sha === await hashValue({ grantSha256, taskId: dependency.taskId, slotSha256: creationRelease.slot_sha,
-        admissionSha256: creationRelease.admission_sha, inputSha256: creationRelease.input_sha, policySha256: creationRelease.policy_sha }),
-    'Comparison review requires the released B creation identity');
-    const product = await db.prepare("SELECT result FROM forge_tasks WHERE id=? AND owner_id=? AND executor='platform' AND kind='game' AND status='done'")
-      .bind(dependency.taskId, owner).first<{ result: string }>();
-    const result = product && parseJson(product.result, 'B artifact result');
-    requireThat(result?.content_hash === identity.sourceHash && typeof result.version_id === 'string',
-      'Comparison review requires the completed B artifact');
-    const version = await db.prepare("SELECT content FROM artifact_versions WHERE id=? AND task_id=? AND owner_id=? AND kind='game'")
-      .bind(result.version_id, dependency.taskId, owner).first<{ content: string }>();
-    requireThat(version && await harnessHash(version.content) === identity.sourceHash, 'Comparison B artifact version drifted');
     const packIdentity = { caseId: slot.caseId, manifestSha256: grant.manifestSha256,
       evidenceSha256: identity.evidenceHash, packSha256: identity.packHash };
+    let localArtifact: string | undefined;
+    if (baseline) {
+      requireThat(await baseline.verifyBArtifact({ taskId: dependency.taskId, caseId: slot.caseId, planSha256: grant.planSha256,
+        manifestSha256: grant.manifestSha256, sourceSha256: identity.sourceHash, evidenceSha256: identity.evidenceHash, packSha256: identity.packHash }),
+      'Baseline review requires the verified completed B artifact');
+    } else {
+      const creationRelease = await readRelease(dependency.taskId);
+      requireThat(creationRelease?.grant_sha === grantSha256 && creationRelease.slot_sha === await hashValue(dependency) &&
+        creationRelease.release_sha === await hashValue({ grantSha256, taskId: dependency.taskId, slotSha256: creationRelease.slot_sha,
+          admissionSha256: creationRelease.admission_sha, inputSha256: creationRelease.input_sha, policySha256: creationRelease.policy_sha }),
+      'Comparison review requires the released B creation identity');
+      const product = await db.prepare("SELECT result FROM forge_tasks WHERE id=? AND owner_id=? AND executor='platform' AND kind='game' AND status='done'")
+        .bind(dependency.taskId, owner).first<{ result: string }>();
+      const result = product && parseJson(product.result, 'B artifact result');
+      requireThat(result?.content_hash === identity.sourceHash && typeof result.version_id === 'string',
+        'Comparison review requires the completed B artifact');
+      const version = await db.prepare("SELECT content FROM artifact_versions WHERE id=? AND task_id=? AND owner_id=? AND kind='game'")
+        .bind(result.version_id, dependency.taskId, owner).first<{ content: string }>();
+      requireThat(version && await harnessHash(version.content) === identity.sourceHash, 'Comparison B artifact version drifted');
+      localArtifact = version.content;
+    }
     const sealed = await openComparisonEvidencePack(await loadEvidencePack(packIdentity), packIdentity);
-    requireThat(sealed.html === version.content, 'Comparison review evidence is for another artifact');
+    requireThat(await harnessHash(sealed.html) === identity.sourceHash && (localArtifact === undefined || sealed.html === localArtifact),
+      'Comparison review evidence is for another artifact');
     const { results: parts } = await db.prepare('SELECT part,data FROM review_inputs WHERE job_id=? ORDER BY part')
       .bind(row.id).all<{ part: number; data: string }>();
     requireThat(parts.length && parts.every((part, index) => part.part === index) &&
@@ -312,14 +339,7 @@ export async function openComparisonTaskControl(options: {
     return bytes;
   }
 
-  async function brokerFor(seal: ComparisonReleaseSeal, task: Awaited<ReturnType<typeof load>>) {
-    requireThat(bindVerifiedBroker && task.capture, 'Verified formal comparison broker is unavailable');
-    const { slot, identity } = task;
-    const scope: BrokerScope = { ...seal, grantSha256, authorizationSha256: grant.authorizationSha256,
-      dispatchGrantSha256: grant.dispatchGrantSha256, planSha256: grant.planSha256,
-      manifestSha256: grant.manifestSha256, runnerDatabaseId: database.id, ownerId: identity.ownerId, operation: slot.operation,
-      sourceSha256: identity.sourceHash, evidenceSha256: identity.evidenceHash, modelConfigSha256: slot.modelConfigSha256,
-      modelContractHash: identity.modelContractHash, deadlineAt: grant.deadlineAt };
+  async function loadProfile(slot: Slot): Promise<PublicProfile> {
     const bytes = await frozenInput(slot.modelConfigSha256, 'model configuration', 64 * 1024);
     const publicModel = parseJson<Omit<StoredModelProfile, 'encryptedKey'>>(bytes, 'public model profile');
     requireThat(publicModel && Object.keys(publicModel).every(field => profiles.includes(field)) &&
@@ -330,6 +350,28 @@ export async function openComparisonTaskControl(options: {
     try { origin = new URL(publicModel.baseUrl); } catch { throw new Error('Invalid frozen public model origin'); }
     requireThat(origin.protocol === 'https:' && !origin.username && !origin.password && !origin.search && !origin.hash,
       'Invalid frozen public model origin');
+    return publicModel;
+  }
+
+  async function baselineProfile(task: Awaited<ReturnType<typeof load>>) {
+    const profile = await loadProfile(task.slot);
+    const purpose = task.slot.operation === 'creation' ? 'game' : 'review';
+    const marker = { ...profile, encryptedKey: 'comparison-public-profile-only' };
+    const config: ModelConfig = { ...marker, activeProfile: 'comparison', profiles: { comparison: marker },
+      routes: { [purpose === 'game' ? 'create' : 'review']: 'comparison' } };
+    requireThat(await modelContractHash(config, purpose) === task.identity.modelContractHash, 'Baseline model contract drifted');
+    return { profile, config, profileSha: await hashValue(['comparison-a-marker-v1', task.row.id, profile]) };
+  }
+
+  async function brokerFor(seal: ComparisonReleaseSeal, task: Awaited<ReturnType<typeof load>>) {
+    requireThat(bindVerifiedBroker && task.capture, 'Verified formal comparison broker is unavailable');
+    const { slot, identity } = task;
+    const scope: BrokerScope = { ...seal, grantSha256, authorizationSha256: grant.authorizationSha256,
+      dispatchGrantSha256: grant.dispatchGrantSha256, planSha256: grant.planSha256,
+      manifestSha256: grant.manifestSha256, runnerDatabaseId: database.id, ownerId: identity.ownerId, operation: slot.operation,
+      sourceSha256: identity.sourceHash, evidenceSha256: identity.evidenceHash, modelConfigSha256: slot.modelConfigSha256,
+      modelContractHash: identity.modelContractHash, deadlineAt: grant.deadlineAt };
+    const publicModel = await loadProfile(slot);
     const broker = await bindVerifiedBroker(Object.freeze(scope));
     requireThat(broker && exact(broker, ['scopeSha256', 'harnessRunner', 'profileId', 'profile']) &&
       broker.scopeSha256 === await hashValue(scope) && id.test(broker.profileId) &&
@@ -364,7 +406,7 @@ export async function openComparisonTaskControl(options: {
   async function release(caller: object, input: ComparisonReleaseSeal) {
     trusted(caller);
     const seal = { ...input };
-    requireThat(bindVerifiedBroker, 'Verified formal comparison broker is unavailable');
+    requireThat(baseline || bindVerifiedBroker, 'Verified formal comparison broker is unavailable');
     await isolated();
     await db.prepare(releaseTable).run();
     const task = await load(seal, true);
@@ -376,7 +418,7 @@ export async function openComparisonTaskControl(options: {
     }
     requireThat(task.row.status === 'queued' && !task.row.model_started_at && !task.row.model_execution_started_at,
       'Only an unstarted queued task may receive a release');
-    const { profileSha } = await brokerFor(seal, task);
+    const { profileSha } = baseline ? await baselineProfile(task) : await brokerFor(seal, task);
     trusted(caller);
     const table = task.slot.operation === 'creation' ? 'forge_tasks' : 'review_jobs';
     const snapshotColumn = task.slot.operation === 'creation' ? 'input_snapshot' : 'rules_snapshot';
@@ -385,14 +427,14 @@ export async function openComparisonTaskControl(options: {
       SELECT a.task_id,?, ?, a.identity_sha,a.input_sha,a.policy_sha,?, ?, ?
       FROM comparison_admissions a JOIN ${table} t ON t.id=a.task_id
       WHERE a.task_id=? AND a.state='paused' AND a.identity_sha=? AND a.input_sha=? AND a.policy_sha=? AND a.identity_json=?
-        AND EXISTS(SELECT 1 FROM comparison_arm WHERE id=1 AND arm='B' AND plan_sha=? AND implementation=?)
+        AND EXISTS(SELECT 1 FROM comparison_arm WHERE id=1 AND arm=? AND plan_sha=? AND implementation=?)
         AND t.owner_id=? AND t.executor=? AND t.status='queued' AND t.model_started_at IS NULL
         ${task.slot.operation === 'review' ? 'AND t.model_execution_started_at IS NULL AND t.input_ready=1 AND t.input_hash=? AND t.title=? AND t.filename=? AND t.topic_id IS NULL' : ''}
-        AND t.harness_policy=? AND t.${snapshotColumn}=?
+        AND ${baseline ? '' : 't.harness_policy=? AND '}t.${snapshotColumn}=?
       ON CONFLICT(task_id) DO NOTHING RETURNING task_id`).bind(grantSha256, seal.slotSha256, profileSha, releaseSha, now(),
-        seal.taskId, seal.admissionSha256, seal.inputSha256, seal.policySha256, canonicalHarness(task.identity), grant.planSha256,
+        seal.taskId, seal.admissionSha256, seal.inputSha256, seal.policySha256, canonicalHarness(task.identity), arm, grant.planSha256,
         grant.implementationCommit, task.row.owner_id, task.row.executor,
-        ...(task.slot.operation === 'review' ? [task.identity.sourceHash, task.slot.caseId, `${task.slot.caseId}.html`] : []), task.row.harness_policy, source ?? null).first();
+        ...(task.slot.operation === 'review' ? [task.identity.sourceHash, task.slot.caseId, `${task.slot.caseId}.html`] : []), ...(baseline ? [] : [task.row.harness_policy]), source ?? null).first();
     const stored = await readRelease(seal.taskId);
     requireThat(stored?.grant_sha === grantSha256 && stored.release_sha === releaseSha && stored.profile_sha === profileSha,
       'Comparison release CAS failed or conflicts with an existing release');
@@ -451,7 +493,7 @@ export async function openComparisonTaskControl(options: {
           reviewCheckpoint = { request: immutable.request, evidence };
         }
       } else requireThat(!await state.storage.get('cloudPhase'), 'Comparison queued review already has a checkpoint');
-      if (missingCheckpoint && modelStarted) {
+      if (missingCheckpoint && modelStarted && !baseline) {
         // The existing runner records the lost started operation as unknown.
         // Cleanup must not depend on profile availability or allow a new start.
         const unavailable = () => { throw new Error('Comparison model is blocked during unknown-outcome cleanup'); };
@@ -469,20 +511,27 @@ export async function openComparisonTaskControl(options: {
           },
         };
         trusted(caller);
-        await alarms[slot.operation](state, { DB: db, SETTINGS_KEY: '', HARNESS_RUNNER: cleanup,
+        await alarms![slot.operation](state, { DB: db, SETTINGS_KEY: '', HARNESS_RUNNER: cleanup,
           modelStore: { get: async () => unavailable() }, captureReview: unavailable }, taskId);
         return { state: 'invoked' as const, taskId };
       }
-      const { env, profileSha } = await brokerFor(seal, task);
-      requireThat(profileSha === stored.profile_sha, 'Comparison broker profile changed after release');
+      const a = baseline ? await baselineProfile(task) : undefined;
+      const b = baseline ? undefined : await brokerFor(seal, task);
+      const modelStore = b?.env.modelStore ?? { get: async () => structuredClone(a!.config) };
+      requireThat((a ?? b)?.profileSha === stored.profile_sha, 'Comparison broker profile changed after release');
       if (checkpointConfig) {
         const selected = activeModelProfile(checkpointConfig, slot.operation === 'creation' ? 'game' : 'review');
-        requireThat(selected && await hashValue([selected.id, selected.profile]) === stored.profile_sha,
+        requireThat(selected, 'Comparison checkpoint profile is missing');
+        if (a) {
+          const { encryptedKey: _marker, ...publicModel } = selected.profile;
+          requireThat(selected.id === 'comparison' && same(publicModel, a.profile) && await baseline!.verifyCheckpointProfile(taskId, selected.profile),
+            'Baseline checkpoint profile changed after release');
+        } else requireThat(await hashValue([selected.id, selected.profile]) === stored.profile_sha,
           'Comparison checkpoint profile changed after release');
       }
       if (reviewCheckpoint) {
         requireThat(task.sealed && task.rules, 'Comparison review checkpoint lost its sealed source');
-        const { images, ...expected } = await prepareReview({ ...env, ownerId: 'admin', modelExecutor: 'platform' }, {
+        const { images, ...expected } = await prepareReview({ DB: db, modelStore, ownerId: 'admin', modelExecutor: 'platform' }, {
           html: task.sealed.html, title: slot.caseId, ...reviewCheckpoint.evidence, rulesSnapshot: task.rules, reportSchemaVersion: 2,
         });
         const user = Array.isArray(expected.user) ? expected.user.map(part => {
@@ -499,7 +548,11 @@ export async function openComparisonTaskControl(options: {
       trusted(caller);
       if (marker === undefined) await state.storage.put(phaseKey, stored.release_sha);
       trusted(caller);
-      await alarms[slot.operation](state, env, taskId);
+      if (a) {
+        requireThat(task.capture, 'Baseline capture is unavailable');
+        await baseline!.run({ scope: { taskId, ownerId: task.identity.ownerId, operation: slot.operation }, profile: a.profile, state,
+          env: { DB: db, captureReview: task.capture }, allowForward: !(missingCheckpoint && modelStarted) });
+      } else await alarms![slot.operation](state, b!.env, taskId);
       return { state: 'invoked' as const, taskId };
     }
     return {

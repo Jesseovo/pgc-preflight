@@ -160,8 +160,8 @@ async function setup(duplicateFirstShot = false) {
     ({ scopeSha256: canonicalSha(scope), profileId: 'isolated-profile',
       profile: scope.operation === 'creation' ? brokerProfile : profileB,
       harnessRunner: { idFromName: (name: string) => name, get: () => ({ fetch: brokerFetch }) } }));
-  const alarms = { creation: vi.fn<Parameters<typeof openComparisonTaskControl>[0]['alarms']['creation']>(),
-    review: vi.fn<Parameters<typeof openComparisonTaskControl>[0]['alarms']['review']>() };
+  const alarms = { creation: vi.fn<NonNullable<Parameters<typeof openComparisonTaskControl>[0]['alarms']>['creation']>(),
+    review: vi.fn<NonNullable<Parameters<typeof openComparisonTaskControl>[0]['alarms']>['review']>() };
   let current = time, packed = material.packed;
   const options = { authority, database: { scope: 'isolated-comparison' as const, id: 'isolated-b', connection: DB },
     grant, runtime: { implementationCommit, runtimeTreeSha256, image }, planBytes,
@@ -218,7 +218,7 @@ test('rejects foreign authority, slot, production marker, queued mutation, expir
   await expect(openComparisonTaskControl({ ...s.options, runtime: { ...s.options.runtime, runtimeTreeSha256: '0'.repeat(64) } }))
     .rejects.toThrow(/runtime attestation/);
   await expect(openComparisonTaskControl({ ...s.options, database: { ...s.options.database, id: 'production' } }))
-    .rejects.toThrow(/isolated B/);
+    .rejects.toThrow(/isolated comparison/);
   const noBroker = await openComparisonTaskControl({ ...s.options, bindVerifiedBroker: undefined });
   await expect(noBroker.release(s.authority, s.gameSeal)).rejects.toThrow(/broker is unavailable/);
   s.sqlite.exec("UPDATE comparison_arm SET arm='A'");

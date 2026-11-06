@@ -1,6 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { build } from 'esbuild';
+import { COMPARISON_SERVICE_NONCE_SCHEMA, createComparisonServiceHandler } from '../server/harness-comparison-service';
+import { canonicalHarness, CCB_ENGINE_COMMIT, modelContractHash } from '../server/harness-policy';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -148,4 +152,184 @@ describe('private adapter from the pinned A archive', () => {
     expect(transportSignal?.aborted).toBe(true);
     expect(direct).not.toHaveBeenCalled();
   });
+  it('bundles the private A Worker and runs the archived review through a signed synthetic candidate', async () => {
+    const bundle = await build({ entryPoints: [prepared.workerEntry], bundle: true, write: false, format: 'esm', metafile: true,
+      platform: 'neutral', mainFields: ['browser', 'module', 'main'], conditions: ['workerd', 'browser'],
+      external: ['node:*'], plugins: [{ name: 'offline-cloudflare', setup(builder) {
+        builder.onResolve({ filter: /^cloudflare:workers$/ }, () => ({ path: 'workers', namespace: 'fixture' }));
+        builder.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: 'export class DurableObject {}\n' +
+          'export class WorkerEntrypoint { constructor(ctx,env){this.env=env;} }' }));
+      } }] });
+    expect(Object.keys(bundle.metafile.inputs).some(path => path.includes('harness-host.ts'))).toBe(false);
+    const bundlePath = join(temporary, 'archived-a-worker.mjs');
+    writeFileSync(bundlePath, bundle.outputFiles[0].contents, { flag: 'wx' });
+    const worker = await import(pathToFileURL(bundlePath).href);
+    expect(worker.default.fetch().status).toBe(403);
+    const direct = vi.fn(() => { throw new Error('Direct network disabled'); });
+    vi.stubGlobal('fetch', direct);
+    const sqlite = new DatabaseSync(':memory:'), nonces = new DatabaseSync(':memory:');
+    try {
+      for (const file of readdirSync(join(prepared.source, 'migrations')).filter(name => name.endsWith('.sql')).sort()) {
+        sqlite.exec(readFileSync(join(prepared.source, 'migrations', file), 'utf8'));
+      }
+      sqlite.exec('CREATE TABLE comparison_arm(id,plan_sha,arm,implementation);' +
+        'CREATE TABLE comparison_admissions(task_id PRIMARY KEY,identity_sha,identity_json,state,input_sha,policy_sha,created_at);' +
+        'CREATE TABLE comparison_schedule_requests(task_id PRIMARY KEY,requested_at);');
+      nonces.exec(COMPARISON_SERVICE_NONCE_SCHEMA);
+      function statement(sql: string, values: any[] = []): any {
+        return { bind: (...args: any[]) => statement(sql, args), first: async () => sqlite.prepare(sql).get(...values) ?? null,
+          all: async () => ({ results: sqlite.prepare(sql).all(...values) }), run: async () => {
+            const value = sqlite.prepare(sql).run(...values);
+            return { meta: { changes: Number(value.changes), last_row_id: Number(value.lastInsertRowid) } };
+          } };
+      }
+      const DB = { prepare: statement, async batch(statements: ReturnType<typeof statement>[]) {
+        sqlite.exec('BEGIN');
+        try {
+          const result = await Promise.all(statements.map(item => item.run()));
+          sqlite.exec('COMMIT');
+          return result;
+        } catch (error) {
+          sqlite.exec('ROLLBACK');
+          throw error;
+        }
+      } };
+      const at = Date.now(), iso = new Date(at).toISOString();
+      const h = (value: string) => sha(Buffer.from(value)), hc = (value: unknown) => h(canonicalHarness(value));
+      const manifestSha256 = 'a'.repeat(64), commit = prepared.manifest.implementationCommit;
+      const caseIds = ['tap-rhythm', 'continuous-drag', 'strategy-tradeoffs', 'collision-feedback', 'difficulty-restart', 'dense-mobile'];
+      const idFor = (n: number) => '00000000-0000-8000-8000-' + String(n).padStart(12, '0');
+      const ruleContent = { sourceUrl: 'https://creator-hub-7mi.pages.dev/#/', capturedAt: iso,
+        rawDirection: 'Synthetic directions', rawScoring: 'Synthetic scoring', scoreMin: 0, scoreMax: 3, passScore: 7,
+        notes: '', calibrationCases: [] };
+      const rules = { schemaVersion: 2, id: 'synthetic-a-review-rules', contentHash: hc(ruleContent), publishedAt: iso, ...ruleContent };
+      const modelConfigSha256 = h(JSON.stringify(reviewProfile));
+      const slots = caseIds.flatMap((caseId, index) => [
+        { taskId: idFor(index * 4), arm: 'A', operation: 'creation', caseId, modelConfigSha256 },
+        { taskId: idFor(index * 4 + 1), arm: 'B', operation: 'creation', caseId, modelConfigSha256 },
+        ...['A', 'B'].map((arm, offset) => ({ taskId: idFor(index * 4 + 2 + offset), arm, operation: 'review', caseId,
+          modelConfigSha256, rulesSha256: h(JSON.stringify(rules)), calibrationSha256: h('[]'), requires: { creationTaskId: idFor(index * 4 + 1) } })),
+      ]);
+      const slot = slots[2], taskId = slot.taskId;
+      const planBytes = JSON.stringify({ schemaVersion: 1, scope: 'formal', executionAllowed: false, manifestSha256,
+        source: { A: { implementationCommit: commit }, B: { implementationCommit: 'b'.repeat(40), engineCommit: CCB_ENGINE_COMMIT } },
+        cases: caseIds.map(id => ({ id })), slots });
+      const planSha256 = h(planBytes);
+      const html = '<!doctype html><title>Synthetic exact B review</title>';
+      const observations = [
+        ['9:16 首次触摸后约 10 秒', 'baseline-9:16-tap'], ['9:19.5 首次触摸前'],
+        ['9:19.5 首次触摸后约 3 秒', 'baseline-9:19.5-tap'], ['9:21 首次触摸后约 10 秒', 'baseline-9:21-tap'],
+      ].map(([label, ...actionRefs], index) => ({ id: 'baseline-' + (index + 1), label, actionRefs, capturedAt: iso }));
+      const probe = JSON.stringify({ captureMethod: 'browser-viewport-v1', observations });
+      const shots = observations.map((entry, index) => {
+        const bytes = Buffer.from([255, 216, 255, index]);
+        return { id: entry.id, sha256: sha(bytes), data: 'data:image/jpeg;base64,' + bytes.toString('base64') };
+      });
+      const htmlSha256 = h(html), evidenceSha256 = h(JSON.stringify({ html: htmlSha256, probe: h(probe), shots: shots.map(shot => shot.sha256) }, null, 2) + '\n');
+      const pack = JSON.stringify({ schemaVersion: 1, caseId: slot.caseId, manifestSha256, evidenceSha256, captureOrigin: 'isolated-chromium',
+        html: { text: html, sha256: htmlSha256 }, probe: { json: probe, sha256: h(probe) }, shots });
+      const packSha256 = h(pack);
+      const profile = { ...reviewProfile, protocol: 'openai' as const, effort: 'low' as const, encryptedKey: 'synthetic-marker' };
+      const contract = await modelContractHash({ ...profile, activeProfile: 'comparison', profiles: { comparison: profile } }, 'review');
+      const admission = canonicalHarness({ schemaVersion: 1, scope: 'formal', planSha256, manifestSha256, slot, ownerId: 'admin',
+        sourceHash: htmlSha256, evidenceHash: evidenceSha256, packHash: packSha256, modelContractHash: contract, harnessPolicy: null });
+      const seal = { taskId, slotSha256: hc(slot), admissionSha256: h(admission), policySha256: hc(null),
+        inputSha256: hc({ inputHash: htmlSha256, rulesSnapshot: rules, evidenceSha256, packSha256 }) };
+      sqlite.prepare('INSERT INTO comparison_arm VALUES(1,?,?,?)').run(planSha256, 'A', commit);
+      sqlite.prepare("INSERT INTO comparison_admissions VALUES(?,?,?,'paused',?,?,?)")
+        .run(taskId, seal.admissionSha256, admission, seal.inputSha256, seal.policySha256, iso);
+      sqlite.prepare('INSERT INTO comparison_schedule_requests VALUES(?,?)').run(taskId, iso);
+      sqlite.prepare(`INSERT INTO review_jobs(id,owner_id,title,filename,usage_day,created_at,updated_at,status,stage,executor,model_executor,
+        input_ready,input_hash,rules_snapshot,report_schema_version,review_mode)
+        VALUES(?,'admin',?,?,'2026-11-06',?,?,'queued','capture','cloud','platform',1,?,?,2,'basic')`)
+        .run(taskId, slot.caseId, slot.caseId + '.html', iso, iso, htmlSha256, JSON.stringify(rules));
+      sqlite.prepare('INSERT INTO review_inputs(job_id,part,data,created_at) VALUES(?,0,?,?)')
+        .run(taskId, JSON.stringify({ html, title: slot.caseId, topic_id: null }), iso);
+      const runtime = { implementationCommit: commit, runtimeTreeSha256: 'c'.repeat(64), image: null, bundleSha256: sha(Buffer.from(bundle.outputFiles[0].contents)) };
+      const grant = { schemaVersion: 1, purpose: 'isolated-comparison', scope: 'formal', authorizationSha256: 'd'.repeat(64),
+        dispatchGrantSha256: 'e'.repeat(64), runnerDatabaseId: 'isolated-a', planSha256, manifestSha256, implementationCommit: commit,
+        runtimeTreeSha256: runtime.runtimeTreeSha256, image: null, notBefore: at - 60_000, deadlineAt: at + 600_000,
+        maxRequests: 60, maxOutputTokens: 1_000_000 };
+      const version = '00000000-0000-4000-8000-000000000099', workerVersion = '00000000-0000-4000-8000-000000000098';
+      const authKey = 'f'.repeat(64);
+      const context = { runId: 'isolated-a-run', runnerGrantSha256: hc(grant), authorizationSha256: grant.authorizationSha256,
+        dispatchGrantSha256: grant.dispatchGrantSha256, runnerDatabaseId: grant.runnerDatabaseId,
+        planSha256, manifestSha256, nonceDatabaseId: 'comparison-nonces', candidateVersion: version,
+        notBefore: grant.notBefore, deadlineAt: grant.deadlineAt, taskIds: [taskId] };
+      const report = { schema_version: 2, assessment_status: 'complete', aes: 1, ease: 2, play: 1, verdict: '打回',
+        score_reasons: { aes: 'synthetic', ease: 'synthetic', play: 'synthetic' }, uncertainties: [], issues: [], strengths: [],
+        reviewer_comment: 'synthetic report', fix_prompt: '', optional_suggestions: [] };
+      const handle = vi.fn(async (call: Parameters<Parameters<typeof createComparisonServiceHandler>[0]['handle']>[0]) => {
+        if (call.kind !== 'baseline') throw Error('Only signed baseline path is permitted');
+        expect(call.scope.taskId).toBe(taskId);
+        expect(call.url).toBe('https://api.deepseek.com/chat/completions');
+        const body = JSON.parse(String(call.init.body));
+        const images = body.messages.at(-1).content.filter((part: any) => part.type === 'image_url');
+        expect(images.map((part: any) => part.image_url.url)).toEqual(shots.map(shot => shot.data));
+        const stageReport = { ...report, reviewer_comment: 'synthetic ' + call.scope.stage };
+        return stream([{ choices: [{ delta: { content: JSON.stringify(stageReport) } }] },
+          { choices: [{ finish_reason: 'stop' }], usage: { prompt_tokens: 51, completion_tokens: 22 } }, '[DONE]']);
+      });
+      const relay = createComparisonServiceHandler({ context, authKey, executingVersion: version, handle,
+        nonceDatabase: { scope: 'isolated-comparison', id: context.nonceDatabaseId, connection: { prepare(sql) {
+          return { bind: (...args) => ({ first: async () => nonces.prepare(sql).get(...args) ?? null }) };
+        } } } });
+      const values = new Map<string, unknown>(), phases: string[] = [];
+      let alarm: number | null = null;
+      const storage = {
+        get: async (key: string) => structuredClone(values.get(key)),
+        put: async (key: string, value: unknown) => { values.set(key, structuredClone(value)); if (key === 'runner:cloudPhase') phases.push(String(value)); },
+        delete: async (keys: string | string[]) => { for (const key of typeof keys === 'string' ? [keys] : keys) values.delete(key); },
+        list: async ({ prefix }: { prefix: string }) => new Map([...values].filter(([key]) => key.startsWith(prefix))),
+        getAlarm: async () => alarm, setAlarm: async (value: number) => { alarm = value; }, deleteAlarm: async () => { alarm = null; },
+        transaction: async (work: (tx: any) => Promise<unknown>) => work(storage),
+      };
+      const verifyCompletedBArtifact = vi.fn(async (proof: any) => proof.taskId === idFor(1) && proof.sourceSha256 === htmlSha256 &&
+        proof.evidenceSha256 === evidenceSha256 && proof.packSha256 === packSha256);
+      const frozen = new Map([JSON.stringify(reviewProfile), JSON.stringify(rules), '[]'].map(bytes => [h(bytes), bytes]));
+      const id = (name: string) => ({ toString: () => 'archive-a:' + name });
+      const env = { DB, COMPARISON_DATABASE_ID: grant.runnerDatabaseId, COMPARISON_WORKER_VERSION: { id: workerVersion },
+        COMPARISON_DEPLOYED_RUNTIME: runtime, COMPARISON_SERVICE_CONTEXT: context, COMPARISON_SERVICE_AUTH: authKey,
+        COMPARISON_TASKS: { idFromName: id, get: () => task },
+        COMPARISON_AUTHORITY: { authorizeRelease: async () => true,
+          readTaskRuntime: async () => ({ grant, planBytes, workerVersion, bundleSha256: runtime.bundleSha256 }),
+          readFrozenInput: async (_task: string, hash: string) => frozen.get(hash), readEvidencePack: async () => pack,
+          verifyCompletedBArtifact } };
+      const task = worker.createBaselineTaskObject({ id: id(taskId), storage }, env, relay);
+      await expect(worker.createBaselineTaskObject({ id: id(otherId()), storage }, env, relay).release(seal)).rejects.toThrow(/does not belong/);
+      await expect(worker.createBaselineTaskObject({ id: id(taskId), storage }, { ...env, COMPARISON_SERVICE_AUTH: undefined }, relay)
+        .release(seal)).rejects.toThrow(/signed baseline candidate/i);
+      const release = await new worker.ComparisonTaskControl({}, env).release(seal);
+      expect(release).toMatchObject({ taskId });
+      expect(alarm).not.toBeNull();
+      const restarted = worker.createBaselineTaskObject({ id: id(taskId), storage }, env, relay);
+      await restarted.alarm();
+      expect(sqlite.prepare('SELECT status FROM review_jobs').get()).toEqual({ status: 'done' });
+      expect(handle.mock.calls.map(([call]) => call.kind === 'baseline' && call.scope.stage)).toEqual(['review', 'review_verify']);
+      expect(phases).toContain('draft-ready');
+      expect(phases).toContain('final-ready');
+      expect(values.get('comparison:bound-task')).toBe(taskId);
+      expect([...values.keys()].filter(key => key.startsWith('runner:'))).toEqual([]);
+      const archive = await new worker.ComparisonTaskControl({}, env).readReviewArchive(taskId);
+      expect(archive).toMatchObject([
+        { taskId, stage: 'review', report: { reviewer_comment: 'synthetic review' } },
+        { taskId, stage: 'review_verify', report: { reviewer_comment: 'synthetic review_verify' } },
+      ]);
+      expect(archive[0].materialRef).toBe(archive[1].materialRef);
+      expect(sqlite.prepare('SELECT policy_sha FROM comparison_execution_releases').get()).toEqual({ policy_sha: hc(null) });
+      expect(await restarted.release(seal)).toEqual(release);
+      await restarted.alarm();
+      expect(handle).toHaveBeenCalledTimes(2);
+      const readOnly = worker.createBaselineTaskObject({ id: id(taskId), storage },
+        { ...env, COMPARISON_AUTHORITY: undefined, COMPARISON_SERVICE_AUTH: undefined }, relay);
+      expect(await readOnly.readReviewArchive(taskId)).toEqual(archive);
+      expect(verifyCompletedBArtifact).toHaveBeenCalled();
+      expect(direct).not.toHaveBeenCalled();
+
+      function otherId() { return idFor(11); }
+    } finally {
+      sqlite.close(); nonces.close();
+    }
+  });
+
 });
