@@ -1,4 +1,5 @@
 import { cleanGameHtml } from '../harness/game-html.mjs';
+import { PLAY_LIMITS, validateHarnessPlayRound, type PlayAction } from '../src/review-play-actions';
 import { canonicalHarness, harnessHash } from './harness-policy';
 import type { HarnessBrowserEvidence, HarnessTools } from './harness-tools';
 
@@ -39,9 +40,36 @@ const encoder = new TextEncoder();
 const string = { type: 'string' };
 const shaSchema = { type: 'string', pattern: '^[a-f0-9]{64}$' };
 const remoteTools = new Set<string>(['capture', 'play-start', 'play-act', 'play-finish', 'play-close']);
+const objectSchema = (properties: Arguments, required: string[]) => ({ type: 'object', properties, required, additionalProperties: false });
 const tool = (name: string, description: string, properties: Arguments = {}, required: string[] = [], readOnly = false) => ({
-  name, description, inputSchema: { type: 'object', properties, required, additionalProperties: false }, readOnly,
+  name, description, inputSchema: objectSchema(properties, required), readOnly,
 });
+const touchPoint = {
+  x: { type: 'number', minimum: 0, exclusiveMaximum: 360 },
+  y: { type: 'number', minimum: 0, exclusiveMaximum: 780 },
+};
+const milliseconds = { type: 'integer', minimum: 0, maximum: 30_000 };
+const actionSchema = (types: PlayAction['type'][], properties: Arguments, required: string[]) =>
+  objectSchema({ type: { enum: types }, ...properties }, ['type', ...required]);
+const playRoundSchema = objectSchema({
+  hypothesis: { type: 'string', minLength: 1, maxLength: 2000, pattern: '\\S' },
+  actions: {
+    type: 'array', minItems: 1, maxItems: PLAY_LIMITS.actions,
+    items: { oneOf: [
+      actionSchema(['tap', 'hold'], { ...touchPoint, durationMs: milliseconds }, ['x', 'y']),
+      actionSchema(['drag'], { ...touchPoint, toX: touchPoint.x, toY: touchPoint.y, durationMs: milliseconds }, ['x', 'y', 'toX', 'toY']),
+      actionSchema(['drag'], { path: {
+        type: 'array', minItems: 2, maxItems: 32,
+        description: 'First atMs must be 0. Later times must strictly increase. Each capture: true uses one additional screenshot.',
+        items: objectSchema({ ...touchPoint, atMs: milliseconds, capture: { type: 'boolean' } }, ['x', 'y', 'atMs']),
+      } }, ['path']),
+      actionSchema(['multi-touch'], { points: {
+        type: 'array', minItems: 2, maxItems: 5, items: objectSchema(touchPoint, ['x', 'y']),
+      }, durationMs: milliseconds }, ['points']),
+      actionSchema(['wait', 'restart'], { durationMs: milliseconds }, []),
+    ] },
+  },
+}, ['hypothesis', 'actions']);
 const definitions = [
   tool('list', 'List task files, lengths, SHA-256 values, text read chunk size, and writable output paths.', {}, [], true),
   tool('read', 'Read text by zero-based UTF-16 offset. Use nextOffset or parallel multiples of the listed read chunk size. Read the complete input/materials.json. Images are supplied separately.',
@@ -52,8 +80,8 @@ const definitions = [
     { path: string, oldText: string, newText: string, expectedSha256: shaSchema }, ['path', 'oldText', 'newText', 'expectedSha256']),
   tool('capture', 'Prepare game.html and capture its exact prepared version in an isolated mobile browser. Inspect the returned original viewport images.'),
   tool('play-start', 'Prepare game.html and start an isolated mobile play session on the exact prepared version. Returns the first original viewport image.'),
-  tool('play-act', 'Perform one bounded round in the original play session. Set round.hypothesis and round.actions for tap, hold, drag, multi-touch, wait or restart.',
-    { sessionId: string, round: { type: 'object' } }, ['sessionId', 'round']),
+  tool('play-act', 'Perform one bounded round in the original play session. Use 360×780 viewport coordinates and durationMs for milliseconds. Choose either a drag path or the start and end coordinates. All rounds share the remaining play and screenshot limits.',
+    { sessionId: string, round: playRoundSchema }, ['sessionId', 'round']),
   tool('play-finish', 'Finish the original session and lock its evidence.', { sessionId: string }, ['sessionId']),
   tool('play-close', 'Close the original isolated play session.', { sessionId: string }, ['sessionId']),
 ];
@@ -396,6 +424,12 @@ export async function openEmbeddedWorkspace(options: {
         requireWorkspace(!known || known.inputHash === bound, 'Tool call ID is already bound to another artifact.');
         requireInput(name === 'play-close' || current?.sha256 === bound,
           'Original play session does not match the current game.html. Close it before opening another.');
+        if (name === 'play-act') {
+          // Reject malformed model input before reserving a browser action.
+          // Failures from the actual browser call still stop the stage.
+          try { validateHarnessPlayRound(args.round); }
+          catch (error) { throw new WorkspaceInputError(error instanceof Error ? error.message : 'Invalid play round.'); }
+        }
         inputHash = bound;
       }
       const record: BrowserCall = known ?? { requestSha256, inputHash, ...(preparation && { preparation }),

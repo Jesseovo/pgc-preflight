@@ -1,6 +1,7 @@
 import puppeteer from '@cloudflare/puppeteer';
 import type { Browser } from 'puppeteer-core';
-import { AdaptivePlay, PLAY_LIMITS, plannedPlayActionMs, playActionCaptureCount, validatePlayActions } from '../scripts/review-adaptive';
+import { AdaptivePlay } from '../scripts/review-adaptive';
+import { PLAY_LIMITS, plannedPlayActionMs, playActionCaptureCount, validateHarnessPlayRound, type PlayAction } from '../src/review-play-actions';
 import { acquireBrowser, connectAcquiredBrowser } from './browser-capacity';
 import { acquireTrackedBrowser, BrowserAcquireRateLimit, captureFor, closeCaptureBrowser, supportsBrowserSessionControl } from './cloud-review-capture';
 import { canonicalHarness, harnessHash } from './harness-policy';
@@ -54,7 +55,7 @@ type ToolDependencies = {
   closeOwn: (browserId: string) => Promise<void>;
   play: (browser: Browser, html: string, inputHash: string, activeMs: number) => Pick<AdaptivePlay, 'start' | 'act' | 'summary' | 'close' | 'shots' | 'playMs' | 'closed'>;
 };
-type ToolInput = { name: ToolName; id: string; args: JSONRecord; inputHash: string; actions: ReturnType<typeof validatePlayActions> };
+type ToolInput = { name: ToolName; id: string; args: JSONRecord; inputHash: string; actions: PlayAction[] };
 type Live = { session: Session; browser: Browser; play: ReturnType<ToolDependencies['play']> };
 
 const freshState = (): ToolState => ({ shots: 0, rounds: 0, actions: 0, activeMs: 0, attempts: 0 });
@@ -109,7 +110,7 @@ async function parseInput(value: unknown): Promise<ToolInput> {
   const args = value.arguments;
   const inputHash = args.inputHash;
   if (typeof inputHash !== 'string' || !hashPattern.test(inputHash)) throw problem('浏览器工具需要锁定 HTML 的 SHA-256。');
-  let actions: ReturnType<typeof validatePlayActions> = [];
+  let actions: PlayAction[] = [];
   if (name === 'capture' || name === 'play-start') {
     if (!exact(args, ['inputHash', 'html']) || typeof args.html !== 'string' || !args.html.trim() ||
         encoder.encode(args.html).length > htmlLimit || await harnessHash(args.html) !== inputHash) {
@@ -120,12 +121,8 @@ async function parseInput(value: unknown): Promise<ToolInput> {
       throw problem('浏览器工具需要原试玩会话编号。');
     }
     if (name === 'play-act') {
-      if (!isObject(args.round) || !exact(args.round, ['hypothesis', 'actions']) ||
-          typeof args.round.hypothesis !== 'string' || !args.round.hypothesis.trim() || args.round.hypothesis.length > 2000) {
-        throw problem('试玩动作需要明确待验证假设。');
-      }
       try {
-        actions = validatePlayActions(args.round.actions, PLAY_LIMITS.actions);
+        actions = validateHarnessPlayRound(args.round);
       } catch (error) {
         throw problem(error instanceof Error ? error.message : '试玩动作不符合约束。');
       }

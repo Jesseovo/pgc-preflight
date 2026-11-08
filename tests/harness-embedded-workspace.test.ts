@@ -1,5 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { runEmbeddedQuery } from '../server/embedded-ccb';
+import type { EmbeddedModelRequest } from '../server/embedded-ccb/types';
+import { PLAY_LIMITS, validatePlayActions } from '../src/review-play-actions';
 import {
   EmbeddedWorkspaceArtifactPersistenceError, openEmbeddedWorkspace,
   type EmbeddedWorkspaceFile, type EmbeddedWorkspaceResult, type EmbeddedWorkspaceStorage,
@@ -249,7 +251,108 @@ it('returns no partial evidence for a bad original image and checks live permiss
   expect((await review.call(args('result', 'write', { path: 'result.txt', content: '{}', expectedSha256: null }))).is_error).toBeUndefined();
 });
 
-it('terminates on a DO read failure or a lost owned browser session without exposing error details', async () => {
+it('exposes the accepted play action forms in the model tool schema', async () => {
+  const { workspace } = await fixture({ browser: { execute: vi.fn(), readResults: vi.fn(), close: vi.fn() } });
+  const play = workspace.tools.find(tool => tool.name === 'play-act')!;
+  const coordinates = {
+    x: { type: 'number', minimum: 0, exclusiveMaximum: 360 },
+    y: { type: 'number', minimum: 0, exclusiveMaximum: 780 },
+  };
+  const duration = { type: 'integer', minimum: 0, maximum: 30_000 };
+  expect(play.inputSchema).toMatchObject({
+    required: ['sessionId', 'round'],
+    properties: {
+      round: {
+        required: ['hypothesis', 'actions'], additionalProperties: false,
+        properties: {
+          hypothesis: { type: 'string', maxLength: 2000 },
+          actions: {
+            type: 'array', minItems: 1, maxItems: PLAY_LIMITS.actions,
+            items: { oneOf: [
+              { required: ['type', 'x', 'y'], properties: { type: { enum: ['tap', 'hold'] }, ...coordinates, durationMs: duration } },
+              { required: ['type', 'x', 'y', 'toX', 'toY'],
+                properties: { type: { enum: ['drag'] }, ...coordinates, toX: coordinates.x, toY: coordinates.y, durationMs: duration } },
+              { required: ['type', 'path'], additionalProperties: false, properties: { type: { enum: ['drag'] }, path: {
+                minItems: 2, maxItems: 32, items: { required: ['x', 'y', 'atMs'], additionalProperties: false,
+                  properties: { ...coordinates, atMs: duration, capture: { type: 'boolean' } } },
+              } } },
+              { required: ['type', 'points'], properties: { type: { enum: ['multi-touch'] }, points: {
+                minItems: 2, maxItems: 5, items: { required: ['x', 'y'], properties: coordinates },
+              }, durationMs: duration } },
+              { required: ['type'], properties: { type: { enum: ['wait', 'restart'] }, durationMs: duration } },
+            ] },
+          },
+        },
+      },
+    },
+  });
+  expect(validatePlayActions([
+    { type: 'tap', x: 359.5, y: 779.5 }, { type: 'hold', x: 0, y: 0, durationMs: 300 },
+    { type: 'drag', x: 0, y: 0, toX: 80, toY: 40 },
+    { type: 'drag', path: [{ x: 10, y: 20, atMs: 0 }, { x: 30, y: 40, atMs: 400, capture: true }] },
+    { type: 'multi-touch', points: [{ x: 20, y: 30 }, { x: 50, y: 60 }] },
+    { type: 'wait', durationMs: 100 }, { type: 'restart' },
+  ], PLAY_LIMITS.actions)).toHaveLength(7);
+  await workspace.close();
+});
+
+it('lets the model correct an invalid play round without spending a browser action', async () => {
+  const image = await imageFile();
+  const browser = {
+    execute: vi.fn(async (value: unknown) => {
+      const { name, arguments: input } = value as { name: string; arguments: { inputHash: string } };
+      return { tool: name, inputHash: input.inputHash, sessionId: 'owned-session',
+        shots: [{ id: name, data: 'data:image/png;base64,' + png, sha256: image.sha256 }],
+      } as unknown as HarnessBrowserEvidence;
+    }),
+    readResults: vi.fn(async () => []), close: vi.fn(async () => {}),
+  };
+  const { workspace } = await fixture({ browser });
+  const written = text(await workspace.call(args('write', 'write', { path: 'game.html', content: game, expectedSha256: null })));
+  await workspace.call(args('open', 'play-start'));
+  const usage = { inputTokens: 10, outputTokens: 5 };
+  const action = (id: string, fields: object) => ({
+    content: [{ type: 'tool_use' as const, id, name: 'play-act',
+      input: { sessionId: 'owned-session', round: { hypothesis: 'Drag moves the game token.', actions: [fields] } } }],
+    stopReason: 'tool_use', usage,
+  });
+  const validDrag = { type: 'drag', x: 90, y: 450, toX: 170, toY: 450, durationMs: 200 };
+  const callModel = vi.fn(async (request: EmbeddedModelRequest) => {
+    const previous = request.messages.at(-1)!.content[0];
+    if (request.turn === 1) return action('invalid', { ...validDrag, toX: 540 });
+    if (request.turn === 2) {
+      expect(previous).toMatchObject({ type: 'tool_result', tool_use_id: 'invalid', is_error: true });
+      expect(browser.execute).toHaveBeenCalledOnce();
+      return action('corrected', validDrag);
+    }
+    expect(previous).toMatchObject({
+      type: 'tool_result', tool_use_id: 'corrected',
+      content: [expect.objectContaining({ type: 'text' }), { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }],
+    });
+    expect(previous).not.toHaveProperty('is_error');
+    return { content: [{ type: 'text' as const, text: 'Completed the corrected test.' }], stopReason: 'end_turn', usage };
+  });
+  const result = await runEmbeddedQuery({
+    system: 'Synthetic workspace play check', model: 'synthetic', contextWindow: 128_000, maxOutputTokens: 2000,
+    maxTotalOutputTokens: 4000, maxModelTurns: 3, signal: new AbortController().signal,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Test the original session' }] }], tools: workspace.tools,
+  }, {
+    callModel,
+    runTool: async (call, signal) => {
+      const value = await workspace.call(args(call.id, call.name, call.input), signal);
+      return { content: value.content, isError: value.is_error };
+    },
+  });
+  expect(result.reason).toBe('completed');
+  expect(result.usage.modelCalls).toBe(3);
+  expect(browser.execute).toHaveBeenCalledTimes(2);
+  expect(browser.execute.mock.calls[1][0]).toMatchObject({
+    name: 'play-act', arguments: { inputHash: written.sha256, sessionId: 'owned-session', round: { actions: [validDrag] } },
+  });
+  await workspace.close();
+});
+
+it.each([409, 410, 502])('terminates on a DO read failure or browser status %s without exposing error details', async status => {
   const image = await imageFile();
   const browser = {
     execute: vi.fn(async (value: unknown) => {
@@ -263,8 +366,8 @@ it('terminates on a DO read failure or a lost owned browser session without expo
   const { workspace, options } = await fixture({ browser });
   await workspace.call(args('write', 'write', { path: 'game.html', content: game, expectedSha256: null }));
   await workspace.call(args('open', 'play-start'));
-  browser.execute.mockRejectedValueOnce(Object.assign(new Error('private disconnected browser response'), { status: 410 }));
-  await expect(workspace.call(args('lost', 'play-act', { sessionId: 'owned-session', round: { actions: [] } })))
+  browser.execute.mockRejectedValueOnce(Object.assign(new Error('private browser response'), { status }));
+  await expect(workspace.call(args('lost', 'play-act', { sessionId: 'owned-session', round: { hypothesis: 'Button responds.', actions: [{ type: 'tap', x: 80, y: 100 }] } })))
     .rejects.toThrow(/^Workspace tool could not complete safely\.$/);
   vi.spyOn(options.storage, 'transaction').mockRejectedValueOnce(new Error('private DO error'));
   await expect(workspace.call(args('broken-storage', 'list'))).rejects.toThrow(/^Workspace tool could not complete safely\.$/);
