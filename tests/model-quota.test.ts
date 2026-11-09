@@ -51,3 +51,35 @@ describe('管理员 Opus Key 余额',()=>{
     fetcher.mockImplementation(async()=>Response.json({currency:'CNY',available:0}));await expect(modelQuota(s.store,s.secrets.SETTINGS_KEY,'opus')).rejects.toThrow('缺少预算');
   });
 });
+
+describe('RightCode 账户余额',()=>{
+  it('通过固定接口查询已保存的 Key，只回传美元余额',async()=>{
+    const s=await setup('https://www.rightapi.ai/claude-aws');
+    const fetcher=vi.fn(async(_url:string,init:RequestInit)=>{
+      expect(new Headers(init.headers).get('Authorization')).toBe('Bearer private-fixture-key');
+      expect(init.redirect).toBe('manual');
+      return Response.json({balance:379.98,subscriptions:[{name:'PRIVATE'}],apiKey:'private-fixture-key'});
+    });
+    vi.stubGlobal('fetch',fetcher);
+    const response=await s.call();
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({profile:'opus',currency:'USD',balance:379.98,queriedAt:expect.any(String)});
+    expect(fetcher.mock.calls[0][0]).toBe('https://api.site/account/summary');
+  });
+
+  it.each(['https://www.rightapi.ai.attacker.test/claude-aws','https://api.site:8443/claude-aws'])('不向未登记的地址 %s 发送 Key',async baseUrl=>{
+    const s=await setup(baseUrl),fetcher=vi.fn();
+    vi.stubGlobal('fetch',fetcher);
+    await expect(modelQuota(s.store,s.secrets.SETTINGS_KEY,'opus')).rejects.toThrow('仅支持');
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('保留真实零余额并拒绝缺失余额的响应',async()=>{
+    const s=await setup('https://api.site');
+    const fetcher=vi.fn(async()=>Response.json({balance:0}));
+    vi.stubGlobal('fetch',fetcher);
+    await expect(modelQuota(s.store,s.secrets.SETTINGS_KEY,'opus')).resolves.toMatchObject({currency:'USD',balance:0});
+    fetcher.mockImplementation(async()=>Response.json({balance:null}));
+    await expect(modelQuota(s.store,s.secrets.SETTINGS_KEY,'opus')).rejects.toThrow('未返回有效的账户余额');
+  });
+});

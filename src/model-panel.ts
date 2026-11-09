@@ -1,4 +1,5 @@
 import { modelCapabilities, type InferenceOptions } from './model-options';
+import { quotaProvider, type ModelQuota } from './model-quota';
 type Profile = InferenceOptions & { name?: string; baseUrl: string; model: string; protocol: 'openai' | 'anthropic'; enabled: boolean; vision?: boolean; hasKey: boolean;keySuffix?:string; updatedAt: string };
 export type ModelView = { activeProfile: string; profiles: Record<string, Profile>; routes: Record<string, string>; effective: Record<string, string> };
 const escape = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
@@ -8,9 +9,10 @@ const steps = [
 ] as const;
 export function mountModelPanel(root: HTMLElement, initial: ModelView, api: (path: string, method?: string, body?: unknown) => Promise<any>, onSaved: (value: any) => void) {
   let config = initial, selected = initial.activeProfile, draft: Profile | undefined, busy = false, editorOpen=false;
-  const quotas=new Map<string,{value?:any;error?:string;loading?:boolean}>();
-  const riffle=(p:Profile)=>p.hasKey&&/^https:\/\/riffle-api\.pages\.dev(?:\/|$)/i.test(p.baseUrl)&&/^claude-opus-5-5$/i.test(p.model);
+  const quotas=new Map<string,{value?:ModelQuota;error?:string;loading?:boolean}>();
+  const savedQuotaProvider=(p:Profile)=>p.hasKey?quotaProvider(p):undefined;
   const money=(v:unknown)=>v===null?'未设上限':typeof v==='number'?'¥'+v.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}):'未提供';
+  const dollars=(v:number)=>v.toLocaleString('zh-CN',{style:'currency',currency:'USD'});
   const name = (id: string) => config.profiles[id]?.name || config.profiles[id]?.model || id;
   const update = (value: ModelView) => { config = value; onSaved(value); };
   const input = (id: string) => root.querySelector<HTMLInputElement>('#' + id)!;
@@ -24,20 +26,22 @@ export function mountModelPanel(root: HTMLElement, initial: ModelView, api: (pat
   }
   function paintSwitchRows(){
     for(const row of root.querySelectorAll<HTMLElement>('[data-model-row]')){
-      const id=row.dataset.modelRow!,p=config.profiles[id],q=quotas.get(id);
+      const id=row.dataset.modelRow!,p=config.profiles[id],q=quotas.get(id),provider=savedQuotaProvider(p);
       const create=(config.effective.create||config.activeProfile)===id,review=(config.effective.review||config.activeProfile)===id;
       row.classList.toggle('in-use',create||review);
-      row.querySelector('.provider-usage')!.textContent=[create?'创作首选':'',review?'审核使用中':'',riffle(p)&&p.enabled?'制作池':''].filter(Boolean).join(' · ');
+      row.querySelector('.provider-usage')!.textContent=[create?'创作首选':'',review?'审核使用中':'',provider==='riffle'&&p.enabled?'制作池':''].filter(Boolean).join(' · ');
       for(const button of row.querySelectorAll<HTMLButtonElement>('[data-use]')){const active=button.dataset.use==='create'?create:review;button.disabled=busy||!p.enabled||!p.hasKey||active;button.textContent=active?(button.dataset.use==='create'?'创作首选':'审核使用中'):(button.dataset.use==='create'?'用于创作':'用于审核');}
       const el=row.querySelector<HTMLElement>('.provider-balance')!;
       el.classList.toggle('quota-error',!!q?.error);
-      el.textContent=!riffle(p)?(p.hasKey?'余额暂不支持':'尚未配置 Key'):q?.value?`可用 ${money(q.value.available)} · 总剩余 ${money(q.value.total.remaining)}${q.error?' · 刷新失败':q.loading?' · 刷新中':''}`:q?.loading?'正在查询余额…':q?.error||'余额待查询';
-      el.title=q?.value?`查询时间：${new Date(q.value.queriedAt).toLocaleString('zh-CN')}；当前可用已扣除在途预占。${q.error||''}`:q?.error||'';
+      const value=q?.value;
+      const balance=value?.currency==='USD'?`账户余额 ${dollars(value.balance)}`:value?`可用 ${money(value.available)} · 总剩余 ${money(value.total.remaining)}`:'';
+      el.textContent=!provider?(p.hasKey?'余额暂不支持':'尚未配置 Key'):value?`${balance}${q.error?' · 刷新失败':q.loading?' · 刷新中':''}`:q?.loading?'正在查询余额…':q?.error||'余额待查询';
+      el.title=value?`查询时间：${new Date(value.queriedAt).toLocaleString('zh-CN')}${value.currency==='CNY'?'；当前可用已扣除在途预占。':''}${q?.error||''}`:q?.error||'';
     }
   }
   async function refreshQuotas(force=false){
     for(const[id,p]of Object.entries(config.profiles)){
-      if(!riffle(p))continue;
+      if(!savedQuotaProvider(p))continue;
       const last=quotas.get(id);if(last?.loading||(!force&&last))continue;
       quotas.set(id,{...last,loading:true});paintSwitchRows();
       try{const value=await api('quota?profile='+encodeURIComponent(id));quotas.set(id,{value});}
@@ -47,6 +51,7 @@ export function mountModelPanel(root: HTMLElement, initial: ModelView, api: (pat
   }
   function render() {
     const p = draft || config.profiles[selected];
+    const provider = savedQuotaProvider(p);
     root.innerHTML = '<section class="model-library settings-card"><div class="settings-heading"><div><span class="eyebrow">MODEL LIBRARY</span><h2>模型与 Key</h2><p class="model-intro">添加、编辑模型配置，保存后即可在上方选择。</p></div><span class="config-status connected">' + Object.values(config.profiles).filter(p => p.hasKey).length + ' 个已配置</span></div>' +
       '<div class="model-editor-layout"><aside class="model-directory"><div class="model-directory-title"><b>模型配置</b><button class="text-button" id="add-model" type="button">＋ 添加</button></div><div class="model-profile-list">' +
       Object.entries(config.profiles).map(([id, v]) => '<button type="button" class="model-profile-item ' + (selected === id ? 'selected' : '') + '" data-profile="' + escape(id) + '"><span class="model-profile-symbol">' + (v.protocol === 'anthropic' ? 'A' : 'O') + '</span><span><b>' + escape(name(id)) + '</b><small>' + escape(v.model) + '</small><em>' + (v.hasKey ? v.enabled ? 'Key 已保存' : '已停用' : '待配置') + '</em></span></button>').join('') +
@@ -58,7 +63,7 @@ export function mountModelPanel(root: HTMLElement, initial: ModelView, api: (pat
       '<div class="model-field-pair"><div class="field"><label for="model-effort">思考强度</label><select id="model-effort"></select></div><div class="field"><label for="model-output-limit">单次输出上限（Token）</label><input id="model-output-limit" type="number" min="0" step="1" value="' + (p.maxOutputTokens || 0) + '"/><p>0 为自动，按任务分配额度。</p></div></div><p class="model-routing-note" id="inference-help"></p>' +
       '<div class="field"><label for="api-key">API Key <span>' + (p.hasKey ? '留空保留当前 Key' : '新配置必填') + '</span></label><div class="key-field"><input id="api-key" type="password" autocomplete="new-password" maxlength="2000" ' + (p.hasKey ? '' : 'required') + ' placeholder="' + (p.hasKey ? '已保存，不会回显' : '粘贴该配置使用的 Key') + '"/><button class="icon-button" id="toggle-key" type="button" aria-label="显示或隐藏 Key">显示</button></div></div>' +
       '<div class="model-capabilities"><label class="enable-toggle"><input id="model-enabled" type="checkbox" ' + (p.enabled ? 'checked' : '') + '/><span><b>启用</b><small>允许新任务使用此配置</small></span></label><label class="enable-toggle"><input id="model-vision" type="checkbox" ' + (p.vision !== false ? 'checked' : '') + '/><span><b>支持图片</b><small>审核时接收真实游戏截图</small></span></label></div>' +
-      (p.hasKey && /^https:\/\/riffle-api\.pages\.dev(?:\/|$)/i.test(p.baseUrl) && /^claude-opus-5-5$/i.test(p.model) ? '<section class="model-quota"><div class="model-quota-heading"><b>Opus Key 预算</b><button type="button" class="subtle-button" id="refresh-quota">查询余额</button></div><div id="quota-result" role="status" aria-live="polite">查询已保存 Key 的人民币预算与在途预占。</div></section>' : '') +
+      (provider ? '<section class="model-quota"><div class="model-quota-heading"><b>'+(provider==='rightcode'?'RightCode 账户余额':'Opus Key 预算')+'</b><button type="button" class="subtle-button" id="refresh-quota">查询余额</button></div><div id="quota-result" role="status" aria-live="polite">'+(provider==='rightcode'?'查询已保存 Key 对应的美元余额。':'查询已保存 Key 的人民币预算与在途预占。')+'</div></section>' : '') +
       '<div class="form-actions"><button type="button" class="subtle-button" id="test-model">测试连接与图片</button><div class="model-action-group">' + (p.hasKey ? '<button type="button" class="text-button model-delete" id="delete-model">删除配置</button>' : '') + '<button type="submit" class="primary-button" id="save-model">保存模型</button></div></div><p id="config-message" class="form-message" role="status" aria-live="polite"></p></form></div></section>' +
       '<section class="settings-card model-routing"><div class="settings-heading"><div><span class="eyebrow">MODEL SELECTION</span><h2>AI 审核和其他功能，分开选择。</h2><p class="model-intro">各选一个模型，保存后用于新的任务。</p></div></div><div class="model-route-list">' +
       steps.map(([id,title,desc], i) => '<label class="model-route-row"><span class="model-route-index">' + String(i+1).padStart(2,'0') + '</span><span class="model-route-copy"><b>' + title + '</b><small>' + desc + '</small></span><select data-route="' + id + '" aria-label="' + title + '模型">' + options(config.effective[id] || config.activeProfile) + '</select><span class="model-route-effective">当前：' + escape(name(config.effective[id] || config.activeProfile)) + '</span></label>').join('') +
@@ -103,9 +108,12 @@ export function mountModelPanel(root: HTMLElement, initial: ModelView, api: (pat
     };
     root.querySelector<HTMLButtonElement>('#toggle-key')!.onclick = () => { input('api-key').type = input('api-key').type === 'password' ? 'text' : 'password'; };
     root.querySelector<HTMLButtonElement>('#refresh-quota')?.addEventListener('click',()=>void action(async()=>{
-      const q=await api('quota?profile='+encodeURIComponent(selected));
-      const money=(v:unknown)=>v===null?'未设上限':typeof v==='number'?'¥'+v.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}):'未提供';
-      const time=(v:string)=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'未提供';
+      const q:ModelQuota=await api('quota?profile='+encodeURIComponent(selected));
+      const time=(v?:string)=>v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'未提供';
+      if(q.currency==='USD'){
+        root.querySelector('#quota-result')!.textContent=`账户余额 ${dollars(q.balance)} · 查询时间 ${time(q.queriedAt)}`;
+        return;
+      }
       root.querySelector('#quota-result')!.innerHTML='<div class="quota-values"><div><small>当前可用</small><strong>'+money(q.available)+'</strong></div><div><small>今日剩余 / 上限</small><b>'+money(q.daily.remaining)+' / '+money(q.daily.limit)+'</b></div><div><small>总剩余 / 上限</small><b>'+money(q.total.remaining)+' / '+money(q.total.limit)+'</b></div></div><p>今日已用 '+money(q.daily.used)+' · 累计已用 '+money(q.total.used)+' · 在途预占 '+money(q.reservations.amount)+'（'+escape(q.reservations.requests??'—')+' 笔）</p><p>请求限制 '+escape(q.requestsPerMinute??'未提供')+' 次/分钟 · 每日重置 '+escape(time(q.daily.resetAt))+'</p><small>查询时间 '+escape(time(q.queriedAt))+' · 当前可用已扣除在途预占，未结算用量可能使余额变化。'+(q.pendingReviewRequests?' 待核算请求 '+escape(q.pendingReviewRequests)+' 笔。':'')+'</small>';
     },'#quota-result'));
     root.querySelector<HTMLFormElement>('#model-form')!.onsubmit = e => { e.preventDefault(); const body = fields(); void action(async () => { update(await api('config','PUT',body)); quotas.delete(selected); draft = undefined; render(); message('模型已保存，可以在上方选择用途。',true); }); };

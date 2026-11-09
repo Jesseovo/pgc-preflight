@@ -1,23 +1,26 @@
 import { useState, type FormEvent } from 'react';
 import type { ModelView } from '../../../model-panel';
 import { modelCapabilities, type ThinkingEffort } from '../../../model-options';
+import { quotaProvider, type ModelQuota } from '../../../model-quota';
 import { Badge, Button, Card, ConfirmAction, Dialog, EmptyState, Field, Input, Select, Stat } from '../../components/ui';
 import { api, useAction, useResource } from '../../lib/api';
 import { adminPath, Cell, DataState, Facts, post, ResponsiveTable, segment, StatusText, time, useAdminRoute } from './shared';
 
 type Profile = ModelView['profiles'][string];
 type Role = 'review' | 'create';
-type QuotaPeriod = { remaining?: number | null; limit?: number | null; used?: number | null; resetAt?: string };
-type Quota = { available?: number | null; daily: QuotaPeriod; total: QuotaPeriod; reservations: { amount?: number; requests?: number }; queriedAt: string; requestsPerMinute?: number; pendingReviewRequests?: number };
-type QuotaRead = { value?: Quota; error?: string };
+type QuotaRead = { value?: ModelQuota; error?: string };
 type ModelRun = { model: string; purpose: string; status: string; effort?: string; max_tokens?: number; input_tokens?: number | null; output_tokens?: number | null; first_text_ms?: number | null; elapsed_ms?: number; finish_reason?: string; error?: string; created_at: string };
 const effortLabels: Record<ThinkingEffort, string> = { auto: '自动', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' };
 const purposes: Record<string, string> = { review: '审核初评', review_verify: '评分复核', expand: '选题扩写', brief: '制作简报', preview: '样板图', assets: '美术资产', game: '游戏制作', tags: '打标', vocab: '补充词库' };
-const riffle = (profile: Profile) => profile.hasKey && /^https:\/\/riffle-api\.pages\.dev(?:\/|$)/i.test(profile.baseUrl) && /^claude-opus-5-5$/i.test(profile.model);
-const money = (amount: number | null | undefined) => amount === null ? '未设上限' : typeof amount === 'number' ? amount.toLocaleString('zh-CN', { style: 'currency', currency: 'CNY' }) : '未提供';
+const savedQuotaProvider = (profile: Profile) => profile.hasKey ? quotaProvider(profile) : undefined;
+const money = (amount: number | null | undefined, currency: ModelQuota['currency'] = 'CNY') => amount === null ? '未设上限' : typeof amount === 'number' ? amount.toLocaleString('zh-CN', { style: 'currency', currency }) : '未提供';
 const seconds = (ms?: number | null) => ms == null ? '未提供' : (ms / 1000).toFixed(1) + ' 秒';
 
-function QuotaDetails({ value }: { value: Quota }) {
+function QuotaDetails({ value }: { value: ModelQuota }) {
+  if (value.currency === 'USD') return <div className="stack">
+    <Stat label="账户余额" value={money(value.balance, value.currency)} />
+    <Facts items={[[ '查询时间', time(value.queriedAt) ]]} />
+  </div>;
   return <div className="stack">
     <div className="stats-grid"><Stat label="当前可用" value={money(value.available)} /><Stat label="今日剩余 / 上限" value={money(value.daily.remaining) + ' / ' + money(value.daily.limit)} /><Stat label="总剩余 / 上限" value={money(value.total.remaining) + ' / ' + money(value.total.limit)} /></div>
     <Facts items={[[ '今日已用', money(value.daily.used) ], [ '累计已用', money(value.total.used) ], [ '在途预占', money(value.reservations.amount) + ' · ' + (value.reservations.requests ?? '未知') + ' 笔' ], [ '请求限制', value.requestsPerMinute == null ? '未提供' : value.requestsPerMinute + ' 次 / 分钟' ], [ '每日重置', time(value.daily.resetAt) ], [ '待核算请求', value.pendingReviewRequests ], [ '查询时间', time(value.queriedAt) ]]} />
@@ -32,6 +35,7 @@ function ModelEditor({ id, profile, existing, active, onClose, onSaved, quota, o
   const [showKey, setShowKey] = useState(false);
   const [testNote, setTestNote] = useState('');
   const cap = modelCapabilities(fields);
+  const provider = savedQuotaProvider(profile);
   const effort = cap.efforts.some(value => value === fields.effort) ? fields.effort : 'auto';
   const change = <K extends keyof typeof fields,>(key: K, value: typeof fields[K]) => setFields(current => ({ ...current, [key]: value }));
   const payload = (form: HTMLFormElement) => ({ profile: id, ...fields, effort, apiKey: String(new FormData(form).get('apiKey') || '') });
@@ -85,14 +89,24 @@ function ModelEditor({ id, profile, existing, active, onClose, onSaved, quota, o
       {active && <p className="small muted">当前用途仍在使用此配置。切换用途后可删除。</p>}
       {testNote && <p role="status">{testNote}</p>}
     </fieldset><StatusText {...action} label="正在处理模型配置…" /></form>
-    {riffle(profile) && <section className="stack"><div className="spread"><h3>Opus Key 预算</h3><Button variant="outline" size="sm" disabled={action.busy} onClick={() => void action.run(async () => {
-      try { onQuota({ value: await api<Quota>(adminPath('quota?profile=' + segment(id))) }); }
+    {provider && <section className="stack"><div className="spread"><h3>{provider === 'rightcode' ? 'RightCode 账户余额' : 'Opus Key 预算'}</h3><Button variant="outline" size="sm" disabled={action.busy} onClick={() => void action.run(async () => {
+      try { onQuota({ value: await api<ModelQuota>(adminPath('quota?profile=' + segment(id))) }); }
       catch (error) { onQuota({ value: quota?.value, error: error instanceof Error ? error.message : '余额查询失败。' }); }
     })}>查询已保存 Key</Button></div>
       {quota?.error && <p className="danger-text" role="alert">{quota.error}</p>}
-      {quota?.value ? <QuotaDetails value={quota.value} /> : <p className="small muted">查询人民币预算、在途预占及请求限制。</p>}
+      {quota?.value ? <QuotaDetails value={quota.value} /> : <p className="small muted">{provider === 'rightcode' ? '查询已保存 Key 对应的美元余额。' : '查询人民币预算、在途预占及请求限制。'}</p>}
     </section>}
   </Dialog>;
+}
+
+function QuotaCell({ profile, quota }: { profile: Profile; quota?: QuotaRead }) {
+  const value = quota?.value;
+  return <Cell label="余额">
+    {value?.currency === 'USD' ? <span>账户余额 {money(value.balance, value.currency)}</span> : value ? <>
+      <span>可用 {money(value.available)}</span><small className="muted">总剩余 {money(value.total.remaining)}</small>
+    </> : <span className="muted small">{savedQuotaProvider(profile) ? '余额待查询' : '余额暂不支持'}</span>}
+    {quota?.error && <small className="danger-text">{quota.error}</small>}
+  </Cell>;
 }
 
 function RecentRuns() {
@@ -130,9 +144,9 @@ function ModelLibrary({ config, onSaved }: { config: ModelView; onSaved: (value:
   function refreshBalances() {
     void balances.run(async () => {
       for (const [id, profile] of entries) {
-        if (!riffle(profile)) continue;
+        if (!savedQuotaProvider(profile)) continue;
         try {
-          const value = await api<Quota>(adminPath('quota?profile=' + segment(id)));
+          const value = await api<ModelQuota>(adminPath('quota?profile=' + segment(id)));
           setQuotas(current => ({ ...current, [id]: { value } }));
         } catch (error) {
           setQuotas(current => ({ ...current, [id]: { value: current[id]?.value, error: error instanceof Error ? error.message : '余额查询失败。' } }));
@@ -142,7 +156,7 @@ function ModelLibrary({ config, onSaved }: { config: ModelView; onSaved: (value:
   }
   return <div className="stack">
     <Card className="stack"><div className="spread"><div><h2>模型配置</h2><p className="small muted">每份配置独立保存一个 Key。平台游戏制作使用可用的 Claude Opus 5.5。</p></div><div className="row">
-      <Button variant="outline" size="sm" disabled={balances.busy || !entries.some(([, profile]) => riffle(profile))} onClick={refreshBalances}>刷新余额</Button>
+      <Button variant="outline" size="sm" disabled={balances.busy || !entries.some(([, profile]) => savedQuotaProvider(profile))} onClick={refreshBalances}>刷新余额</Button>
       <Button size="sm" disabled={count >= 24} onClick={() => {
         const active = config.profiles[config.activeProfile];
         setEditor({ id: 'model-' + crypto.randomUUID(), profile: { name: '', baseUrl: active?.baseUrl || '', model: active?.model || '', protocol: active?.protocol || 'openai', enabled: true, vision: active?.vision, hasKey: false, updatedAt: '' } });
@@ -152,8 +166,8 @@ function ModelLibrary({ config, onSaved }: { config: ModelView; onSaved: (value:
     {entries.length ? <ResponsiveTable className="admin-model-table"><thead role="rowgroup"><tr role="row"><th>配置 / 接口</th><th>状态</th><th>余额</th><th>用途</th><th>操作</th></tr></thead><tbody role="rowgroup">{entries.map(([id, profile]) => <tr role="row" key={id}>
       <Cell wide><b>{name(id)}</b><small className="muted">{profile.model} · {profile.protocol}</small><small className="muted">{profile.baseUrl || '地址未填写'}</small></Cell>
       <Cell label="状态"><Badge tone={eligible(id) ? 'sage' : 'neutral'}>{!profile.hasKey ? '待配置 Key' : profile.enabled ? '启用' : '停用'}</Badge>{profile.vision !== false && <small className="muted">支持图片</small>}</Cell>
-      <Cell label="余额">{quotas[id]?.value ? <><span>可用 {money(quotas[id].value?.available)}</span><small className="muted">总剩余 {money(quotas[id].value?.total.remaining)}</small></> : <span className="muted small">{riffle(profile) ? '余额待查询' : '余额暂不支持'}</span>}{quotas[id]?.error && <small className="danger-text">{quotas[id].error}</small>}</Cell>
-      <Cell label="用途" wide><div className="row">{effective.create === id && <Badge tone="sage">创作首选</Badge>}{effective.review === id && <Badge tone="blue">审核使用中</Badge>}{riffle(profile) && profile.enabled && <Badge>制作池</Badge>}</div></Cell>
+      <QuotaCell profile={profile} quota={quotas[id]} />
+      <Cell label="用途" wide><div className="row">{effective.create === id && <Badge tone="sage">创作首选</Badge>}{effective.review === id && <Badge tone="blue">审核使用中</Badge>}{savedQuotaProvider(profile) === 'riffle' && profile.enabled && <Badge>制作池</Badge>}</div></Cell>
       <Cell wide><div className="row"><Button size="sm" variant="ghost" onClick={() => setEditor({ id, profile })}>编辑</Button>
         <Button size="sm" variant="outline" disabled={action.busy || !eligible(id) || effective.create === id || !eligible(effective.review)} onClick={() => saveRoutes({ ...effective, create: id })}>用于创作</Button>
         <Button size="sm" variant="outline" disabled={action.busy || !eligible(id) || effective.review === id || !eligible(effective.create)} onClick={() => saveRoutes({ ...effective, review: id })}>用于审核</Button></div></Cell>
