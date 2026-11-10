@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>微缩温室素材</title>
+<canvas width="160" height="160"></canvas>
+<script id="game-assets">
+const GAME_ASSETS = {
+  sprout(ctx, x, y, size) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(size / 100, size / 100);
+    ctx.fillStyle = '#96e0aa';
+    ctx.fill(new Path2D('M0 22c-32 0-46-20-46-49 30 0 46 18 46 36 0-22 15-40 45-40C45-2 28 22 0 22z'), 'evenodd');
+    ctx.fillStyle = '#ffc57d';
+    ctx.fill(new Path2D('M-6 5h12v41h-12z'));
+    ctx.restore();
+  }
+};
+</script>
+<script>
+GAME_ASSETS.sprout(document.querySelector('canvas').getContext('2d'), 80, 80, 140);
+</script>
+</html>

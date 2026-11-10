@@ -1,0 +1,212 @@
+[
+  {
+    "id": "tap-rhythm",
+    "checklist": [
+      {
+        "id": "core-rules",
+        "metric": "core",
+        "criterion": "用早按和对时按各一轮，核对命中数及成功门槛。"
+      },
+      {
+        "id": "core-lifecycle",
+        "metric": "core",
+        "criterion": "实际开始、可操作、胜负有结果且均可重开，重新进入初始状态。"
+      },
+      {
+        "id": "core-materials",
+        "metric": "core",
+        "criterion": "核对 540×960 舞台、样板图的配色和面板层次、内联素材库与实际调用 GAME_ASSETS.pulse，记录源码和画面证据。"
+      },
+      {
+        "id": "control",
+        "metric": "control",
+        "criterion": "试玩页先解释节拍窗口，并允许按按钮开始；节拍环逼近中心供无声试玩。"
+      },
+      {
+        "id": "feedback",
+        "metric": "feedback",
+        "criterion": "命中及漏拍显示不同文本和形状，分数与当前拍号分开显示。"
+      },
+      {
+        "id": "layout",
+        "metric": "layout",
+        "criterion": "底部校准按钮和上方节拍环同时完整可见。"
+      }
+    ]
+  },
+  {
+    "id": "continuous-drag",
+    "checklist": [
+      {
+        "id": "core-rules",
+        "metric": "core",
+        "criterion": "按住并经左、右、中三门，再用中途松手的路径对照。"
+      },
+      {
+        "id": "core-lifecycle",
+        "metric": "core",
+        "criterion": "实际开始、可操作、胜负有结果且均可重开，重新进入初始状态。"
+      },
+      {
+        "id": "core-materials",
+        "metric": "core",
+        "criterion": "核对 540×960 舞台、样板图的配色和面板层次、内联素材库与实际调用 GAME_ASSETS.sled，记录源码和画面证据。"
+      },
+      {
+        "id": "control",
+        "metric": "control",
+        "criterion": "把手有可见的可拖动提示；任一尺寸下横向触点与把手同步。"
+      },
+      {
+        "id": "feedback",
+        "metric": "feedback",
+        "criterion": "门通过、撞门、提前松手显示独立反馈和当前门数。"
+      },
+      {
+        "id": "layout",
+        "metric": "layout",
+        "criterion": "中途手指覆盖把手时仍能看见下一道门和门数。"
+      }
+    ]
+  },
+  {
+    "id": "strategy-tradeoffs",
+    "checklist": [
+      {
+        "id": "core-rules",
+        "metric": "core",
+        "criterion": "比较成功路径和连续发报；确认耗电、温降、两项目标均约束。"
+      },
+      {
+        "id": "core-lifecycle",
+        "metric": "core",
+        "criterion": "实际开始、可操作、胜负有结果且均可重开，重新进入初始状态。"
+      },
+      {
+        "id": "core-materials",
+        "metric": "core",
+        "criterion": "核对 540×960 舞台、样板图的配色和面板层次、内联素材库与实际调用 GAME_ASSETS.cell，记录源码和画面证据。"
+      },
+      {
+        "id": "control",
+        "metric": "control",
+        "criterion": "每次选择前能看到该动作花费、效果及不可用理由。"
+      },
+      {
+        "id": "feedback",
+        "metric": "feedback",
+        "criterion": "回合结束显示状态变化和结果解释，当前值与变化量可区分。"
+      },
+      {
+        "id": "layout",
+        "metric": "layout",
+        "criterion": "三项状态与三项动作无需滚动即可同时访问。"
+      }
+    ]
+  },
+  {
+    "id": "collision-feedback",
+    "checklist": [
+      {
+        "id": "core-rules",
+        "metric": "core",
+        "criterion": "实际撞一次、从邻道绕过、拾取一次，核对盾量和包裹数。"
+      },
+      {
+        "id": "core-lifecycle",
+        "metric": "core",
+        "criterion": "实际开始、可操作、胜负有结果且均可重开，重新进入初始状态。"
+      },
+      {
+        "id": "core-materials",
+        "metric": "core",
+        "criterion": "核对 540×960 舞台、样板图的配色和面板层次、内联素材库与实际调用 GAME_ASSETS.crate，记录源码和画面证据。"
+      },
+      {
+        "id": "control",
+        "metric": "control",
+        "criterion": "开局明确左右变轨方式，玩家所在车道易辨认。"
+      },
+      {
+        "id": "feedback",
+        "metric": "feedback",
+        "criterion": "红碰撞和蓝拾取有不同文字、轮廓变化和计数反馈。"
+      },
+      {
+        "id": "layout",
+        "metric": "layout",
+        "criterion": "接收线和两侧按钮在最窄尺寸保持分离。"
+      }
+    ]
+  },
+  {
+    "id": "difficulty-restart",
+    "checklist": [
+      {
+        "id": "core-rules",
+        "metric": "core",
+        "criterion": "故意在后层误选，重开后验证第一层，然后完成三层并再次重开。"
+      },
+      {
+        "id": "core-lifecycle",
+        "metric": "core",
+        "criterion": "实际开始、可操作、胜负有结果且均可重开，重新进入初始状态。"
+      },
+      {
+        "id": "core-materials",
+        "metric": "core",
+        "criterion": "核对 540×960 舞台、样板图的配色和面板层次、内联素材库与实际调用 GAME_ASSETS.bridge，记录源码和画面证据。"
+      },
+      {
+        "id": "control",
+        "metric": "control",
+        "criterion": "显示层数和清晰的等待、选择状态；不可提前蒙点。"
+      },
+      {
+        "id": "feedback",
+        "metric": "feedback",
+        "criterion": "过层反馈、失败原因和重开按钮分明，连点重开不会多开计时。"
+      },
+      {
+        "id": "layout",
+        "metric": "layout",
+        "criterion": "四块踏板和重开区在最窄尺寸有可辨认分隔。"
+      }
+    ]
+  },
+  {
+    "id": "dense-mobile",
+    "checklist": [
+      {
+        "id": "core-rules",
+        "metric": "core",
+        "criterion": "完成成功路径并通过反复调同一区消耗次数后验证失败。"
+      },
+      {
+        "id": "core-lifecycle",
+        "metric": "core",
+        "criterion": "实际开始、可操作、胜负有结果且均可重开，重新进入初始状态。"
+      },
+      {
+        "id": "core-materials",
+        "metric": "core",
+        "criterion": "核对 540×960 舞台、样板图的配色和面板层次、内联素材库与实际调用 GAME_ASSETS.sprout，记录源码和画面证据。"
+      },
+      {
+        "id": "control",
+        "metric": "control",
+        "criterion": "区名和按钮标签可区分，并清楚显示禁用和余量。"
+      },
+      {
+        "id": "feedback",
+        "metric": "feedback",
+        "criterion": "相邻区域变化不会被误认为当前区，目标带及水罐余量有文字提示。"
+      },
+      {
+        "id": "layout",
+        "metric": "layout",
+        "criterion": "320×568 视口无横向溢出，四行控制和底部说明可读可达。"
+      }
+    ]
+  }
+]

@@ -1,3 +1,5 @@
+import type { PublicHarnessTask } from '../harness-status';
+
 // Administrator DTOs contain presentation metadata. Artifact source is fetched
 // only through the selected material endpoint, never through lists or totals.
 export type AdminRange='today'|'7d'|'30d'|'all';
@@ -20,7 +22,7 @@ export interface AdminTask {
   id:string;type:'creation'|'review';kind:string;kindLabel:string;ownerId:string;ownerName:string;
   projectId:number|null;projectType:'topic'|'game'|null;title:string;executor:'platform'|'agent';
   status:string;statusLabel:string;detail:string;error:string;createdAt:string;updatedAt:string;startedAt:string|null;
-  resultId?:number|null;canRetry:boolean;retryReason:string;retryOf?:string|null;requestedBy?:string|null;
+  harness?:PublicHarnessTask;resultId?:number|null;canRetry:boolean;retryReason:string;retryOf?:string|null;requestedBy?:string|null;
 }
 export interface AdminTaskDetail {task:AdminTask;retryTaskId:string|null;sourceAvailable:boolean;continuePrompt:string|null}
 export interface AdminPage<T> {items:T[];total:number;page:number;pageSize:number;members:AdminMemberOption[];updatedAt:string;activeCount:number;waitingAgentCount:number}

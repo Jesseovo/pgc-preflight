@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="960" viewBox="0 0 540 960" aria-label="极地滑索样板图">
+  <rect width="540" height="960" fill="#102a43"/>
+  <rect x="26" y="28" width="488" height="106" rx="20" fill="none" stroke="#87e8f4" stroke-width="3"/>
+  <text x="48" y="86" fill="#87e8f4" font-size="30">极地滑索</text>
+  <rect x="26" y="158" width="488" height="530" rx="26" fill="none" stroke="#87e8f4" stroke-width="3"/>
+  <g transform="translate(270 402) scale(2)">
+    <path d="M-42 -2h84v25l-17 12h-50l-17 -12zm8 -26h68v14h-68z" fill="#87e8f4" fill-rule="evenodd"/>
+    <path d="M-22 8h44v10h-44z" fill="#ff927d"/>
+  </g>
+  <rect x="26" y="725" width="488" height="126" rx="22" fill="#ff927d"/>
+  <text x="270" y="802" fill="#102a43" font-size="27" text-anchor="middle">拖动滑索柄</text>
+  <path d="M48 903h444" stroke="#87e8f4" stroke-width="3"/>
+</svg>

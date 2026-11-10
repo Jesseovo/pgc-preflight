@@ -3,6 +3,8 @@ import type { ModelConfig, ModelPurpose } from './settings';
 import { modelTransport, ModelOutputError } from './model';
 import type { ModelThrottleDatabase } from './model-throttle';
 import { inferenceOptions } from '../src/model-options';
+import {harnessCompletion,type HarnessExecution} from './harness-execution';
+import type {HarnessBinding} from './harness-policy';
 
 export class LLMError extends Error {
   status: number;
@@ -51,7 +53,7 @@ async function keyedRequestId(base: string | undefined, messages: unknown) {
   return `${base}-${suffix}`;
 }
 
-export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; generation?: {id:string;deadline:number;capacityReserved?:boolean;onUncertain?():void;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; strictJson?: boolean; parse?: (text:string)=>any; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low' | 'high'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
+export async function complete(env: { modelStore: { get(): Promise<any> }; SETTINGS_KEY: string; DB?: ModelThrottleDatabase; HARNESS_RUNNER?:HarnessBinding;harnessExecution?:HarnessExecution;generation?: {id:string;deadline:number;capacityReserved?:boolean;onUncertain?():void;onStart():Promise<void>;onWait(message:string):Promise<void>} }, _cfg: Record<string, string>, req: { system: string; user: unknown; schema?: unknown; strictJson?: boolean; parse?: (text:string)=>any; normalize?: (value:any)=>any; validate?: (value: any) => string[]; maxTokens?: number; timeoutMs?: number; deadline?: number; idempotencyKey?: string; onWait?: (message: string) => Promise<void>; onStart?: () => Promise<void>; onProgress?: (characters: number) => Promise<void>; maxAttempts?: number; outputEffort?: 'low' | 'high'; purpose?: ModelPurpose; requiredProfile?: 'opus'; outputFormat?: 'html' }) {
   const configured = await env.modelStore.get();
   const active = activeModelProfile(configured, req.purpose || 'create');
   if (req.requiredProfile && (!active || active.profile.protocol !== 'anthropic' || !/^claude-opus-5-5$/i.test(active.profile.model))) throw new LLMError('游戏制作必须使用 Claude Opus 5.5，请在管理页保存并启用对应配置。', 409);
@@ -65,6 +67,16 @@ export async function complete(env: { modelStore: { get(): Promise<any> }; SETTI
     };
   }
   if (active.profile.vision === false) req = { ...req, user: withoutImages(req.user) };
+  if(env.harnessExecution){
+    const text=await harnessCompletion(env,req);
+    if(!req.schema&&!req.parse)return text;
+    // Reuse the existing report/artifact validators. The harness is an
+    // executor, never a report repairer, grading rule, or fallback model.
+    const parsed=req.parse?req.parse(text):parseRootJson(text),value=req.normalize?req.normalize(parsed):parsed;
+    const errors=req.validate?.(value)||[];
+    if(errors.length)throw new ModelOutputError('Harness 输出未通过原有结构与证据校验：'+errors.join('、'),'format');
+    return value;
+  }
   let apiKey: string;
   try { apiKey = await decryptKey(active.profile.encryptedKey, env.SETTINGS_KEY); }
   catch { throw new LLMError('审核模型密钥无法读取，请在管理页重新保存配置。', 503); }

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>灯塔校音素材</title>
+<canvas width="160" height="160"></canvas>
+<script id="game-assets">
+const GAME_ASSETS = {
+  pulse(ctx, x, y, size) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(size / 100, size / 100);
+    ctx.fillStyle = '#65e0ce';
+    ctx.fill(new Path2D('M0 -48a48 48 0 1 1 0 96a48 48 0 1 1 0 -96zm0 12a36 36 0 1 0 0 72a36 36 0 1 0 0 -72z'), 'evenodd');
+    ctx.fillStyle = '#ffbf69';
+    ctx.fill(new Path2D('M-8 -21h16v42h-16z'));
+    ctx.restore();
+  }
+};
+</script>
+<script>
+GAME_ASSETS.pulse(document.querySelector('canvas').getContext('2d'), 80, 80, 140);
+</script>
+</html>

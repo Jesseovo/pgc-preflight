@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="960" viewBox="0 0 540 960" aria-label="雾塔修路样板图">
+  <rect width="540" height="960" fill="#26223f"/>
+  <rect x="26" y="28" width="488" height="106" rx="20" fill="none" stroke="#8cceff" stroke-width="3"/>
+  <text x="48" y="86" fill="#8cceff" font-size="30">雾塔修路</text>
+  <rect x="26" y="158" width="488" height="530" rx="26" fill="none" stroke="#8cceff" stroke-width="3"/>
+  <g transform="translate(270 402) scale(2)">
+    <path d="M-45 -29h90v12h-90zm8 18h74v12h-74zm8 18h58v12h-58zm8 18h42v12h-42z" fill="#8cceff" fill-rule="evenodd"/>
+    <path d="M-7 -42h14v57h-14z" fill="#ffad77"/>
+  </g>
+  <rect x="26" y="725" width="488" height="126" rx="22" fill="#ffad77"/>
+  <text x="270" y="802" fill="#26223f" font-size="27" text-anchor="middle">点亮安全踏板</text>
+  <path d="M48 903h444" stroke="#8cceff" stroke-width="3"/>
+</svg>

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>小站配给素材</title>
+<canvas width="160" height="160"></canvas>
+<script id="game-assets">
+const GAME_ASSETS = {
+  cell(ctx, x, y, size) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(size / 100, size / 100);
+    ctx.fillStyle = '#82d8a8';
+    ctx.fill(new Path2D('M-45 -27h75v54h-75zm77 13h13v28h-13z'), 'evenodd');
+    ctx.fillStyle = '#f0c779';
+    ctx.fill(new Path2D('M-28 -15h9v30h-9zm17 0h9v30h-9zm17 0h9v30h-9z'));
+    ctx.restore();
+  }
+};
+</script>
+<script>
+GAME_ASSETS.cell(document.querySelector('canvas').getContext('2d'), 80, 80, 140);
+</script>
+</html>

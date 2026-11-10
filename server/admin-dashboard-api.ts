@@ -4,6 +4,8 @@ import {memberStore} from './storage';
 import {problem} from './review-device-state';
 import {artifactColumns} from './forge-workspace';
 import {scheduleForgeTask,type ForgeTask} from './forge-tasks';
+import {harnessPurpose,newHarnessPolicy} from './harness-policy';
+import {publicHarnessFields,readPublicHarnessUsage,withOptionalHarnessPolicy,type PublicHarnessUsage} from './harness-task-status';
 import type {AdminDashboard,AdminMaterial,AdminMemberOption,AdminPage,AdminProject,AdminProjectDetail,AdminRange,AdminTask,AdminTaskDetail,AdminVersion,MaterialKind} from '../src/admin/contracts';
 
 const all=async(DB:any,sql:string,...p:any[]):Promise<any[]> => (await DB.prepare(sql).bind(...p).all()).results||[];
@@ -53,13 +55,13 @@ async function memberOptions(DB:any):Promise<AdminMemberOption[]> {
 const topicIdSql="CASE WHEN json_valid(f.payload) THEN COALESCE(json_extract(f.payload,'$.id'),json_extract(f.payload,'$.ids[0]')) END";
 // Unary + on the correlated topic ID removes INTEGER affinity, allowing SQLite
 // to seek the matching JSON expression index rather than scan an owner's tasks.
-const taskProjection=`WITH task_meta AS (
+const taskProjection=(policy=false)=>`WITH task_meta AS (
  SELECT f.id,'creation' AS type,f.kind,f.owner_id,COALESCE(m.display_name,CASE WHEN f.owner_id='admin' THEN '历史管理员档案' ELSE '已移除成员' END) owner_name,
  ${topicIdSql} project_id,CASE WHEN f.kind IN ('expand','game','preview','brief','assets') THEN 'topic' ELSE NULL END project_type,
  COALESCE(CASE WHEN json_valid(t.data) THEN json_extract(t.data,'$.title') END,t.subject,'') title,
  f.executor,f.status,f.detail,f.error,f.created_at,f.updated_at,f.started_at,NULL result_id,f.retry_of,f.requested_by,
  (CASE WHEN json_valid(f.input_snapshot) THEN json_type(f.input_snapshot,'$.cfg')='object' AND (f.kind NOT IN ('expand','game','preview','brief','assets') OR (t.id IS NOT NULL AND json_extract(f.input_snapshot,'$.topic.id')=t.id AND json_extract(f.input_snapshot,'$.topic.owner_id')=f.owner_id)) ELSE 0 END) source_available,
- CASE WHEN f.owner_id='admin' OR (m.enabled=1 AND m.star=1) THEN 1 ELSE 0 END owner_eligible
+ CASE WHEN f.owner_id='admin' OR (m.enabled=1 AND m.star=1) THEN 1 ELSE 0 END owner_eligible${policy?',f.harness_policy':''}
  FROM forge_tasks f LEFT JOIN members m ON m.id=f.owner_id
  LEFT JOIN topics t ON t.id=${topicIdSql} AND t.owner_id=f.owner_id AND f.kind IN ('expand','game','preview','brief','assets')
  UNION ALL
@@ -67,10 +69,10 @@ const taskProjection=`WITH task_meta AS (
  COALESCE(r.topic_id,v.topic_id),CASE WHEN COALESCE(r.topic_id,v.topic_id) IS NOT NULL THEN 'topic' ELSE NULL END,r.title,
  CASE WHEN r.model_executor='agent' THEN 'agent' ELSE 'platform' END,r.status,
  CASE WHEN r.model_executor='agent' AND r.status NOT IN ('done','error') THEN '等待成员 Agent 回传' ELSE r.stage END,r.error,r.created_at,r.updated_at,r.model_started_at,r.result_id,NULL,NULL,
- (r.input_ready=1 AND EXISTS(SELECT 1 FROM review_inputs i WHERE i.job_id=r.id)),1
+ (r.input_ready=1 AND EXISTS(SELECT 1 FROM review_inputs i WHERE i.job_id=r.id)),1${policy?',r.harness_policy':''}
  FROM review_jobs r LEFT JOIN members m ON m.id=r.owner_id LEFT JOIN reviews v ON v.id=r.result_id AND v.owner_id=r.owner_id
 )`;
-function taskDto(r:any):AdminTask {
+function taskDto(r:any,usage?:PublicHarnessUsage):AdminTask {
   const agent=r.executor==='agent',failed=r.status==='error',source=!!r.source_available,supported=['expand','brief','preview','assets','game','suggest','tag'].includes(r.kind);
   let retryReason='';
   if(r.type==='review')retryReason=source?'请重新上传文件并发起审核。':'原始审核文件已清理，请重新上传文件。';
@@ -80,7 +82,7 @@ function taskDto(r:any):AdminTask {
   else if(!source)retryReason='原始创作输入已不存在，无法重试。';
   else if(!r.owner_eligible)retryReason='成员已停用或 Star 权限已撤销。';
   const statusLabel=taskStatusLabel(r);
-  return {id:r.id,type:r.type,kind:r.kind,kindLabel:kindLabels[r.kind]||r.kind,ownerId:r.owner_id,ownerName:r.owner_name,projectId:r.project_type?r.project_id:null,projectType:r.project_type,title:text(r.title,160)||kindLabels[r.kind]||r.kind,executor:agent?'agent':'platform',status:r.status,statusLabel,detail:text(r.detail,700),error:text(r.error,700),createdAt:r.created_at,updatedAt:r.updated_at,startedAt:r.started_at||null,resultId:r.result_id||null,canRetry:r.type==='creation'&&supported&&failed&&!agent&&source&&!!r.owner_eligible,retryReason,retryOf:r.retry_of||null,requestedBy:r.requested_by||null};
+  return {...publicHarnessFields(r.harness_policy,usage),id:r.id,type:r.type,kind:r.kind,kindLabel:kindLabels[r.kind]||r.kind,ownerId:r.owner_id,ownerName:r.owner_name,projectId:r.project_type?r.project_id:null,projectType:r.project_type,title:text(r.title,160)||kindLabels[r.kind]||r.kind,executor:agent?'agent':'platform',status:r.status,statusLabel,detail:text(r.detail,700),error:text(r.error,700),createdAt:r.created_at,updatedAt:r.updated_at,startedAt:r.started_at||null,resultId:r.result_id||null,canRetry:r.type==='creation'&&supported&&failed&&!agent&&source&&!!r.owner_eligible,retryReason,retryOf:r.retry_of||null,requestedBy:r.requested_by||null};
 }
 
 const projectProjection=`WITH project_meta AS (
@@ -134,15 +136,22 @@ function taskWhere(p:URLSearchParams){
   if(q){f.clauses.push('(instr(lower(title),lower(?))>0 OR instr(lower(id),lower(?))>0)');f.params.push(q,q);}
   return {...f,where:f.clauses.length?`WHERE ${f.clauses.join(' AND ')}`:''};
 }
+async function taskDtos(DB:any,rows:any[]) {
+  const [forge,review]=await Promise.all([
+    readPublicHarnessUsage(DB,'forge',rows.filter(row=>row.type==='creation')),
+    readPublicHarnessUsage(DB,'review',rows.filter(row=>row.type==='review')),
+  ]);
+  return rows.map(row=>taskDto(row,(row.type==='creation'?forge:review).get(row.id)));
+}
 async function taskPage(DB:any,p:URLSearchParams):Promise<AdminPage<AdminTask>> {
   const {where,params}=taskWhere(p),{page,pageSize}=paging(p);
-  const [counts,rows,members]=await Promise.all([first(DB,`${taskProjection} SELECT count(*) total,COALESCE(sum(executor='platform' AND ${activeSql}),0) active_count,COALESCE(sum(executor='agent' AND ${activeSql}),0) waiting_count FROM task_meta ${where}`,...params),all(DB,`${taskProjection} SELECT * FROM task_meta ${where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`,...params,pageSize,(page-1)*pageSize),memberOptions(DB)]);
-  return {items:rows.map(taskDto),total:counts.total,page,pageSize,members,updatedAt:at(),activeCount:counts.active_count,waitingAgentCount:counts.waiting_count};
+  const [counts,rows,members]=await Promise.all([first(DB,`${taskProjection()} SELECT count(*) total,COALESCE(sum(executor='platform' AND ${activeSql}),0) active_count,COALESCE(sum(executor='agent' AND ${activeSql}),0) waiting_count FROM task_meta ${where}`,...params),withOptionalHarnessPolicy(policy=>all(DB,`${taskProjection(!!policy)} SELECT * FROM task_meta ${where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`,...params,pageSize,(page-1)*pageSize)),memberOptions(DB)]);
+  return {items:await taskDtos(DB,rows),total:counts.total,page,pageSize,members,updatedAt:at(),activeCount:counts.active_count,waitingAgentCount:counts.waiting_count};
 }
 async function taskDetail(DB:any,type:string,id:string):Promise<AdminTaskDetail> {
-  const row=await first(DB,`${taskProjection} SELECT * FROM task_meta WHERE type=? AND id=?`,type,id);if(!row)throw problem('任务不存在。',404);
+  const row=await withOptionalHarnessPolicy(policy=>first(DB,`${taskProjection(!!policy)} SELECT * FROM task_meta WHERE type=? AND id=?`,type,id));if(!row)throw problem('任务不存在。',404);
   const retry=row.type==='creation'?await first(DB,'SELECT id FROM forge_tasks WHERE retry_of=?',id):null;
-  return {task:taskDto(row),retryTaskId:retry?.id||null,sourceAvailable:!!row.source_available,continuePrompt:row.executor==='agent'&&!terminal(row.status)?row.type==='creation'?`请继续原创作任务 ${id}，沿用原设备授权和任务回执，读取当前状态并完成结果回传，不要新建任务。`:`请继续原审核任务 ${id}，沿用原设备授权和租约，完成材料读取、初评、同模型复核及结果回传，不要新建审核任务。`:null};
+  return {task:(await taskDtos(DB,[row]))[0],retryTaskId:retry?.id||null,sourceAvailable:!!row.source_available,continuePrompt:row.executor==='agent'&&!terminal(row.status)?row.type==='creation'?`请继续原创作任务 ${id}，沿用原设备授权和任务回执，读取当前状态并完成结果回传，不要新建任务。`:`请继续原审核任务 ${id}，沿用原设备授权和租约，完成材料读取、初评、同模型复核及结果回传，不要新建审核任务。`:null};
 }
 async function projectDetail(DB:any,type:string,id:number):Promise<AdminProjectDetail> {
   const row=await projectRow(DB,type,id),project=projectDto(row);
@@ -199,8 +208,11 @@ async function retryCreation(env:any,id:string):Promise<AdminTask> {
   // requestId is an execution/idempotency identity, not a creation input.
   const payload=job.type==='game'?JSON.stringify({...job,requestId:newId}):row.payload;
   const topicGuard=artifactColumns[job.type]?' AND EXISTS(SELECT 1 FROM topics WHERE id=? AND owner_id=?)':'';
-  // Preserve the locked workflow version. A new task starts without a saved phase.
-  const insert=DB.prepare(`INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,created_at,updated_at,owner_id,executor,input_snapshot,creative_version,retry_of,requested_by) SELECT ?,kind,scope,?,'queued','等待后台执行…',?,?,owner_id,'platform',input_snapshot,creative_version,id,'admin' FROM forge_tasks WHERE id=? AND status='error' AND executor='platform' AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE retry_of=?) AND (owner_id='admin' OR EXISTS(SELECT 1 FROM members m WHERE m.id=forge_tasks.owner_id AND m.enabled=1 AND m.star=1))${topicGuard}`).bind(newId,payload,stamp,stamp,id,id,...(topicGuard?[topicId,owner]:[]));
+  // Preserve the workflow version, but resolve the execution engine for the new task.
+  const active=await first(DB,"SELECT id FROM forge_tasks WHERE scope=? AND status IN ('queued','running')",row.scope);
+  if(active)return (await taskDetail(DB,'creation',active.id)).task;
+  const harness=owner==='admin'||job.type==='game'&&row.creative_version!==2?null:await newHarnessPolicy(env,owner,'forge',harnessPurpose(job.type),job.type==='mechanism-check'?8000:job.type==='expand'&&row.creative_version===2?24000:undefined);
+  const insert=DB.prepare(`INSERT OR IGNORE INTO forge_tasks(id,kind,scope,payload,status,detail,created_at,updated_at,owner_id,executor,input_snapshot,creative_version,retry_of,requested_by${harness?',harness_policy':''}) SELECT ?,kind,scope,?,'queued','等待后台执行…',?,?,owner_id,'platform',input_snapshot,creative_version,id,'admin'${harness?',?':''} FROM forge_tasks WHERE id=? AND status='error' AND executor='platform' AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE retry_of=?) AND (owner_id='admin' OR EXISTS(SELECT 1 FROM members m WHERE m.id=forge_tasks.owner_id AND m.enabled=1 AND m.star=1))${topicGuard}`).bind(newId,payload,stamp,stamp,...(harness?[JSON.stringify(harness)]:[]),id,id,...(topicGuard?[topicId,owner]:[]));
   const statements=[insert];
   if(['expand','brief','assets','game'].includes(job.type)){
     const column=job.type==='game'?'product':job.type;
@@ -222,7 +234,7 @@ async function dashboard(DB:any,p:URLSearchParams):Promise<AdminDashboard> {
     all(DB,"SELECT owner_id,count(*) n FROM (SELECT v.owner_id,v.topic_id,min(v.created_at) first_at FROM artifact_versions v JOIN topics t ON t.id=v.topic_id AND t.owner_id=v.owner_id AND t.product_html IS NOT NULL AND trim(t.product_html)<>'' WHERE v.kind='game' AND v.disposition<>'pending' GROUP BY v.owner_id,v.topic_id) WHERE first_at>=? AND first_at<? AND (?='' OR owner_id=?) GROUP BY owner_id",...params),
     all(DB,`${activeTaskProjection} SELECT owner_id,sum(executor='platform') platform_count,sum(executor='agent') agent_count FROM active_tasks WHERE (?='' OR owner_id=?) GROUP BY owner_id`,owner,owner),
     all(DB,`${activeTaskProjection}, active_ranked AS (SELECT owner_id,kind,executor,status,updated_at,row_number() OVER(PARTITION BY owner_id ORDER BY CASE WHEN executor='platform' THEN 0 ELSE 1 END,updated_at DESC,id DESC) member_rank FROM active_tasks WHERE (?='' OR owner_id=?)) SELECT owner_id,kind,executor,status,updated_at FROM active_ranked WHERE member_rank=1 ORDER BY CASE WHEN executor='platform' THEN 0 ELSE 1 END,updated_at DESC`,owner,owner),
-    all(DB,`${taskProjection} SELECT * FROM task_meta WHERE status='error' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?) ORDER BY updated_at DESC LIMIT 8`,...params),
+    withOptionalHarnessPolicy(policy=>all(DB,`${taskProjection(!!policy)} SELECT * FROM task_meta WHERE status='error' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?) ORDER BY updated_at DESC LIMIT 8`,...params)),
     all(DB,`${projectProjection}, first_products AS (SELECT owner_id,topic_id,min(created_at) first_at FROM artifact_versions WHERE kind='game' AND disposition<>'pending' GROUP BY owner_id,topic_id) SELECT p.* FROM projects p JOIN first_products f ON p.type='topic' AND f.topic_id=p.id AND f.owner_id=p.owner_id WHERE p.has_game=1 AND f.first_at>=? AND f.first_at<? AND (?='' OR p.owner_id=?) ORDER BY f.first_at DESC,p.id DESC LIMIT 6`,...params),
   ]);
   const step=range==='today'?3600000:86400000,start=Date.parse(bounds[0]);
@@ -233,12 +245,12 @@ async function dashboard(DB:any,p:URLSearchParams):Promise<AdminDashboard> {
   ]);
   const trend=Array.from({length:Math.round((Date.parse(bounds[1])-start)/step)},(_,i)=>({from:new Date(start+i*step).toISOString(),to:new Date(start+(i+1)*step).toISOString(),products:productTrend.find(r=>r.bucket===i)?.n||0,reviews:reviewTrend.find(r=>r.bucket===i)?.n||0}));
   const taskGroups=['platform-queued','platform-running','agent-queued','agent-running'].map(key=>({key,count:taskStates.find(r=>r.executor+'-'+r.stage===key)?.n||0}));
-  const failures=await first(DB,`${taskProjection} SELECT count(*) n FROM task_meta WHERE status='error' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?)`,...params);
+  const failures=await first(DB,`${taskProjection()} SELECT count(*) n FROM task_meta WHERE status='error' AND updated_at>=? AND updated_at<? AND (?='' OR owner_id=?)`,...params);
   const byOwner=(rows:any[],id:string)=>rows.find(r=>r.owner_id===id),progress=members.filter(m=>!owner||m.id===owner).map(m=>{
     const creations=byOwner(creationCounts,m.id),reviews=byOwner(reviewCounts,m.id),counts=byOwner(activeCounts,m.id),current=active.find(t=>t.owner_id===m.id),last=[creations?.last_activity,reviews?.last_activity,current?.updated_at].filter(Boolean).sort().at(-1)||null;
     return {id:m.id,displayName:m.displayName,username:m.username,star:m.star,enabled:m.enabled,creations:creations?.n||0,reviews:reviews?.n||0,products:byOwner(productCounts,m.id)?.n||0,activeTasks:counts?.platform_count||0,currentTask:current?`${kindLabels[current.kind]||current.kind} · ${taskStatusLabel(current)}`:null,lastActivity:last};
   });
-  return {trend,taskGroups,window:{from:bounds[0],to:bounds[1]},range,timeZone:'Asia/Shanghai',updatedAt:at(),members,metrics:{productiveMembers:progress.filter(m=>m.creations+m.reviews+m.products>0).length,newProducts:productCounts.reduce((n,r)=>n+r.n,0),failedTasks:failures.n,activeTasks:activeCounts.reduce((n,r)=>n+r.platform_count,0)},progress,latestProducts:products.map(projectDto),attention:attention.map(taskDto),waitingAgentCount:activeCounts.reduce((n,r)=>n+r.agent_count,0)};
+  return {trend,taskGroups,window:{from:bounds[0],to:bounds[1]},range,timeZone:'Asia/Shanghai',updatedAt:at(),members,metrics:{productiveMembers:progress.filter(m=>m.creations+m.reviews+m.products>0).length,newProducts:productCounts.reduce((n,r)=>n+r.n,0),failedTasks:failures.n,activeTasks:activeCounts.reduce((n,r)=>n+r.platform_count,0)},progress,latestProducts:products.map(projectDto),attention:await taskDtos(DB,attention),waitingAgentCount:activeCounts.reduce((n,r)=>n+r.agent_count,0)};
 }
 
 export async function adminDashboardApi(request:Request,env:any):Promise<Response|null> {

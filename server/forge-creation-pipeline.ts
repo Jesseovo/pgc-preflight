@@ -8,16 +8,23 @@ import {captureFor} from './cloud-review-capture';
 import {digest,canonicalJson,stamp,problem} from './review-device-state';
 import {failForgeTask} from './forge-tasks';
 import {parseProductionOutput} from './forge-production-output';
+import {finishHarnessTask,HarnessCapacityWait,harnessExecutionFor} from './harness-execution';
+import {parseHarnessPolicy} from './harness-policy';
+import {HARNESS_MAX_REQUEST_MS} from './harness-protocol';
 
-type Stage='build'|'polish'|'repair';
-type Checkpoint={model?:string|null;phase:string;stage:Stage;snapshot:any;config:any;output?:any;capture?:any;previous?:any;previousCapture?:any;versionId?:string;createdAt:number;stageStartedAt?:number;failure?:string};
+type AgentStage='build'|'polish'|'repair';
+type Stage=AgentStage|'repair2';
+type HarnessEvidence={evidenceId:string;inputHash:string;evidenceHash:string;origin:string;tool:string;
+  shots:{id:string;data:string;sha256:string}[];actions:{id:string}[];[key:string]:unknown};
+type Checkpoint={model?:string|null;phase:string;stage:Stage;snapshot:any;config:any;output?:any;capture?:any;previous?:any;previousCapture?:any;versionId?:string;createdAt:number;stageStartedAt?:number;harnessDeadlineAt?:number;harnessEvidence?:HarnessEvidence[];failure?:string};
 const schemas={build:GAME_BUILD_SCHEMA,polish:GAME_POLISH_SCHEMA,repair:GAME_REPAIR_SCHEMA};
-const labels={build:'完整玩法与内容',polish:'美术与交互精修',repair:'定向修复'};
+const labels={build:'完整玩法与内容',polish:'美术与交互精修',repair:'定向修复',repair2:'第二次定向修复'};
 const strings=(x:any,max=100)=>Array.isArray(x)&&x.length<=max&&x.every(v=>typeof v==='string'&&v.length<=12000);
 const allowed=(value:any,keys:string[])=>value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).every(k=>keys.includes(k));
 
 // Structural/evidence validation only. No score, taste, or defect inference.
-export function validateCreationOutput(value:any,stage:Stage,capture?:any,previous?:any):string[]{
+export function validateCreationOutput(value:any,stage:Stage,capture?:any,previous?:any,mayRequestRepair=stage==='polish',
+  harnessEvidence?:HarnessEvidence[],outputHash?:string):string[]{
   if(!allowed(value,['html','requirements','decisions','coreChanges',...(stage==='build'?[]:['selfCheck'])])||typeof value.html!=='string'||!value.html.trim())return ['html'];
   if(!Array.isArray(value.requirements)||!value.requirements.length||value.requirements.length>100||value.requirements.some((r:any)=>!allowed(r,['id','text','status','evidence','reason'])||typeof r.id!=='string'||!r.id.trim()||typeof r.text!=='string'||!r.text.trim()||!['implemented','unverified','deferred'].includes(r.status)||['evidence','reason'].some(k=>k in r&&typeof r[k]!=='string')))return ['requirements'];
   if(new Set(value.requirements.map((r:any)=>r.id)).size!==value.requirements.length)return ['requirements.id'];
@@ -26,14 +33,21 @@ export function validateCreationOutput(value:any,stage:Stage,capture?:any,previo
   const requirements=new Set(value.requirements.map((r:any)=>r.id));
   if(previous?.requirements?.some((r:any)=>!requirements.has(r.id)))return ['requirements must retain prior IDs'];
   if(previous?.coreChanges?.some((change:string)=>!value.coreChanges.includes(change)))return ['coreChanges must retain prior changes'];
-  const check=value.selfCheck,refs=new Set([...(capture?.shots||[]).map((s:any)=>s.id),...(capture?.probe?.actions||[]).map((a:any)=>a.id)]);
-  if(!allowed(check,['findings','unverified','changes','requestRepair'])||!Array.isArray(check.findings)||check.findings.length>50||!strings(check.unverified)||!strings(check.changes)||typeof check.requestRepair!=='boolean'||stage==='repair'&&check.requestRepair)return ['selfCheck'];
+  const check=value.selfCheck,refs=new Map<string,string>();
+  for(const ref of [...(capture?.shots||[]),...(capture?.probe?.actions||[])])refs.set(ref.id,capture.inputHash);
+  for(const evidence of harnessEvidence??[])for(const ref of harnessEvidenceRefs(evidence))refs.set(ref,evidence.inputHash);
+  if(!allowed(check,['findings','unverified','changes','requestRepair'])||!Array.isArray(check.findings)||check.findings.length>50||!strings(check.unverified)||!strings(check.changes)||typeof check.requestRepair!=='boolean'||!mayRequestRepair&&check.requestRepair)return ['selfCheck'];
   for(const f of check.findings){
     if(!allowed(f,['kind','id','phenomenon','trigger','cause','minimalChange','retest','evidenceRefs','coreChange','resolved'])||!['confirmed','experience','unverified'].includes(f.kind)||['id','phenomenon','trigger','cause','minimalChange','retest'].some(k=>typeof f[k]!=='string')||!f.id.trim()||!f.phenomenon.trim()||!strings(f.evidenceRefs,32)||f.evidenceRefs.some((r:string)=>!refs.has(r))||typeof f.coreChange!=='boolean'||typeof f.resolved!=='boolean')return ['selfCheck.findings'];
     if(f.kind!=='unverified'&&!f.evidenceRefs.length)return ['selfCheck.findings.evidenceRefs'];
   }
   if(new Set(check.findings.map((f:any)=>f.id)).size!==check.findings.length)return ['selfCheck.findings.id'];
-  if(check.requestRepair&&!check.findings.some((f:any)=>f.kind==='confirmed'&&!f.resolved&&!f.coreChange&&f.evidenceRefs.length))return ['selfCheck.requestRepair requires an evidenced unresolved finding'];
+  if(check.requestRepair&&!check.findings.some((f:any)=>f.kind==='confirmed'&&!f.resolved&&!f.coreChange&&f.evidenceRefs.length&&
+    (!outputHash||!harnessEvidence||f.evidenceRefs.some((ref:string)=>[capture?.inputHash,outputHash].includes(refs.get(ref)))))){
+    return [outputHash&&harnessEvidence
+      ? 'selfCheck.requestRepair requires an evidenced unresolved finding on a current HTML version'
+      : 'selfCheck.requestRepair requires an evidenced unresolved finding'];
+  }
   return [];
 }
 
@@ -47,8 +61,47 @@ async function shotHash(data:string){
   try{bytes=Uint8Array.from(atob(base64),c=>c.charCodeAt(0));}catch{throw problem('制作采集图片编码不正确。');}
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new Uint8Array(bytes).buffer)),b=>b.toString(16).padStart(2,'0')).join('');
 }
-const captureHash=(stage:Stage,shots:any[],probe:any,inputHash:string)=>digest(canonicalJson({stage,shots:shots.map(({data,...s}:any)=>s),probe,inputHash}));
-export async function lockCreationCapture(raw:any,stage:Stage,html:string){
+const harnessEvidenceLimit=8*1024*1024;
+const shaPattern=/^[a-f0-9]{64}$/;
+const utf8Size=(value:string)=>new TextEncoder().encode(value).length;
+const harnessEvidenceRefs=(record:HarnessEvidence)=>record.tool==='play-close'?[]:
+  [record.evidenceId,...record.shots.map(shot=>shot.id),...record.actions.map(action=>action.id)];
+const harnessEvidenceMetadata=(records:HarnessEvidence[],outputHash:string)=>records.map(record=>({
+  evidenceId:record.evidenceId,inputHash:record.inputHash,evidenceHash:record.evidenceHash,
+  refs:harnessEvidenceRefs(record),matchesOutput:record.inputHash===outputHash,
+}));
+async function verifyHarnessEvidence(raw:unknown):Promise<HarnessEvidence[]>{
+  if(!Array.isArray(raw)||raw.length>32)throw problem('Harness 试玩证据数量无效。',409);
+  const refs=new Set<string>();
+  const records:HarnessEvidence[]=[];
+  let shotCount=0,actionCount=0;
+  for(const value of raw){
+    const record=value as HarnessEvidence;
+    if(!record||typeof record!=='object'||record.origin!=='harness-browser-tool'||record.contextOrigin!=='creator-self-check'||record.sourceBlind!==false||!/^tool-[a-f0-9]{64}$/.test(record.evidenceId)||
+      !shaPattern.test(record.inputHash)||!shaPattern.test(record.evidenceHash)||!['capture','play-start','play-act','play-finish','play-close'].includes(record.tool)||
+      !Array.isArray(record.shots)||!Array.isArray(record.actions)||(shotCount+=record.shots.length)>12||
+      (actionCount+=record.tool==='capture'?0:record.actions.length)>24){
+      throw problem('Harness 试玩证据结构无效。',409);
+    }
+    const {evidenceHash,...body}=record;
+    if(await digest(canonicalJson(body))!==evidenceHash)throw problem('Harness 试玩记录哈希不匹配。',409);
+    for(const item of [record,...record.shots,...record.actions]){
+      const ref=item===record?record.evidenceId:(item as {id:string}).id;
+      if(!evidenceId(ref)||refs.has(ref)||item!==record&&!ref.startsWith(record.evidenceId+':'))throw problem('Harness 试玩证据编号无效。',409);
+      refs.add(ref);
+    }
+    for(const shot of record.shots){
+      if(typeof shot.data!=='string'||!shaPattern.test(shot.sha256)||await shotHash(shot.data)!==shot.sha256)throw problem('Harness 试玩原图哈希不匹配。',409);
+    }
+    records.push(record);
+  }
+  if(utf8Size(JSON.stringify(records))>harnessEvidenceLimit)throw problem('Harness 试玩证据超过保存上限。',413);
+  return records;
+}
+const captureHash=(stage:Stage,shots:any[],probe:any,inputHash:string,harnessEvidenceHash?:string)=>digest(canonicalJson({
+  stage,shots:shots.map(({data,...s}:any)=>s),probe,inputHash,...(harnessEvidenceHash?{harnessEvidenceHash}:{}),
+}));
+export async function lockCreationCapture(raw:any,stage:Stage,html:string,harnessEvidenceHash?:string){
   const actions=raw?.probe?.actions,observations=raw?.probe?.observations;
   if(raw?.probe?.captureMethod!=='browser-viewport-v1'||!Array.isArray(raw.shots)||raw.shots.length!==4||!Array.isArray(actions)||actions.length!==3||!Array.isArray(observations)||observations.length!==4)throw problem('制作采集必须保留三个手机比例的动作记录与四张完整视口原图。');
   const actionIds=new Set(actions.map((a:any)=>a?.id)),shotIds=new Set(raw.shots.map((s:any)=>s?.id));
@@ -66,8 +119,8 @@ export async function lockCreationCapture(raw:any,stage:Stage,html:string){
       id:ref(id),label,capturedAt,actionRefs:actionRefs.map(ref),elapsedMs,errors,title,domText,canvases,
       audio:audio?{contextStates:audio.contextStates,sourceStarts:audio.sourceStarts,media:audio.media,measuredListening:false}:undefined,
     }))};
-  const inputHash=await digest(html),hash=await captureHash(stage,shots,probe,inputHash);
-  return {stage,shots,probe,inputHash,hash,capturedAt:stamp(),origin:'isolated-chromium',listeningVerified:false};
+  const inputHash=await digest(html),hash=await captureHash(stage,shots,probe,inputHash,harnessEvidenceHash);
+  return {stage,shots,probe,inputHash,hash,...(harnessEvidenceHash?{harnessEvidenceHash}:{}),capturedAt:stamp(),origin:'isolated-chromium',listeningVerified:false};
 }
 
 async function access(env:any,row:any){
@@ -99,7 +152,10 @@ function evidenceStatements(DB:any,row:any,cp:Checkpoint,stageGuard?:{check:stri
   const text=JSON.stringify(cp.capture),parts=[];
   if(new TextEncoder().encode(text).length>2_150_000)throw problem('制作采集超过保存上限，请减小原图编码大小。',413);
   const {shots,...metadata}=cp.capture;
-  const details=JSON.stringify({...metadata,shots:shots.map(({data,...s}:any)=>s)});
+  const extras=cp.harnessEvidence?.length?cp.harnessEvidence:undefined;
+  if(extras&&utf8Size(text)+utf8Size(JSON.stringify(extras))>harnessEvidenceLimit)throw problem('制作采集超过 Harness 原图保存上限。',413);
+  const details=JSON.stringify({...metadata,shots:shots.map(({data,...s}:any)=>s),
+    ...(extras?{harnessEvidence:harnessEvidenceMetadata(extras,cp.capture.inputHash)}:{})});
   if(new TextEncoder().encode(details).length>256_000)throw problem('制作采集记录超过保存上限。',413);
   const filter='WHERE task_id=? AND stage=? AND owner_id=? AND content_hash=?';
   const params=[row.id,cp.stage,row.owner_id,cp.capture.inputHash];
@@ -114,10 +170,30 @@ function evidenceStatements(DB:any,row:any,cp:Checkpoint,stageGuard?:{check:stri
   return parts;
 }
 
+function harnessEvidenceStatements(DB:any,row:any,cp:Checkpoint,checkJson:string){
+  if(!cp.harnessEvidence?.length)return [];
+  const text=JSON.stringify(cp.harnessEvidence);
+  if(utf8Size(text)>harnessEvidenceLimit)throw problem('Harness 试玩证据超过保存上限。',413);
+  const parts=[];
+  for(let start=0;start<text.length;){
+    let end=Math.min(start+96_000,text.length);
+    if(end<text.length&&/[\uD800-\uDBFF]/.test(text[end-1]))end--;
+    parts.push(DB.prepare(`INSERT OR IGNORE INTO forge_creation_evidence(task_id,stage,part,content)
+      SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM forge_creation_stages WHERE task_id=? AND stage=? AND owner_id=? AND self_check=?)`)
+      .bind(row.id,cp.stage,-1-parts.length,text.slice(start,end),row.id,cp.stage,row.owner_id,checkJson));
+    start=end;
+  }
+  return parts;
+}
+async function supplementalHash(cp:Checkpoint){
+  return cp.harnessEvidence?.length?digest(canonicalJson(cp.harnessEvidence)):undefined;
+}
+
 async function persistStage(DB:any,row:any,cp:Checkpoint,withEvidence=false,deviceTokenHash?:string){
   const hash=await digest(cp.output.html);
   const id=cp.versionId||crypto.randomUUID(),at=stamp(),s=cp.snapshot;
-  const check={schemaVersion:2,kind:'creator-self-check',model:cp.model??activeModelProfile(cp.config,'game')?.profile.model??null,requirements:cp.output.requirements,decisions:cp.output.decisions,coreChanges:cp.output.coreChanges,selfCheck:cp.output.selfCheck||null,judgedInputHash:cp.previousCapture?.inputHash||null,judgedEvidenceHash:cp.previousCapture?.hash||null,outputHash:hash,verification:'model-claims; changed output requires independent review'};
+  const harnessEvidenceHash=await supplementalHash(cp);
+  const check={schemaVersion:2,kind:'creator-self-check',model:cp.model??activeModelProfile(cp.config,'game')?.profile.model??null,requirements:cp.output.requirements,decisions:cp.output.decisions,coreChanges:cp.output.coreChanges,selfCheck:cp.output.selfCheck||null,judgedInputHash:cp.previousCapture?.inputHash||null,judgedEvidenceHash:cp.previousCapture?.hash||null,outputHash:hash,...(harnessEvidenceHash?{harnessEvidenceHash,harnessEvidence:harnessEvidenceMetadata(cp.harnessEvidence!,hash)}:{}),verification:'model-claims; changed output requires independent review'};
   const checkJson=canonicalJson(check);
   if(new TextEncoder().encode(checkJson).length>512_000)throw problem('制作记录超过保存上限。',413);
   const liveDevice=row.executor==='agent'?`AND EXISTS(SELECT 1 FROM forge_agents d JOIN members m ON m.id=d.owner_id
@@ -131,6 +207,7 @@ async function persistStage(DB:any,row:any,cp:Checkpoint,withEvidence=false,devi
     DB.prepare(`INSERT OR IGNORE INTO forge_creation_stages(task_id,stage,owner_id,topic_id,version_id,content_hash,input_hash,self_check,created_at)
       SELECT ?,?,?,?,?,?,?,?,? WHERE ${liveTask} AND EXISTS(SELECT 1 FROM artifact_versions WHERE id=? AND owner_id=? AND topic_id=? AND kind='game')`)
       .bind(row.id,cp.stage,row.owner_id,s.topic.id,id,hash,cp.previousCapture?.inputHash||null,checkJson,at,...liveParams,id,row.owner_id,s.topic.id),
+    ...harnessEvidenceStatements(DB,row,cp,checkJson),
     ...(withEvidence?evidenceStatements(DB,row,cp,{check:checkJson,sql:liveTask,params:liveParams}):[]),
   ]);
   const saved=await DB.prepare(`SELECT * FROM forge_creation_stages WHERE task_id=? AND stage=? AND owner_id=? AND ${liveTask}`).bind(row.id,cp.stage,row.owner_id,...liveParams).first();
@@ -170,8 +247,14 @@ export async function creationPipelineAlarm(state:any,env:any,id:string){
 export async function advanceCreationPipeline(state:any,env:any,id:string){
   const DB=env.DB,storage=state.storage;
   const row=await DB.prepare('SELECT * FROM forge_tasks WHERE id=?').bind(id).first();
-  if(!row||row.executor!=='platform'||row.creative_version!==2||row.kind!=='game'||!['queued','running'].includes(row.status)){await storage.deleteAll();return false;}
+  if(!row||row.executor!=='platform'||row.creative_version!==2||row.kind!=='game'){await storage.deleteAll();return false;}
+  if(!['queued','running'].includes(row.status)){
+    if(row.harness_policy)await finishHarnessTask(env,id,row.status==='done'?'completed':'failed');
+    await storage.deleteAll();return false;
+  }
   let cp=await getCheckpoint(storage);
+  let harness;
+  try{harness=parseHarnessPolicy(row.harness_policy);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
   try{await access(env,row);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
   if((!cp||cp.phase==='ready')&&Date.now()-Date.parse(row.created_at)>86400000){await failForgeTask(env,row,'制作等待超过 24 小时；已完成版本保留，请明确重试。');await storage.deleteAll();return false;}
   if(!cp){
@@ -179,20 +262,29 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     const snapshot=JSON.parse(row.input_snapshot||'null');
     if(!snapshot?.topic?.brief_md?.trim()){await failForgeTask(env,row,'完整制作需要先生成策划书。');await storage.deleteAll();return false;}
     const config=await env.modelStore.get(),profiles=Object.fromEntries(Object.entries(modelProfiles(config)).filter(([,profile])=>profile?.vision!==false));
-    const visualConfig=config&&Object.keys(profiles).length?{...config,profiles}:null;
-    if(!activeModelProfile(visualConfig,'game')){await failForgeTask(env,row,'完整制作与精修需要已启用并支持视觉的 Claude Opus 5.5。');await storage.deleteAll();return false;}
+    const visualConfig=harness?config:config&&Object.keys(profiles).length?{...config,profiles}:null;
+    const selected=activeModelProfile(visualConfig,'game');
+    if(!selected||selected.profile.vision===false){await failForgeTask(env,row,'完整制作与精修需要已启用并支持视觉的 Claude Opus 5.5。');await storage.deleteAll();return false;}
     cp={phase:'ready',stage:'build',snapshot,config:visualConfig,createdAt:Date.now()};
     await putCheckpoint(storage,cp);
-    await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(stamp(),stamp(),stamp(),id).run();
+    await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(harness?null:stamp(),stamp(),stamp(),id).run();
     return true;
   }
-  if(row.status==='queued')await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(stamp(),stamp(),stamp(),id).run();
+  if(row.status==='queued')await DB.prepare("UPDATE forge_tasks SET status='running',started_at=coalesce(started_at,?),phase_started_at=?,updated_at=? WHERE id=? AND status='queued'").bind(harness?null:stamp(),stamp(),stamp(),id).run();
+  const deadlineAt=cp.harnessDeadlineAt;
+  const awaitingAllocation=harness&&cp.stage==='build'&&deadlineAt===undefined;
+  const expired=()=>deadlineAt!==undefined&&Date.now()>=deadlineAt;
+  const deadlineFailure='制作任务已到达总时限；已完成的阶段版本保留，未自动重发模型请求。';
+  if(expired()&&cp.phase!=='captured'&&cp.phase!=='publish'){
+    if(cp.phase==='output')await persistStage(DB,row,cp);
+    await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;
+  }
   if(cp.phase==='started'||cp.phase==='failed'){
     await failForgeTask(env,row,cp.phase==='started'?'制作阶段中断，模型结果未知；已完成版本保留，未自动重发请求。':cp.failure||'制作阶段失败；已完成版本保留，请明确重试。');await storage.deleteAll();return false;
   }
   if(cp.phase==='ready'){
-    let lease:any;
-    try{lease=await claimCreationModel(DB,cp.config,env.SETTINGS_KEY,'game',`${id}:${cp.stage}`);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
+    let lease:Awaited<ReturnType<typeof claimCreationModel>>;
+    try{lease=harness?{config:cp.config,reserved:false,lease:{release:async()=>{}}}:await claimCreationModel(DB,cp.config,env.SETTINGS_KEY,'game',`${id}:${cp.stage}`);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
     if(!lease){await progress(DB,id,`${cp.stage}:waiting`,'等待制作模型名额…',Date.now());await storage.setAlarm(Date.now()+5000);return false;}
     let uncertain=false,output:any;
     let timer:ReturnType<typeof setInterval>|undefined;
@@ -200,19 +292,54 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
       const active=activeModelProfile(lease.config,'game');if(!active)throw new Error('制作模型未配置。');
       // Freeze a single selected profile, including key/config, for all stages.
       if(cp.stage==='build')cp.config={...active.profile,activeProfile:active.id,profiles:{[active.id]:active.profile},routes:{create:active.id,review:active.id}};
-      cp.phase='started';cp.stageStartedAt=Date.now();await putCheckpoint(storage,cp);await storage.setAlarm(Date.now()+14*60000);
-      await progress(DB,id,`${cp.stage}:model`,labels[cp.stage],cp.stageStartedAt);
+      cp.phase='started';cp.stageStartedAt=Date.now();await putCheckpoint(storage,cp);
+      const stageDeadline=Math.min(deadlineAt??Infinity,cp.stageStartedAt+HARNESS_MAX_REQUEST_MS);
+      await storage.setAlarm(Math.min(deadlineAt??Infinity,cp.stageStartedAt+14*60000));
+      await progress(DB,id,`${cp.stage}:${awaitingAllocation?'waiting':'model'}`,awaitingAllocation?'等待隔离执行名额…':labels[cp.stage],cp.stageStartedAt);
       timer=setInterval(()=>{void DB.prepare("UPDATE forge_tasks SET updated_at=? WHERE id=? AND status='running'").bind(stamp(),id).run().catch(()=>{});},30000);
       const s=cp.snapshot;
-      const input={topic:s.topic,brief:s.topic.brief_md,styleSvg:s.topic.preview_svg||'',assetHtml:s.topic.assets_html||'',html:cp.previous?.html,capture:cp.previousCapture,selfCheck:cp.previous?.selfCheck,requirements:cp.previous?.requirements,decisions:cp.previous?.decisions,coreChanges:cp.previous?.coreChanges};
-      const runtime={...env,modelStore:{get:async()=>cp!.config},generation:{id:`${id}:${cp.stage}`,capacityReserved:lease.reserved,deadline:Date.now()+12*60000,onUncertain:()=>{uncertain=true;},onStart:async()=>{await access(env,row);const update=await DB.prepare("UPDATE forge_tasks SET model_started_at=coalesce(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(stamp(),stamp(),id).run();if(!update.meta.changes)throw new Error('制作任务已停止。');},onWait:async(message:string)=>progress(DB,id,`${cp!.stage}:model`,`${labels[cp!.stage]} · ${message}`)}};
+      const input={topic:s.topic,brief:s.topic.brief_md,styleSvg:s.topic.preview_svg||'',assetHtml:s.topic.assets_html||'',html:cp.previous?.html,capture:cp.previousCapture,selfCheck:cp.previous?.selfCheck,requirements:cp.previous?.requirements,decisions:cp.previous?.decisions,coreChanges:cp.previous?.coreChanges,harnessEvidence:cp.harnessEvidence};
+      const harnessExecution=harness?harnessExecutionFor(row,'forge',cp.stage,await digest(row.input_snapshot||'null'),deadlineAt??cp.stageStartedAt+harness.limits.maxDurationMs):undefined;
+      if(harnessExecution)harnessExecution.onEvidence=async evidence=>{
+        const sealed=await verifyHarnessEvidence(evidence);
+        if(cp!.harnessEvidence?.some((record,index)=>sealed[index]?.evidenceHash!==record.evidenceHash)){
+          throw problem('Harness 试玩证据不能省略或替换已锁定的记录。',409);
+        }
+        cp!.harnessEvidence=sealed;
+      };
+      if(harnessExecution&&cp.previous?.html)harnessExecution.previousHtml=cp.previous.html;
+      if(harnessExecution&&awaitingAllocation)harnessExecution.onAllocated=async clock=>{
+        cp!.harnessDeadlineAt=clock.taskDeadlineAt;cp!.stageStartedAt=clock.startedAt;
+        await putCheckpoint(storage,cp!);
+        await storage.setAlarm(Math.min(clock.taskDeadlineAt,clock.stageDeadlineAt+2*60000));
+        await DB.prepare("UPDATE forge_tasks SET started_at=?,phase='build:model',phase_started_at=?,updated_at=? WHERE id=? AND status='running'").bind(new Date(clock.startedAt).toISOString(),new Date(clock.startedAt).toISOString(),stamp(),id).run();
+      };
+      const runtime={...env,harnessExecution,modelStore:{get:async()=>cp!.config},generation:{id:`${id}:${cp.stage}`,capacityReserved:lease.reserved,deadline:stageDeadline,onUncertain:()=>{uncertain=true;},onStart:async()=>{await access(env,row);const update=await DB.prepare("UPDATE forge_tasks SET model_started_at=coalesce(model_started_at,?),updated_at=? WHERE id=? AND status='running'").bind(stamp(),stamp(),id).run();if(!update.meta.changes)throw new Error('制作任务已停止。');},onWait:async(message:string)=>progress(DB,id,`${cp!.stage}:model`,`${labels[cp!.stage]} · ${message}`)}};
       // Newly queued tasks lock the approved 64k policy. A pre-upgrade task
       // without that declaration retains its former 32,768-token ceiling.
-      const budget=s.platform_creation_policy?.version===1&&s.platform_creation_policy?.maxTokens===64000?64000:32768;
-      const result=await complete(runtime,s.cfg,{system:gameStageSystem(cp.stage,'framed'),user:gameStageUser(cp.stage,input,'framed'),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous),maxTokens:budget,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
+      const legacyBudget=s.platform_creation_policy?.version===1&&s.platform_creation_policy?.maxTokens===64000?64000:32768;
+      const budget=harness?.limits.maxOutputTokens??legacyBudget;
+      const remainingRepairs=cp.stage==='polish'?(harness?.limits.maxRepairs??1):cp.stage==='repair'?Math.max(0,(harness?.limits.maxRepairs??1)-1):0;
+      const promptStage=cp.stage==='repair2'?'repair':cp.stage;
+      const format=harness?'workspace':'framed';
+      const system=gameStageSystem(promptStage,format,remainingRepairs)+(harness?
+        '\nHarness 补测记录只对应记录中的 inputHash。仅引用实际返回的证据编号。若请求自动修复，未解决问题必须引用刚采集的上一阶段成品或本次实际交付 HTML 的证据，不能只依据旧版或中间版。': '');
+      const result=await complete(runtime,s.cfg,{system,user:gameStageUser(promptStage,input,format),parse:parseProductionOutput,validate:value=>validateCreationOutput(value,cp!.stage,cp!.previousCapture,cp!.previous,remainingRepairs>0,cp!.harnessEvidence),maxTokens:budget,maxAttempts:1,purpose:'game',requiredProfile:'opus',outputEffort:'high'});
+      if(harness&&cp.harnessDeadlineAt===undefined)throw new Error('Harness 启动时间未保存，未重复发起模型请求。');
       const html=await prepareArtifact('game',result.html,s);
       output={...result,html};
-    }catch(e){cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await storage.deleteAll();return false;}
+      if(harness){
+        const errors=validateCreationOutput(output,cp.stage,cp.previousCapture,cp.previous,remainingRepairs>0,
+          cp.harnessEvidence??[],await digest(html));
+        if(errors.length)throw problem(`制作阶段结构或版本证据不完整：${errors.join('、')}`);
+      }
+    }catch(e){
+      if(e instanceof HarnessCapacityWait&&cp.stage==='build'&&cp.harnessDeadlineAt===undefined){
+        cp.phase='ready';cp.stageStartedAt=undefined;await putCheckpoint(storage,cp);
+        await progress(DB,id,'build:waiting',e.message,Date.now());await storage.setAlarm(Date.now()+5000);return false;
+      }
+      cp.phase='failed';cp.failure=(e as Error).message;await putCheckpoint(storage,cp);await failForgeTask(env,row,cp.failure);await storage.deleteAll();return false;
+    }
     finally{clearInterval(timer);if(!uncertain)await lease.lease.release().catch(()=>{});}
     cp.output=output;cp.phase='output';
     // A transient checkpoint failure cannot trigger a fresh paid request.
@@ -225,15 +352,22 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     await persistStage(DB,row,cp);
     await progress(DB,id,`${cp.stage}:capture`,`${labels[cp.stage]}已保存，正在采集三种手机比例…`,Date.now());
     let capture:any,error:any;
-    for(let attempt=0;attempt<2;attempt++)try{capture=await (env.captureReview||captureFor({...env,creationCaptureStrict:true}))(cp.output.html,async(message:string)=>progress(DB,id,`${cp!.stage}:capture`,message));break;}catch(e){error=e;}
-    if(!capture){await failForgeTask(env,row,`采集未完成，已保存阶段版本：${error instanceof Error?error.message:'环境不可用'}`);await storage.deleteAll();return false;}
-    try{cp.capture=await lockCreationCapture(capture,cp.stage,cp.output.html);}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
+    for(let attempt=0;attempt<2&&!expired();attempt++)try{
+      capture=await (env.captureReview||captureFor({...env,creationCaptureStrict:true}))(cp.output.html,async(message:string)=>progress(DB,id,`${cp!.stage}:capture`,message),deadlineAt);
+      break;
+    }catch(e){error=e;}
+    if(!capture||expired()){await failForgeTask(env,row,expired()?deadlineFailure:`采集未完成，已保存阶段版本：${error instanceof Error?error.message:'环境不可用'}`);await storage.deleteAll();return false;}
+    try{cp.capture=await lockCreationCapture(capture,cp.stage,cp.output.html,await supplementalHash(cp));}catch(e){await failForgeTask(env,row,(e as Error).message);await storage.deleteAll();return false;}
     cp.phase='captured';await putCheckpoint(storage,cp);return true;
   }
   if(cp.phase==='captured'){
     await persistEvidence(DB,row,cp);
-    if(cp.stage==='build'||cp.stage==='polish'&&cp.output.selfCheck?.requestRepair){
-      const next:Stage=cp.stage==='build'?'polish':'repair';
+    const requestsRepair=cp.output.selfCheck?.requestRepair===true;
+    const next:Stage|null=cp.stage==='build'?'polish':
+      cp.stage==='polish'&&requestsRepair?'repair':
+      cp.stage==='repair'&&requestsRepair&&(harness?.limits.maxRepairs??0)>1?'repair2':null;
+    if(next){
+      if(expired()){await failForgeTask(env,row,deadlineFailure);await storage.deleteAll();return false;}
       cp={...cp,stage:next,phase:'ready',previous:cp.output,previousCapture:cp.capture,output:undefined,capture:undefined,versionId:undefined};
       // Each paid stage has its own bounded alarm invocation, rather than
       // accumulating two twelve-minute calls in one event lifetime.
@@ -241,7 +375,10 @@ export async function advanceCreationPipeline(state:any,env:any,id:string){
     }
     cp.phase='publish';await putCheckpoint(storage,cp);return true;
   }
-  if(cp.phase==='publish'){await publish(DB,row,cp);await storage.deleteAll();return false;}
+  if(cp.phase==='publish'){
+    if(harness)await finishHarnessTask(env,id,'completed');
+    await publish(DB,row,cp);await storage.deleteAll();return false;
+  }
   throw new Error('未知制作检查点。');
 }
 
@@ -252,20 +389,35 @@ export async function creationChecks(DB:any,owner:string,topicId:number){
 }
 export async function creationEvidence(DB:any,owner:string,topicId:number,taskId:string,stage:string){
   await ownedTopic(DB,topicId,owner);
-  const row=await DB.prepare('SELECT evidence_hash,content_hash FROM forge_creation_stages WHERE owner_id=? AND topic_id=? AND task_id=? AND stage=?').bind(owner,topicId,taskId,stage).first();
-  if(!row?.evidence_hash)throw problem('制作采集记录不存在。',404);
-  const parts=(await DB.prepare('SELECT content FROM forge_creation_evidence WHERE task_id=? AND stage=? ORDER BY part').bind(taskId,stage).all()).results||[];
+  const row=await DB.prepare('SELECT evidence_hash,content_hash,self_check FROM forge_creation_stages WHERE owner_id=? AND topic_id=? AND task_id=? AND stage=?').bind(owner,topicId,taskId,stage).first();
+  if(!row)throw problem('制作采集记录不存在。',404);
+  const extraHash=JSON.parse(row.self_check).harnessEvidenceHash;
+  let harnessEvidence:HarnessEvidence[]|undefined;
+  if(extraHash){
+    try{
+      const extras=(await DB.prepare('SELECT content FROM forge_creation_evidence WHERE task_id=? AND stage=? AND part<0 ORDER BY part DESC').bind(taskId,stage).all()).results||[];
+      harnessEvidence=await verifyHarnessEvidence(JSON.parse(extras.map((r:any)=>r.content).join('')));
+      if(await digest(canonicalJson(harnessEvidence))!==extraHash)throw new Error('Harness evidence hash');
+    }catch{throw problem('锁定 Harness 试玩证据无法校验。',409);}
+  }
+  if(!row.evidence_hash){
+    if(harnessEvidence)return {stage,inputHash:row.content_hash,hash:null,shots:[],harnessEvidenceHash:extraHash,harnessEvidence};
+    throw problem('制作采集记录不存在。',404);
+  }
+  const parts=(await DB.prepare('SELECT content FROM forge_creation_evidence WHERE task_id=? AND stage=? AND part>=0 ORDER BY part').bind(taskId,stage).all()).results||[];
   let capture:any;
   try{capture=JSON.parse(parts.map((r:any)=>r.content).join(''));}catch{throw problem('锁定制作证据无法校验。',409);}
-  if(capture.stage!==stage||capture.inputHash!==row.content_hash||capture.hash!==row.evidence_hash||!Array.isArray(capture.shots)||capture.shots.length!==4||
+  if(capture.stage!==stage||capture.inputHash!==row.content_hash||capture.hash!==row.evidence_hash||capture.harnessEvidenceHash!==extraHash||
+    !Array.isArray(capture.shots)||capture.shots.length!==4||
     (await Promise.all(capture.shots.map(async(s:any)=>await shotHash(s.data)===s.hash))).includes(false)||
-    await captureHash(capture.stage,capture.shots,capture.probe,capture.inputHash)!==row.evidence_hash)throw problem('锁定制作证据无法校验。',409);
-  return capture;
+    await captureHash(capture.stage,capture.shots,capture.probe,capture.inputHash,extraHash)!==row.evidence_hash)throw problem('锁定制作证据无法校验。',409);
+  return harnessEvidence?{...capture,harnessEvidence}:capture;
 }
 
 export async function recordAgentCreationStage(DB:any,row:any,payload:any,deviceTokenHash?:string){
   if(row.kind!=='game'||row.creative_version!==2||row.executor!=='agent'||row.status!=='running')throw problem('此任务不接受分阶段制作回传。',409);
-  const stage:Stage=payload.stage;
+  if(payload.harnessEvidence!==undefined||payload.capture?.harnessEvidence!==undefined||payload.capture?.harnessEvidenceHash!==undefined)throw problem('成员设备不能回传平台 Harness 试玩证据。');
+  const stage:AgentStage=payload.stage;
   if(!['build','polish','repair'].includes(stage)||payload.model!=null&&(typeof payload.model!=='string'||!payload.model.trim()||payload.model.length>160))throw problem('阶段或模型名称无效。');
   const snapshot=JSON.parse(row.input_snapshot),previousStage=stage==='polish'?'build':stage==='repair'?'polish':null;
   let previous:any,previousCapture:any;
@@ -286,7 +438,7 @@ export async function recordAgentCreationStage(DB:any,row:any,payload:any,device
   await DB.prepare(`UPDATE forge_tasks SET phase=?,detail=?,updated_at=?,phase_started_at=CASE WHEN phase IS NOT ? THEN ? ELSE phase_started_at END
     WHERE id=? AND status='running' AND NOT EXISTS(SELECT 1 FROM forge_creation_stages WHERE task_id=?
       AND CASE stage WHEN 'build' THEN 1 WHEN 'polish' THEN 2 ELSE 3 END > ?)`).bind(`${stage}:captured`,`${labels[stage]}与实际采集已保存。`,stamp(),`${stage}:captured`,stamp(),row.id,row.id,['build','polish','repair'].indexOf(stage)+1).run();
-  const next:Stage|null=stage==='build'?'polish':stage==='polish'&&payload.output.selfCheck?.requestRepair?'repair':null;
+  const next:AgentStage|null=stage==='build'?'polish':stage==='polish'&&payload.output.selfCheck?.requestRepair?'repair':null;
   return {stage,version_id:cp.versionId,content_hash:capture.inputHash,evidence_hash:capture.hash,...(next?{nextMaterials:{stage:next,system:gameStageSystem(next),user:gameStageUser(next,{topic:snapshot.topic,brief:snapshot.topic.brief_md,styleSvg:snapshot.topic.preview_svg||'',assetHtml:snapshot.topic.assets_html||'',html,capture,selfCheck:cp.output.selfCheck,requirements:cp.output.requirements,decisions:cp.output.decisions,coreChanges:cp.output.coreChanges}),schema:schemas[next]}}:{nextMaterials:null,complete:{result:{stage},model:cp.model}})};
 }
 
