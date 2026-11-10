@@ -270,7 +270,7 @@ function repaintFor(root, repaint) { return () => {
   else if (id) focusCardActivity(root, id);
 }; }
 
-const stageLabels={build:'制作',polish:'精修',repair:'定向修复'};
+const stageLabels={build:'制作',polish:'精修',repair:'定向修复',repair2:'第二次定向修复'};
 function creationChecksHtml(viewer) {
   const {checks,evidence,record} = viewer;
   const hash = (label,value) => value ? `<p class="small"><b>${label}</b> <code style="overflow-wrap:anywhere">${esc(value)}</code></p>` : '';

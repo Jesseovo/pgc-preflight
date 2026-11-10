@@ -1,0 +1,282 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/claude-code-best/claude-code",
+    "commit": "963e0013184ecc1521289a0fc7d5da4bb6e45356",
+    "sourceInspection": "Pinned local checkout. Authorized private study port. The upstream repository was not redistributed."
+  },
+  "scope": "CCB non-streaming tool-execution query path embedded in a Worker, with host callbacks for all external effects.",
+  "sources": {
+    "src/query.ts": {
+      "sha256": "e2c642c8ab39e2103beeaa6be233b66a02320dba0333a2a058fcb095acfb50df",
+      "references": [
+        {
+          "behavior": "query state and transition metadata",
+          "startLine": 261,
+          "endLine": 273
+        },
+        {
+          "behavior": "actual tools drive continuation",
+          "startLine": 749,
+          "endLine": 756
+        },
+        {
+          "behavior": "abort closes unmatched tools",
+          "startLine": 1298,
+          "endLine": 1334
+        },
+        {
+          "behavior": "after tools, bound next turn and update transcript",
+          "startLine": 2036,
+          "endLine": 2059
+        }
+      ]
+    },
+    "src/query/transitions.ts": {
+      "sha256": "306fa7b0422e200f85464d1757dae7f403554c62fdb8e9e3ef49472a966a161b",
+      "references": [
+        {
+          "behavior": "typed terminals and continuations",
+          "startLine": 1,
+          "endLine": 20
+        }
+      ]
+    },
+    "src/services/tools/toolOrchestration.ts": {
+      "sha256": "bf74b508b526a47fd80e1a48fca6921cdaf4302c07f93fcdc6b4cbf0bc94862f",
+      "references": [
+        {
+          "behavior": "non-streaming tool scheduler",
+          "startLine": 20,
+          "endLine": 99
+        },
+        {
+          "behavior": "adjacent read-only batch partition",
+          "startLine": 99,
+          "endLine": 133
+        }
+      ]
+    },
+    "src/utils/generators.ts": {
+      "sha256": "6fd476e2746a002efa4782565d51117f39f96425aaeb375b61fb4a7dc50e57ec",
+      "references": [
+        {
+          "behavior": "completion-order bounded concurrent merge",
+          "startLine": 24,
+          "endLine": 76
+        }
+      ]
+    },
+    "src/services/tools/StreamingToolExecutor.ts": {
+      "sha256": "b6414abce15b400bfa758482f5487bebb7f3c956ace6370ac07f4baf33de9a4c",
+      "references": [
+        {
+          "behavior": "unavailable tool error and exclusive tool barrier",
+          "startLine": 90,
+          "endLine": 180
+        }
+      ]
+    },
+    "src/utils/messages.ts": {
+      "sha256": "ed11dab79579a9350ee751c3af095af5a4274c6c867e54155bdbe51bb12ea013",
+      "references": [
+        {
+          "behavior": "strict/repair tool pairing",
+          "startLine": 5594
+        }
+      ]
+    },
+    "src/services/compact/grouping.ts": {
+      "sha256": "af1541451a5e127f4303049fe771fc2d472319d91ca27feebb954c532eaf3695",
+      "references": [
+        {
+          "behavior": "whole API round grouping",
+          "startLine": 22
+        }
+      ]
+    },
+    "src/services/compact/autoCompact.ts": {
+      "sha256": "81e7eac76b680ba71f96853c30efae1d55777b75e06ada7141b375271ff10155",
+      "references": [
+        {
+          "behavior": "context window output reserve and thresholds",
+          "startLine": 30,
+          "endLine": 122
+        }
+      ]
+    },
+    "src/services/compact/compact.ts": {
+      "sha256": "a08ef94b2894488c6f45490f63af30b16293ab1bd86c3422679acc2101e31211",
+      "references": [
+        {
+          "behavior": "compaction API round retention",
+          "startLine": 261,
+          "endLine": 299
+        }
+      ]
+    },
+    "src/services/compact/prompt.ts": {
+      "sha256": "d30c3db139ec82af9ee1db35504fcb55d76a50aa0b1e3318c238aa47abdac772",
+      "references": [
+        {
+          "behavior": "discard summary scratchpad",
+          "startLine": 312,
+          "endLine": 338
+        }
+      ]
+    },
+    "src/query/tokenBudget.ts": {
+      "sha256": "e1ca96ad655d1d4789cc7bb338e33f6c82cd99a8c91c9899d0697f91ce6d24cd",
+      "references": [
+        {
+          "behavior": "Optional continuation nudge, intentionally disabled in bounded PGC runs",
+          "startLine": 38
+        }
+      ]
+    },
+    "src/constants/prompts.ts": {
+      "sha256": "b9c9682609d646dd073380656add5c3d55666db9ce9219a69b9361112828602e",
+      "references": [
+        {
+          "behavior": "Untrusted instructions in tool and file evidence",
+          "startLine": 193,
+          "endLine": 193
+        },
+        {
+          "behavior": "Stay in task scope, verify completion, read before changing, diagnose failures",
+          "startLine": 201,
+          "endLine": 233
+        },
+        {
+          "behavior": "Respect authorized scope and avoid destructive shortcuts",
+          "startLine": 245,
+          "endLine": 256
+        },
+        {
+          "behavior": "Prefer direct dedicated tool calls",
+          "startLine": 259,
+          "endLine": 295
+        }
+      ]
+    },
+    "src/utils/tokens.ts": {
+      "sha256": "68dde6e361db05d287b7e027646663ee5f0988f284971c519faac01cd23f2e6b",
+      "references": [
+        {
+          "behavior": "Use last API usage and estimate subsequently appended tool results",
+          "startLine": 251,
+          "endLine": 287
+        }
+      ]
+    }
+  },
+  "extractedPrimitives": [
+    {
+      "embedded": "server/embedded-ccb/upstream.ts#groupMessagesByApiRound",
+      "source": "src/services/compact/grouping.ts",
+      "adaptation": "Original body, widened the type to retain the embedded message payload."
+    },
+    {
+      "embedded": "server/embedded-ccb/upstream.ts#partitionToolCalls",
+      "source": "src/services/tools/toolOrchestration.ts",
+      "adaptation": "Original adjacent grouping, replaces CLI registry and schema/classifier lookups with one trusted input validity and read-only predicate."
+    },
+    {
+      "embedded": "server/embedded-ccb/upstream.ts#all",
+      "source": "src/utils/generators.ts",
+      "adaptation": "Original generator and queue type unchanged."
+    },
+    {
+      "embedded": "server/embedded-ccb/transitions.ts",
+      "source": "src/query/transitions.ts",
+      "adaptation": "Original transition and terminal vocabulary. Only the used branch subset is surfaced; PGC adds terminal tool_error and output_limit."
+    },
+    {
+      "embedded": "server/embedded-ccb/upstream.ts#collectToolUses",
+      "source": "src/query.ts",
+      "adaptation": "Native assistant tool-block accumulation and needsFollowUp decision extracted from the stream handler, applied to one verified full model response."
+    },
+    {
+      "embedded": "server/embedded-ccb/upstream.ts#nextToolTurn",
+      "source": "src/query.ts",
+      "adaptation": "After-tool nextTurnCount, upper limit, transcript append, and next_turn transition retained. CLI context fields and attachment event are omitted."
+    },
+    {
+      "embedded": "server/embedded-ccb/upstream.ts#formatCompactSummary",
+      "source": "src/services/compact/prompt.ts",
+      "adaptation": "Original summary formatter applied after the embedded fork validates exactly one summary block."
+    }
+  ],
+  "preservedBehavior": [
+    "The query continues on actual tool_use blocks even when the provider stop reason differs. A clean no-tool stop completes even without final text; the host validates the required file or report.",
+    "Tool results immediately follow their assistant round. Duplicate, missing and orphaned IDs fail closed, following upstream strict mode. Explicit tool errors remain paired.",
+    "Read-only batches merge in completion order, with ten in flight at most. Mutations are exclusive and act as ordering barriers.",
+    "Thinking and signatures pass unchanged in the main model trajectory and remain in task memory.",
+    "Proactive context pressure uses the CCB effective context window and verified prior API usage as a lower bound. It compacts only complete earlier API rounds. The newest round, immutable input, and all original generated image bytes with their tool/result-part identities remain available.",
+    "Compaction runs through the same model callback and counts against the shared model-call and output caps."
+  ],
+  "adaptations": [
+    "The provider callback returns one terminal native response. Tool execution during the partial model stream and CLI progress events are omitted.",
+    "The embedded task has no interactive commands, stop hooks, CLI attachments/queued notifications, context modifiers, analytics, auth selection, sessions, background agents, or filesystem authority. Tool capabilities and persistence are host-owned.",
+    "Provider retries, model fallback, output-limit escalation, reactive replay and speculative token-budget continuation are disabled. A transport error and unknown output retain the requested output reservation. A thrown tool or workspace persistence error stops the query before another model call.",
+    "Refusals, missing or unsupported terminal reasons and truncated responses fail closed. In particular, a truncated response cannot execute partial or complete-looking tools.",
+    "The default token estimator uses UTF-8 and image approximations, and can be replaced by a host counter. The prior API usage excludes provider fields the host does not expose, such as separate cache-token counters. Compaction leaves the pending main call and at least one output token in the aggregate budget.",
+    "The compact fork keeps the upstream no-tools emphasis, chronological detailed summary, concrete file and error references, summary formatter, and recent-round retention. It receives only older working data, no tools or raw reasoning. It requires one summary block and omits CLI transcript paths, all-user-turn reproduction, file rehydration, microcompact, prompt cache compaction, server memory compaction, reactive retries and external summary backends.",
+    "Final result exports only final assistant text and bounded usage metadata. Raw thinking, signatures, and transcripts are excluded from the result."
+  ],
+  "behaviorFixtures": {
+    "apiRoundGroups": [
+      [
+        "prompt"
+      ],
+      [
+        "tool-a",
+        "result-a",
+        "tool-b",
+        "result-b"
+      ],
+      [
+        "followup"
+      ]
+    ],
+    "toolBatches": [
+      [
+        true,
+        2
+      ],
+      [
+        false,
+        1
+      ],
+      [
+        true,
+        1
+      ],
+      [
+        false,
+        1
+      ],
+      [
+        true,
+        1
+      ]
+    ],
+    "oracle": "The checked-in source excerpts execute in every checkout, including clean GitHub CI. Local original source byte verification is an additional check."
+  },
+  "oracleBoundary": "CI executes the original pinned source fragments in tests/fixtures/embedded-ccb-upstream.json for native tool detection, completion, max turn, transcript update, strict pairing and summary formatting. The fixture pins original file SHA-256 and exact byte/line ranges. The local source checkout, when present, independently verifies the original file and excerpt bytes. Whole upstream QueryEngine, SDK stream, CLI attachments, hooks, reactive retries and original prompt/template stack are outside the tested equivalence.",
+  "executionPrompt": {
+    "embedded": "server/embedded-ccb/prompt.ts#getEmbeddedExecutionPrompt",
+    "source": "src/constants/prompts.ts",
+    "preserves": [
+      "Original scope and no-unrequested-change wording",
+      "Original read-before-change and diagnose-before-identical-retry guidance",
+      "Dedicated exposed tools and evidence-based completion verification",
+      "Untrusted tool and file data does not grant authority"
+    ],
+    "adapts": [
+      "Game uses the existing PGC private workspace list/read/patch/write and browser contracts with game.html and record.json output",
+      "Review and other tool-free purposes use locked evidence and return the originally requested format",
+      "Excludes CLI, shell, Git, hidden/deferred tools, agent delegation, interactive prompts, optional skill discovery and upgrades"
+    ]
+  }
+}

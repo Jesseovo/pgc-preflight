@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="960" viewBox="0 0 540 960" aria-label="灯塔校音样板图">
+  <rect width="540" height="960" fill="#102842"/>
+  <rect x="26" y="28" width="488" height="106" rx="20" fill="none" stroke="#65e0ce" stroke-width="3"/>
+  <text x="48" y="86" fill="#65e0ce" font-size="30">灯塔校音</text>
+  <rect x="26" y="158" width="488" height="530" rx="26" fill="none" stroke="#65e0ce" stroke-width="3"/>
+  <g transform="translate(270 402) scale(2)">
+    <path d="M0 -48a48 48 0 1 1 0 96a48 48 0 1 1 0 -96zm0 12a36 36 0 1 0 0 72a36 36 0 1 0 0 -72z" fill="#65e0ce" fill-rule="evenodd"/>
+    <path d="M-8 -21h16v42h-16z" fill="#ffbf69"/>
+  </g>
+  <rect x="26" y="725" width="488" height="126" rx="22" fill="#ffbf69"/>
+  <text x="270" y="802" fill="#102842" font-size="27" text-anchor="middle">校准按钮</text>
+  <path d="M48 903h444" stroke="#65e0ce" stroke-width="3"/>
+</svg>

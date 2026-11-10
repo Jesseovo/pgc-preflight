@@ -1,3 +1,4 @@
+import {purgeEmbeddedArtifacts} from './harness-embedded-artifacts';
 import puppeteer from '@cloudflare/puppeteer';
 import type { Browser } from 'puppeteer-core';
 import { inspectGame } from './checker';
@@ -25,7 +26,7 @@ export {CreatorFeedbackRunner} from './creator-feedback-runner';
 
 interface QueueMessage<T> { id: string; body: T; attempts?: number; ack(): void; retry(options?: { delaySeconds?: number }): void }
 interface QueueBatch<T> { messages: QueueMessage<T>[] }
-interface Env extends CreatorFeedbackEnv { CREATIVE_V2_ROLLOUT?:string; ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
+interface Env extends CreatorFeedbackEnv { HARNESS_ROLLOUT?:string;HARNESS_RELEASE?:string;HARNESS_RUNNER?:ForgeRunnerBinding; CREATIVE_V2_ROLLOUT?:string; ASSETS: { fetch(request: Request): Promise<Response> }; BROWSER: Parameters<typeof puppeteer.launch>[0]; CHECK_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> }; FORGE_QUEUE: { send(message: ForgeJob): Promise<void> }; FORGE_RUNNER:ForgeRunnerBinding; REVIEW_QUEUE: { send(message: {type: 'review'; id: string}): Promise<void> }; DB:Database; ADMIN_PASSWORD:string; SETTINGS_KEY:string }
 interface WorkerContext { waitUntil(promise: Promise<unknown>): void }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
 
@@ -63,7 +64,7 @@ const app = {
     }
     if(url.pathname.startsWith('/api/admin/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`admin:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
-      return (await adminApi(request,store,env,members,env.DB,{captureReview:captureFor(env),FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,CREATOR_FEEDBACK_ENABLED:env.CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_TOKEN:env.CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_RUNNER:env.CREATOR_FEEDBACK_RUNNER}))!;
+      return (await adminApi(request,store,env,members,env.DB,{HARNESS_ROLLOUT:env.HARNESS_ROLLOUT,HARNESS_RELEASE:env.HARNESS_RELEASE,HARNESS_RUNNER:env.HARNESS_RUNNER,captureReview:captureFor(env),FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,CREATOR_FEEDBACK_ENABLED:env.CREATOR_FEEDBACK_ENABLED,CREATOR_FEEDBACK_TOKEN:env.CREATOR_FEEDBACK_TOKEN,CREATOR_FEEDBACK_RUNNER:env.CREATOR_FEEDBACK_RUNNER}))!;
     }
     if(url.pathname.startsWith('/api/auth/')){
       if(request.method!=='GET'){const rate=await env.CHECK_RATE_LIMIT.limit({key:`auth:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'登录操作较频繁，请稍后重试。'},429);}
@@ -72,7 +73,7 @@ const app = {
     if(url.pathname.startsWith('/api/forge/')){
       if(request.method!=='GET'){const rate=await env.FORGE_RATE_LIMIT.limit({key:`forge:${request.headers.get('CF-Connecting-IP')||'unknown'}`});if(!rate.success)return json({error:'操作较频繁，请一分钟后重试。'},429);}
       const route=url.pathname.slice('/api/forge/'.length).split('/').filter(Boolean);
-      return forgeApi(request,{CREATIVE_V2_ROLLOUT:creativeRollout,DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,
+      return forgeApi(request,{HARNESS_ROLLOUT:env.HARNESS_ROLLOUT,HARNESS_RELEASE:env.HARNESS_RELEASE,HARNESS_RUNNER:env.HARNESS_RUNNER,CREATIVE_V2_ROLLOUT:creativeRollout,DB:env.DB,ADMIN_PASSWORD:env.ADMIN_PASSWORD,SETTINGS_KEY:env.SETTINGS_KEY,modelStore:store,FORGE_RUNNER:env.FORGE_RUNNER,REVIEW_QUEUE:env.REVIEW_QUEUE,
         reviewExecutor:'device',
       },route,members,ctx);
     }
@@ -134,6 +135,7 @@ const app = {
     await purgeReviewInputs(env);
     await recoverForgeTasks({...env,modelStore:configStore(env.DB)});
     await purgeOldForgeTasks(env.DB);
+    await purgeEmbeddedArtifacts(env.DB);
     await env.DB.prepare('DELETE FROM model_slots WHERE expires_at < ?').bind(Date.now()).run();
     await env.DB.prepare('DELETE FROM model_runs WHERE created_at < ?').bind(new Date(Date.now()-30*86400000).toISOString()).run();
     await env.DB.prepare("UPDATE topics SET product_status = 'error', product_error = '制作进程意外中断，未保存完整成品；请检查后重试。', updated_at = ? WHERE product_status = 'running' AND updated_at < ? AND NOT EXISTS(SELECT 1 FROM forge_tasks WHERE forge_tasks.owner_id=topics.owner_id AND executor='agent' AND scope=topics.owner_id||':game:'||topics.id AND status IN ('queued','running'))")

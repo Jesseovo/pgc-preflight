@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="540" height="960" viewBox="0 0 540 960" aria-label="小站配给样板图">
+  <rect width="540" height="960" fill="#18332b"/>
+  <rect x="26" y="28" width="488" height="106" rx="20" fill="none" stroke="#82d8a8" stroke-width="3"/>
+  <text x="48" y="86" fill="#82d8a8" font-size="30">小站配给</text>
+  <rect x="26" y="158" width="488" height="530" rx="26" fill="none" stroke="#82d8a8" stroke-width="3"/>
+  <g transform="translate(270 402) scale(2)">
+    <path d="M-45 -27h75v54h-75zm77 13h13v28h-13z" fill="#82d8a8" fill-rule="evenodd"/>
+    <path d="M-28 -15h9v30h-9zm17 0h9v30h-9zm17 0h9v30h-9z" fill="#f0c779"/>
+  </g>
+  <rect x="26" y="725" width="488" height="126" rx="22" fill="#f0c779"/>
+  <text x="270" y="802" fill="#18332b" font-size="27" text-anchor="middle">选电力分配</text>
+  <path d="M48 903h444" stroke="#82d8a8" stroke-width="3"/>
+</svg>

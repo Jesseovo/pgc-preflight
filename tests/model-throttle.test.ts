@@ -34,14 +34,24 @@ describe('模型限流与恢复', () => {
 
   it('一个任务收到429后，其他等待任务遵守共享冷却，并错开恢复', async () => {
     vi.useFakeTimers();
-    const { DB } = setup(); const first = createModelThrottle(DB, config), second = createModelThrottle(DB, config);
+    const { DB } = setup(); const first = createModelThrottle(DB, config);
     const signal = new AbortController().signal; await first.wait(signal);
-    let secondAt = 0, thirdAt = 0;
-    const pending = second.wait(signal).then(() => { secondAt = Date.now(); });
+    const queue = () => {
+      let queued!: () => void;
+      const waiting = new Promise<void>(resolve => { queued = resolve; });
+      // Web Crypto runs outside the fake clock. Resolve after onWait so the
+      // throttle installs its timer before the test advances time.
+      const started = createModelThrottle(DB, config).wait(signal, () => queueMicrotask(queued)).then(() => Date.now());
+      return { waiting, started };
+    };
+    const second = queue();
+    await second.waiting;
     await vi.advanceTimersByTimeAsync(1000);
     const start = Date.now(); await first.cooldown(18000);
-    const third = createModelThrottle(DB, config).wait(signal).then(() => { thirdAt = Date.now(); });
-    await vi.advanceTimersByTimeAsync(50000); await Promise.all([pending, third]);
+    const third = queue();
+    await third.waiting;
+    await vi.advanceTimersByTimeAsync(50000);
+    const [secondAt, thirdAt] = await Promise.all([second.started, third.started]);
     expect(Math.min(secondAt, thirdAt)).toBeGreaterThanOrEqual(start + 18000);
     expect(Math.abs(secondAt - thirdAt)).toBeGreaterThanOrEqual(7000);
   });

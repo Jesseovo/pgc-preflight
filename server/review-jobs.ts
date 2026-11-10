@@ -6,6 +6,8 @@ import {digest} from './review-device-state';
 import {withHumanReviews} from './human-review';
 import {getActiveReviewRules} from './review-rules';
 import {validReviewArtifactVersion,verifyReviewArtifact} from './creation-review-links';
+import {newHarnessPolicy,type HarnessBinding} from './harness-policy';
+import {publicHarnessFields,readPublicHarnessUsage,type PublicHarnessUsage} from './harness-task-status';
 
 type ReviewJob = { type: 'review'; id: string };
 export interface ReviewJobEnv {
@@ -16,10 +18,13 @@ export interface ReviewJobEnv {
   captureReview?: (html:string, onWait?:(message:string)=>Promise<void>) => Promise<any>;
   reviewExecutor?: 'device';
   modelExecutor?: 'agent' | 'platform';
+  HARNESS_RUNNER?:HarnessBinding;
+  HARNESS_ROLLOUT?:string;
+  HARNESS_RELEASE?:string;
 }
 const stamp = () => new Date().toISOString();
 const fail = (message: string, status = 400) => Object.assign(new Error(message), { status });
-const publicJob = ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, artifact_version_id, review_mode,report_schema_version,rules_snapshot, human_review=null }: any) => ({ id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,...(artifact_version_id?{artifactVersionId:artifact_version_id}:{}),...(report_schema_version===2?{review_mode,report_schema_version,rules_snapshot:JSON.parse(rules_snapshot)}:{}),human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
+const publicJob = ({ harness_policy,id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, local_model, input_hash, artifact_version_id, review_mode,report_schema_version,rules_snapshot, human_review=null }: any, usage?: PublicHarnessUsage) => ({ ...publicHarnessFields(harness_policy,usage),id, title, filename, stage, status, error, result_id, created_at, updated_at, quota_charged, model_executor, model: local_model,input_hash,...(artifact_version_id?{artifactVersionId:artifact_version_id}:{}),...(report_schema_version===2?{review_mode,report_schema_version,rules_snapshot:JSON.parse(rules_snapshot)}:{}),human_review,human_status:human_review?.status??null,human_score:human_review?.score??null });
 
 export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: string) {
   const local = env.modelExecutor !== 'platform';
@@ -42,7 +47,8 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   const original=async(row:any)=>{
     if((artifactId||row.artifact_version_id)&&(artifactId!==row.artifact_version_id||inputHash!==row.input_hash||
       payload.topic_id!=null&&payload.topic_id!==row.topic_id||(payload.review_mode??'basic')!==row.review_mode))throw fail('原审核请求已经锁定成品版本、文件和审核模式。',409);
-    return publicJob((await withHumanReviews(env.DB,[row],true))[0]);
+    const [human,usage]=await Promise.all([withHumanReviews(env.DB,[row],true),readPublicHarnessUsage(env.DB,'review',[row])]);
+    return publicJob(human[0],usage.get(row.id));
   };
   const existing = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
   if (existing) {
@@ -71,17 +77,18 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
   // One serialized SQLite statement reserves quota even when several uploads
   // arrive together. The same request ID can never charge twice.
   const day = reviewDay();
+  const harnessPolicy=!local&&ownerId==='admin'?await newHarnessPolicy(env,ownerId,'review','review'):null;
   const inserted = local ? await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id,owner_id,title,filename,topic_id,stage,usage_day,created_at,updated_at,executor,input_ready,model_executor,quota_charged,input_hash,rules_snapshot,report_schema_version,review_mode${artifactId?',artifact_version_id':''})
     SELECT ?,?,?,?,?,'capture',?,?,?,'device',0,'agent',0,?,?,?,?${artifactId?',?':''} WHERE
     (?='admin' OR EXISTS(SELECT 1 FROM members WHERE id=? AND enabled=1 AND can_review=1))
     ${artifactId?"AND EXISTS(SELECT 1 FROM artifact_versions WHERE id=? AND owner_id=? AND topic_id=? AND kind='game')":''}`)
     .bind(id,ownerId,title,filename,topicId,day,now,now,inputHash,rulesSnapshot,reportSchemaVersion,reviewMode,...(artifactId?[artifactId]:[]),ownerId,ownerId,...(artifactId?[artifactId,ownerId,topicId]:[])).run()
-    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, topic_id, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash,rules_snapshot,report_schema_version,review_mode)
-    SELECT ?, ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',?,?,?,? WHERE
+    : await env.DB.prepare(`INSERT OR IGNORE INTO review_jobs (id, owner_id, title, filename, topic_id, stage, usage_day, created_at, updated_at,executor,input_ready,model_executor,input_hash,rules_snapshot,report_schema_version,review_mode${harnessPolicy?',harness_policy':''})
+    SELECT ?, ?, ?, ?, ?, 'capture', ?, ?, ?, ?, 0, 'platform',?,?,?,?${harnessPolicy?',?':''} WHERE
     (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND status IN ('queued', 'running')) < 50
     AND (? = 'admin' OR EXISTS (SELECT 1 FROM members WHERE id = ? AND enabled = 1 AND can_review = 1 AND
       daily_review_limit > (SELECT COUNT(*) FROM review_jobs WHERE owner_id = ? AND usage_day = ? AND quota_charged = 1)))`)
-    .bind(id, ownerId, title, filename, topicId, day, now, now,env.reviewExecutor||'cloud',inputHash,rulesSnapshot,reportSchemaVersion,reviewMode, ownerId, ownerId, ownerId, ownerId, day).run();
+    .bind(id, ownerId, title, filename, topicId, day, now, now,env.reviewExecutor||'cloud',inputHash,rulesSnapshot,reportSchemaVersion,reviewMode,...(harnessPolicy?[JSON.stringify(harnessPolicy)]:[]), ownerId, ownerId, ownerId, ownerId, day).run();
   if (!inserted.meta.changes) {
     const duplicate = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
     if (duplicate) return original(duplicate);
@@ -119,7 +126,7 @@ export async function enqueueReview(env: ReviewJobEnv, payload: any, ownerId: st
       throw fail(`后台调度未确认，任务 ${id} 已保留，请使用原编号重试。`,503);
     }
   }
-  return { id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform',...(artifactId?{artifactVersionId:artifactId,input_hash:inputHash}:{}),...(reportSchemaVersion===2?{review_mode:reviewMode,report_schema_version:2,rules_snapshot:rules}:{}) };
+  return { ...publicHarnessFields(harnessPolicy?JSON.stringify(harnessPolicy):null), id, title, filename, stage:'capture', status: 'queued', error: '', result_id: null, created_at: now, updated_at: now, quota_charged:local?0:1, model_executor:local?'agent':'platform',...(artifactId?{artifactVersionId:artifactId,input_hash:inputHash}:{}),...(reportSchemaVersion===2?{review_mode:reviewMode,report_schema_version:2,rules_snapshot:rules}:{}) };
 }
 
 export async function scheduleCloudReview(env: Pick<ReviewJobEnv,'REVIEW_RUNNER'|'REVIEW_QUEUE'>, id:string) {
@@ -137,7 +144,9 @@ export async function listReviewJobs(env: ReviewJobEnv, ownerId: string) {
   await recoverInterruptedReviews(env, ownerId);
   const { results } = await env.DB.prepare("SELECT * FROM review_jobs WHERE owner_id = ? AND owner_hidden = 0 AND (created_at > ? OR (model_executor='agent' AND status IN ('queued','running'))) ORDER BY created_at DESC LIMIT 100")
     .bind(ownerId, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()).all();
-  return (await withHumanReviews(env.DB,results||[],true)).map(publicJob);
+  const rows=results||[];
+  const [human,usage]=await Promise.all([withHumanReviews(env.DB,rows,true),readPublicHarnessUsage(env.DB,'review',rows)]);
+  return human.map(row=>publicJob(row,usage.get(row.id)));
 }
 
 export async function recoverInterruptedReviews(env: {DB:any}, ownerId?: string) {
@@ -163,7 +172,8 @@ export async function getReviewJob(env: ReviewJobEnv, id: string, ownerId: strin
     row = await env.DB.prepare('SELECT * FROM review_jobs WHERE id = ? AND owner_id = ?').bind(id, ownerId).first();
     if (row.status === 'error') await deleteInput(env, id);
   }
-  return publicJob((await withHumanReviews(env.DB,[row],true))[0]);
+  const [human,usage]=await Promise.all([withHumanReviews(env.DB,[row],true),readPublicHarnessUsage(env.DB,'review',[row])]);
+  return publicJob(human[0],usage.get(row.id));
 }
 
 // Model activity updates the member-visible stage and also renews the job

@@ -1,0 +1,158 @@
+name: CCB research image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_image:
+        description: Push the tested research image to the private Cloudflare registry (no Worker deployment)
+        type: boolean
+        default: false
+  push:
+    branches: [codex/ccb-harness-integration]
+    paths:
+      - 'harness/**'
+      - 'server/harness-*.ts'
+      - 'tests/harness-*.test.ts'
+      - 'scripts/harness-native-probe*'
+      - 'scripts/harness-egress-probe*'
+      - 'scripts/harness-browser-close-probe*'
+      - 'scripts/harness-comparison*'
+      - 'scripts/prepare-harness-comparison*'
+      - 'scripts/run-harness-native-probe.mjs'
+      - '.github/workflows/ccb-research-image.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ccb-research-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CCB_COMMIT: 963e0013184ecc1521289a0fc7d5da4bb6e45356
+      RESEARCH_IMAGE: pgc-ccb-research:${{ github.sha }}
+    steps:
+      - name: Check out research source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Offline comparison tests execute the exact archived baseline commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24.16.0'
+
+      - name: Run regression tests and build PGC
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Build local Linux amd64 research image
+        run: |
+          grep -Fq "tar.gz/${CCB_COMMIT}" harness/Dockerfile
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "io.pgc.ccb.revision=${CCB_COMMIT}" \
+            --tag "${RESEARCH_IMAGE}" harness
+
+      - name: Probe bundled CCB and private health endpoint offline
+        shell: bash
+        run: |
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint node "${RESEARCH_IMAGE}" /opt/ccb/dist/cli-node.js --version
+
+          probe_name="ccb-research-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$probe_name" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$probe_name" --network none --cap-drop ALL \
+            --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev \
+            --env PGC_HARNESS_CONTROL_TOKEN=synthetic-offline-probe-only \
+            --env PGC_HARNESS_GATEWAY_URL=http://pgc-harness.internal \
+            "${RESEARCH_IMAGE}" >/dev/null
+
+          docker exec -i "$probe_name" node --input-type=module - <<'JS'
+          import assert from 'node:assert/strict';
+          import { setTimeout } from 'node:timers/promises';
+
+          assert.notEqual(process.getuid(), 0);
+          const url = 'http://127.0.0.1:8080/v1/health';
+          const probe = async headers => fetch(url, { headers, signal: AbortSignal.timeout(500) });
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const response = await probe({}).catch(() => null);
+            if (response) {
+              assert.equal(response.status, 401);
+              const ready = await probe({ authorization: 'Bearer synthetic-offline-probe-only' });
+              assert.equal(ready.status, 200);
+              assert.deepEqual(await ready.json(), { status: 'ready' });
+              process.exit(0);
+            }
+            await setTimeout(250);
+          }
+          throw new Error('Private runtime did not become ready');
+          JS
+
+      - name: Verify image drops process privileges itself
+        shell: bash
+        run: |
+          docker run --rm --network none --cap-drop ALL --entrypoint /usr/bin/setpriv "${RESEARCH_IMAGE}" --version
+          probe_name="ccb-privileges-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$probe_name" >/dev/null 2>&1 || true' EXIT
+          for mode in already-restricted granted-capabilities; do
+            if [ "$mode" = already-restricted ]; then
+              startup=(--cap-drop ALL)
+              command=()
+            else
+              startup=(--user 0:0 --entrypoint /usr/bin/setpriv)
+              command=(--reuid=1000 --regid=1000 --clear-groups --inh-caps=+setpcap,+net_raw --ambient-caps=+setpcap,+net_raw /bin/sh -ec 'for kind in CapEff CapAmb; do value="$(sed -n "s/^$kind:[[:space:]]*//p" /proc/self/status)"; case "$value" in *[1-9a-f]*) ;; *) exit 1 ;; esac; done; exec /opt/harness/launch')
+            fi
+            docker run --detach --name "$probe_name" --network none \
+              --add-host pgc-harness.internal:127.0.0.1 \
+              --read-only --tmpfs /tmp:rw,nosuid,nodev \
+              --env PGC_HARNESS_CONTROL_TOKEN=synthetic-offline-probe-only \
+              --env PGC_HARNESS_GATEWAY_URL=http://pgc-harness.internal \
+              "${startup[@]}" "${RESEARCH_IMAGE}" "${command[@]}" >/dev/null
+            docker exec --user 1000:1000 -i "$probe_name" node --input-type=module - < harness/check-process-privileges.mjs
+            docker rm -f "$probe_name" >/dev/null
+          done
+
+          # A nonzero bounding set without effective CAP_SETPCAP cannot be
+          # cleared. The image must stop before Node rather than run partially
+          # restricted. These are Docker's normal USER node capabilities.
+          docker create --name "$probe_name" --network none \
+            --env PGC_HARNESS_CONTROL_TOKEN=synthetic-offline-probe-only \
+            --env PGC_HARNESS_GATEWAY_URL=http://pgc-harness.internal \
+            "${RESEARCH_IMAGE}" >/dev/null
+          docker start "$probe_name" >/dev/null
+          test "$(timeout 15 docker wait "$probe_name")" != 0
+          test "$(docker inspect --format '{{.State.Running}}' "$probe_name")" = false
+
+      - name: Push tested research image with dedicated CI credential
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'Dedicated Cloudflare CI secret is missing'; exit 1; }
+          npx wrangler containers push "$RESEARCH_IMAGE"
+          docker image inspect "$RESEARCH_IMAGE" --format '{{json .RepoDigests}}' > image-digests.json
+          node --input-type=module - <<'JS'
+          import {readFileSync,writeFileSync} from 'node:fs';
+          const digests=JSON.parse(readFileSync('image-digests.json','utf8'));
+          const image=digests.find(value=>/^registry\.cloudflare\.com\/[a-f0-9]{32}\/.+@sha256:[a-f0-9]{64}$/.test(value));
+          if(!image)throw new Error('Cloudflare digest was not returned');
+          writeFileSync('research-image.json',JSON.stringify({schemaVersion:1,image,implementationCommit:process.env.GITHUB_SHA,engineCommit:process.env.CCB_COMMIT,linuxOfflineSmoke:true,providerCompatibilityVerified:false,nativeIsolationVerified:false},null,2));
+          JS
+
+      - name: Save research image receipt
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_image
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ccb-research-image-${{ github.sha }}
+          path: research-image.json
+          retention-days: 7

@@ -2,6 +2,7 @@ import { useContext, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { AdminMaterial, AdminMemberOption, AdminPage, AdminProject, AdminProjectDetail, AdminRoute, AdminTask, AdminTaskDetail, AdminVersion, MaterialKind } from '../../../admin/contracts';
 import { Badge, Button, Card, ConfirmAction, EmptyState, ErrorState, Field, Input, JsonDetails, PageHeader, Select, Table, Tabs } from '../../components/ui';
 import { GamePlayer } from '../../components/GamePlayer';
+import { harnessUsageLabel } from '../../../harness-status';
 import { useAction, useResource } from '../../lib/api';
 import { AdminListContext, adminPath, Cell, DataState, Download, Facts, MemberOptions, Options, Pager, post, ranges, ResponsiveTable, segment, Status, StatusText, time, useAdminListInterval, useAdminRoute } from './shared';
 
@@ -130,7 +131,7 @@ export function TaskTable({ tasks, empty = '暂无任务', fromOverview = false 
       else inspect(inspector);
     }}>{task.title || task.kindLabel}</button><small className="muted">{task.ownerName} · {task.kindLabel} · #{task.id.slice(0, 8)}</small></Cell>
     <Cell label="执行来源">{taskSource(task)}</Cell>
-    <Cell label="当前状态"><Status value={task.status}>{task.statusLabel}</Status>{(task.error || task.detail) && <small className={task.error ? 'danger-text admin-clamp' : 'muted admin-clamp'}>{task.error || task.detail}</small>}</Cell><Cell label="更新" wide>{time(task.updatedAt)}</Cell>
+    <Cell label="当前状态"><Status value={task.status}>{task.statusLabel}</Status>{(task.error || task.detail) && <small className={task.error ? 'danger-text admin-clamp' : 'muted admin-clamp'}>{task.error || task.detail}</small>}{task.harness && <small className="muted">{harnessUsageLabel(task.harness)}</small>}</Cell><Cell label="更新" wide>{time(task.updatedAt)}</Cell>
   </tr>)}</tbody></ResponsiveTable> : <EmptyState title={empty} />;
 }
 
@@ -320,6 +321,7 @@ export function TaskDetail({ route, embedded = false }: { route: AdminRoute; emb
           <h2>{task.error ? '任务未完成' : active && task.executor === 'agent' ? '等待成员 Agent' : task.status === 'queued' ? '任务已排队' : active ? '平台任务进行中' : '任务已结束'}</h2>
           <p className="admin-prose">{task.detail || (active && task.executor === 'agent' ? '状态会随原设备的领取或结果回传更新。' : '可查看关联作品和结果了解详情。')}</p>
           {active && task.executor === 'platform' && <progress aria-label={task.statusLabel} />}
+          {task.harness && <p className="small muted">{harnessUsageLabel(task.harness)}</p>}
           {task.error && <details><summary>失败原因</summary><pre>{task.error}</pre></details>}
           <div className="row">
             {task.projectId != null && task.projectType && <Button variant="outline" onClick={() => inspect({ kind: 'project', id: String(task.projectId), type: task.projectType || 'topic' })}>关联作品</Button>}

@@ -40,3 +40,23 @@ it('上游瞬时429在采集前等待恢复，不直接打断游戏审核',async
     expect(await task).toBe('browser');expect(launch).toHaveBeenCalledTimes(2);
   }finally{sqlite.close();}
 });
+
+it('backs off inside the shared launch gate after the tracked acquire confirms HTTP 429', async () => {
+  vi.useFakeTimers();
+  const {sqlite,DB}=database();
+  try {
+    const { acquireTrackedBrowser } = await import('../server/cloud-review-capture');
+    const acquire = vi.fn<() => Promise<{sessionId:string}>>()
+      .mockRejectedValueOnce(new Error('Unable to create new browser: code: 429: message: private response'))
+      .mockResolvedValueOnce({sessionId:'own-browser'});
+    const rejected = vi.fn(async () => {});
+    const limits = async () => ({activeSessions:[],maxConcurrentSessions:2,allowedBrowserAcquisitions:1,timeUntilNextAllowedBrowserAcquisition:0});
+    const result=acquireBrowser(DB,limits,()=>acquireTrackedBrowser(acquire,rejected,'Unknown browser acquisition.'),undefined,12_000);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(acquire).toHaveBeenCalledOnce();
+    expect(rejected).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toEqual({sessionId:'own-browser'});
+    expect(acquire).toHaveBeenCalledTimes(2);
+  } finally { sqlite.close(); }
+});

@@ -3,11 +3,12 @@ import {DatabaseSync} from 'node:sqlite';
 import {readFileSync,readdirSync} from 'node:fs';
 import {dispatch as dispatchForge} from '../server/forge-api';
 import {executeForgeTask,ForgeRunner} from '../server/forge-runner';
-import {enqueueForgeTask,failForgeTask,readForgeTask,recoverForgeTasks} from '../server/forge-tasks';
+import {enqueueForgeTask,failForgeTask,publicForgeTask,readForgeTask,recoverForgeTasks} from '../server/forge-tasks';
 import {complete} from '../server/forge-llm';
 import {parseProductionOutput} from '../server/forge-production-output';
 import {saveConfig} from '../server/settings';
 import {tryModelSlot} from '../server/model-capacity';
+import {CCB_ENGINE_COMMIT,harnessHash,modelContractHash} from '../server/harness-policy';
 import type {ModelConfig} from '../server/settings';
 
 const databases:DatabaseSync[]=[];
@@ -73,7 +74,7 @@ describe('后台创作的持久任务',()=>{
     const one=await tryModelSlot(s.env.DB,runtime,'other-one',Date.now()+14*60000),two=await tryModelSlot(s.env.DB,runtime,'other-two',Date.now()+14*60000);
     const row=await enqueueForgeTask(s.env,{type:'game',id:9,requestId:'unused'});
     const fetcher=vi.fn(async()=>response('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><canvas></canvas><script>let score=0;</script></body></html>'));vi.stubGlobal('fetch',fetcher);
-    const storage={get:async()=>row.id,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    const storage={get:async(key:string)=>key==='taskId'?row.id:undefined,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
     await new ForgeRunner({storage},s.env).alarm();
     expect(s.task(row.id)).toMatchObject({status:'queued',model_started_at:null,started_at:null});expect(fetcher).not.toHaveBeenCalled();
     expect(storage.deleteAll).not.toHaveBeenCalled();expect(storage.setAlarm.mock.calls.at(-1)![0]-Date.now()).toBeGreaterThan(4000);
@@ -109,6 +110,44 @@ describe('后台创作的持久任务',()=>{
     expect(s.sqlite.prepare('SELECT count(*) n FROM forge_tasks').get()).toMatchObject({n:1});
   });
 
+  it('recovers a completed Harness artifact after the watchdog deadline without entering the model again',async()=>{
+    const s=await setup();
+    const at=new Date().toISOString();
+    s.sqlite.prepare("INSERT INTO members(id,username,display_name,password_hash,password_salt,created_at,updated_at,star) VALUES('star','star','Star','fixture','fixture',?,?,1)").run(at,at);
+    s.sqlite.exec("UPDATE topics SET owner_id='star' WHERE id=9");
+    s.env.ownerId='star';
+    const row=await enqueueForgeTask(s.env,{type:'preview',id:9});
+    const policy={version:1,engine:'ccb',engineCommit:CCB_ENGINE_COMMIT,image:`registry.cloudflare.com/${'1'.repeat(32)}/fixture@sha256:${'2'.repeat(64)}`,
+      family:'forge',purpose:'preview',releaseHash:'a'.repeat(64),modelContractHash:await modelContractHash(await s.env.modelStore.get(),'preview'),
+      limits:{maxOutputTokens:16_000,maxTotalOutputTokens:16_000,maxModelTurns:6,maxDurationMs:720_000,maxRepairs:0}};
+    s.sqlite.prepare('UPDATE forge_tasks SET harness_policy=? WHERE id=?').run(JSON.stringify(policy),row.id);
+    const svg='<svg viewBox="0 0 540 960"><rect width="10" height="10"/></svg>';
+    const outputHash=await harnessHash(svg);
+    let finishes=0;
+    const harnessFetch=vi.fn(async(request:Request)=>{
+      const url=new URL(request.url);
+      if(url.pathname==='/start')return Response.json({state:'running'});
+      if(url.pathname==='/status')return Response.json({state:'succeeded'});
+      if(url.pathname==='/result')return Response.json({materialHash:url.searchParams.get('material'),text:svg,outputHash});
+      expect(url.pathname).toBe('/finish');
+      expect(await request.json()).toEqual({outcome:'completed'});
+      return ++finishes===1?Response.json({error:'fixture unavailable'},{status:503}):Response.json({ok:true});
+    });
+    s.env.HARNESS_RUNNER={idFromName:(id:string)=>id,get:()=>({fetch:harnessFetch})};
+    const modelFetch=vi.fn();vi.stubGlobal('fetch',modelFetch);
+    await executeForgeTask(s.env,row.id);
+    expect(s.task(row.id)).toMatchObject({status:'running',result:expect.any(String)});
+    expect(publicForgeTask(s.task(row.id)).result).toBeNull();
+    s.sqlite.prepare('UPDATE forge_tasks SET started_at=? WHERE id=?').run(new Date(Date.now()-15*60_000).toISOString(),row.id);
+    expect((await readForgeTask(s.env,row.id))?.status).toBe('running');
+    const storage={get:async(key:string)=>key==='taskId'?row.id:undefined,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    await new ForgeRunner({storage},s.env).alarm();
+    expect(s.task(row.id).status).toBe('done');
+    expect(s.sqlite.prepare("SELECT count(*) n FROM artifact_versions WHERE task_id=?").get(row.id)).toMatchObject({n:1});
+    expect(harnessFetch.mock.calls.map(([req])=>new URL(req.url).pathname)).toEqual(['/start','/status','/result','/finish','/finish']);
+    expect(modelFetch).not.toHaveBeenCalled();
+  });
+
   it('旧队列的固定编号在任务完成后再次投递不会生成新任务',async()=>{
     const s=await setup(),id=crypto.randomUUID();
     await enqueueForgeTask(s.env,{type:'preview',id:9},id);
@@ -123,7 +162,7 @@ describe('后台创作的持久任务',()=>{
     const s=await setup();
     const row=await enqueueForgeTask(s.env,{type:'game',id:9,requestId:'unused'});
     s.sqlite.prepare("UPDATE forge_tasks SET status='running',started_at=?,model_started_at=? WHERE id=?").run(new Date().toISOString(),new Date().toISOString(),row.id);
-    const storage={get:async()=>row.id,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
+    const storage={get:async(key:string)=>key==='taskId'?row.id:undefined,setAlarm:vi.fn(),deleteAlarm:vi.fn(),deleteAll:vi.fn()};
     const fetcher=vi.fn();vi.stubGlobal('fetch',fetcher);
     await new ForgeRunner({storage},s.env).alarm();
     expect(fetcher).not.toHaveBeenCalled();expect(s.task(row.id).status).toBe('error');expect(s.row().product_status).toBe('error');

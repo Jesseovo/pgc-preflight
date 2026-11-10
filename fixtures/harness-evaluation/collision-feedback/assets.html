@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>轨道分拣素材</title>
+<canvas width="160" height="160"></canvas>
+<script id="game-assets">
+const GAME_ASSETS = {
+  crate(ctx, x, y, size) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(size / 100, size / 100);
+    ctx.fillStyle = '#63c9e8';
+    ctx.fill(new Path2D('M-42 -34h84v68h-84z'), 'evenodd');
+    ctx.fillStyle = '#ff9076';
+    ctx.fill(new Path2D('M-40 -23l10 -10 71 57-10 10zm10 57-10 -10 71-57 10 10z'));
+    ctx.restore();
+  }
+};
+</script>
+<script>
+GAME_ASSETS.crate(document.querySelector('canvas').getContext('2d'), 80, 80, 140);
+</script>
+</html>

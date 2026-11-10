@@ -287,30 +287,31 @@ ${CREATIVE_MATERIALS}
 - requirements 逐条列 {id,text,status,evidence?,reason?}：沿用制作需求 ID，没有现成 ID 时用 R1、R2…稳定编号；状态为 implemented / unverified / deferred。implemented 表示代码实现，不声称运行验证；evidence 只填源码或实际采集依据。未验证和未完成分别写原因。不要漏掉设计后段。精修或定向修复保留前一阶段全部需求 ID，可以根据证据更新状态。coreChanges 累积保留此前每条原文，可追加新条目。
 - 完整实现已确认的玩法内容。没有行数或极简首版限制。`;
 
-const GAME_EVIDENCE_BOUNDARY = `【证据边界】
+const gameEvidenceBoundary = (repairBudget, continuation = false) => `【证据边界】
 - 视口图实际送达时，使用图像和动作 ID 引用，说明现象、触发条件、可能根因、最小改动和如何复测。若模型不支持视觉而未送图，只能根据实际运行记录和源码，不能引用未看到的图或宣称已验证外观。区分已确认的问题、体验建议和待验证事项。只改源码可以说明改了哪里，不能声称在输出的新 HTML 上已复测。
 - 单次触摸及持续动画不是输入成功证明；不同视口是独立采样，不拼成一局。没执行对应手势、结算重开、前后台、长期节奏、熟练/新手、挂机/重复操作的，列为未验证。音频节点不是试听证据；未实际试听写「未试听」，无设备和帧时测量写「未测真机性能」。不得根据未测项捏造缺陷、通过或评分。
 - selfCheck 字段为 {findings,unverified,changes,requestRepair}。findings 每项填 {id,kind,phenomenon,trigger,evidenceRefs,cause,minimalChange,retest,coreChange,resolved}；kind 为 confirmed / experience / unverified。evidenceRefs 只填实际材料 ID。resolved 指本次针对明确根因改了代码，运行复测由后续采集验证；retest 写需要验证的步骤，不能把它表述成已完成。
-- 仅当采集中有可复现证据、问题尚未解决且最小修复不涉及核心设计时，才可 requestRepair=true；不能因证据不足、纯体验或希望多打磨一次而要求付费修复。至多一次定向修复。核心设计争议明确交成员确认。`;
+- 仅当采集中有可复现证据、问题尚未解决且最小修复不涉及核心设计时，才可 requestRepair=true；不能因证据不足、纯体验或希望多打磨一次而要求付费修复。${continuation ? "本阶段之后只允许最后一次定向修复。" : repairBudget > 1 ? "当前任务最多进行两次定向修复。" : "至多一次定向修复。"}核心设计争议明确交成员确认。`;
 
 /**
  * @param {"build"|"polish"|"repair"} stage
- * @param {"json"|"framed"} format
+ * @param {"json"|"framed"|"workspace"} format
+ * @param {number} remainingRepairs
  */
-export function gameStageSystem(stage, format = "json") {
+export function gameStageSystem(stage, format = "json", remainingRepairs = stage === "polish" ? 1 : 0) {
   const delivery = format === "json" ? "，以 JSON 的 html 字段交付" : "";
   const common = `你是 PGC 游戏制作者。制作完整的单文件可玩 HTML${delivery}。${GAME_STAGE_COMMON}`;
   if (stage === "build") return `${common}
 本阶段制作可运行版本：完整打通规则、操作、阶段推进、胜负、风险奖励、得分、重开、BGM、音效和存储容错。集中维护调参区；优先清晰可验证的实现，不在此阶段虚报试听、试玩或性能。
 ${gameStageFormat(stage, format)}`;
   if (stage === "polish") return `${common}
-本阶段精修：从上一版 HTML 和实际采集出发，保持玩法、输入、胜负和资产库，深化媒介纹理、轮廓、待机和状态反馈、HUD、混音与随进度变化的音色。把能从输入复现的基础问题一并最小修正；整理保留的要求与待复测事项。
-${GAME_EVIDENCE_BOUNDARY}
-${gameStageFormat(stage, format)}`;
+本阶段精修：从上一版 HTML 和实际采集出发，保持玩法、输入、胜负和资产库，深化媒介纹理、轮廓、待机和状态反馈、HUD、混音与随进度变化的音色。把能从输入复现的基础问题一并最小修正；整理保留的要求与待复测事项。${remainingRepairs === 0 ? " requestRepair 必须为 false，已无后续自动修复轮次。" : ""}
+${gameEvidenceBoundary(remainingRepairs)}
+${gameStageFormat(stage, format, remainingRepairs > 0)}`;
   if (stage === "repair") return `${common}
-本阶段只处理已指出的、可从最新采集复现的非核心问题。先用采集确认触发和根因，再做最小修复；不能证实就保持现状并标记待验证。保留已经正常的设计和资产。requestRepair 必须为 false，不继续自动返工。
-${GAME_EVIDENCE_BOUNDARY}
-${gameStageFormat(stage, format)}`;
+本阶段只处理已指出的、可从最新采集复现的非核心问题。先用采集确认触发和根因，再做最小修复；不能证实就保持现状并标记待验证。保留已经正常的设计和资产。${remainingRepairs > 0 ? "若仍有可复现且未解决的非核心问题，可按证据边界明确请求最后一次定向修复。" : "requestRepair 必须为 false，不继续自动返工。"}
+${gameEvidenceBoundary(remainingRepairs, remainingRepairs > 0)}
+${gameStageFormat(stage, format, remainingRepairs > 0)}`;
   throw new Error("未知的游戏制作阶段。");
 }
 
@@ -341,13 +342,19 @@ const gameRecordBoundary = "不能写进 HTML 注释、脚本、DOM 或可访问
 
 /**
  * @param {"build"|"polish"|"repair"} stage
- * @param {"json"|"framed"} format
+ * @param {"json"|"framed"|"workspace"} format
+ * @param {boolean} mayRequestRepair
  */
-function gameStageFormat(stage, format) {
-  const schema = {build: GAME_BUILD_SCHEMA, polish: GAME_POLISH_SCHEMA, repair: GAME_REPAIR_SCHEMA}[stage];
-  if (format === "framed") {
+function gameStageFormat(stage, format, mayRequestRepair = stage === "polish") {
+  const schema = stage === "build" ? GAME_BUILD_SCHEMA : mayRequestRepair ? GAME_POLISH_SCHEMA : GAME_REPAIR_SCHEMA;
+  if (format === "framed" || format === "workspace") {
     const recordFields = Object.fromEntries(Object.entries(schema.properties).filter(([name]) => name !== "html"));
     const required = schema.required.filter(name => name !== "html");
+    const recordSchema = JSON.stringify(closed(recordFields, required));
+    if (format === "workspace") return `【工作区交付格式】
+使用私有工作区工具保存两个文件。game.html 保存从 <!doctype html> 到 </html> 的完整 HTML 原文，保留原始引号、换行和脚本。record.json 只保存符合下方 Schema 的单个 JSON 对象。两个文件都不含区块标记或 Markdown 代码围栏。${gameRecordBoundary}
+【记录 JSON Schema】
+${recordSchema}`;
     return `【交付格式】
 按下方结构输出两个连续区块。四个标记各占独立一行，各出现一次。首行必须是 HTML 开始标记，末行必须是记录结束标记。区块外不写解释、Markdown 代码围栏或其他文字。用实际产物替换模板中省略的部分。
 
@@ -362,7 +369,7 @@ function gameStageFormat(stage, format) {
 
 HTML 区块从 <!doctype html> 到 </html>，直接输出 HTML 原文，保留原始引号、换行和脚本。记录区块只包含下面的 JSON 字段。${gameRecordBoundary}
 【记录 JSON Schema】
-${JSON.stringify(closed(recordFields, required))}`;
+${recordSchema}`;
   }
   const keys = schema.required;
   return `【交付格式】
@@ -375,18 +382,19 @@ ${JSON.stringify(htmlEscapeExample)}
 const gameJsonReminder = '请按系统给定的顶层字段返回单个 JSON 对象。完整 HTML 只放在正确转义的 "html" 字符串中。';
 
 const gameFramedReminder = "请按系统给定的 PGC_HTML 和 PGC_RECORD 区块交付完整 HTML 原文及独立 JSON 记录。保留四行标记，区块外不加内容。";
+const gameWorkspaceReminder = "请使用私有工作区工具，将完整 HTML 原文保存为 game.html，独立 JSON 记录保存为 record.json。";
 
 /**
  * @param {"build"|"polish"|"repair"} stage
  * @param {{topic:any, brief:string, styleSvg?:string, styleImage?:string, assetHtml?:string,
  *   html?:string, capture?:{shots:{id:string,label:string,data:string,actionRefs?:string[]}[],probe:unknown,hash?:string,stage?:string},
- *   requirements?:unknown,decisions?:unknown,coreChanges?:unknown,selfCheck?:unknown}} input
- * @param {"json"|"framed"} format
+ *   requirements?:unknown,decisions?:unknown,coreChanges?:unknown,selfCheck?:unknown,harnessEvidence?:Array<{evidenceId:string,inputHash:string,shots:Array<{id:string,data:string}>}>}} input
+ * @param {"json"|"framed"|"workspace"} format
  * @returns {Array<{type:"text",text:string}|{type:"image",data:string}>}
  */
 export function gameStageUser(stage, input, format = "json") {
-  const gameOutputReminder = format === "framed" ? gameFramedReminder : gameJsonReminder;
-  const { topic, brief, styleSvg, styleImage, assetHtml, html, capture, requirements, decisions, coreChanges, selfCheck } = input;
+  const gameOutputReminder = format === "workspace" ? gameWorkspaceReminder : format === "framed" ? gameFramedReminder : gameJsonReminder;
+  const { topic, brief, styleSvg, styleImage, assetHtml, html, capture, requirements, decisions, coreChanges, selfCheck, harnessEvidence } = input;
   const asset = extractGameAssetScript(assetHtml);
   if (assetHtml && !asset) throw new Error("锁定的美术资产缺少可复用的 GAME_ASSETS 脚本。");
   /** @type {Array<{type:"text",text:string}|{type:"image",data:string}>} */
@@ -407,6 +415,14 @@ export function gameStageUser(stage, input, format = "json") {
   for (const { id, label, data, actionRefs } of shots) {
     parts.push({ type: "text", text: `原图证据 ID：${id}；${label}；动作：${(actionRefs || []).join("、") || "无"}` });
     parts.push({ type: "image", data });
+  }
+  for (const evidence of harnessEvidence || []) {
+    const { shots: toolShots, ...record } = evidence;
+    parts.push({ type: "text", text: `【Harness 试玩补测】${JSON.stringify({...record,shots:toolShots.map(({data,...shot})=>shot)})}\n以上记录只对应 inputHash 指定的 HTML。旧版或中间版证据不能证明新输出已修复。` });
+    for (const shot of toolShots) {
+      parts.push({ type: "text", text: `Harness 原图证据 ID：${shot.id} · HTML SHA-256：${evidence.inputHash}` });
+      parts.push({ type: "image", data: shot.data });
+    }
   }
   parts.push({ type: "text", text: gameOutputReminder });
   return parts;

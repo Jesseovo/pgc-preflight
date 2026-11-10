@@ -117,6 +117,14 @@ describe('新版创作材料',()=>{
     expect(gameStageSystem(stage)).toBe(gameStageSystem(stage,'json'));
     expect(gameStageSystem(stage)).not.toMatch(/PGC_HTML|PGC_RECORD/);
     expect(framed.slice(0,-1)).toEqual(agent.slice(0,-1));
+    const workspaceSystem=gameStageSystem(stage,'workspace');
+    expect(workspaceSystem).toContain('game.html 保存从 <!doctype html> 到 </html> 的完整 HTML 原文');
+    expect(workspaceSystem).toContain('record.json 只保存符合下方 Schema 的单个 JSON 对象');
+    expect(workspaceSystem).not.toMatch(/PGC_HTML|PGC_RECORD|顶层 "html" 字段/);
+    expect(JSON.parse(workspaceSystem.split('【记录 JSON Schema】\n')[1])).toEqual(metadata);
+    const workspace=gameStageUser(stage,material,'workspace');
+    expect(workspace.at(-1)).toMatchObject({type:'text',text:expect.stringContaining('独立 JSON 记录保存为 record.json')});
+    expect(workspace.slice(0,-1)).toEqual(framed.slice(0,-1));
   });
 
   it('自检作为独立结构，返工不得要求额外返工',()=>{

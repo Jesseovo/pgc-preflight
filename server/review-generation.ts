@@ -18,7 +18,7 @@ export async function generateReview(env: Environment, cfg: Record<string, strin
 // never substitutes for verification, nor permits replay of an unknown call.
 export async function generateReviewStage(env: Environment, cfg: Record<string, string>, request: Request, purpose: 'review' | 'review_verify', draft?: unknown) {
   const deadline = Math.min(request.deadline ?? Infinity, Date.now() + 12 * 60 * 1000);
-  if (purpose === 'review_verify' && deadline - Date.now() < 30000) throw new Error('评分依据复核未完成，请重试；本次未发布评分。');
+  if (!env.harnessExecution?.recoverSealed && purpose === 'review_verify' && deadline - Date.now() < 30000) throw new Error('评分依据复核未完成，请重试；本次未发布评分。');
   const stage = purpose === 'review' ? '模型正在结合完整画面、源码与校准样本评分' : '模型正在复核评分依据，检查误扣分与相互矛盾的建议';
   const onWait = async (message: string) => request.onWait?.(message ? `${stage} · ${message}` : stage);
   const config = await env.modelStore.get();
@@ -31,7 +31,7 @@ export async function generateReviewStage(env: Environment, cfg: Record<string, 
   const schema = version === 2 ? REVIEW_SCHEMA_V2 : REVIEW_SCHEMA;
   const system = `${request.system}\n\n初评阶段没有平台附加的草稿，按原始证据输出初评。仅复核阶段在原始证据之后附上待复核草稿，并适用以下复核规则：\n${verification}`;
   const options = { ...request, system, schema, normalize:normalizeReviewOutput, validate: (value: unknown) => reviewReportErrors(value, {schemaVersion: version}), purpose, maxTokens, timeoutMs: 300000, deadline, onWait };
-  await onWait('');
+  if(!env.harnessExecution?.recoverSealed)await onWait('');
   if (purpose === 'review') return complete(env, cfg, options);
   if (!draft) throw new Error('初评结果缺失，不能开始复核。');
   const parts = typeof request.user === 'string' ? [{ type: 'text', text: request.user }] : request.user as Array<Record<string, string>>;
